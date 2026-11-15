@@ -194,6 +194,8 @@ const FORMATS_WIDTH: f32 = 260.0;
 
 pub struct Gallery {
     pub store: Arc<ArtworkStore>,
+    /// The page dragged and flicked by a finger or the pen, as on a tablet.
+    glide: Glide,
     entries: Vec<GalleryEntry>,
     /// The stack open: its folder and name.
     stack: Option<(String, String)>,
@@ -353,6 +355,7 @@ impl Gallery {
             reader: None,
             duplicating: Vec::new(),
             new_open: false,
+            glide: Glide::default(),
             presets,
             kinds: Vec::new(),
             screen_px: (1920, 1080),
@@ -1200,8 +1203,21 @@ impl Gallery {
         } else {
             self.opening_stack = None;
         }
+        // a finger or the pen dragging the page moves it (and a flick keeps it going); the wheel
+        // and the scroll bar too
+        let lifted = self.lifted.is_some() || self.spreading.is_some();
+        let driven = self.glide.frame(ui, rect, lifted);
+        let mut area =
+            ScrollArea::vertical().id_salt("gallery grid").scroll_source(egui::containers::scroll_area::ScrollSource {
+                drag: egui::containers::scroll_area::DragScroll::Never,
+                ..Default::default()
+            });
+        if let Some(y) = driven {
+            area = area.vertical_scroll_offset(y);
+        }
+        let caught = self.glide.caught;
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-            ScrollArea::vertical().id_salt("gallery grid").show(ui, |ui| {
+            let shown = area.show(ui, |ui| {
                 let (all, _) = ui.allocate_exact_size(vec2(rect.width(), rows as f32 * pitch + 24.0), Sense::hover());
                 for (i, entry) in entries.iter().enumerate() {
                     let (row, column) = (i / columns, i % columns);
@@ -1238,7 +1254,8 @@ impl Gallery {
                             ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(HOLD_S - held));
                         }
                     }
-                    let tapped = response.clicked() && self.lifted.is_none();
+                    // (a touch that stops the page gliding is no tap)
+                    let tapped = response.clicked() && self.lifted.is_none() && !caught;
                     // its picture shrinks under a press and grows as it lifts
                     let dir = entry_dir(entry);
                     let pressed = ui.input(|inp| inp.pointer.press_start_time().map_or(0.0, |t| inp.time - t));
@@ -1318,6 +1335,8 @@ impl Gallery {
                     }
                 }
             });
+            self.glide
+                .shown(shown.state.clamped_offset().y, (shown.content_size.y - shown.inner_rect.height()).max(0.0));
         });
         self.drag(ui, &entries, &cells);
         self.drawn_cells = drawn;
@@ -2238,6 +2257,122 @@ impl ThumbnailReader {
             }
         });
         ThumbnailReader { asks, read }
+    }
+}
+
+/// How quickly a flicked page slows (its speed a part of itself a second), and the slowest it
+/// keeps going (points a second).
+const GLIDE_SLOWING: f32 = 3.2;
+const GLIDE_LEAST: f32 = 12.0;
+/// How far a press moves before it is told apart as a drag of the page or along it (points).
+const GLIDE_DECIDE: f32 = 6.0;
+/// How long a flick's speed is measured over (seconds).
+const GLIDE_SPAN: f64 = 0.08;
+
+/// The gallery page under a finger or the pen: dragged up and down with it, gliding on after a
+/// flick and slowing to a stop, caught by a touch.
+#[derive(Default)]
+struct Glide {
+    /// Where the page is (points scrolled), and how far it can go.
+    y: f32,
+    most: f32,
+    /// A press on the page not yet a drag of it (where it began), or one that is.
+    deciding: Option<Pos2>,
+    dragging: bool,
+    /// The recent moves, for a flick's speed: when, and how far.
+    moves: Vec<(f64, f32)>,
+    /// Gliding: points a second (up the page is more).
+    speed: f32,
+    last: Option<f64>,
+    /// A press stopped the page gliding: it is no tap.
+    caught: bool,
+}
+
+impl Glide {
+    /// Before the page is shown: the press and drag under way, and where the page goes this
+    /// frame, if the drag or a glide moves it (else the wheel and scroll bar may).
+    fn frame(&mut self, ui: &Ui, rect: Rect, lifted: bool) -> Option<f32> {
+        let (now, down, pressed, at, delta, dt) = ui.input(|i| {
+            (
+                i.time,
+                i.pointer.primary_down(),
+                i.pointer.primary_pressed(),
+                i.pointer.interact_pos(),
+                i.pointer.delta(),
+                i.stable_dt.clamp(0.001, 0.05),
+            )
+        });
+        let mut moved = false;
+        if pressed && at.is_some_and(|p| rect.contains(p)) {
+            // a touch while it glides stops it there
+            self.caught = self.speed.abs() > GLIDE_LEAST * 4.0;
+            self.speed = 0.0;
+            self.deciding = at;
+            self.dragging = false;
+            self.moves.clear();
+        }
+        if down && !lifted {
+            if let (Some(from), Some(p)) = (self.deciding, at) {
+                let gone = p - from;
+                if gone.length() >= GLIDE_DECIDE {
+                    // up and down drags the page; across is the artwork's own swipe
+                    self.dragging = gone.y.abs() > gone.x.abs();
+                    self.deciding = None;
+                    if self.dragging {
+                        // the way it went while deciding counts
+                        self.y = (self.y - gone.y).clamp(0.0, self.most);
+                        moved = true;
+                    }
+                }
+            } else if self.dragging && delta.y != 0.0 {
+                self.y = (self.y - delta.y).clamp(0.0, self.most);
+                self.moves.push((now, delta.y));
+                moved = true;
+            }
+            self.moves.retain(|(t, _)| now - *t <= GLIDE_SPAN);
+        } else if !down {
+            if self.dragging {
+                // let go: as fast as it was going, it glides on
+                let span: f32 = self.moves.iter().map(|(_, d)| *d).sum();
+                let over = self.moves.first().map_or(0.0, |(t, _)| (now - *t).max(1.0 / 120.0));
+                self.speed = if self.moves.is_empty() { 0.0 } else { -span / over as f32 };
+                self.last = Some(now);
+            }
+            self.dragging = false;
+            self.deciding = None;
+            self.moves.clear();
+            if self.caught && !pressed {
+                self.caught = false;
+            }
+        }
+        if lifted {
+            self.dragging = false;
+            self.speed = 0.0;
+        }
+        if !self.dragging && self.speed.abs() >= GLIDE_LEAST {
+            let step = self.last.map_or(dt, |l| ((now - l) as f32).clamp(0.0, 0.05));
+            self.last = Some(now);
+            self.y += self.speed * step;
+            self.speed *= (-GLIDE_SLOWING * step).exp();
+            if self.y <= 0.0 || self.y >= self.most {
+                self.y = self.y.clamp(0.0, self.most);
+                self.speed = 0.0;
+            }
+            moved = true;
+            ui.ctx().request_repaint();
+        } else if !self.dragging {
+            self.speed = 0.0;
+        }
+        moved.then_some(self.y)
+    }
+
+    /// After the page is shown: where it is (the wheel or the scroll bar may have moved it) and
+    /// how far it can go.
+    fn shown(&mut self, y: f32, most: f32) {
+        self.most = most;
+        if !self.dragging && self.speed == 0.0 {
+            self.y = y;
+        }
     }
 }
 
