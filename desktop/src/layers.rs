@@ -399,13 +399,8 @@ impl Layers {
                 plus = Rect::from_min_size(pos2(body.right() - 18.0 - 40.0, body.top() + 12.0), vec2(40.0, 41.0));
                 look.icon(ui, &icons::PLUS_MEDIUM, plus.center(), 41.0, argb(PANEL_GLYPH));
                 if ui.interact(plus, ui.scope_id().with("new layer"), Sense::click()).clicked() {
-                    // new layers vector (the title menu's switch): one at once; else, with plugins'
-                    // kinds of layer on, it asks which
-                    if let Some(kind) = self.vector_kind().filter(|_| vector_default()) {
-                        if session.add_plugin_layer(kind) == 0 {
-                            crate::files::no_room(session);
-                        }
-                    } else if !self.layer_kinds.is_empty() {
+                    // with plugins' kinds of layer on, it asks which
+                    if !self.layer_kinds.is_empty() {
                         self.add_menu.open();
                     } else if session.add_layer() == 0 {
                         crate::files::no_room(session);
@@ -631,16 +626,7 @@ impl Layers {
         backdrops: &mut Vec<f32>,
     ) {
         let ink = menu::INK;
-        let mut entries = Vec::new();
-        // vector layers, while their plugin is on: new ones vector, and empty plain ones made so
-        if self.vector_kind().is_some() {
-            let label = if vector_default() { "New Layers Vector: On" } else { "New Layers Vector: Off" };
-            entries.push(Entry::Item(&icons::MENU_NEW_LAYER, label, ink));
-            entries.push(Entry::Item(&icons::MENU_CHECK_CIRCLE, "Make Empty Layers Vector", ink));
-            entries.push(menu::DIVIDER);
-        }
-        entries.push(Entry::Item(&icons::MENU_SELECT_ALL, "Select All", ink));
-        entries.push(menu::DIVIDER);
+        let mut entries = vec![Entry::Item(&icons::MENU_SELECT_ALL, "Select All", ink), menu::DIVIDER];
         if picked {
             entries.push(Entry::Item(&icons::MENU_GROUP, "Group", ink));
             entries.push(Entry::Item(&icons::MENU_MERGE, "Merge", ink));
@@ -669,26 +655,6 @@ impl Layers {
         let Some(Entry::Item(_, label, _)) = tapped.and_then(|i| entries.get(i)) else { return };
         self.title_menu.close();
         match *label {
-            "New Layers Vector: On" | "New Layers Vector: Off" => set_vector_default(!vector_default()),
-            "Make Empty Layers Vector" => {
-                if let Some(kind) = self.vector_kind() {
-                    let made = session
-                        .layers()
-                        .iter()
-                        .filter(|l| l.kind == LayerType::Paint && !l.text && l.plugin_kind.is_none() && !l.locked)
-                        .filter(|l| session.layer_unpainted(l.id))
-                        .filter(|l| make_vector(session, l, &kind))
-                        .count();
-                    self.notice = Some((
-                        match made {
-                            0 => "No empty layers to make vector".into(),
-                            1 => "1 layer made vector".into(),
-                            n => format!("{n} layers made vector"),
-                        },
-                        true,
-                    ));
-                }
-            }
             "Select All" => _ = session.pick_all_layers(),
             "Group" => _ = session.group_picked(),
             "Merge" => _ = session.merge_picked(),
@@ -1363,23 +1329,7 @@ impl Layers {
         row_y: f32,
         backdrops: &mut Vec<f32>,
     ) {
-        let mut rows: Vec<LayerOptionRow> = session.layer_options(l.id);
-        // vector on or off, while vector layers' plugin is on: off flattens one to pixels (as
-        // Rasterize does); on makes an empty plain layer one (a painted one's paint can't become
-        // strokes)
-        let vector = self.vector_kind();
-        let is_vector = l.plugin_kind.as_ref().is_some_and(|k| vector.as_ref() == Some(k));
-        let plain = l.kind == LayerType::Paint && !l.text && l.plugin_kind.is_none();
-        if vector.is_some() && !l.locked && (is_vector || plain) {
-            let enabled = is_vector || session.layer_unpainted(l.id);
-            let label = if enabled { "Vector" } else { "Vector (empty layers only)" };
-            rows.push(LayerOptionRow {
-                option: LayerOption::Rasterize,
-                label: label.to_owned(),
-                enabled,
-                switch_on: Some(is_vector),
-            });
-        }
+        let rows: Vec<LayerOptionRow> = session.layer_options(l.id);
         // a plugin's actions for the layer, after the app's own
         let actions = std::mem::take(&mut self.plugin_actions);
         let count = rows.len() + actions.len();
@@ -1390,7 +1340,6 @@ impl Layers {
         let top = (row_y - height / 2.0).clamp(screen.top() + OPTIONS_TOP, lowest);
         let rect = Rect::from_min_size(pos2(panel.left() + OPTIONS_LEFT, top), vec2(OPTIONS_WIDTH, height));
         let mut chosen = None;
-        let mut vector_row = false;
         let mut action = None;
         self.options_menu.show(
             ctx,
@@ -1409,7 +1358,6 @@ impl Layers {
                 for (&row, r) in places.iter().zip(&rows) {
                     if menu::option(ui, look, row, &r.label, r.switch_on.unwrap_or(false), r.enabled, false) {
                         chosen = Some(r.option);
-                        vector_row = r.label.starts_with("Vector");
                     }
                 }
                 for (&row, a) in places.iter().skip(rows.len()).zip(&actions) {
@@ -1427,17 +1375,6 @@ impl Layers {
         // every row closes the menu, a switch's too (it shows ticked next time)
         let Some(does) = chosen else { return };
         self.options_menu.close();
-        if vector_row {
-            if is_vector {
-                session.rasterize_layer(l.id);
-                self.notice = Some(("Layer made pixels".into(), true));
-            } else if let Some(kind) = vector
-                && make_vector(session, l, &kind)
-            {
-                self.notice = Some(("Layer made vector".into(), true));
-            }
-            return;
-        }
         match does {
             LayerOption::Rename => self.renaming = Some((l.id, l.name.clone(), false)),
             LayerOption::Ungroup => _ = session.ungroup(l.id),
@@ -2113,52 +2050,6 @@ impl Pinch {
         } else {
             None
         }
-    }
-}
-
-/// New layers are vector layers (the Layers title menu's switch), kept between runs
-/// ("vector_default" in the app's folder).
-fn vector_default() -> bool {
-    static READ: std::sync::Once = std::sync::Once::new();
-    READ.call_once(|| {
-        let kept = std::fs::read_to_string(crate::files::app_dir().join("vector_default")).unwrap_or_default();
-        VECTOR_DEFAULT.store(kept.trim() == "true", std::sync::atomic::Ordering::Relaxed);
-    });
-    VECTOR_DEFAULT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-static VECTOR_DEFAULT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn set_vector_default(on: bool) {
-    vector_default();
-    VECTOR_DEFAULT.store(on, std::sync::atomic::Ordering::Relaxed);
-    crate::files::keep_text("vector_default", &format!("{on}\n"));
-}
-
-/// Plain layer `l` (empty) made a vector layer of `kind` in its place: its name, opacity, blend
-/// and showing kept, and made current. True if it was.
-fn make_vector(session: &CanvasSession, l: &LayerInfo, kind: &str) -> bool {
-    if !session.select_layer(l.id) {
-        return false;
-    }
-    let made = session.add_plugin_layer(kind.to_owned());
-    if made == 0 {
-        crate::files::no_room(session);
-        return false;
-    }
-    session.rename_layer(made, l.name.clone());
-    session.set_layer_opacity(made, l.opacity, true);
-    session.set_layer_blend(made, l.blend);
-    session.set_layer_visible(made, l.visible);
-    session.delete_layer(l.id);
-    session.select_layer(made);
-    true
-}
-
-impl Layers {
-    /// The vector layers' kind, while their plugin is on.
-    fn vector_kind(&self) -> Option<String> {
-        self.layer_kinds.iter().find(|k| k.key.ends_with(".vector")).map(|k| k.key.clone())
     }
 }
 

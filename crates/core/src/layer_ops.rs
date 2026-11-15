@@ -101,11 +101,6 @@ pub(crate) fn painted_rect(pixels: &[u8], width: u32) -> Option<IRect> {
 
 #[uniffi::export]
 impl CanvasSession {
-    /// Whether layer `id` has nothing painted on it (as the GPU finds it).
-    pub fn layer_unpainted(&self, id: u64) -> bool {
-        self.shared.lock().painted_box(LayerId(id)).is_none()
-    }
-
     /// Selects what is on layer `id` (by its coverage), as one undo step.
     pub fn select_layer_contents(&self, id: u64) -> bool {
         let mut guard = self.shared.lock();
