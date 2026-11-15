@@ -1909,13 +1909,15 @@ impl CanvasSession {
                 let parted = t.gesture_pair.is_some_and(|(a, b)| a == id || b == id);
                 let pinched = parted && self.end_box_pinch(&mut t, cancelled, &mut out);
                 Self::follow_fingers(&mut t);
-                // two fingers parting as they close fast fit a canvas pinched smaller than it
-                // fits, settling into place (a tap's fingers aren't a pinch)
+                // two fingers parting as they close fast square the canvas up to the right angle
+                // it is nearest, about where they were, at the zoom it is (a tap's fingers aren't
+                // a pinch)
                 let tap = Self::fingers_tapped(&t, now);
                 if parted && !pinched && !cancelled && !tap && t.tap_pointers == 2 && t.gesture_pair.is_none() {
                     let flicked = Self::pinch_speed(&t, now) < QUICK_PINCH_SPEED;
-                    if flicked && self.pinched_smaller_than_fit() {
-                        out.push(TouchCommand::Fit);
+                    if flicked {
+                        let (x, y, _, _) = t.last;
+                        self.settle_straight(x, y);
                     }
                 }
                 // the first lift decides a tap, and it does what it does there: the fingers left
@@ -2374,12 +2376,6 @@ impl CanvasSession {
             Some(&(ms, was)) if now - ms > 0.5 => (scale - was) / ((now - ms) / 1000.0) as f32,
             _ => 0.0,
         }
-    }
-
-    /// The canvas as pinched is smaller on the screen than it is fitted.
-    fn pinched_smaller_than_fit(&self) -> bool {
-        let st = self.shared.lock();
-        st.view.is_some_and(|v| v.zoom() < st.fitted_view().zoom())
     }
 
     /// One step of two fingers at `ms`: the view follows them. True if there were two to follow.
@@ -3094,19 +3090,29 @@ mod tests {
     }
 
     #[test]
-    fn a_quick_pinch_in_fits_the_canvas() {
-        let s = shown(1.0);
-        let fitted = zoom(&s);
-        let out = pinch(&s, -5.0, 120.0, 0.0);
-        assert!(zoom(&s) < fitted * 0.5);
-        assert!(out.contains(&TouchCommand::Fit), "{out:?}");
-        // from fitted, a small flick in fits it again
-        let s = shown(1.0);
+    fn a_quick_pinch_in_squares_the_canvas_where_it_is() {
+        // turned a little by hand, zoomed in
+        let s = shown(3.0);
+        if let Some(v) = s.shared.lock().view.as_mut() {
+            v.gesture(Vec2::new(400.0, 300.0), Vec2::new(0.0, 0.0), 1.0, 0.08);
+        }
         let out = pinch(&s, -6.9, 32.0, 0.0);
-        assert!(out.contains(&TouchCommand::Fit), "{out:?}");
-        // closing a little faster than 2.5 a second fits, a little slower doesn't
-        assert!(pinch(&shown(1.0), -2.8, 150.0, 0.0).contains(&TouchCommand::Fit));
-        assert!(!pinch(&shown(1.0), -2.2, 150.0, 0.0).contains(&TouchCommand::Fit));
+        assert!(!out.contains(&TouchCommand::Fit), "{out:?}");
+        let (pinched, motion) = {
+            let st = s.shared.lock();
+            (st.view.expect("a view"), st.view_motion.expect("settling"))
+        };
+        // square again, at the zoom the pinch left it, the middle of the fingers kept in place
+        assert!(motion.to.rotation().abs() < 1e-4, "{}", motion.to.rotation());
+        assert!((motion.to.zoom() - pinched.zoom()).abs() < 1e-3 * pinched.zoom());
+        let middle = Vec2::new(400.0, 300.0);
+        let under = pinched.screen_to_canvas(middle).expect("invertible");
+        let back = motion.to.to_screen().apply(under);
+        assert!((back - middle).length() < 0.5, "{back:?}");
+        // a slower pinch leaves it as it is
+        let s = shown(3.0);
+        pinch(&s, -2.2, 150.0, 0.0);
+        assert!(s.shared.lock().view_motion.is_none());
     }
 
     #[test]

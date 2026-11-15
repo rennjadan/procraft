@@ -7,7 +7,8 @@
 
   For every user of the machine, with a wizard: Welcome, the install folder (Program Files\ProCraft
   at first, then wherever the last version went), Ready, progress, and Finish with a ticked
-  "Launch ProCraft". It installs ProCraft.exe, the licence files and a Start menu shortcut. A newer
+  "Launch ProCraft". It installs ProCraft.exe, the licence files, a Start menu shortcut, a desktop
+  shortcut and the "ProCraft Data" folder the app keeps its files in. A newer
   version takes an older one's place. Modelled on SolidCraft's (tangency-labs/solidcraft).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
@@ -29,9 +30,13 @@
     <Property Id="ARPHELPLINK" Value="https://github.com/artcraft-android/procraft/issues" />
 
     <StandardDirectory Id="ProgramFiles6432Folder">
-      <Directory Id="INSTALLFOLDER" Name="ProCraft" />
+      <Directory Id="INSTALLFOLDER" Name="ProCraft">
+        <!-- the app keeps its artworks, brushes and settings here, in the folder chosen -->
+        <Directory Id="DATAFOLDER" Name="ProCraft Data" />
+      </Directory>
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder" />
+    <StandardDirectory Id="DesktopFolder" />
 
     <!-- an upgrade goes where the version before it went (kept by the App component) -->
     <Property Id="INSTALLFOLDER">
@@ -40,6 +45,8 @@
 
     <Feature Id="Main" Title="ProCraft" Level="1">
       <ComponentGroupRef Id="ProCraftFiles" />
+      <ComponentRef Id="DesktopShortcut" />
+      <ComponentRef Id="DataFolder" />
     </Feature>
 
     <!-- the install folder wizard without its licence page (MIT OR Apache-2.0: nothing to accept) -->
@@ -50,7 +57,7 @@
       <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchProCraft"
                Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
     </UI>
-    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="ProCraft $(var.DisplayVersion) is installed. You can start it any time from the Start menu." />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="ProCraft $(var.DisplayVersion) is installed. You can start it any time from its desktop icon or the Start menu." />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch ProCraft" />
     <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
     <Property Id="WixShellExecTarget" Value="[#ProCraftExe]" />
@@ -74,5 +81,22 @@
       <Component Id="Notice"><File Source="$(var.BinDir)\NOTICE" /></Component>
       <Component Id="Attribution"><File Source="$(var.BinDir)\ATTRIBUTION.md" /></Component>
     </ComponentGroup>
+
+    <!-- a plain (not advertised) desktop shortcut straight to ProCraft.exe with the app's own
+         icon: the Start menu's shortcut is left as it is -->
+    <Component Id="DesktopShortcut" Directory="DesktopFolder" Guid="5B0C2A4E-6F0E-4C7B-9E55-2D3C8B1F7A61">
+      <Shortcut Id="DesktopShortcutLink" Name="ProCraft" Description="Paint, draw and sketch"
+                Target="[#ProCraftExe]" WorkingDirectory="INSTALLFOLDER" Icon="ProCraftIcon.exe" IconIndex="0" />
+      <RegistryValue Root="HKCU" Key="Software\ProCraft" Name="DesktopShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!-- the data folder in the folder chosen, which everyone who uses the PC may write to (even in
+         Program Files); what is kept there stays when ProCraft is updated or removed -->
+    <Component Id="DataFolder" Directory="DATAFOLDER" Guid="8E2D6C11-3A9B-4F0D-B7C4-6A1E5F92D3B8" Permanent="yes">
+      <CreateFolder>
+        <PermissionEx Sddl="D:PAI(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1301bf;;;BU)" />
+      </CreateFolder>
+      <RegistryValue Root="HKLM" Key="Software\ProCraft" Name="DataDir" Type="string" Value="[DATAFOLDER]" KeyPath="yes" />
+    </Component>
   </Fragment>
 </Wix>

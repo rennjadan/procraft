@@ -1,0 +1,55 @@
+# Renn's builds: every push to a branch (or a run started by hand from the Actions tab) builds the
+# Windows x64 installer and portable zip, nothing else. They are under the run's "Artifacts".
+name: Windows build
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+env:
+  RUST_VERSION: "1.99.0"
+
+jobs:
+  windows-x64:
+    name: Windows x64
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    env:
+      DIST: ${{ github.workspace }}/dist
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: v
+        name: Resolve version
+        run: |
+          listed="$(sed -n 's/^procraft\.version=//p' android/gradle.properties | tr -d '\r')"
+          echo "version=$listed" >>"$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-build-x64
+
+      - name: Install WiX v5
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          echo "$USERPROFILE/.dotnet/tools" >>"$GITHUB_PATH"
+          "$USERPROFILE/.dotnet/tools/wix" extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
+
+      - name: Package for Windows
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: ./packaging/windows/package.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: procraft-windows-x64
+          path: dist/*
+          if-no-files-found: error

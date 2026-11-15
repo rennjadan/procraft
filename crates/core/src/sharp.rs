@@ -51,6 +51,25 @@ pub(crate) struct Sharp {
     failed: Option<Shown>,
     /// How many sharp pictures were made.
     pub(crate) made: u64,
+    /// Never made: plugins' layers show only their own pixels, which change only where a stroke
+    /// lands (the app's Prefs can say so).
+    pub(crate) off: bool,
+}
+
+impl crate::CanvasSession {
+    /// Whether plugins' layers are drawn again sharp once the view settles zoomed in (as they
+    /// start), or show only their own pixels.
+    pub fn set_sharp_layers(&self, on: bool) {
+        let mut st = self.shared.lock();
+        if st.sharp.off == !on {
+            return;
+        }
+        st.sharp.off = !on;
+        if !on {
+            st.drop_sharp(true);
+        }
+        self.shared.frame(&mut st);
+    }
 }
 
 /// Where the part of the canvas on a target shows: the canvas rectangle's top left and the size
@@ -167,6 +186,7 @@ impl State {
             && !self.scene_shown()
             && self.sphere.is_none();
         plain
+            && !self.sharp.off
             && to_screen.scale_factor() >= SHARP_FROM
             && self.doc.layers().iter().any(|l| l.plugin.is_some() && self.sharp_items(l.id))
     }

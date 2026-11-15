@@ -2079,6 +2079,34 @@ impl CanvasSession {
         true
     }
 
+    /// Turns the canvas to the right angle it is nearest (upright, on its side, upside down) about
+    /// `pivot` (window pixels, the fingers' middle), keeping its zoom and the part of it under the
+    /// fingers where it is, settling into place as [`CanvasSession::settle_to_fit`] does. A quick
+    /// pinch does this: a canvas turned a little by hand comes back square wherever it is being
+    /// worked on, at the size it is.
+    pub fn settle_straight(&self, pivot_x: f32, pivot_y: f32) {
+        let mut st = self.shared.lock();
+        let Some(from) = st.view else { return };
+        let rotation = from.rotation();
+        if !rotation.is_finite() || !(pivot_x.is_finite() && pivot_y.is_finite()) {
+            return;
+        }
+        let right = std::f32::consts::FRAC_PI_2;
+        let turn = (rotation / right).round() * right - rotation;
+        if turn.abs() < 1e-5 {
+            return;
+        }
+        let pivot = Vec2::new(pivot_x, pivot_y);
+        let to = View::from_affine(
+            from.to_screen()
+                .then(procraft_engine::geom::Affine::translate(Vec2::ZERO - pivot))
+                .then(procraft_engine::geom::Affine::rotate(turn))
+                .then(procraft_engine::geom::Affine::translate(pivot)),
+        );
+        st.view_motion = Some(ViewMotion { from, to, start: std::time::Instant::now(), curve: ViewCurve::Settle });
+        self.shared.frame(&mut st);
+    }
+
     /// Fits the whole canvas in the window again, growing back into place over 0.3 s, slowing to
     /// a stop (as leaving crop without cropping does).
     pub fn ease_to_fit(&self) {

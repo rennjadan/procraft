@@ -82,9 +82,31 @@ impl Format {
     }
 }
 
-/// Where the app keeps what it keeps between runs (palettes and the like): the platform's place
-/// for an app's data.
+/// Where the app keeps what it keeps between runs (artworks, brushes, palettes and the like).
+/// On Windows that is the "ProCraft Data" folder beside ProCraft.exe, in the folder the installer
+/// was told to put it in (the installer makes it and lets its users write there), or beside a
+/// portable copy; where that can't be written to, the platform's place for an app's data, as
+/// elsewhere. `PROCRAFT_DATA` names another folder. Decided once a run.
 pub fn app_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        if let Some(dir) = std::env::var_os("PROCRAFT_DATA").filter(|d| !d.is_empty()) {
+            return PathBuf::from(dir);
+        }
+        let usual = usual_app_dir();
+        if cfg!(windows)
+            && let Some(beside) = beside_exe()
+        {
+            first_use(&beside, &usual);
+            return beside;
+        }
+        usual
+    })
+    .clone()
+}
+
+/// The platform's place for an app's data.
+fn usual_app_dir() -> PathBuf {
     let home = || std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
     if cfg!(windows) {
         std::env::var_os("APPDATA").map(PathBuf::from).unwrap_or_else(home).join("ProCraft")
@@ -96,6 +118,43 @@ pub fn app_dir() -> PathBuf {
             .unwrap_or_else(|| home().join(".local/share"))
             .join("procraft")
     }
+}
+
+/// The data folder beside the running ProCraft.exe, if it is there or can be made, and written to.
+fn beside_exe() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.join("ProCraft Data");
+    std::fs::create_dir_all(&dir).ok()?;
+    let probe = dir.join(".can-write");
+    std::fs::write(&probe, b"ok").ok()?;
+    let _ = std::fs::remove_file(&probe);
+    Some(dir)
+}
+
+/// The first time the folder beside the app is used, what an earlier version kept in the
+/// platform's place comes along (copied: the old folder stays as it was).
+fn first_use(dir: &Path, old: &Path) {
+    let started = dir.join("artworks").exists() || dir.join("interface").exists();
+    if started || !old.is_dir() || dir == old {
+        return;
+    }
+    if let Err(e) = copy_tree(old, dir) {
+        log::warn!("bringing {} to {}: {e}", old.display(), dir.display());
+    }
+}
+
+fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
+        } else if !target.exists() {
+            std::fs::copy(entry.path(), &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Shows a passing message with an OK button.

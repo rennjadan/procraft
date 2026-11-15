@@ -24,6 +24,7 @@ mod export_card;
 mod files;
 #[cfg(target_os = "macos")]
 mod finder;
+mod full_screen;
 mod gallery;
 mod gesture_controls;
 mod gradient_map;
@@ -277,6 +278,7 @@ fn main() {
         tap_held: None,
         interface_touches: input::InterfaceTouches::default(),
         closed: false,
+        full: full_screen::FullScreen::kept(),
     };
     // a panic on the window's thread ends the app: said, rather than the window just vanishing
     // (its message and place are in the log already)
@@ -342,6 +344,9 @@ struct App {
     interface_touches: input::InterfaceTouches,
     /// The window was closed (the artwork open kept): the app's end needs nothing more.
     closed: bool,
+    /// Full screen as F11 makes it, the taskbar covered, and a swipe up from the bottom edge to
+    /// show the taskbar for a while (see [`FullScreen`]).
+    full: full_screen::FullScreen,
 }
 
 /// The app's icon, for the window's title bar and the task bar.
@@ -368,7 +373,11 @@ impl ApplicationHandler for App {
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0))
             // opened for a test (PROCRAFT_BACKGROUND set), it leaves the keyboard where it was
-            .with_active(std::env::var_os("PROCRAFT_BACKGROUND").is_none());
+            .with_active(std::env::var_os("PROCRAFT_BACKGROUND").is_none())
+            // full screen, the taskbar covered, unless F11 last left it a window; a window starts
+            // filling the screen, not where the system happens to put it
+            .with_maximized(true)
+            .with_fullscreen(self.full.wanted.then_some(winit::window::Fullscreen::Borderless(None)));
         // on Linux the desktop's menus match the window to the app's entry (procraft.desktop)
         #[cfg(target_os = "linux")]
         let attributes = {
@@ -433,6 +442,12 @@ impl ApplicationHandler for App {
             self.projection_event(event);
             return;
         }
+        let Some(event) = (match self.screen.as_ref() {
+            Some(screen) => self.full.event(&screen.window, event),
+            None => Some(event),
+        }) else {
+            return;
+        };
         let Some(event) = self.tap_assist(event) else { return };
         let Some(screen) = self.screen.as_mut() else { return };
         let session = self.session.clone();
@@ -474,7 +489,11 @@ impl ApplicationHandler for App {
             && key.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)
         {
             let full = screen.window.fullscreen().is_none();
+            self.full.chosen(full);
             screen.window.set_fullscreen(full.then_some(winit::window::Fullscreen::Borderless(None)));
+            if !full {
+                screen.window.set_maximized(true);
+            }
         }
         match event {
             WindowEvent::CloseRequested => {

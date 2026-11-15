@@ -41,6 +41,12 @@ pub struct Prefs {
     /// Brush sizes relative to the screen (else to the canvas).
     pub brush_on_screen: bool,
     pub brush_cursor: bool,
+    /// Vector (plugin) layers drawn again at the screen's resolution once the view settles zoomed
+    /// in. Off, as it starts here, a stroke changes only the pixels it lands on.
+    pub sharp_layers: bool,
+    /// The fine + where the pen hovers or last touched, when no brush outline shows there. Off,
+    /// nothing marks the pen's place: an accurate pen needs no mark.
+    pub pen_cross: bool,
     pub cursor_shows: CursorShows,
     pub cursor_style: CursorStyle,
     /// The colour model the Colors panel's disc and Value sliders work in.
@@ -98,6 +104,8 @@ impl Default for Prefs {
             right_handed: false,
             brush_on_screen: false,
             brush_cursor: true,
+            pen_cross: true,
+            sharp_layers: false,
             cursor_shows: CursorShows::Hovering,
             cursor_style: CursorStyle::Brush,
             colour_model: procraft_core::ColourModel::Hsb,
@@ -155,6 +163,8 @@ impl Prefs {
                 "right_handed" => p.right_handed = on,
                 "brush_on_screen" => p.brush_on_screen = on,
                 "brush_cursor" => p.brush_cursor = on,
+                "pen_cross" => p.pen_cross = on,
+                "sharp_layers" => p.sharp_layers = on,
                 "cursor_shows" => p.cursor_shows = pick(&SHOWS, value).unwrap_or(p.cursor_shows),
                 "cursor_style" => p.cursor_style = pick(&STYLES, value).unwrap_or(p.cursor_style),
                 "colour_model" => {
@@ -212,6 +222,8 @@ impl Prefs {
             format!("right_handed {}", self.right_handed),
             format!("brush_on_screen {}", self.brush_on_screen),
             format!("brush_cursor {}", self.brush_cursor),
+            format!("pen_cross {}", self.pen_cross),
+            format!("sharp_layers {}", self.sharp_layers),
             format!("cursor_shows {}", place(&SHOWS, self.cursor_shows)),
             format!("cursor_style {}", place(&STYLES, self.cursor_style)),
             format!("colour_model {}", self.colour_model.key()),
@@ -253,6 +265,7 @@ impl Prefs {
         session.set_selection_visibility(self.selection_visibility);
         session.use_plugins(Arc::clone(&self.plugins));
         session.set_simplified_undos(self.simplified_undos);
+        session.set_sharp_layers(self.sharp_layers);
         session.set_speed_distance(self.speed_distance);
         session.set_input_settings(
             self.stabilization,

@@ -119,6 +119,10 @@ pub enum Act {
     LightInterface,
     RightHanded,
     BrushCursor,
+    /// The pen's + crosshair shown or hidden (Pressure and Smoothing).
+    PenCross,
+    /// Vector layers drawn again sharp when zoomed in, or left as their pixels.
+    SharpLayers,
     ProjectCanvas,
     ResetInput,
 }
@@ -393,6 +397,7 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     Button("Pressure and Smoothing", None, Some(Act::Page(Page::Pressure))),
                     Button("Gesture controls", None, Some(Act::GestureControls)),
                     Button("Plugins", None, Some(Act::Page(Page::Plugins))),
+                    Switch("Sharp vector layers when zoomed", prefs.sharp_layers, Some(Act::SharpLayers)),
                 ],
                 vec![
                     Slide(
@@ -580,7 +585,8 @@ impl Actions {
                         let rows = 20.0
                             + group_height(&smoothing_rows(prefs))
                             + 16.0
-                            + ROW_HEIGHT
+                            + 2.0 * ROW_HEIGHT
+                            + 1.0
                             + 24.0
                             + 19.0
                             + curve
@@ -665,6 +671,14 @@ impl Actions {
             }
             Some(Tapped::Act(Act::BrushCursor)) => {
                 prefs.brush_cursor = !prefs.brush_cursor;
+                Some(Act::Prefs)
+            }
+            Some(Tapped::Act(Act::PenCross)) => {
+                prefs.pen_cross = !prefs.pen_cross;
+                Some(Act::Prefs)
+            }
+            Some(Tapped::Act(Act::SharpLayers)) => {
+                prefs.sharp_layers = !prefs.sharp_layers;
                 Some(Act::Prefs)
             }
             Some(Tapped::Act(Act::ProjectCanvas)) => {
@@ -1007,7 +1021,10 @@ impl Actions {
                     ui.add_space(16.0);
                     // with no filtering it has nothing to do
                     let can = (prefs.motion_filtering > 0.0).then_some(Act::TipAttachment);
-                    let tip = [Row::Switch("Tip Attachment", prefs.tip_attached, can)];
+                    let tip = [
+                        Row::Switch("Tip Attachment", prefs.tip_attached, can),
+                        Row::Switch("Pen crosshair", prefs.pen_cross, Some(Act::PenCross)),
+                    ];
                     tapped = tapped.or(group_view(ui, &tip, 1, &mut self.swipes).0);
                     ui.add_space(24.0);
                     let (label, _) = ui.allocate_exact_size(vec2(width, 19.0), Sense::hover());

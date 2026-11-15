@@ -1152,7 +1152,11 @@ impl Interface {
                 && let Some(at) = ctx.pointer_latest_pos().filter(|at| on_canvas(*at))
             {
                 ctx.set_cursor_icon(egui::CursorIcon::None);
-                if input.pressing_from_afar() && !self.overlays.outline_shown() && self.overlays.picking.is_none() {
+                if self.prefs.pen_cross
+                    && input.pressing_from_afar()
+                    && !self.overlays.outline_shown()
+                    && self.overlays.picking.is_none()
+                {
                     hover_cross(ctx, at);
                 }
             }
@@ -1165,7 +1169,9 @@ impl Interface {
         self.overlays.hover(session, info, ppp, at.filter(|_| self.prefs.cursor_shown(true)));
         if let Some(at) = at.filter(|_| !self.overlays.outline_shown()) {
             ctx.set_cursor_icon(egui::CursorIcon::None);
-            hover_cross(ctx, at);
+            if self.prefs.pen_cross {
+                hover_cross(ctx, at);
+            }
         }
     }
 
@@ -2530,6 +2536,8 @@ impl Interface {
                         | Act::LightInterface
                         | Act::RightHanded
                         | Act::BrushCursor
+                        | Act::PenCross
+                        | Act::SharpLayers
                         | Act::ProjectCanvas
                         | Act::ResetInput,
                     )
