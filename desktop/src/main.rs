@@ -375,6 +375,8 @@ impl ApplicationHandler for App {
             .with_min_inner_size(LogicalSize::new(640.0, 480.0))
             // opened for a test (PROCRAFT_BACKGROUND set), it leaves the keyboard where it was
             .with_active(std::env::var_os("PROCRAFT_BACKGROUND").is_none())
+            // shown once its first frame is drawn (`resumed`)
+            .with_visible(false)
             // full screen, the taskbar covered, unless F11 last left it a window; a window starts
             // filling the screen, not where the system happens to put it
             .with_maximized(true)
@@ -438,6 +440,13 @@ impl ApplicationHandler for App {
         // a newer build of this copy looked for, a moment after it opens
         update::start(Arc::clone(&screen.window), self.wake.clone());
         self.screen = Some(screen);
+        // the first frame (the curtain, black) drawn before the window shows, so it never shows
+        // empty or white; it lifts from there
+        self.frame();
+        if let Some(screen) = &self.screen {
+            screen.window.set_visible(true);
+            screen.window.request_redraw();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
@@ -468,8 +477,12 @@ impl ApplicationHandler for App {
         // (the start's watch asks too)
         startup::answered();
         // an update downloaded and its installer waiting: the app closes as its close button would
-        if update::take_ready() {
-            self.app_event(event_loop, WindowEvent::CloseRequested);
+        // the curtain falls first, saying so; the app closes once it is down (`about_to_wait`)
+        if let Some(words) = update::take_ready() {
+            self.full.close_with(words);
+            if let Some(screen) = &self.screen {
+                screen.window.request_redraw();
+            }
             return;
         }
         let Some(window) = self.screen.as_ref().map(|s| (s.window.id(), s.window.scale_factor())) else { return };
@@ -498,6 +511,15 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // a finger held back for the taskbar swipe that turned out to be no swipe goes to the app;
+        // the curtain down for an update, the app closes
+        for event in self.full.take_overdue() {
+            self.app_event(event_loop, event);
+        }
+        if self.full.take_closed() {
+            self.app_event(event_loop, WindowEvent::CloseRequested);
+            return;
+        }
         // files opened from the Finder meanwhile come in as files dropped on the window do
         #[cfg(target_os = "macos")]
         {
@@ -782,7 +804,7 @@ impl App {
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
         let raw = screen.take_input();
-        let full = &self.full;
+        let full = &mut self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
             full.paint(ui.ctx());
@@ -861,7 +883,7 @@ impl App {
         let waited = screen.canvases_waited();
         // (on OpenGL from the first frame, which stays while they are made)
         let getting_ready = waited.is_some_and(|w| w >= CANVASES_SLOW) || screen.canvases_later();
-        let full = &self.full;
+        let full = &mut self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             interface.style_once(ui.ctx());
             full.paint(ui.ctx());

@@ -64,10 +64,16 @@ pub fn next_mode() {
     crate::files::keep_text("updates", &format!("{next}\n"));
 }
 
-/// Whether the app should close now for an update (asked once).
-pub fn take_ready() -> bool {
-    READY.swap(false, Ordering::Relaxed)
+/// What the app is to close for now, said on its curtain as it does (asked once).
+pub fn take_ready() -> Option<&'static str> {
+    if !READY.swap(false, Ordering::Relaxed) {
+        return None;
+    }
+    Some(if MOVING.load(Ordering::Relaxed) { "Moving your artworks\u{2026}" } else { "Updating ProCraft\u{2026}" })
 }
+
+/// The app closes to move the artworks' folder, not for an update.
+static MOVING: AtomicBool = AtomicBool::new(false);
 
 /// Whether this copy can update itself at all.
 pub fn available() -> bool {
@@ -125,6 +131,7 @@ pub fn restart() {
         });
     match (reopened, APP.get()) {
         (Ok(()), Some((_, wake))) if cfg!(windows) => {
+            MOVING.store(true, Ordering::Relaxed);
             READY.store(true, Ordering::Relaxed);
             let _ = wake.send_event(());
         }
@@ -213,7 +220,7 @@ fn look_once(asked: bool) -> Result<(), String> {
         if automatic { String::new() } else { format!("Start-Process -FilePath '{}'", quoted(&exe.to_string_lossy())) };
     let helper = format!(
         "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; \
-         Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{target}\"', '/passive', '/norestart') -Verb RunAs -Wait; \
+         Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{target}\"', '/qn', '/norestart') -Verb RunAs -Wait; \
          Remove-Item -LiteralPath '{target}' -ErrorAction SilentlyContinue; {reopen}",
         pid = std::process::id(),
     );

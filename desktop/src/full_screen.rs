@@ -1,9 +1,12 @@
-//! Full screen, as F11 makes it, with a swipe in from the top (or bottom) edge to show the taskbar.
+//! Full screen, as F11 makes it; a finger swipe that shows the taskbar over it; and the curtain
+//! the app fades in from as it opens and out to as it closes for an update.
 //!
-//! The window never changes size or leaves full screen for it: the taskbar is brought up over the
-//! app, as the Windows key brings it up over a full-screen game, while the app eases back under
-//! a soft veil that follows the finger. The next touch or click on the app eases the veil away,
-//! and Windows puts the taskbar back behind the app.
+//! The window never changes size or leaves full screen for the taskbar: it is brought up over the
+//! app, as the Windows key brings it up over a full-screen game, while the app eases back under a
+//! soft veil that follows the finger. A quick finger swipe down anywhere in the top part of the
+//! screen does it (or up in the bottom part, as Prefs say); the pen never does, and a slow stroke,
+//! a hold or a second finger goes to the app as it came. The next touch or click on the app eases
+//! the veil away, and Windows puts the taskbar back behind the app.
 
 use std::time::Instant;
 
@@ -13,17 +16,20 @@ use winit::window::Window;
 
 use crate::files;
 
-/// How far in from the edge a swipe has to start (points): a little way in, as Windows keeps the
-/// very edge for its own swipes.
-const EDGE_ZONE: f64 = 44.0;
-/// How far in it travels before it counts as a pull and not a tap (points).
-const PULL_START: f64 = 10.0;
-/// How far in a pull goes to bring the veil all the way (points), and the part of that past which
+/// The part of the window, from the swipe's edge, a swipe may start in.
+const SWIPE_AREA: f64 = 0.6;
+/// How far a finger goes before it is told apart (points), and how quickly it has to be going
+/// along the swipe then (points a millisecond): slower, it is a stroke.
+const DECIDE_AFTER: f64 = 14.0;
+const SWIPE_SPEED: f64 = 0.45;
+/// A finger held back longer than this (milliseconds) without being a swipe goes to the app.
+const HOLD_MOST_MS: f64 = 140.0;
+/// How far a pull goes to bring the veil all the way (points), and the part of that past which
 /// letting go shows the taskbar.
-const PULL_FULL: f64 = 90.0;
-const PULL_COMMIT: f32 = 0.4;
-/// A flick in this fast or faster (points a millisecond) shows it however short it was.
-const FLICK: f64 = 0.45;
+const PULL_FULL: f64 = 110.0;
+const PULL_COMMIT: f32 = 0.35;
+/// A flick this fast or faster (points a millisecond) shows it however short it was.
+const FLICK: f64 = 0.5;
 /// The veil at its darkest, over the whole app.
 const VEIL_MOST: f32 = 0.42;
 /// How long the veil takes to settle in, and to go (seconds).
@@ -31,15 +37,21 @@ const EASE_IN_S: f32 = 0.32;
 const EASE_OUT_S: f32 = 0.26;
 /// After the app is used again, a touch or click this soon only brings it back (seconds).
 const RETURN_GRACE_S: f32 = 0.5;
+/// The curtain: frames drawn under it before it lifts, how long it takes to lift, and to fall
+/// before the app closes for an update (seconds).
+const CURTAIN_FRAMES: u32 = 3;
+const CURTAIN_UP_S: f32 = 0.55;
+const CURTAIN_DOWN_S: f32 = 0.4;
 
-/// A touch that began at the edge, held back until it is known to be a pull or not.
-struct Edge {
+/// A finger that began where a swipe may, held back until it is known to be one or not.
+struct Held {
     id: u64,
     start: PhysicalPosition<f64>,
-    held: Vec<WindowEvent>,
+    since: Instant,
+    events: Vec<WindowEvent>,
 }
 
-/// A touch pulling the veil in: where it began, and its last place and time for its speed.
+/// A finger pulling the veil in: where it began, and its last place and time for its speed.
 struct Pull {
     id: u64,
     start: PhysicalPosition<f64>,
@@ -47,7 +59,7 @@ struct Pull {
     speed: f64,
 }
 
-/// The veil easing from one level to another.
+/// A level easing from one value to another.
 #[derive(Clone, Copy)]
 struct Ease {
     from: f32,
@@ -56,16 +68,35 @@ struct Ease {
     seconds: f32,
 }
 
-/// Full screen, as F11 makes it, kept between runs ("window" in the app's folder), and the swipe
-/// that shows the taskbar over it. F11 turns all of it off (a plain window) and back on.
+impl Ease {
+    fn at(to: f32) -> Ease {
+        Ease { from: to, to, start: Instant::now(), seconds: 0.0 }
+    }
+
+    fn level(&self) -> f32 {
+        let t = (self.start.elapsed().as_secs_f32() / self.seconds.max(0.01)).min(1.0);
+        self.from + (self.to - self.from) * ease(t)
+    }
+
+    fn moving(&self) -> bool {
+        self.start.elapsed().as_secs_f32() < self.seconds && (self.to - self.from).abs() > 1e-4
+    }
+
+    fn to(&self, to: f32, seconds: f32) -> Ease {
+        Ease { from: self.level(), to, start: Instant::now(), seconds }
+    }
+}
+
+/// Full screen, as F11 makes it, kept between runs ("window" in the app's folder), the swipe that
+/// shows the taskbar over it, and the curtain. F11 turns full screen off (a plain window) and on.
 pub(crate) struct FullScreen {
     /// Full screen wanted (F11 not having turned it off).
     pub(crate) wanted: bool,
-    edge: Option<Edge>,
+    held: Option<Held>,
     pull: Option<Pull>,
     /// The veil's level while a finger pulls it (0..1).
     pulled: f32,
-    ease: Option<Ease>,
+    veil: Ease,
     /// The taskbar is up over the app.
     revealed: bool,
     /// The app was just used again: the next touch or click (within the grace) only does that.
@@ -73,6 +104,12 @@ pub(crate) struct FullScreen {
     /// A touch, or the mouse's press, that only brought the app back: the rest of it reaches nothing.
     swallowed: Option<u64>,
     mouse_swallowed: bool,
+    /// Black over everything: lifting once the app has drawn a few frames, falling before it
+    /// closes for an update (with what it says meanwhile).
+    curtain: Ease,
+    frames: u32,
+    closing: Option<&'static str>,
+    closed: bool,
 }
 
 impl FullScreen {
@@ -81,50 +118,42 @@ impl FullScreen {
         let wanted = !text.lines().any(|l| l.trim() == "full_screen false");
         FullScreen {
             wanted,
-            edge: None,
+            held: None,
             pull: None,
             pulled: 0.0,
-            ease: None,
+            veil: Ease::at(0.0),
             revealed: false,
             returned: None,
             swallowed: None,
             mouse_swallowed: false,
+            curtain: Ease::at(1.0),
+            frames: 0,
+            closing: None,
+            closed: false,
         }
     }
 
     /// F11 pressed: full screen on or off from now on, and next time.
     pub(crate) fn chosen(&mut self, full: bool) {
         self.wanted = full;
-        self.edge = None;
         self.pull = None;
         self.revealed = false;
-        self.settle_to(0.0, EASE_OUT_S);
+        self.veil = self.veil.to(0.0, EASE_OUT_S);
         files::keep_text("window", &format!("full_screen {full}\n"));
     }
 
     /// The veil's level now (0 none, 1 at its darkest).
     fn level(&self) -> f32 {
-        if self.pull.is_some() {
-            return self.pulled;
-        }
-        match self.ease {
-            Some(e) => {
-                let t = (e.start.elapsed().as_secs_f32() / e.seconds.max(0.01)).min(1.0);
-                e.from + (e.to - e.from) * ease(t)
-            }
-            None => 0.0,
-        }
+        if self.pull.is_some() { self.pulled } else { self.veil.level() }
     }
 
-    /// Whether the veil is still moving (a frame is wanted).
+    /// Whether frames are wanted: the veil or the curtain moving, or a finger held back.
     pub(crate) fn moving(&self) -> bool {
         self.pull.is_some()
-            || self.ease.is_some_and(|e| e.start.elapsed().as_secs_f32() < e.seconds && (e.to - e.from).abs() > 1e-4)
-    }
-
-    fn settle_to(&mut self, to: f32, seconds: f32) {
-        let from = self.level();
-        self.ease = Some(Ease { from, to, start: Instant::now(), seconds });
+            || self.held.is_some()
+            || self.veil.moving()
+            || self.curtain.moving()
+            || self.frames < CURTAIN_FRAMES + 1
     }
 
     /// The taskbar up, the veil easing the rest of the way in.
@@ -132,7 +161,7 @@ impl FullScreen {
         log::info!("taskbar swipe: the taskbar shown");
         self.revealed = true;
         self.returned = None;
-        self.settle_to(1.0, EASE_IN_S);
+        self.veil = self.veil.to(1.0, EASE_IN_S);
         show_taskbar();
     }
 
@@ -140,40 +169,84 @@ impl FullScreen {
     fn back(&mut self) {
         self.revealed = false;
         self.returned = Some(Instant::now());
-        self.settle_to(0.0, EASE_OUT_S);
+        self.veil = self.veil.to(0.0, EASE_OUT_S);
     }
 
-    /// Draws the veil over everything, while it shows.
-    pub(crate) fn paint(&self, ctx: &egui::Context) {
-        let level = self.level().clamp(0.0, 1.0);
-        if level > 0.002 {
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::unique("taskbar veil")));
-            let alpha = (level * VEIL_MOST * 255.0).round() as u8;
-            painter.rect_filled(ctx.content_rect(), 0.0, egui::Color32::from_black_alpha(alpha));
+    /// The curtain falls, saying `words`, before the app closes (for an update).
+    pub(crate) fn close_with(&mut self, words: &'static str) {
+        self.closing = Some(words);
+        self.curtain = self.curtain.to(1.0, CURTAIN_DOWN_S);
+    }
+
+    /// The curtain is down for closing: the app closes now (true once).
+    pub(crate) fn take_closed(&mut self) -> bool {
+        if self.closing.is_some() && !self.closed && !self.curtain.moving() {
+            self.closed = true;
+            return true;
+        }
+        false
+    }
+
+    /// A finger held back past its time without being a swipe: what it did, for the app.
+    pub(crate) fn take_overdue(&mut self) -> Vec<WindowEvent> {
+        match &self.held {
+            Some(h) if h.since.elapsed().as_secs_f64() * 1000.0 >= HOLD_MOST_MS => {
+                self.held.take().map(|h| h.events).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Draws the veil and the curtain over everything, while they show.
+    pub(crate) fn paint(&mut self, ctx: &egui::Context) {
+        self.frames = self.frames.saturating_add(1);
+        if self.frames == CURTAIN_FRAMES && self.closing.is_none() {
+            self.curtain = self.curtain.to(0.0, CURTAIN_UP_S);
+        }
+        let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::unique("full screen veil")));
+        let screen = ctx.content_rect();
+        let veil = self.level().clamp(0.0, 1.0);
+        if veil > 0.002 {
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha((veil * VEIL_MOST * 255.0).round() as u8));
+        }
+        let curtain = self.curtain.level().clamp(0.0, 1.0);
+        if curtain > 0.002 {
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha((curtain * 255.0).round() as u8));
+            if let Some(words) = self.closing {
+                let ink = egui::Color32::from_white_alpha((curtain * 220.0).round() as u8);
+                painter.text(
+                    screen.center(),
+                    egui::Align2::CENTER_CENTER,
+                    words,
+                    egui::FontId::proportional(22.0),
+                    ink,
+                );
+            }
         }
         if self.moving() {
             ctx.request_repaint();
         }
     }
 
-    /// Watches the touches (a pen's too) and clicks for the pull in from the edge and for the app
-    /// being used again. Returns the events for the app: none while a touch is held back, those
-    /// held back once it turns out not to be a pull, or the event as it came.
-    /// `edge` is the edge the swipe comes from: the top (true) or the bottom, or none with it off.
+    /// Watches the touches and clicks for the swipe and for the app being used again. Returns the
+    /// events for the app: none while a finger is held back, those held back (then this one) once
+    /// it turns out not to be a swipe, or the event as it came. `edge` is the edge the swipe comes
+    /// from: the top (true) or the bottom, or none with it off.
     pub(crate) fn event(&mut self, window: &Window, event: WindowEvent, edge: Option<bool>) -> Vec<WindowEvent> {
         let Some(from_top) = edge.filter(|_| self.wanted && window.fullscreen().is_some()) else {
-            self.edge = None;
             self.pull = None;
-            return vec![event];
+            let mut out = self.held.take().map(|h| h.events).unwrap_or_default();
+            out.push(event);
+            return out;
         };
         let points = window.scale_factor().max(0.1);
         let height = f64::from(window.inner_size().height);
-        // how far in from the edge `at` is, from `start`
-        let inward = |start: PhysicalPosition<f64>, at: PhysicalPosition<f64>| {
+        // how far along the swipe `at` is from `start` (down from the top, or up from the bottom)
+        let along = |start: PhysicalPosition<f64>, at: PhysicalPosition<f64>| {
             if from_top { at.y - start.y } else { start.y - at.y }
         };
-        let in_zone = |at: PhysicalPosition<f64>| {
-            if from_top { at.y <= EDGE_ZONE * points } else { at.y >= height - EDGE_ZONE * points }
+        let in_area = |at: PhysicalPosition<f64>| {
+            if from_top { at.y <= height * SWIPE_AREA } else { at.y >= height * (1.0 - SWIPE_AREA) }
         };
         let grace = |r: Option<Instant>| r.is_some_and(|r| r.elapsed().as_secs_f32() < RETURN_GRACE_S);
         match &event {
@@ -181,7 +254,7 @@ impl FullScreen {
             WindowEvent::Focused(false) => {
                 // a pull cut short by something else taking the screen
                 if self.pull.take().is_some() && !self.revealed {
-                    self.ease = Some(Ease { from: self.pulled, to: 0.0, start: Instant::now(), seconds: EASE_OUT_S });
+                    self.veil = Ease::at(self.pulled).to(0.0, EASE_OUT_S);
                 }
             }
             WindowEvent::Touch(t) => {
@@ -194,46 +267,52 @@ impl FullScreen {
                 // the veil following a pull
                 if let Some(pull) = self.pull.as_mut().filter(|p| p.id == t.id) {
                     let now = Instant::now();
-                    let travel = inward(pull.start, t.location);
+                    let travel = along(pull.start, t.location);
                     let ms = now.duration_since(pull.last.1).as_secs_f64() * 1000.0;
                     if ms > 0.5 {
                         pull.speed = (travel - pull.last.0) / points / ms;
                         pull.last = (travel, now);
                     }
-                    self.pulled = ((travel / points - PULL_START) / PULL_FULL).clamp(0.0, 1.0) as f32;
+                    self.pulled = ((travel / points - DECIDE_AFTER) / PULL_FULL).clamp(0.0, 1.0) as f32;
                     if matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled) {
-                        let flicked = pull.speed >= FLICK && t.phase == TouchPhase::Ended;
-                        let far = self.pulled >= PULL_COMMIT && t.phase == TouchPhase::Ended;
+                        let lifted = t.phase == TouchPhase::Ended;
+                        let commit = lifted && (pull.speed >= FLICK || self.pulled >= PULL_COMMIT);
                         self.pull = None;
-                        self.ease = Some(Ease { from: self.pulled, to: self.pulled, start: now, seconds: 0.0 });
-                        if flicked || far {
+                        self.veil = Ease::at(self.pulled);
+                        if commit {
                             self.reveal();
                         } else {
-                            self.settle_to(0.0, EASE_OUT_S);
+                            self.veil = self.veil.to(0.0, EASE_OUT_S);
                         }
                     }
                     return Vec::new();
                 }
-                // a touch at the edge, held back while it shows what it is
-                if let Some(edge) = self.edge.as_mut().filter(|e| e.id == t.id) {
-                    edge.held.push(event.clone());
-                    let travel = inward(edge.start, t.location) / points;
-                    let across = (t.location.x - edge.start.x).abs() / points;
+                // a finger held back while it shows what it is
+                if let Some(held) = self.held.as_mut().filter(|h| h.id == t.id) {
+                    held.events.push(event.clone());
+                    let travel = along(held.start, t.location) / points;
+                    let across = (t.location.x - held.start.x).abs() / points;
+                    let ms = (held.since.elapsed().as_secs_f64() * 1000.0).max(1.0);
                     let ended = matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled);
-                    if !ended && travel >= PULL_START && travel > across * 1.2 {
-                        let start = edge.start;
-                        self.edge = None;
+                    let gone = travel.hypot(across);
+                    if !ended && travel >= DECIDE_AFTER && travel > across * 1.5 && travel / ms >= SWIPE_SPEED {
+                        // a swipe: what the finger began in the app is called off
+                        let start = held.start;
+                        self.held = None;
                         self.pulled = 0.0;
                         self.pull = Some(Pull { id: t.id, start, last: (travel * points, Instant::now()), speed: 0.0 });
+                        log::info!("taskbar swipe: a finger swiping");
                         return Vec::new();
                     }
-                    if ended || travel.hypot(across) >= PULL_START {
-                        // a tap or a drag along the edge: the app has it as it was
-                        return self.edge.take().map(|e| e.held).unwrap_or_default();
+                    if ended || gone >= DECIDE_AFTER || ms >= HOLD_MOST_MS {
+                        // a tap, a stroke or a hold: the app has it as it was
+                        return self.held.take().map(|h| h.events).unwrap_or_default();
                     }
                     return Vec::new();
                 }
                 if t.phase == TouchPhase::Started {
+                    // another finger: what was held back is no swipe, it goes first
+                    let mut out = self.held.take().map(|h| h.events).unwrap_or_default();
                     // the first touch back on the app only brings it back
                     if self.revealed || grace(self.returned) {
                         if self.revealed {
@@ -241,13 +320,16 @@ impl FullScreen {
                         }
                         self.returned = None;
                         self.swallowed = Some(t.id);
+                        return out;
+                    }
+                    let finger = crate::pen::is_pen(t.id) != Some(true);
+                    if out.is_empty() && finger && self.pull.is_none() && in_area(t.location) {
+                        self.held =
+                            Some(Held { id: t.id, start: t.location, since: Instant::now(), events: vec![event] });
                         return Vec::new();
                     }
-                    if self.edge.is_none() && self.pull.is_none() && in_zone(t.location) {
-                        log::info!("taskbar swipe: a touch at the edge ({:.0}, {:.0})", t.location.x, t.location.y);
-                        self.edge = Some(Edge { id: t.id, start: t.location, held: vec![event] });
-                        return Vec::new();
-                    }
+                    out.push(event);
+                    return out;
                 }
             }
             WindowEvent::MouseInput { state: ElementState::Pressed, .. } if self.revealed || grace(self.returned) => {
@@ -263,6 +345,12 @@ impl FullScreen {
                 return Vec::new();
             }
             _ => {}
+        }
+        // anything else goes on behind what is held back, in order, once that has gone
+        if self.held.is_some() && matches!(event, WindowEvent::Touch(_) | WindowEvent::MouseInput { .. }) {
+            let mut out = self.held.take().map(|h| h.events).unwrap_or_default();
+            out.push(event);
+            return out;
         }
         vec![event]
     }
