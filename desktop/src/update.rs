@@ -1,21 +1,62 @@
 //! Updates on Windows, from the GitHub releases of the repository this copy was built from
-//! (`PROCRAFT_UPDATE_REPO` and its build number `PROCRAFT_BUILD`, given by the build workflow).
+//! (`PROCRAFT_UPDATE_REPO` and its build number `PROCRAFT_BUILD`, given by the build workflow,
+//! whose builds are Renn's version with the original developer's newest work merged in).
 //!
-//! A moment after the app opens, it asks GitHub for the latest release. If that release is a
-//! newer build and this copy is the installed one, it asks once whether to update. Yes: the
-//! installer is downloaded, a helper waits for the app to close, installs it (Windows asks to
-//! allow it) and opens ProCraft again; the app closes itself as the close button would, the
-//! artwork open kept. A copy built without those (a developer's, a portable one run elsewhere)
-//! never asks.
+//! Prefs' Updates setting says what happens when a newer build is out:
+//! - Automatic (as it starts): it is downloaded quietly, and installed when ProCraft closes.
+//! - Ask first: ProCraft asks; yes saves, closes, installs and opens it again.
+//! - Off: nothing, unless Check for updates now is tapped (which asks).
+//!
+//! It looks a moment after the app opens and every few hours while it stays open. Windows asks to
+//! allow the installer each time. Only the installed copy updates: a portable one, or one built
+//! without those (a developer's), never does.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
-/// The update is downloaded and its helper waiting: the app is to close.
+use winit::event_loop::EventLoopProxy;
+use winit::window::Window;
+
+/// What happens when a newer build is out: [`AUTOMATIC`], 1 (ask first) or [`OFF`].
+pub const AUTOMATIC: u8 = 0;
+pub const OFF: u8 = 2;
+
+/// The Updates setting's name for `mode`.
+pub fn mode_name(mode: u8) -> &'static str {
+    match mode {
+        AUTOMATIC => "Automatic",
+        OFF => "Off",
+        _ => "Ask first",
+    }
+}
+
+static MODE: AtomicU8 = AtomicU8::new(AUTOMATIC);
+/// The update is downloaded and its installer waiting: the app is to close now.
 static READY: AtomicBool = AtomicBool::new(false);
+/// A look under way.
+static LOOKING: AtomicBool = AtomicBool::new(false);
+/// The release whose installer is downloaded and waits for the app to close.
+static WAITING: Mutex<Option<String>> = Mutex::new(None);
+/// The window the questions show over, and how to wake the app to close.
+static APP: OnceLock<(Arc<Window>, EventLoopProxy<()>)> = OnceLock::new();
+
+/// How long between looks while the app stays open.
+const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Prefs' Updates setting.
+pub fn set_mode(mode: u8) {
+    MODE.store(mode.min(OFF), Ordering::Relaxed);
+}
 
 /// Whether the app should close now for an update (asked once).
 pub fn take_ready() -> bool {
     READY.swap(false, Ordering::Relaxed)
+}
+
+/// Whether this copy can update itself at all.
+pub fn available() -> bool {
+    cfg!(windows) && built().is_some()
 }
 
 /// The build this copy is, and where its updates come from.
@@ -25,17 +66,19 @@ fn built() -> Option<(u64, &'static str)> {
     (!repo.is_empty() && repo.contains('/')).then_some((build, repo))
 }
 
-/// Starts looking for an update, on a thread of its own; `wake` tells the app when to close.
-pub fn start(window: std::sync::Arc<winit::window::Window>, wake: winit::event_loop::EventLoopProxy<()>) {
-    let Some((build, repo)) = built() else { return };
-    if !cfg!(windows) || std::env::var_os("PROCRAFT_BACKGROUND").is_some() {
+/// Starts looking, a moment after the app opens and then every few hours, on a thread of its own.
+pub fn start(window: Arc<Window>, wake: EventLoopProxy<()>) {
+    if !available() || std::env::var_os("PROCRAFT_BACKGROUND").is_some() {
         return;
     }
-    let spawned = std::thread::Builder::new().name("procraft-update".to_owned()).spawn(move || {
-        // the app open and settled first
-        std::thread::sleep(std::time::Duration::from_secs(6));
-        if let Err(e) = look(build, repo, &window, &wake) {
-            log::info!("update: {e}");
+    let _ = APP.set((window, wake));
+    let spawned = std::thread::Builder::new().name("procraft-update".to_owned()).spawn(|| {
+        std::thread::sleep(Duration::from_secs(8));
+        loop {
+            if MODE.load(Ordering::Relaxed) != OFF {
+                look(false);
+            }
+            std::thread::sleep(EVERY);
         }
     });
     if let Err(e) = spawned {
@@ -43,81 +86,185 @@ pub fn start(window: std::sync::Arc<winit::window::Window>, wake: winit::event_l
     }
 }
 
-/// Asks for the latest release; offers it if it is newer; on yes, gets it ready.
-fn look(
-    build: u64,
-    repo: &str,
-    window: &winit::window::Window,
-    wake: &winit::event_loop::EventLoopProxy<()>,
-) -> Result<(), String> {
+/// Check for updates now (Prefs): it says what it found, and asks before installing.
+pub fn check_now() {
+    if !available() {
+        say("This copy of ProCraft doesn't update itself (it wasn't built for updates).");
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new().name("procraft-update-now".to_owned()).spawn(|| look(true)) {
+        log::warn!("update: {e}");
+    }
+}
+
+/// What the latest release is.
+enum Found {
+    /// This copy isn't the installed one.
+    NotInstalled,
+    Release {
+        build: u64,
+        tag: String,
+        url: String,
+        waiting_developer: bool,
+    },
+}
+
+/// One look: what is found, and what is done about it.
+fn look(asked: bool) {
+    if LOOKING.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let outcome = look_once(asked);
+    LOOKING.store(false, Ordering::Relaxed);
+    if let Err(e) = outcome {
+        log::info!("update: {e}");
+        if asked {
+            say(&format!("Couldn't check for updates: {e}"));
+        }
+    }
+}
+
+fn look_once(asked: bool) -> Result<(), String> {
+    let Some((build, repo)) = built() else { return Ok(()) };
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let folder = exe.parent().ok_or("no folder")?.to_string_lossy().into_owned();
-    // the latest release's tag and installer, if this copy is the one installed
+    let (newer, tag, url, waiting_developer) = match latest(repo, &folder)? {
+        Found::NotInstalled => {
+            if asked {
+                say("Only the installed ProCraft updates itself; this copy runs from another folder.");
+            }
+            return Ok(());
+        }
+        Found::Release { build: newer, tag, url, waiting_developer } => (newer, tag, url, waiting_developer),
+    };
+    let developer_note = if waiting_developer {
+        "\n\nThe original developer's newest changes clash with yours, so they aren't in it yet: ask \
+         Claude to merge them."
+    } else {
+        ""
+    };
+    if newer <= build {
+        if asked {
+            say(&format!("ProCraft is up to date.{developer_note}"));
+        }
+        return Ok(());
+    }
+    let waiting = WAITING.lock().ok().and_then(|w| w.clone());
+    if waiting.as_deref() == Some(tag.as_str()) {
+        if asked {
+            say("The update is downloaded, and installs when you close ProCraft.");
+        }
+        return Ok(());
+    }
+    let automatic = !asked && MODE.load(Ordering::Relaxed) == AUTOMATIC;
+    if !automatic
+        && !question(&format!(
+            "A new version of ProCraft is ready.\n\nInstall it now? ProCraft will save, close, update \
+             and open again (Windows will ask to allow the installer).{developer_note}"
+        ))
+    {
+        return Ok(());
+    }
+    // downloaded first, so nothing closes for an update that can't be had
+    let msi = std::env::temp_dir().join(format!("procraft-{tag}.msi"));
+    let target = quoted(&msi.to_string_lossy());
+    powershell(&format!(
+        "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; \
+         Invoke-WebRequest -Uri '{}' -OutFile '{target}' -UseBasicParsing -TimeoutSec 900",
+        quoted(&url)
+    ))?;
+    // the helper: waits for the app to close, installs, and (asked) opens it again
+    let reopen =
+        if automatic { String::new() } else { format!("Start-Process -FilePath '{}'", quoted(&exe.to_string_lossy())) };
+    let helper = format!(
+        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; \
+         Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{target}\"', '/passive', '/norestart') -Verb RunAs -Wait; \
+         Remove-Item -LiteralPath '{target}' -ErrorAction SilentlyContinue; {reopen}",
+        pid = std::process::id(),
+    );
+    spawn_hidden(&helper)?;
+    if let Ok(mut w) = WAITING.lock() {
+        *w = Some(tag);
+    }
+    if !automatic {
+        READY.store(true, Ordering::Relaxed);
+        if let Some((_, wake)) = APP.get() {
+            let _ = wake.send_event(());
+        }
+    }
+    Ok(())
+}
+
+/// The latest release of `repo`: its build, tag, installer and whether the developer's newest
+/// work is still waiting; or that this copy (in `folder`) isn't the installed one.
+fn latest(repo: &str, folder: &str) -> Result<Found, String> {
     let script = format!(
         r#"$ErrorActionPreference = 'Stop'
 $installed = (Get-ItemProperty -Path 'HKLM:\Software\ProCraft' -Name InstallDir -ErrorAction SilentlyContinue).InstallDir
 if (-not $installed -or ($installed.TrimEnd('\') -ne '{folder}'.TrimEnd('\'))) {{ 'NOT-INSTALLED'; exit }}
 $r = Invoke-RestMethod -Uri 'https://api.github.com/repos/{repo}/releases/latest' -Headers @{{ 'User-Agent' = 'ProCraft' }} -TimeoutSec 20
 $msi = $r.assets | Where-Object {{ $_.name -like '*windows-x64.msi' }} | Select-Object -First 1
-if ($msi) {{ "$($r.tag_name) $($msi.browser_download_url)" }}"#,
-        folder = folder.replace('\'', "''"),
+if (-not $msi) {{ 'NO-INSTALLER'; exit }}
+"$($r.tag_name) $($msi.browser_download_url)"
+if ($r.body -match 'UPSTREAM-CONFLICT') {{ 'DEVELOPER-WAITING' }}"#,
+        folder = quoted(folder),
+        repo = quoted(repo),
     );
     let answer = powershell(&script)?;
-    let line = answer.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or_default();
-    if line.is_empty() || line == "NOT-INSTALLED" {
-        return Ok(());
+    let lines: Vec<&str> = answer.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    match lines.first().copied() {
+        Some("NOT-INSTALLED") => Ok(Found::NotInstalled),
+        Some("NO-INSTALLER") | None => Err("the latest release has no installer".to_owned()),
+        Some(line) => {
+            let (tag, url) = line.split_once(' ').ok_or("an answer not understood")?;
+            let build = tag.strip_prefix("build-").and_then(|n| n.parse::<u64>().ok()).ok_or("a tag not understood")?;
+            Ok(Found::Release {
+                build,
+                tag: tag.to_owned(),
+                url: url.to_owned(),
+                waiting_developer: lines.contains(&"DEVELOPER-WAITING"),
+            })
+        }
     }
-    let (tag, url) = line.split_once(' ').ok_or("an answer not understood")?;
-    let newer = tag.strip_prefix("build-").and_then(|n| n.parse::<u64>().ok()).ok_or("a tag not understood")?;
-    if newer <= build {
-        return Ok(());
+}
+
+/// `text` inside a PowerShell single-quoted string.
+fn quoted(text: &str) -> String {
+    text.replace('\'', "''")
+}
+
+fn dialog(text: &str) -> rfd::MessageDialog {
+    let dialog =
+        rfd::MessageDialog::new().set_level(rfd::MessageLevel::Info).set_title("ProCraft update").set_description(text);
+    // over the app, which is full screen
+    match APP.get() {
+        Some((window, _)) => dialog.set_parent(window.as_ref()),
+        None => dialog,
     }
-    let yes = rfd::MessageDialog::new()
-        .set_level(rfd::MessageLevel::Info)
-        .set_title("ProCraft update")
-        .set_description(
-            "A new version of ProCraft is ready.\n\nInstall it now? ProCraft will save, close, update \
-             and open again (Windows will ask to allow the installer).",
-        )
-        .set_buttons(rfd::MessageButtons::YesNo)
-        // over the app, which is full screen
-        .set_parent(window)
-        .show();
-    if yes != rfd::MessageDialogResult::Yes {
-        return Ok(());
-    }
-    // downloaded first, so nothing closes for an update that can't be had
-    let msi = std::env::temp_dir().join(format!("procraft-{tag}.msi"));
-    let target = msi.to_string_lossy().replace('\'', "''");
-    powershell(&format!(
-        "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; \
-         Invoke-WebRequest -Uri '{url}' -OutFile '{target}' -UseBasicParsing -TimeoutSec 600"
-    ))?;
-    // the helper: waits for the app to close, installs, opens it again
-    let pid = std::process::id();
-    let exe_path = exe.to_string_lossy().replace('\'', "''");
-    let helper = format!(
-        "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; \
-         $p = Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{target}\"', '/passive', '/norestart') -Verb RunAs -Wait -PassThru; \
-         Remove-Item -LiteralPath '{target}' -ErrorAction SilentlyContinue; \
-         Start-Process -FilePath '{exe_path}'"
-    );
-    spawn_hidden(&helper)?;
-    READY.store(true, Ordering::Relaxed);
-    let _ = wake.send_event(());
-    Ok(())
+}
+
+fn say(text: &str) {
+    dialog(text).set_buttons(rfd::MessageButtons::Ok).show();
+}
+
+fn question(text: &str) -> bool {
+    dialog(text).set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
 }
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-/// Runs a PowerShell script with no window, and gives what it printed.
-fn powershell(script: &str) -> Result<String, String> {
+fn command(script: &str) -> std::process::Command {
     let mut command = std::process::Command::new("powershell.exe");
     command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
     #[cfg(windows)]
     std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
-    let out = command.output().map_err(|e| e.to_string())?;
+    command
+}
+
+/// Runs a PowerShell script with no window, and gives what it printed.
+fn powershell(script: &str) -> Result<String, String> {
+    let out = command(script).output().map_err(|e| e.to_string())?;
     if !out.status.success() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
     }
@@ -126,9 +273,5 @@ fn powershell(script: &str) -> Result<String, String> {
 
 /// Starts a PowerShell script with no window that outlives the app.
 fn spawn_hidden(script: &str) -> Result<(), String> {
-    let mut command = std::process::Command::new("powershell.exe");
-    command.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script]);
-    #[cfg(windows)]
-    std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
-    command.spawn().map(|_| ()).map_err(|e| e.to_string())
+    command(script).spawn().map(|_| ()).map_err(|e| e.to_string())
 }

@@ -2505,6 +2505,7 @@ impl Interface {
                         self.open = None;
                     }
                     Some(Act::About) => crate::files::about(),
+                    Some(Act::CheckUpdates) => crate::update::check_now(),
                     Some(Act::GestureControls) => {
                         self.open = None;
                         self.gesture_controls.open = true;
@@ -2544,6 +2545,7 @@ impl Interface {
                         | Act::PenCross
                         | Act::SharpLayers
                         | Act::TaskbarEdge
+                        | Act::UpdatesMode
                         | Act::ProjectCanvas
                         | Act::ResetInput,
                     )

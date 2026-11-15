@@ -1,12 +1,19 @@
-# Renn's builds: every push to renn-changes (or a run started by hand from the Actions tab) builds the
-# Windows x64 installer and portable zip, nothing else, and publishes them as the latest release,
-# tagged build-<UTC yyyymmddHHMM>. The installed app checks that release when it opens and offers
-# to update itself (desktop/src/update.rs).
+# Renn's builds of ProCraft for Windows x64, published as the latest release (tag build-<UTC
+# yyyymmddHHMM>), which the installed app finds and installs (desktop/src/update.rs).
+#
+# Each build is Renn's version (branch renn-changes) with the original developer's newest work
+# (artcraft-android/procraft, main) merged in. If that merge clashes, or the merged app doesn't
+# build, Renn's version is built alone and the release says the developer's update is waiting.
+#
+# It runs when renn-changes is pushed, by hand from the Actions tab, and once a day on its own to
+# pick up the developer's updates (skipped when nothing changed since the last release).
 name: Windows build
 
 on:
   push:
     branches: [renn-changes]
+  schedule:
+    - cron: "23 9 * * *"
   workflow_dispatch:
 
 permissions:
@@ -18,6 +25,7 @@ concurrency:
 
 env:
   RUST_VERSION: "1.99.0"
+  UPSTREAM: https://github.com/artcraft-android/procraft.git
 
 jobs:
   windows-x64:
@@ -28,31 +36,79 @@ jobs:
         shell: bash
     env:
       DIST: ${{ github.workspace }}/dist
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: renn-changes
+          fetch-depth: 0
+
+      - id: up
+        name: Bring in the original developer's updates
+        run: |
+          git config user.name "ProCraft build"
+          git config user.email "procraft-build@users.noreply.github.com"
+          git remote add upstream "$UPSTREAM"
+          git fetch --no-tags upstream main
+          ours="$(git rev-parse HEAD)"
+          theirs="$(git rev-parse upstream/main)"
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            state=included
+          elif git merge --no-ff --no-edit upstream/main; then
+            # Renn's build stays as it is
+            git checkout "$ours" -- .github/workflows/windows-build.yml
+            git commit --amend --no-edit -q || true
+            state=merged
+          else
+            git merge --abort
+            state=conflict
+          fi
+          echo "ours=$ours" >>"$GITHUB_OUTPUT"
+          echo "theirs=$theirs" >>"$GITHUB_OUTPUT"
+          echo "state=$state" >>"$GITHUB_OUTPUT"
+          echo "key=$ours+$theirs" >>"$GITHUB_OUTPUT"
+          echo "Developer's update: $state ($theirs)" >>"$GITHUB_STEP_SUMMARY"
+
+      - id: skip
+        name: Nothing new since the last release?
+        env:
+          KEY: ${{ steps.up.outputs.key }}
+        run: |
+          last="$(gh release view --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null | sed -n 's/^KEY: //p' | tr -d '\r')"
+          if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$last" = "$KEY" ]; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            echo "Nothing new: no build" >>"$GITHUB_STEP_SUMMARY"
+          fi
 
       - id: v
+        if: steps.skip.outputs.skip != 'true'
         name: Resolve version and build number
         run: |
           listed="$(sed -n 's/^procraft\.version=//p' android/gradle.properties | tr -d '\r')"
           echo "version=$listed" >>"$GITHUB_OUTPUT"
           echo "build=$(date -u +%Y%m%d%H%M)" >>"$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - if: steps.skip.outputs.skip != 'true'
+        uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ env.RUST_VERSION }}
 
-      - uses: Swatinem/rust-cache@v2
+      - if: steps.skip.outputs.skip != 'true'
+        uses: Swatinem/rust-cache@v2
         with:
           key: windows-build-x64
 
-      - name: Install WiX v5
+      - if: steps.skip.outputs.skip != 'true'
+        name: Install WiX v5
         run: |
           dotnet tool install --global wix --version 5.0.2
           echo "$USERPROFILE/.dotnet/tools" >>"$GITHUB_PATH"
           "$USERPROFILE/.dotnet/tools/wix" extension add -g WixToolset.UI.wixext/5.0.2 WixToolset.Util.wixext/5.0.2
 
-      - name: Package for Windows
+      - id: pkg
+        if: steps.skip.outputs.skip != 'true'
+        name: Package for Windows
+        continue-on-error: true
         shell: pwsh
         env:
           VERSION: ${{ steps.v.outputs.version }}
@@ -60,18 +116,52 @@ jobs:
           PROCRAFT_UPDATE_REPO: ${{ github.repository }}
         run: ./packaging/windows/package.ps1
 
-      - uses: actions/upload-artifact@v4
+      # the merged app didn't build: Renn's version alone, the developer's update left waiting
+      - id: alone
+        if: steps.skip.outputs.skip != 'true' && steps.pkg.outcome == 'failure' && steps.up.outputs.state == 'merged'
+        name: Package Renn's version alone
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          PROCRAFT_BUILD: ${{ steps.v.outputs.build }}
+          PROCRAFT_UPDATE_REPO: ${{ github.repository }}
+          OURS: ${{ steps.up.outputs.ours }}
+        run: |
+          git reset --hard $env:OURS
+          Remove-Item -Recurse -Force dist -ErrorAction SilentlyContinue
+          ./packaging/windows/package.ps1
+
+      - if: steps.skip.outputs.skip != 'true' && steps.pkg.outcome == 'failure' && steps.up.outputs.state != 'merged'
+        name: The build failed
+        run: exit 1
+
+      - if: steps.skip.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: procraft-windows-x64
           path: dist/*
           if-no-files-found: error
 
-      - name: Publish the release
+      - if: steps.skip.outputs.skip != 'true'
+        name: Publish the release
         env:
-          GH_TOKEN: ${{ github.token }}
           BUILD: ${{ steps.v.outputs.build }}
+          OURS: ${{ steps.up.outputs.ours }}
+          THEIRS: ${{ steps.up.outputs.theirs }}
+          STATE: ${{ steps.up.outputs.state }}
+          KEY: ${{ steps.up.outputs.key }}
+          ALONE: ${{ steps.alone.outcome }}
         run: |
+          case "$STATE" in
+            included|merged)
+              if [ "$ALONE" = success ]; then
+                upstream="UPSTREAM-CONFLICT: the developer's newest changes don't build with Renn's yet (${THEIRS:0:7})"
+              else
+                upstream="UPSTREAM: includes the developer's work up to ${THEIRS:0:7}"
+              fi ;;
+            *) upstream="UPSTREAM-CONFLICT: the developer's newest changes clash with Renn's (${THEIRS:0:7})" ;;
+          esac
+          printf '%s\n\nRenn'"'"'s version %s.\n\nKEY: %s\n' "$upstream" "${OURS:0:7}" "$KEY" >notes.md
           gh release create "build-$BUILD" dist/*.msi dist/*.zip \
-            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --latest \
-            --title "ProCraft (Renn) build $BUILD" \
-            --notes "Built from $GITHUB_SHA on renn-changes. The installed app offers this update when it opens."
+            --repo "$GITHUB_REPOSITORY" --target "$OURS" --latest \
+            --title "ProCraft (Renn) build $BUILD" --notes-file notes.md

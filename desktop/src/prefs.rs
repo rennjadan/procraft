@@ -46,6 +46,8 @@ pub struct Prefs {
     pub sharp_layers: bool,
     /// In full screen, the taskbar is swiped in from the top edge (as it starts), else the bottom.
     pub taskbar_from_top: bool,
+    /// What happens when a newer build is out (see `crate::update`): Automatic, Ask first or Off.
+    pub updates: u8,
     /// The fine + where the pen hovers or last touched, when no brush outline shows there. Off,
     /// nothing marks the pen's place: an accurate pen needs no mark.
     pub pen_cross: bool,
@@ -109,6 +111,7 @@ impl Default for Prefs {
             pen_cross: true,
             sharp_layers: false,
             taskbar_from_top: true,
+            updates: crate::update::AUTOMATIC,
             cursor_shows: CursorShows::Hovering,
             cursor_style: CursorStyle::Brush,
             colour_model: procraft_core::ColourModel::Hsb,
@@ -169,6 +172,9 @@ impl Prefs {
                 "pen_cross" => p.pen_cross = on,
                 "sharp_layers" => p.sharp_layers = on,
                 "taskbar_from_top" => p.taskbar_from_top = on,
+                "updates" => {
+                    p.updates = value.parse::<u8>().map_or(crate::update::AUTOMATIC, |m| m.min(crate::update::OFF))
+                }
                 "cursor_shows" => p.cursor_shows = pick(&SHOWS, value).unwrap_or(p.cursor_shows),
                 "cursor_style" => p.cursor_style = pick(&STYLES, value).unwrap_or(p.cursor_style),
                 "colour_model" => {
@@ -215,6 +221,7 @@ impl Prefs {
         }
         // the interface shows as it was left
         crate::look::set_light(p.light_interface);
+        crate::update::set_mode(p.updates);
         p
     }
 
@@ -229,6 +236,7 @@ impl Prefs {
             format!("pen_cross {}", self.pen_cross),
             format!("sharp_layers {}", self.sharp_layers),
             format!("taskbar_from_top {}", self.taskbar_from_top),
+            format!("updates {}", self.updates),
             format!("cursor_shows {}", place(&SHOWS, self.cursor_shows)),
             format!("cursor_style {}", place(&STYLES, self.cursor_style)),
             format!("colour_model {}", self.colour_model.key()),
@@ -259,6 +267,7 @@ impl Prefs {
         ];
         let lines: Vec<String> = lines.into_iter().chain(self.plugins.kept_lines()).collect();
         crate::files::keep_text("interface", &(lines.join("\n") + "\n"));
+        crate::update::set_mode(self.updates);
     }
 
     /// The artwork follows them.

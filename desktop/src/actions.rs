@@ -125,6 +125,10 @@ pub enum Act {
     SharpLayers,
     /// The edge the taskbar is swiped in from in full screen: the top or the bottom.
     TaskbarEdge,
+    /// Updates: Automatic, Ask first or Off, in turn.
+    UpdatesMode,
+    /// Looks for an update now.
+    CheckUpdates,
     ProjectCanvas,
     ResetInput,
 }
@@ -400,6 +404,8 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     Button("Gesture controls", None, Some(Act::GestureControls)),
                     Button("Plugins", None, Some(Act::Page(Page::Plugins))),
                     Switch("Sharp vector layers when zoomed", prefs.sharp_layers, Some(Act::SharpLayers)),
+                    Button("Updates", Some(crate::update::mode_name(prefs.updates)), Some(Act::UpdatesMode)),
+                    Button("Check for updates now", None, Some(Act::CheckUpdates)),
                     Button(
                         "Taskbar swipe",
                         Some(if prefs.taskbar_from_top { "From top" } else { "From bottom" }),
@@ -690,6 +696,10 @@ impl Actions {
             }
             Some(Tapped::Act(Act::TaskbarEdge)) => {
                 prefs.taskbar_from_top = !prefs.taskbar_from_top;
+                Some(Act::Prefs)
+            }
+            Some(Tapped::Act(Act::UpdatesMode)) => {
+                prefs.updates = (prefs.updates.min(crate::update::OFF) + 1) % 3;
                 Some(Act::Prefs)
             }
             Some(Tapped::Act(Act::ProjectCanvas)) => {
