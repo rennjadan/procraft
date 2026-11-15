@@ -3,10 +3,10 @@
 //!
 //! The window never changes size or leaves full screen for the taskbar: it is brought up over the
 //! app, as the Windows key brings it up over a full-screen game, while the app eases back under a
-//! soft veil that follows the finger. A quick finger swipe down anywhere in the top part of the
-//! screen does it (or up in the bottom part, as Prefs say); the pen never does, and a slow stroke,
-//! a hold or a second finger goes to the app as it came. The next touch or click on the app eases
-//! the veil away, and Windows puts the taskbar back behind the app.
+//! soft veil that follows the finger. A finger or the pen dragged down from the middle of the top
+//! bar does it, at any speed (or up from the middle of the bottom, as Prefs say); a tap there, a
+//! drag along the bar, a hold or a second finger goes to the app as it came. The next touch or click
+//! on the app eases the veil away, and Windows puts the taskbar back behind the app.
 
 use std::time::Instant;
 
@@ -16,14 +16,16 @@ use winit::window::Window;
 
 use crate::files;
 
-/// The part of the window, from the swipe's edge, a swipe may start in.
-const SWIPE_AREA: f64 = 0.6;
-/// How far a finger goes before it is told apart (points), and how quickly it has to be going
-/// along the swipe then (points a millisecond): slower, it is a stroke.
-const DECIDE_AFTER: f64 = 14.0;
-const SWIPE_SPEED: f64 = 0.45;
-/// A finger held back longer than this (milliseconds) without being a swipe goes to the app.
-const HOLD_MOST_MS: f64 = 140.0;
+/// Where a swipe may start: this far in from its edge (points, the top bar's depth and a little),
+/// and the middle part of the window's width.
+const SWIPE_DEPTH: f64 = 72.0;
+const SWIPE_MIDDLE: f64 = 0.5;
+/// How far a touch goes before it is told apart (points).
+const DECIDE_AFTER: f64 = 10.0;
+/// A touch held still there longer than this (milliseconds) goes to the app (a press held).
+const HOLD_MOST_MS: f64 = 600.0;
+/// Still, for that: moved less than this (points).
+const STILL: f64 = 3.0;
 /// How far a pull goes to bring the veil all the way (points), and the part of that past which
 /// letting go shows the taskbar.
 const PULL_FULL: f64 = 110.0;
@@ -49,6 +51,8 @@ struct Held {
     start: PhysicalPosition<f64>,
     since: Instant,
     events: Vec<WindowEvent>,
+    /// It has moved (a slow drag): only its lift or its way decides it, not time.
+    moved: bool,
 }
 
 /// A finger pulling the veil in: where it began, and its last place and time for its speed.
@@ -190,7 +194,7 @@ impl FullScreen {
     /// A finger held back past its time without being a swipe: what it did, for the app.
     pub(crate) fn take_overdue(&mut self) -> Vec<WindowEvent> {
         match &self.held {
-            Some(h) if h.since.elapsed().as_secs_f64() * 1000.0 >= HOLD_MOST_MS => {
+            Some(h) if !h.moved && h.since.elapsed().as_secs_f64() * 1000.0 >= HOLD_MOST_MS => {
                 self.held.take().map(|h| h.events).unwrap_or_default()
             }
             _ => Vec::new(),
@@ -245,8 +249,11 @@ impl FullScreen {
         let along = |start: PhysicalPosition<f64>, at: PhysicalPosition<f64>| {
             if from_top { at.y - start.y } else { start.y - at.y }
         };
+        let width = f64::from(window.inner_size().width);
         let in_area = |at: PhysicalPosition<f64>| {
-            if from_top { at.y <= height * SWIPE_AREA } else { at.y >= height * (1.0 - SWIPE_AREA) }
+            let deep = SWIPE_DEPTH * points;
+            let across = (at.x - width / 2.0).abs() <= width * SWIPE_MIDDLE / 2.0;
+            across && if from_top { at.y <= deep } else { at.y >= height - deep }
         };
         let grace = |r: Option<Instant>| r.is_some_and(|r| r.elapsed().as_secs_f32() < RETURN_GRACE_S);
         match &event {
@@ -295,16 +302,17 @@ impl FullScreen {
                     let ms = (held.since.elapsed().as_secs_f64() * 1000.0).max(1.0);
                     let ended = matches!(t.phase, TouchPhase::Ended | TouchPhase::Cancelled);
                     let gone = travel.hypot(across);
-                    if !ended && travel >= DECIDE_AFTER && travel > across * 1.5 && travel / ms >= SWIPE_SPEED {
+                    held.moved |= gone >= STILL;
+                    if !ended && travel >= DECIDE_AFTER && travel > across * 1.2 {
                         // a swipe: what the finger began in the app is called off
                         let start = held.start;
                         self.held = None;
                         self.pulled = 0.0;
                         self.pull = Some(Pull { id: t.id, start, last: (travel * points, Instant::now()), speed: 0.0 });
-                        log::info!("taskbar swipe: a finger swiping");
+                        log::info!("taskbar swipe: pulling");
                         return Vec::new();
                     }
-                    if ended || gone >= DECIDE_AFTER || ms >= HOLD_MOST_MS {
+                    if ended || gone >= DECIDE_AFTER || (ms >= HOLD_MOST_MS && gone < STILL) {
                         // a tap, a stroke or a hold: the app has it as it was
                         return self.held.take().map(|h| h.events).unwrap_or_default();
                     }
@@ -322,10 +330,14 @@ impl FullScreen {
                         self.swallowed = Some(t.id);
                         return out;
                     }
-                    let finger = crate::pen::is_pen(t.id) != Some(true);
-                    if out.is_empty() && finger && self.pull.is_none() && in_area(t.location) {
-                        self.held =
-                            Some(Held { id: t.id, start: t.location, since: Instant::now(), events: vec![event] });
+                    if out.is_empty() && self.pull.is_none() && in_area(t.location) {
+                        self.held = Some(Held {
+                            id: t.id,
+                            start: t.location,
+                            since: Instant::now(),
+                            events: vec![event],
+                            moved: false,
+                        });
                         return Vec::new();
                     }
                     out.push(event);
