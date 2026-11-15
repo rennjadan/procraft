@@ -1,6 +1,7 @@
-"""Draws ProCraft's own interface icons from plain geometry (docs/icons/STYLE_GUIDE.md) and puts them
-in place: an SVG master per icon (assets/icons/procraft/<name>.svg, a 24-unit grid), and its path
-data, scaled into its slot (assets/icons/slots.tsv), in Icons.kt.
+"""Draws ProCraft's own interface icons from plain geometry (docs/icons/STYLE_GUIDE.md), takes in the
+ones contributors drew (assets/icons/contributed/), and puts them in place: an SVG master per icon
+(assets/icons/procraft/<name>.svg, a 24-unit grid), and its path data, scaled into its slot
+(assets/icons/slots.tsv), in Icons.kt.
 Needs shapely. Run from anywhere:
 
     python tools/icons/draw_icons.py
@@ -57,6 +58,113 @@ def along_diagonal(shape, tip):
     return translate(rotate(shape, -45, origin=(0, 0)), tip[0], tip[1])
 
 
+SVG_TOKEN = re.compile(r'[MmLlHhVvCcSsZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+
+
+def path_rings(d):
+    """SVG path data (M, L, H, V, C, S and Z, absolute or relative) as closed rings, curves flattened."""
+    tokens = SVG_TOKEN.findall(d)
+    if re.search(r'[QqTtAa]', d):
+        raise SystemExit(f'path data with quadratic curves or arcs: {d[:40]}')
+    rings, ring, cmd, i = [], None, None, 0
+    x = y = 0.0
+    ctrl = None
+    while i < len(tokens):
+        if tokens[i].isalpha():
+            cmd = tokens[i]
+            i += 1
+            if cmd in 'Zz':
+                if ring:
+                    rings.append(ring)
+                    x, y = ring[0]
+                ring, ctrl = None, None
+                continue
+        nums = {'M': 2, 'L': 2, 'H': 1, 'V': 1, 'C': 6, 'S': 4}[cmd.upper()]
+        v = [float(t) for t in tokens[i:i + nums]]
+        i += nums
+        rel = cmd.islower()
+        ox, oy = (x, y) if rel else (0.0, 0.0)
+        c = cmd.upper()
+        if c == 'M':
+            if ring:
+                rings.append(ring)
+            x, y = v[0] + ox, v[1] + oy
+            ring, ctrl = [(x, y)], None
+            cmd = 'l' if rel else 'L'
+            continue
+        if c in 'LHV':
+            if c == 'L':
+                x, y = v[0] + ox, v[1] + oy
+            elif c == 'H':
+                x = v[0] + ox
+            else:
+                y = v[0] + oy
+            ring.append((x, y))
+            ctrl = None
+            continue
+        if c == 'C':
+            p1, p2, p3 = (v[0] + ox, v[1] + oy), (v[2] + ox, v[3] + oy), (v[4] + ox, v[5] + oy)
+        else:
+            p1 = (2 * x - ctrl[0], 2 * y - ctrl[1]) if ctrl else (x, y)
+            p2, p3 = (v[0] + ox, v[1] + oy), (v[2] + ox, v[3] + oy)
+        for k in range(1, 17):
+            t = k / 16
+            u = 1 - t
+            ring.append((u ** 3 * x + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t ** 3 * p3[0],
+                         u ** 3 * y + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t ** 3 * p3[1]))
+        ctrl = p2
+        x, y = p3
+    if ring:
+        rings.append(ring)
+    return rings
+
+
+def svg_parts(path):
+    """A drawing made in an editor: each of its paths, polygons and rectangles as a filled shape."""
+    text = open(path, encoding='utf-8').read()
+    parts = []
+    for tag, attrs in re.findall(r'<(path|polygon|rect)\b([^>]*)>', text):
+        a = dict(re.findall(r'([\w-]+)="([^"]*)"', attrs))
+        if tag == 'path':
+            rings = path_rings(a['d'])
+        elif tag == 'polygon':
+            n = [float(t) for t in re.findall(r'[-+]?(?:\d+\.?\d*|\.\d+)', a['points'])]
+            rings = [list(zip(n[0::2], n[1::2]))]
+        else:
+            x0, y0, w, h = (float(a.get(k, 0)) for k in ('x', 'y', 'width', 'height'))
+            r = float(a.get('rx', a.get('ry', 0)))
+            rings = [list(soft(box(x0, y0, x0 + w, y0 + h), r).exterior.coords)]
+        # each ring cuts what it lies over (even-odd), which is the same as non-zero for drawings
+        # whose holes run the other way round
+        shape = Polygon()
+        for ring in rings:
+            shape = shape.symmetric_difference(Polygon(ring).buffer(0))
+        parts.append(shape)
+    return parts
+
+
+# Drawings given by contributors (assets/icons/contributed/<who>/<name>.svg, on the same 24 grid)
+# and who drew them, for their masters' notes.
+CONTRIBUTED = os.path.join(ROOT, 'assets', 'icons', 'contributed')
+CONTRIBUTORS = {'lork': 'lork (github.com/lork-fork)'}
+
+
+def contributed(who, name, weight=0.0, soft_by=0.15):
+    """A contributor's drawing settled into the set: every part widened by `weight` each side
+    (narrowed if negative), so its lines are as heavy as the drawn icons' beside it where it is
+    shown, and its outer corners rounded by at least `soft_by` (the sparkles' round, the smallest
+    in the set)."""
+    drawn = [part.buffer(weight - soft_by, quad_segs=8).buffer(soft_by, quad_segs=8)
+             for part in svg_parts(os.path.join(CONTRIBUTED, who, f'{name}.svg'))]
+    return unary_union(drawn)
+
+
+# The contributed icons and who drew each. Their lines already weigh what the bar's glyphs' do where
+# they are shown (1.7 and 1.9 pt across; the glyphs they replaced 1.4 and 1.9, the rest of the bar
+# 2.9 to 4.4), so they get no weight.
+CONTRIBUTED_ICONS = {'adjustments': 'lork', 'selection': 'lork'}
+
+
 def wrench():
     """Actions: an open-end wrench with a hole in its handle."""
     head = (15.5, 8.5)
@@ -67,19 +175,9 @@ def wrench():
 
 
 def wand():
-    """Adjustments: a wand with a banded tip and three sparkles."""
+    """Automatic: a wand with a banded tip and three sparkles."""
     shaft = capsule((4.5, 19.5), (15.0, 9.0), 1.5).difference(gap_across((12.6, 11.4), (SQ2, -SQ2), 6))
     return unary_union([shaft, star(18.6, 5.2, 3.3), star(11.2, 4.0, 2.0), star(20.2, 11.8, 1.8)])
-
-
-def selection():
-    """Selection: a selection's four corner marks around a solid square."""
-    marks = []
-    for (cx, cy), (dx, dy) in (((3.5, 3.5), (1, 1)), ((20.5, 3.5), (-1, 1)), ((3.5, 20.5), (1, -1)), ((20.5, 20.5), (-1, -1))):
-        marks.append(capsule((cx, cy), (cx + 5 * dx, cy), 1.1))
-        marks.append(capsule((cx, cy), (cx, cy + 5 * dy), 1.1))
-    inside = soft(box(8.6, 8.6, 15.4, 15.4), 1.0)
-    return unary_union(marks + [inside])
 
 
 def arrow():
@@ -729,6 +827,12 @@ def folder():
 def new_set():
     """New set: a folder with a plus cut out of it."""
     return folder().difference(capsule((8.6, 14.8), (15.4, 14.8), 1.1)).difference(capsule((12.0, 11.4), (12.0, 18.2), 1.1))
+
+
+def new_layer():
+    """New layer: a single sheet with a plus cut out of it."""
+    sheet = soft(Polygon([(12, 5.8), (22, 12), (12, 18.2), (2, 12)]), 1.0)
+    return sheet.difference(capsule((9.1, 12), (14.9, 12), 1.1)).difference(capsule((12, 9.1), (12, 14.9), 1.1))
 
 
 def volumes():
@@ -1597,7 +1701,7 @@ BLENDS = {'multiply': overlap_dark, 'darken': darken, 'shade': sunset, 'color-bu
 # drawn smaller than the box they're placed in: a bare symbol filling a tile's box is too heavy
 SHRINK = {'blend-subtract': 0.75, 'blend-divide': 0.85}
 DRAWINGS = {
-    'actions': wrench, 'adjustments': wand, 'selection': selection, 'transform': arrow,
+    'actions': wrench, 'transform': arrow,
     'brush': paintbrush, 'smudge': fingertip, 'erase': eraser, 'layers': layers,
     'undo': lambda: turning_arrow(False), 'redo': lambda: turning_arrow(True),
     'tabadd': plus, 'tabcanvas': canvas_tab, 'tabshare': share_tab, 'tabimport': import_tab, 'tabvideo': video_tab,
@@ -1622,7 +1726,7 @@ DRAWINGS = {
     'studiodynamics': chevrons, 'studiostylus': stylus, 'studioproperties': gear, 'studiomaterials': material_ball,
     'studiopreview': eye, 'studioabout': name_tag,
     'infoabout': name_tag, 'infodimensions': ruler, 'infolayers': layers, 'infoprofile': gamut, 'infovideo': video_tab,
-    'infostatistics': pie, 'menunewbrush': new_brush, 'menunewset': new_set, 'menushare': share_tab,
+    'infostatistics': pie, 'menunewbrush': new_brush, 'menunewset': new_set, 'menunewlayer': new_layer, 'menushare': share_tab,
     'menulibraries': volumes, 'menunewlibrary': new_library,
     'menuchevron': chevron, 'disclose': lambda: chevron(90), 'donetick': tick, 'add': plus, 'fullscreen': full_screen,
     'cardcompact': rows, 'cardstack': stacked_cards, 'folder-fill': folder, 'sweep': bin_, 'keyboard': keyboard,
@@ -1647,6 +1751,7 @@ DRAWINGS = {
     'recentset': hourglass, 'swipe-find': target, 'swipe-pin': upright_tack, 'swipe-unpin': struck_tack,
     'swipe-clear': broom, 'menuclear': broom, 'pinmark': upright_tack, 'alertquestion': question_disc,
 }
+DRAWINGS.update({name: (lambda who=who, name=name: contributed(who, name)) for name, who in CONTRIBUTED_ICONS.items()})
 DRAWINGS.update({f'set-{k}': draw for k, draw in enumerate(SET_ICONS)})
 DRAWINGS.update({f'blend-{k}': draw for k, draw in BLENDS.items()})
 
@@ -1683,9 +1788,15 @@ def main():
     src = open(ICONS, encoding='utf-8', newline='').read()
     for name, draw in DRAWINGS.items():
         shape = draw().simplify(0.02)
+        if name in CONTRIBUTED_ICONS:
+            who = CONTRIBUTED_ICONS[name]
+            origin = (f'drawn by {CONTRIBUTORS[who]}, placed from assets/icons/contributed/{who}/{name}.svg '
+                      'by tools/icons/draw_icons.py')
+        else:
+            origin = 'original, drawn by tools/icons/draw_icons.py'
         with open(os.path.join(MASTERS, f'{name}.svg'), 'w', encoding='utf-8', newline='\n') as f:
             f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">\n'
-                    f'  <!-- ProCraft {name} icon: original, drawn by tools/icons/draw_icons.py. MIT OR Apache-2.0. -->\n'
+                    f'  <!-- ProCraft {name} icon: {origin}. MIT OR Apache-2.0. -->\n'
                     f'  <path fill="currentColor" fill-rule="evenodd" d="{path_data(shape)}"/>\n</svg>\n')
         w, h, (x0, y0, x1, y1) = places[name]
         bx0, by0, bx1, by1 = shape.bounds

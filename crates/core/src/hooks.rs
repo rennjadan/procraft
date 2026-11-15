@@ -12,9 +12,9 @@ use crate::plugins::Plugins;
 use crate::{CanvasSession, KeyCombo};
 
 /// A plugin at work: a lock of its own, so a long call holds up nothing but it.
-type Shared = Arc<Mutex<Running>>;
+pub(crate) type Shared = Arc<Mutex<Running>>;
 
-fn at_work(running: &Shared) -> MutexGuard<'_, Running> {
+pub(crate) fn at_work(running: &Shared) -> MutexGuard<'_, Running> {
     running.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -32,6 +32,10 @@ struct OnHook {
     events: Option<Shared>,
     /// The kinds of layer it adds (keys `<id>.<key>`), in its manifest's order.
     layer_kinds: Vec<crate::PluginKind>,
+    /// Its brush engines, in its manifest's order, and the looks of the brushes they drew lately,
+    /// by engine and data (the latest last).
+    brush_engines: Vec<crate::plugin_brushes::BrushEngine>,
+    looks: Vec<(String, u64, Arc<crate::plugin_brushes::BrushLook>)>,
 }
 
 #[derive(Default)]
@@ -55,6 +59,8 @@ pub(crate) struct Hooks {
     store: Option<PathBuf>,
     /// The plugins' own artworks open, each by its plugin: told its controls as they change.
     canvases: Mutex<Vec<(String, std::sync::Weak<crate::PluginCanvas>)>>,
+    /// Counts the plugins coming on and off and their controls changing.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Hooks {
@@ -80,10 +86,21 @@ impl Hooks {
         }
         working.stopped.push((id, stop));
         working.untold = Some(format!("A plugin stopped. {}", stop.text()));
+        self.changed();
     }
 
     fn has(&self, hook: Hook) -> bool {
         self.hooked.load(Ordering::Relaxed) & hook.bit() != 0
+    }
+
+    /// A number that changes whenever a plugin comes on or off or its controls change: what a
+    /// plugin answered before it changed may not be what it answers now.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    fn changed(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
     }
 
     /// The bits go by what is on now.
@@ -290,6 +307,13 @@ impl Hooks {
             && self.through(Hook::PinPanels, false, |running, said| Ok(said | running.pin_panels()?))
     }
 
+    /// The clear hook: whether the interface keeps clear of the status bar and the screen's cutouts
+    /// (a camera's), rather than taking the whole window.
+    pub(crate) fn keep_clear(&self) -> bool {
+        self.has(Hook::KeepClear)
+            && self.through(Hook::KeepClear, false, |running, said| Ok(said | running.keep_clear()?))
+    }
+
     /// The undo notice hook: whether undo and redo go by without the notice naming what they took
     /// back or brought back.
     pub(crate) fn hide_undo_notice(&self) -> bool {
@@ -459,9 +483,20 @@ impl Hooks {
         let running = Arc::new(Mutex::new(running));
         working.on.insert(
             at,
-            OnHook { id, running, hooks, brush_keys: Vec::new(), picture: None, events: None, layer_kinds: Vec::new() },
+            OnHook {
+                id,
+                running,
+                hooks,
+                brush_keys: Vec::new(),
+                picture: None,
+                events: None,
+                layer_kinds: Vec::new(),
+                brush_engines: Vec::new(),
+                looks: Vec::new(),
+            },
         );
         self.rehook(&working);
+        self.changed();
     }
 
     /// `id`'s copy of its code for its events (see [`OnHook::events`]).
@@ -567,6 +602,91 @@ impl Hooks {
         done.inspect_err(|stop| self.stopped(&id, *stop)).ok()
     }
 
+    /// The brush engines `id` has, in its manifest's order.
+    pub(crate) fn brush_engines(&self, id: &str, engines: Vec<crate::plugin_brushes::BrushEngine>) {
+        if let Some(plugin) = self.working().on.iter_mut().find(|p| p.id == id) {
+            plugin.brush_engines = engines;
+        }
+    }
+
+    /// The brush engines on that read files whose names end `ending` (all of them for none): each
+    /// plugin's id, code, the engine's place among its engines and its key.
+    pub(crate) fn engines_reading(&self, ending: Option<&str>) -> Vec<(String, Shared, usize, String)> {
+        if !self.has(Hook::Brushes) {
+            return Vec::new();
+        }
+        let working = self.working();
+        let mut found = Vec::new();
+        for p in &working.on {
+            for (index, engine) in p.brush_engines.iter().enumerate() {
+                if ending.is_none_or(|e| engine.accepts.iter().any(|a| a == e)) {
+                    found.push((p.id.clone(), Arc::clone(&p.running), index, engine.key.clone()));
+                }
+            }
+        }
+        found
+    }
+
+    /// The brush engine `key` (`<id>.<key>`), if its plugin is on: its plugin's id, code and the
+    /// engine's place among its engines.
+    pub(crate) fn engine(&self, key: &str) -> Option<(String, Shared, usize)> {
+        if !self.has(Hook::Brushes) {
+            return None;
+        }
+        let working = self.working();
+        working.on.iter().find_map(|p| {
+            let index = p.brush_engines.iter().position(|e| e.key == key)?;
+            Some((p.id.clone(), Arc::clone(&p.running), index))
+        })
+    }
+
+    /// The action that is engine `key`'s brushes' studio, if its plugin is on and has one.
+    pub(crate) fn engine_studio(&self, key: &str) -> Option<String> {
+        if !self.has(Hook::Brushes) {
+            return None;
+        }
+        let working = self.working();
+        working.on.iter().find_map(|p| p.brush_engines.iter().find(|e| e.key == key)?.studio.clone())
+    }
+
+    /// The look engine `key` gave the brush whose data is `id`, if it is kept.
+    pub(crate) fn look_kept(&self, key: &str, id: u64) -> Option<Arc<crate::plugin_brushes::BrushLook>> {
+        let mut working = self.working();
+        let plugin = working.on.iter_mut().find(|p| p.brush_engines.iter().any(|e| e.key == key))?;
+        let at = plugin.looks.iter().position(|(k, i, _)| k == key && *i == id)?;
+        // the latest last
+        let kept = plugin.looks.remove(at);
+        let look = Arc::clone(&kept.2);
+        plugin.looks.push(kept);
+        Some(look)
+    }
+
+    /// The look engine `key` gave the brush whose data is `id`, kept while its plugin stays on (the
+    /// last few).
+    pub(crate) fn keep_look(&self, key: &str, id: u64, look: Arc<crate::plugin_brushes::BrushLook>) {
+        let mut working = self.working();
+        if let Some(plugin) = working.on.iter_mut().find(|p| p.brush_engines.iter().any(|e| e.key == key)) {
+            plugin.looks.retain(|(k, i, _)| !(k == key && *i == id));
+            plugin.looks.push((key.to_owned(), id, look));
+            let over = plugin.looks.len().saturating_sub(crate::plugin_brushes::LOOKS_KEPT);
+            plugin.looks.drain(..over);
+        }
+    }
+
+    /// The look engine `key` of plugin `id` gave the brush whose data is `data`, as it was kept on
+    /// the disk.
+    pub(crate) fn look_on_disk(&self, id: &str, key: &str, data: u64) -> Option<Vec<u8>> {
+        plugin_file::read_look(self.store.as_deref()?, id, key, data)
+    }
+
+    /// Keeps `look` on the disk with plugin `id`, as engine `key`'s for the brush whose data is
+    /// `data`.
+    pub(crate) fn keep_look_on_disk(&self, id: &str, key: &str, data: u64, look: &[u8]) {
+        if let Some(store) = &self.store {
+            plugin_file::write_look(store, id, key, data, look);
+        }
+    }
+
     /// The keys of `id`'s rows in the brush studio, in their order.
     pub(crate) fn brush_keys(&self, id: &str, keys: Vec<String>) {
         if let Some(plugin) = self.working().on.iter_mut().find(|p| p.id == id) {
@@ -590,10 +710,12 @@ impl Hooks {
         let mut working = self.working();
         working.on.retain(|p| p.id != id);
         self.rehook(&working);
+        self.changed();
     }
 
     /// Tells `id`, if it is on, control `index` has `value`.
     pub(crate) fn control(&self, id: &str, index: usize, value: f32) {
+        self.changed();
         {
             let mut working = self.working();
             if let Some(at) = working.on.iter().position(|p| p.id == id) {
@@ -734,6 +856,12 @@ pub(crate) mod tests {
         (global $size (mut f32) (f32.const 1))
         (func (export "procraft_control") (param i32 f32) (global.set $size (local.get 1)))
         (func (export "procraft_interface_scale") (param f32 f32) (result f32) (global.get $size)))"#;
+    /// Answers the clear hook by its one switch.
+    const CLEARS: &str = r#"(module
+        (global $clear (mut i32) (i32.const 0))
+        (func (export "procraft_control") (param i32 f32)
+            (global.set $clear (f32.ne (local.get 1) (f32.const 0))))
+        (func (export "procraft_keep_clear") (result i32) (global.get $clear)))"#;
     /// Answers the pick hook by its one switch.
     const PICKS: &str = r#"(module
         (global $layer (mut i32) (i32.const 0))
@@ -1554,6 +1682,46 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn colordrop_by_all_layers_stops_at_a_light_line_as_at_a_dark_one() {
+        let Some(s) = session() else { return };
+        let dir = store("fill-all-light");
+        // a light blue ring on the first layer, over the white background
+        s.set_color(0.55, 0.8, 0.95);
+        s.set_brush_size(0.2);
+        let ring: Vec<PenSample> = (0..=120)
+            .map(|i| {
+                let a = i as f32 / 120.0 * std::f32::consts::TAU;
+                sample(100.0 + 50.0 * a.cos(), 100.0 + 50.0 * a.sin(), f64::from(i) * 8.0)
+            })
+            .collect();
+        s.stroke_begin(PointerKind::Finger, ring[..1].to_vec());
+        s.stroke_add(ring[1..].to_vec());
+        s.stroke_end(vec![]);
+        // seen over white, every pixel of it is nearer to white than a drop's first threshold
+        // reaches: a fill going by the canvas as it shows would pass it
+        let line = picture(&s);
+        let from_white =
+            line.as_chunks::<4>().0.iter().map(|p| (0..3).map(|c| p[3].saturating_sub(p[c])).max().unwrap_or(0));
+        assert!(from_white.max().unwrap() < 128);
+        s.add_layer();
+        let plugins = filling_by_all(&dir);
+        assert!(plugins.set_on(ID.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        // dropped inside it on the empty layer at the threshold a drop starts with: it fills up to
+        // the ring and no further, as it does at a black ring
+        assert!(s.pour_begin(100.0, 100.0, 0.0, 0.0, 1.0, 0.5));
+        s.pour_end(true, None);
+        s.await_pour();
+        let rgba = picture(&s);
+        let blue_at = |x: usize, y: usize| rgba[(y * 200 + x) * 4 + 2] > 200 && rgba[(y * 200 + x) * 4 + 3] > 200;
+        assert!(blue_at(100, 100) && blue_at(80, 120), "filled where it was dropped");
+        for (x, y) in [(100, 20), (20, 100), (180, 100), (100, 180), (5, 5), (195, 195)] {
+            assert!(!blue_at(x, y), "not past the ring at ({x}, {y})");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_interface_takes_a_plugin_s_colour_while_it_is_on() {
         let dir = store("interface-colour");
         // red for the accent, nothing said for any other role
@@ -2014,6 +2182,31 @@ pub(crate) mod tests {
         assert!(plugins.set_on(ID.to_owned(), true));
         assert_eq!(plugins.interface_scale(1600.0, 1000.0), 1.0);
         assert_eq!(card(&plugins).problem.as_deref(), Some("Switched off: it gave an answer that makes no sense."));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_interface_keeps_clear_of_the_system_while_a_plugin_s_switch_says() {
+        let dir = store("clear");
+        let module = wat::parse_str(CLEARS).unwrap();
+        let plugins = Plugins::with_store(dir.clone());
+        let mut manifest = coded(ID, &module);
+        manifest["hooks"] = json!(["keep_clear"]);
+        manifest["controls"] = json!([{ "key": "clear", "type": "switch", "label": "Keep clear" }]);
+        assert_eq!(plugins.install(file(&manifest, &module)), None);
+        assert!(!plugins.keep_clear(), "imported, it says nothing");
+        assert!(plugins.set_on(ID.to_owned(), true));
+        assert!(!plugins.keep_clear(), "its switch starts off");
+        let key = format!("{ID}.clear");
+        assert!(plugins.set_switch(key.clone(), true));
+        assert!(plugins.keep_clear());
+        // kept through a restart
+        let next = restarted(&dir, &plugins);
+        assert!(next.keep_clear());
+        assert!(plugins.set_switch(key, false));
+        assert!(!plugins.keep_clear());
+        assert!(plugins.set_on(ID.to_owned(), false));
+        assert!(!plugins.keep_clear());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

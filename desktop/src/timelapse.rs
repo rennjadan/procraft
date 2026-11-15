@@ -50,6 +50,9 @@ impl TimeLapseUi {
         // keeps a time-lapse
         if let Some((left, _)) = self.lapse.take() {
             std::thread::spawn(move || {
+                // behind what is drawn meanwhile: a long session's video takes a while to make,
+                // and the next artwork is opening
+                in_background();
                 let _ = for_package(&left);
             });
         }
@@ -58,6 +61,7 @@ impl TimeLapseUi {
         if let Some((_, lapse)) = &self.lapse {
             let lapse = Arc::clone(lapse);
             std::thread::spawn(move || {
+                in_background();
                 let gone = drop_pictures(&lapse);
                 if gone > 0 {
                     log::info!("the time-lapse's videos hold {gone} frames: their pictures went");
@@ -130,11 +134,8 @@ It can't be brought back."
         let (tx, rx) = channel();
         let (session, lapse) = (Arc::clone(session), Arc::clone(lapse));
         std::thread::spawn(move || {
-            // frames as large as the video they make, private layers left out
-            let side = time_lapse_side(lapse.settings());
-            if let Some(shot) = session.time_lapse_frame(side) {
-                lapse.record(shot.rgba, shot.width, shot.height);
-            }
+            // read back at the size frames are kept, private layers left out
+            session.record_time_lapse(Arc::clone(&lapse));
             // one that couldn't be kept is told once, from the window's thread
             if let Some(text) = lapse.take_problem() {
                 crate::files::tell_later("Can't keep the time-lapse", &text);
@@ -306,6 +307,20 @@ pub fn for_package(dir: &str) -> procraft_core::PackageTimeLapse {
     lapse.for_package()
 }
 
+/// The thread this is called on yields to the app's others (Windows's background mode: lower
+/// processor and disk priority), for work nobody waits on.
+#[allow(unsafe_code)]
+fn in_background() {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+        // SAFETY: the calling thread's own pseudo handle, its priority only
+        if let Err(e) = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } {
+            log::warn!("background priority: {e}");
+        }
+    }
+}
+
 /// The pictures its videos hold too gone, once this system has read those videos: videos go
 /// through its own decoders, and where it has none for them the pictures are all there is to
 /// replay. How many went.
@@ -467,7 +482,7 @@ fn on_white(frame: &procraft_core::ThumbnailImage, w: u32, h: u32) -> Vec<u8> {
 /// The video made copied where the person picks.
 fn save_as(made: &std::path::Path) {
     let name = made.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let Some(to) = rfd::FileDialog::new()
+    let Some(to) = crate::files::dialog()
         .set_title("Export time-lapse video")
         .set_file_name(name)
         .add_filter("MP4 video", &["mp4"])

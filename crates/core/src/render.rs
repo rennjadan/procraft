@@ -105,11 +105,13 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
     let Some(queue) = queue else { return };
 
     let mut config: Option<wgpu::SurfaceConfiguration> = None;
+    // whether the surface was last configured asking for wide colour
+    let mut wide = false;
     let mut last_present: Option<Instant> = None;
     let started = Instant::now();
     let mut pipelines_kept = false;
     loop {
-        let (size, reconfigure) = {
+        let (size, reconfigure, wants_wide) = {
             let mut st = shared.lock();
             // a device lost draws nothing again: there is only its stopping to wait for
             while !st.stop && (!st.needs_frame || st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
@@ -124,15 +126,19 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
                     None => shared.wake.wait(&mut st),
                 }
             }
+            shared.took_back();
             if st.stop {
                 break;
             }
-            (st.window_size, std::mem::replace(&mut st.reconfigure, false))
+            (st.window_size, std::mem::replace(&mut st.reconfigure, false), st.wide_colour())
         };
-        if reconfigure || config.is_none() {
+        // configured again too when the canvas comes to want wide colour or stops (its profile
+        // changed, or the app's setting)
+        if reconfigure || config.is_none() || wants_wide != wide {
             let st = shared.lock();
             let Some(gpu) = st.gpu.as_ref() else { break };
-            config = configure(gpu, &surface, size, true);
+            config = configure(gpu, &surface, size, wants_wide);
+            wide = wants_wide;
         }
         let Some(format) = config.as_ref().map(|c| c.format) else {
             std::thread::sleep(Duration::from_millis(16));
@@ -232,20 +238,22 @@ pub(crate) fn project(shared: Arc<Shared>, window: Window) {
     let Some(queue) = shared.lock().gpu.as_ref().map(|g| g.queue.clone()) else { return };
     let mut config: Option<wgpu::SurfaceConfiguration> = None;
     let mut size = (0, 0);
+    let mut wide = false;
     let mut drawn: Option<u64> = None;
     loop {
-        let (wanted, frames) = {
+        let (wanted, frames, wants_wide) = {
             let st = shared.lock();
             if st.projection_stop {
                 break;
             }
-            (st.projection_size, st.frames)
+            (st.projection_size, st.frames, st.wide_colour())
         };
-        if wanted != size || config.is_none() {
+        if wanted != size || config.is_none() || wants_wide != wide {
             size = wanted;
             let st = shared.lock();
             let Some(gpu) = st.gpu.as_ref() else { break };
-            config = configure(gpu, &surface, size, true);
+            config = configure(gpu, &surface, size, wants_wide);
+            wide = wants_wide;
             drawn = None;
         }
         let Some(format) = config.as_ref().map(|c| c.format) else {

@@ -1,6 +1,13 @@
 package io.github.artcraftandroid.procraft.ui
 
 import android.content.res.Configuration
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.displayCutout
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.statusBarsIgnoringVisibility
+import androidx.compose.foundation.layout.union
 import androidx.compose.material3.LocalTextStyle
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Typography
@@ -46,7 +53,7 @@ private const val TRACKING = -0.045f
  * whatever the system font scale: sp equal dp inside the theme.
  */
 @Composable
-fun ProCraftTheme(interfaceSize: Float = 1f, content: @Composable () -> Unit) {
+fun ProCraftTheme(interfaceSize: Float = 1f, clear: Clearance = Clearance(), content: @Composable () -> Unit) {
     val assets = LocalContext.current.assets
     val text = remember(assets) {
         val family = FontFamily(
@@ -81,12 +88,24 @@ fun ProCraftTheme(interfaceSize: Float = 1f, content: @Composable () -> Unit) {
         val density = LocalDensity.current
         CompositionLocalProvider(
             LocalDensity provides Density(density.density * interfaceSize, 1f),
-            LocalConfiguration provides sizedScreen(interfaceSize),
+            LocalConfiguration provides sizedScreen(interfaceSize, clear, density.density),
             LocalSizeSettled provides sizeSettled(interfaceSize),
             LocalTextStyle provides text,
+            LocalClearance provides clear,
             androidx.compose.foundation.LocalIndication provides NoIndication,
-            content = content,
-        )
+        ) {
+            // the interface inside what it keeps clear of, the rest black; with nothing to keep
+            // clear of, the whole window, each part of it measured to it as the window's root does
+            val inside = with(LocalDensity.current) {
+                androidx.compose.foundation.layout.PaddingValues(clear.left.toDp(), clear.top.toDp(), clear.right.toDp(), clear.bottom.toDp())
+            }
+            androidx.compose.foundation.layout.Box(
+                androidx.compose.ui.Modifier.fillMaxSize()
+                    .then(if (clear.none) androidx.compose.ui.Modifier else androidx.compose.ui.Modifier.background(androidx.compose.ui.graphics.Color.Black))
+                    .padding(inside),
+                propagateMinConstraints = true,
+            ) { content() }
+        }
     }
 }
 
@@ -113,27 +132,67 @@ private fun sizeSettled(interfaceSize: Float): Int {
     return settled
 }
 
-/** How big the interface shows with [chosen] set: as far as the window has room. */
+/**
+ * How far in from the window's edges the interface is laid out (pixels), to keep clear of the status
+ * bar and the screen's cutouts, such as a camera's, while a plugin asks it to. Everything goes
+ * inside, the canvas too, so a place in the window is one in the interface less its [corner].
+ */
+@androidx.compose.runtime.Immutable
+data class Clearance(val left: Int = 0, val top: Int = 0, val right: Int = 0, val bottom: Int = 0) {
+    /** Where the interface's top left is in the window. */
+    val corner: androidx.compose.ui.geometry.Offset get() = androidx.compose.ui.geometry.Offset(left.toFloat(), top.toFloat())
+
+    /** Whether the interface takes the whole window. */
+    val none: Boolean get() = left == 0 && top == 0 && right == 0 && bottom == 0
+}
+
+/** What the interface keeps clear of, inside the theme: see [Clearance]. */
+val LocalClearance = staticCompositionLocalOf { Clearance() }
+
+/**
+ * What the interface keeps clear of with [plugins] as they are ([changes] when they change): the
+ * status bar's band, kept whether the bar shows or not (so a swipe showing it for a moment moves
+ * nothing), and the screen's cutouts, while a plugin asks; nothing otherwise.
+ */
+@OptIn(androidx.compose.foundation.layout.ExperimentalLayoutApi::class)
 @Composable
-fun fittedInterfaceSize(plugins: Plugins, changes: Any? = null): Float {
+fun clearance(plugins: Plugins, changes: Any? = null): Clearance {
+    val clear = remember(plugins, changes) { plugins.keepClear() }
+    if (!clear) return Clearance()
+    val density = LocalDensity.current
+    val ltr = androidx.compose.ui.unit.LayoutDirection.Ltr
+    val insets = WindowInsets.statusBarsIgnoringVisibility.union(WindowInsets.displayCutout)
+    return Clearance(insets.getLeft(density, ltr), insets.getTop(density), insets.getRight(density, ltr), insets.getBottom(density))
+}
+
+/** How big the interface shows with [chosen] set: as far as the window, less what it keeps [clear] of, has room. */
+@Composable
+fun fittedInterfaceSize(plugins: Plugins, changes: Any? = null, clear: Clearance = Clearance()): Float {
     val screen = LocalConfiguration.current
-    return remember(plugins, changes, screen.screenWidthDp, screen.screenHeightDp) {
-        plugins.interfaceScale(screen.screenWidthDp.toFloat(), screen.screenHeightDp.toFloat())
+    val density = LocalDensity.current.density
+    return remember(plugins, changes, screen.screenWidthDp, screen.screenHeightDp, clear, density) {
+        plugins.interfaceScale(screen.screenWidthDp - (clear.left + clear.right) / density, screen.screenHeightDp - (clear.top + clear.bottom) / density)
     }
 }
 
-/** The screen as the interface measures it at [interfaceSize]: as many of its dp as fit across it. */
+/**
+ * The screen as the interface measures it at [interfaceSize]: as many of its dp as fit across it,
+ * less what it keeps [clear] of ([density]: the screen's own).
+ */
 @Composable
-private fun sizedScreen(interfaceSize: Float): Configuration {
+private fun sizedScreen(interfaceSize: Float, clear: Clearance, density: Float): Configuration {
     val screen = LocalConfiguration.current
-    return remember(screen, interfaceSize) {
-        if (interfaceSize == 1f) {
+    return remember(screen, interfaceSize, clear, density) {
+        if (interfaceSize == 1f && clear.none) {
             screen
         } else {
+            val across = (clear.left + clear.right) / density
+            val down = (clear.top + clear.bottom) / density
             Configuration(screen).apply {
-                screenWidthDp = (screenWidthDp / interfaceSize).toInt()
-                screenHeightDp = (screenHeightDp / interfaceSize).toInt()
+                screenWidthDp = ((screenWidthDp - across) / interfaceSize).toInt()
+                screenHeightDp = ((screenHeightDp - down) / interfaceSize).toInt()
                 smallestScreenWidthDp = (smallestScreenWidthDp / interfaceSize).toInt()
+                if (!clear.none) smallestScreenWidthDp = minOf(smallestScreenWidthDp, screenWidthDp, screenHeightDp)
             }
         }
     }

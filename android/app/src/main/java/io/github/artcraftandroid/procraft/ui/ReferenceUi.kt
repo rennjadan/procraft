@@ -138,7 +138,9 @@ private fun ReferenceWindowContent(vm: CanvasViewModel) {
             // where the picture's area is, read when a finger picks (kept as the layout itself, so a
             // window dragged since is never read where it was)
             val area = remember { arrayOfNulls<androidx.compose.ui.layout.LayoutCoordinates>(1) }
-            val toScreen = { p: Offset -> area[0]?.takeIf { it.isAttached }?.localToRoot(p) ?: p }
+            // (the loupe's place in the interface: in the window, less what it keeps clear of)
+            val corner = LocalClearance.current.corner
+            val toScreen = { p: Offset -> area[0]?.takeIf { it.isAttached }?.localToRoot(p)?.minus(corner) ?: p }
             Box(
                 Modifier.fillMaxSize().clipToBounds()
                     .onGloballyPositioned { area[0] = it }

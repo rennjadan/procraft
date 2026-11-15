@@ -1,10 +1,10 @@
 package io.github.artcraftandroid.procraft.canvas
 
+import io.github.artcraftandroid.procraft.AppLog
 import io.github.artcraftandroid.procraft.ui.CanvasSpace
 import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.util.Log
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
@@ -41,6 +41,7 @@ import io.github.artcraftandroid.procraft.core.KeyShortcut
 import io.github.artcraftandroid.procraft.core.ModeButton
 import io.github.artcraftandroid.procraft.core.Modes
 import io.github.artcraftandroid.procraft.core.modeSwitch
+import io.github.artcraftandroid.procraft.core.modeSwitchDeselects
 import io.github.artcraftandroid.procraft.core.GuideType
 import io.github.artcraftandroid.procraft.core.GuideUnit
 import io.github.artcraftandroid.procraft.core.SymmetryType
@@ -57,7 +58,10 @@ import io.github.artcraftandroid.procraft.core.Interpolation
 import io.github.artcraftandroid.procraft.core.LayerInfo
 import io.github.artcraftandroid.procraft.core.TextAlignment
 import io.github.artcraftandroid.procraft.core.TextInfo
+import io.github.artcraftandroid.procraft.core.TextRunInfo
 import io.github.artcraftandroid.procraft.core.TextSide
+import io.github.artcraftandroid.procraft.core.TextStyleChange
+import io.github.artcraftandroid.procraft.core.textIndexFromUtf16
 import io.github.artcraftandroid.procraft.core.LayerType
 import io.github.artcraftandroid.procraft.core.MobileException
 import io.github.artcraftandroid.procraft.core.SelectionDisplay
@@ -77,6 +81,7 @@ import io.github.artcraftandroid.procraft.core.brushBlendModes
 import io.github.artcraftandroid.procraft.core.grainBlendModes
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlin.math.abs
 import kotlin.math.roundToInt
 import androidx.compose.ui.text.TextRange
@@ -144,6 +149,17 @@ internal fun brushFileName(name: String, single: Boolean): String {
     return base + if (single) ".${CanvasViewModel.BRUSH_EXTENSION}" else ".${CanvasViewModel.BRUSH_SET_EXTENSION}"
 }
 
+/**
+ * The file another app's brushes from a file called [name] wait in for a canvas to open: [stamp]
+ * (to keep them in order), `-`, then the name's letters and digits in any script, its spaces, `_`,
+ * `-` and `.` (anything else made `_`). Read again by that name, its ending still says what the
+ * file is, to the brush engines plugins bring (a Krita bundle or preset) as when it came.
+ */
+internal fun pendingBrushFileName(stamp: Long, name: String): String {
+    val kept = name.map { if (it.isLetterOrDigit() || it in " _-.") it else '_' }.joinToString("").trim()
+    return "$stamp-${kept.ifEmpty { "Imported" }}"
+}
+
 /** The gallery, the open artwork and the state of the controls around it; outlives configuration changes. */
 class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var session: CanvasSession? = null
@@ -154,6 +170,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     var screen by mutableStateOf(Screen.GALLERY)
         private set
+
+    /**
+     * Whether the app's window is in wide colour: only while the open canvas shows in it (a Display
+     * P3, CMYK or imported-profile canvas, Wide Color on), so its window and the canvas's surface
+     * always agree. MainActivity follows.
+     */
+    var wideColorWindow by mutableStateOf(false)
+        private set
+
     val store = ArtworkStore(File(app.filesDir, "artworks"))
     var artworks by mutableStateOf<List<Artwork>>(emptyList())
         private set
@@ -486,6 +511,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     var tweensOn by mutableStateOf(false)
         private set
 
+    /**
+     * Whether a plugin makes the strokes' sound, as last asked: only then does a hovering pen tell
+     * the canvas where it is (each hover event would otherwise wait on the canvas for nothing).
+     */
+    var strokeSoundOn = false
+        private set
+
     // the interface's accent as the plugins give it
     init { followPluginLooks() }
 
@@ -517,7 +549,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // set up before the session is, the first time
         @Suppress("SENSELESS_COMPARISON")
         if (strokeSound == null) return
-        strokeSound.follow(session?.takeIf { inFront && screen == Screen.CANVAS }, plugins.makesStrokeSound())
+        strokeSoundOn = plugins.makesStrokeSound()
+        strokeSound.follow(session?.takeIf { inFront && screen == Screen.CANVAS }, strokeSoundOn)
     }
 
     /** The app came to the front ([front]) or went behind: the strokes' sound follows. */
@@ -639,6 +672,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             pluginPanel = plugins.panel()
             s.takeFailure()?.let { showNotice(it) }
             readPlugins()
+            if (s.takeBrushesChanged()) libraryChanged()
             refresh()
         }
     }
@@ -655,6 +689,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             pluginPanel = plugins.panel()
             s.takeFailure()?.let { showNotice(it) }
             readPlugins()
+            // a plugin's studio changed a brush: read again and kept
+            if (s.takeBrushesChanged()) libraryChanged()
             refresh()
         }
     }
@@ -1045,6 +1081,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** How the colour panel and swatches show the canvas's colours: its space, its press. */
     private fun refreshCanvasSpace(s: CanvasSession) {
+        // a canvas put in another profile may go into wide colour or out of it
+        refreshWideColor(s)
         val name = s.profile()
         val space = io.github.artcraftandroid.procraft.ui.CanvasSpace
         val p3 = io.github.artcraftandroid.procraft.gallery.CanvasPreset.P3
@@ -1404,10 +1442,22 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         applyFitInsets()
     }
 
-    /** The settings the canvas itself keeps: simplified undos and the speed distance. */
+    /** The settings the canvas itself keeps: simplified undos, the speed distance and wide colour. */
     private fun applyAppSettings(s: CanvasSession) {
         s.setSimplifiedUndos(interfacePrefs.getBoolean(SIMPLIFIED_UNDOS, true))
         s.setSpeedDistance(interfacePrefs.getFloat(SPEED_DISTANCE, 1f))
+        s.setWideColour(wideColorAllowed())
+        refreshWideColor(s)
+    }
+
+    /** Whether a canvas may show in wide colour: the screen takes it and Wide Color is on. */
+    private fun wideColorAllowed(): Boolean =
+        getApplication<Application>().resources.configuration.isScreenWideColorGamut &&
+            interfacePrefs.getBoolean(WIDE_COLOR, wideColorByDefault())
+
+    /** The window follows [s]'s canvas into wide colour and out of it. */
+    private fun refreshWideColor(s: CanvasSession) {
+        wideColorWindow = s.showsWideColour()
     }
 
     /** What fitting the canvas keeps clear of: the top bar and the sidebar, with Fit Canvas Inside Interface. */
@@ -1840,7 +1890,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 CanvasSession.openModel(file, name, files, artwork, 0u)
                     .also(::loadModelTextures).also(::loadBrushes)
             }.onFailure {
-                android.util.Log.e("ProCraft", "opening a model", it)
+                AppLog.e("ProCraft", "opening a model", it)
                 why = (it as? io.github.artcraftandroid.procraft.core.MobileException.File)?.reason?.substringAfter(": ", "")
             }.getOrNull()
         }
@@ -2107,7 +2157,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     }
                 } ?: io.github.artcraftandroid.procraft.core.PagesOutcome.Unreadable
             } catch (e: Exception) {
-                android.util.Log.e("ProCraft", "importing a PDF", e)
+                AppLog.e("ProCraft", "importing a PDF", e)
                 io.github.artcraftandroid.procraft.core.PagesOutcome.Unreadable
             } finally {
                 pages.deleteRecursively()
@@ -2131,7 +2181,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 app.contentResolver.openInputStream(uri)?.use { input -> temp.outputStream().use { input.copyTo(it) } }
                 io.github.artcraftandroid.procraft.core.importPsd(temp.path, dir.path, name?.substringBeforeLast('.')?.trim().orEmpty())
             } catch (e: Exception) {
-                android.util.Log.e("ProCraft", "importing a PSD", e)
+                AppLog.e("ProCraft", "importing a PSD", e)
                 io.github.artcraftandroid.procraft.core.PsdOutcome.Unreadable
             } finally {
                 temp.delete()
@@ -2171,7 +2221,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             } ?: error("nothing to read")
             temp
         }.getOrElse {
-            if (!importCancelled) android.util.Log.e("ProCraft", "copying a file in", it)
+            if (!importCancelled) AppLog.e("ProCraft", "copying a file in", it)
             temp.delete()
             null
         }
@@ -2200,7 +2250,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             true
         } catch (e: Exception) {
-            android.util.Log.e("ProCraft", "importing a package", e)
+            AppLog.e("ProCraft", "importing a package", e)
             false
         }
     }
@@ -2213,7 +2263,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val out = File(File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }, "$base.$extension")
                 s.exportPackage(out.path, System.nanoTime().toULong(), timeLapse?.forPackage())
                 out
-            }.onFailure { android.util.Log.e("ProCraft", "exporting a package", it) }.getOrNull()
+            }.onFailure { AppLog.e("ProCraft", "exporting a package", it) }.getOrNull()
         }
     }
 
@@ -2462,6 +2512,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         closePluginPanel()
         val lapse = timeLapse
         session = null
+        wideColorWindow = false
         artworkDir = null
         panel = Panel.NONE
         screen = Screen.GALLERY
@@ -2537,6 +2588,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The canvas view's ear for a pen's side button that comes as a key (true: the second), and what it did. */
     var penKeyHeard: ((second: Boolean, action: PenKeyAction) -> Unit)? = null
+
+    /** The canvas view's touch input, for what covers the canvas and passes its touches on (the guide editor). */
+    var canvasTouch: ((android.view.MotionEvent) -> Boolean)? = null
+
+    /**
+     * Hides the system's bars again (set by the activity). A drag down from the top bar can show
+     * them for a moment, and a second drag while they show would pull the notification shade
+     * instead of the colour.
+     */
+    var hideSystemBars: (() -> Unit)? = null
 
     /** A pen's side button came as a key (see [penKeyButton]): true if a canvas took it. */
     fun penKey(second: Boolean, action: PenKeyAction = PenKeyAction.PRESSED): Boolean {
@@ -2808,25 +2869,27 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         guide = session?.setGuideOn(on)
     }
 
-    /** Opens the guide editor (turning the guide on), the canvas fitted between its bars. */
+    /**
+     * Opens the guide editor (turning the guide on), the canvas moving into the middle of the
+     * screen; the canvas's touches work the guide (and move the view) until it closes.
+     */
     fun openGuideEditor() {
         val s = session ?: return
         endQuickShape()
         closePanels()
         if (guide?.on != true) s.setGuideOn(true)
-        val d = density
-        // fitted between a fifth of the screen's height above and below (either way up), 40 in from the sides
-        val band = windowSize.y * GUIDE_FIT_BAND
-        guide = s.guideEditBegin(GUIDE_FIT_SIDE_DP * d, band, windowSize.x - GUIDE_FIT_SIDE_DP * d, windowSize.y - band)
+        guide = s.guideEditBegin()
+        s.setTouchGuideEditing(true)
         guideEditing = true
-        refreshView()
+        followView()
     }
 
     fun closeGuideEditor(keep: Boolean) {
+        session?.setTouchGuideEditing(false)
         guide = session?.guideEditEnd(keep)
         guideEditing = false
         symmetryOptionsOpen = false
-        refreshView()
+        followView()
     }
 
     fun chooseGuideKind(kind: GuideType) {
@@ -2855,31 +2918,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         refresh()
     }
 
-    /** What a touch at [p] in the guide editor takes: the turn handle (-2), the centre (-1), or a vanishing point (its index); a tap elsewhere in perspective adds one. */
-    fun guideGrab(p: Offset): Int? {
-        val g = guide ?: return null
-        val reach = QUICKSHAPE_REACH_DP * density
-        symmetryOptionsOpen = false
-        if (g.kind == GuideType.PERSPECTIVE) {
-            val index = session?.touchVanishingPoint(p.x, p.y)?.toInt()
-            guide = session?.guide()
-            return index
-        }
-        return when {
-            (Offset(g.handle[0], g.handle[1]) - p).getDistance() <= reach -> -2
-            (Offset(g.centre[0], g.centre[1]) - p).getDistance() <= reach -> -1
-            else -> null
-        }
-    }
-
-    fun guideDrag(grab: Int?, p: Offset) {
-        val s = session ?: return
-        guide = when (grab) {
-            null -> return
-            -2 -> s.turnGuide(p.x, p.y)
-            -1 -> s.moveGuideCentre(p.x, p.y)
-            else -> s.moveVanishingPoint(grab.toUInt(), p.x, p.y)
-        }
+    /**
+     * The guide editor's canvas touched ([touched]: a touch came down, closing symmetry's options)
+     * or its handle dragged: the guide as it now is (a perspective tap may have added a point).
+     */
+    fun guideTouched(touched: Boolean) {
+        if (touched) symmetryOptionsOpen = false
+        guide = session?.guide() ?: guide
     }
 
     // copy and paste, flipping, pictures
@@ -2959,13 +3004,18 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             showNotice(said)
             return
         }
-        val ids = session?.layersAt(at.x, at.y).orEmpty()
-        if (ids.isEmpty()) {
-            message = "Nothing is drawn there."
-            return
+        val s = session ?: return
+        // read back from the GPU off the main thread, as a finger set to pick layers asks on every touch
+        viewModelScope.launch {
+            val ids = withContext(Dispatchers.Default) { s.layersAt(at.x, at.y) }
+            if (session !== s) return@launch
+            if (ids.isEmpty()) {
+                message = "Nothing is drawn there."
+                return@launch
+            }
+            selectLayer(ids.first())
+            layerChoice = if (ids.size > 1) at to ids else null
         }
-        selectLayer(ids.first())
-        layerChoice = if (ids.size > 1) at to ids else null
     }
 
     /** The QuickMenu, open around this window point. */
@@ -3062,21 +3112,21 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * A key of a hardware keyboard on the canvas ([ctrl] the command key): true if it is a
-     * shortcut, done (as a plugin rebinding keys takes it), or the key a plugin's panel asked for.
-     * Typing in a text field never comes here.
+     * A [press] of a hardware keyboard on the canvas (its key as the shared shortcuts name it,
+     * crates/core keys.rs, which say what it does): true if it is a shortcut, done (as a plugin
+     * rebinding keys takes it), or the key a plugin's panel asked for. Typing in a text field never
+     * comes here.
      */
-    fun keyShortcut(keyCode: Int, ctrl: Boolean, shift: Boolean, alt: Boolean): Boolean {
+    internal fun keyShortcut(press: KeyPress): Boolean {
         if (screen != Screen.CANVAS || session == null) return false
-        // the key as the shared shortcuts name it (crates/core keys.rs), which say what it does
-        val name = keyName(keyCode) ?: return false
+        val (name, command, shift, alt) = press
         if (pluginPanel?.keyPress == true) {
-            pluginPanelKey(io.github.artcraftandroid.procraft.core.KeyCombo(name, ctrl, shift, alt))
+            pluginPanelKey(io.github.artcraftandroid.procraft.core.KeyCombo(name, command, shift, alt))
             return true
         }
         // the arrows move what is transformed, or the strokes the selection takes
         val nudges = transforming || takenBox.isNotEmpty()
-        when (val shortcut = plugins.keyShortcut(name, ctrl, shift, alt, nudges) ?: return false) {
+        when (val shortcut = plugins.keyShortcut(name, command, shift, alt, nudges) ?: return false) {
             KeyShortcut.Undo -> undo()
             KeyShortcut.Redo -> redo()
             KeyShortcut.CopyLayer -> copyLayer()
@@ -3458,7 +3508,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     added++
                 }
             } catch (e: Exception) {
-                android.util.Log.e("ProCraft", "a video's frames", e)
+                AppLog.e("ProCraft", "a video's frames", e)
             } finally {
                 retriever.release()
             }
@@ -3693,11 +3743,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         frameJob = viewModelScope.launch {
             do {
                 frameStale = false
-                withContext(Dispatchers.Default) {
-                    // frames as large as the video they make, private layers left out
-                    val shot = s.timeLapseFrame(t.settings.side.toUInt()) ?: return@withContext
-                    t.record(shot.rgba, shot.width.toInt(), shot.height.toInt())
-                }
+                // read back at the size frames are kept, private layers left out, and kept by the
+                // core without the picture coming here: a frame after each stroke
+                withContext(Dispatchers.Default) { t.recordFrom(s) }
                 // one that couldn't be kept (the storage full) is told once
                 t.takeProblem()?.let { message = it }
             } while (frameStale)
@@ -3753,7 +3801,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                         }
                         !exportCancelled
                     }
-                }.onFailure { Log.e(TAG, "exporting the time-lapse", it) }.getOrDefault(false)
+                }.onFailure { AppLog.e(TAG, "exporting the time-lapse", it) }.getOrDefault(false)
                 out.takeIf { ok }
             }
             if (exportCancelled) return null
@@ -4205,6 +4253,34 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** The style sheet (fonts, styles, design, attributes) is open over the keyboard. */
     var textStyleOpen by mutableStateOf(false)
 
+    /**
+     * The look the style sheet shows for the letters chosen (the first one's; underline and outline
+     * on only when all of them have it), or for what is typed next at the caret.
+     */
+    var textLook by mutableStateOf<TextRunInfo?>(null)
+        private set
+
+    /** The letters chosen in the text field as the core counts them (not UTF-16): first and last. */
+    private fun textChosen(v: TextFieldValue = textField): Pair<UInt, UInt> =
+        textIndexFromUtf16(v.text, v.selection.min.toUInt()) to textIndexFromUtf16(v.text, v.selection.max.toUInt())
+
+    private fun refreshTextLook() {
+        val (start, end) = textChosen()
+        textLook = session?.textLook(start, end)
+    }
+
+    /**
+     * The look of the letters chosen changed by [change] (theirs alone); with only a caret, the look
+     * of what is typed there next.
+     */
+    fun restyleText(change: TextStyleChange) {
+        val (start, end) = textChosen()
+        val now = session?.textRestyle(start, end, change) ?: return
+        textInfo = now
+        renderText()
+        refreshTextLook()
+    }
+
     /** The text as it was when the style sheet opened, for its Cancel. */
     private var textBeforeStyle: TextInfo? = null
 
@@ -4247,7 +4323,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val families = withContext(Dispatchers.IO) { uris.mapNotNull { importFont(it) } }
             val family = families.firstOrNull() ?: return@launch
-            changeText { it.copy(font = family) }
+            restyleText(TextStyleChange.Font(family))
             showNotice(if (families.size > 1) "Fonts imported" else "Font imported")
         }
     }
@@ -4283,7 +4359,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             kerning = 0f, tracking = 0f, leading = 0f, baseline = 0f, opacity = 1f,
             align = TextAlignment.CENTER, underline = false, outline = false, vertical = false, allCaps = false,
             r = ((rgb shr 16) and 255) / 255f, g = ((rgb shr 8) and 255) / 255f, b = (rgb and 255) / 255f,
-            x = 0f, y = 0f, width = 0f,
+            x = 0f, y = 0f, width = 0f, runs = emptyList(),
         )
         info = s.newTextPlaced(info, windowSize.x, windowSize.y, screenDensity)
         if (s.textBegin(null, info) == null) {
@@ -4319,19 +4395,26 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         textInfo = info
         textField = TextFieldValue(info.text, TextRange(0, info.text.length))
         textStyleOpen = false
+        refreshTextLook()
         renderText()
         refresh()
     }
 
     fun changeTextField(v: TextFieldValue) {
+        val before = textField
         textField = v
+        // what was typed is found against where the letters chosen were; then where they now are
         if (v.text != textInfo?.text) changeText { it.copy(text = v.text) }
+        if (v.text != before.text || v.selection != before.selection) {
+            val (start, end) = textChosen(v)
+            session?.textSelect(start, end)
+            refreshTextLook()
+        }
     }
 
     fun changeText(f: (TextInfo) -> TextInfo) {
         val info = textInfo?.let(f) ?: return
-        textInfo = info
-        session?.setText(info)
+        textInfo = session?.setText(info) ?: info
         renderText()
     }
 
@@ -4784,7 +4867,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             // the shared core tells the kinds apart and makes them brushes off the main
             // thread; they join the library here, once nothing holds a place in it
             val read = withContext(Dispatchers.Default) {
-                io.github.artcraftandroid.procraft.core.readBrushes(bytes, name)
+                // plugins' brush engines make theirs of the file here too, off the main thread
+                io.github.artcraftandroid.procraft.core.readBrushes(bytes, name)?.also { r -> it.makeEngineBrushes(r) }
             }
             if (importCancelled) return
             read?.let {
@@ -4875,7 +4959,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             if (!any) return false
             withContext(Dispatchers.IO) {
                 pendingBrushDir.mkdirs()
-                File(pendingBrushDir, "${System.nanoTime()}-${setName.replace(Regex("[^A-Za-z0-9 _-]"), "_")}.other").writeBytes(bytes)
+                File(pendingBrushDir, pendingBrushFileName(System.nanoTime(), name)).writeBytes(bytes)
             }
             message = "Brushes will be added to the library when a canvas opens."
             return true
@@ -4929,7 +5013,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val f = withContext(Dispatchers.IO) { pendingBrushDir.listFiles()?.minByOrNull { it.name } } ?: break
                 val read = withContext(Dispatchers.Default) {
                     // named after the set, for another app's (kept as .abr by earlier versions)
-                    runCatching { io.github.artcraftandroid.procraft.core.readBrushes(f.readBytes(), f.name.substringAfter('-')) }.getOrNull()
+                    runCatching {
+                        io.github.artcraftandroid.procraft.core.readBrushes(f.readBytes(), f.name.substringAfter('-'))
+                            ?.also { r -> session?.makeEngineBrushes(r) }
+                    }.getOrNull()
                 }
                 if (session == null) break
                 if (read != null) {
@@ -5033,7 +5120,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** Keeps the tools' brushes, the sets' choices and each brush's sliders for the next session. */
     private fun keepChoices(s: CanvasSession) {
         viewModelScope.launch(Dispatchers.IO) {
-            val kept = brushLibraryWrites.withLock { runCatching { s.keepBrushChoices(brushesDir.path) }.getOrDefault(false) }
+            // (begun, it ends even if the canvas goes meanwhile)
+            val kept = withContext(NonCancellable) {
+                brushLibraryWrites.withLock { runCatching { s.keepBrushChoices(brushesDir.path) }.getOrDefault(false) }
+            }
             libraryKept(kept)
         }
     }
@@ -5121,6 +5211,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     /** Opens the studio on the current tool's brush. */
     fun openStudio() {
         val s = session ?: return
+        // a brush a plugin's brush engine draws opens in that plugin's own studio
+        s.brushStudioAction()?.let {
+            runPluginAction(it)
+            return
+        }
         // the brush library stays open under it, so Cancel and Done go back to it
         if (panel != Panel.BRUSHES) closePanels()
         studioName = s.studioBegin()
@@ -5284,7 +5379,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     } catch (e: kotlinx.coroutines.CancellationException) {
         throw e
     } catch (e: Throwable) {
-        Log.e(TAG, doing, e)
+        AppLog.e(TAG, doing, e)
         message = "This picture couldn't be used."
         null
     }
@@ -5547,9 +5642,13 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private fun keepBrushLibrary(s: CanvasSession) {
         if (libraryKeepWaiting.getAndSet(s) === s) return
         viewModelScope.launch(Dispatchers.IO) {
-            val kept = brushLibraryWrites.withLock {
-                libraryKeepWaiting.compareAndSet(s, null)
-                runCatching { s.keepBrushes(brushesDir.path) }.getOrDefault(false)
+            // begun, it ends even if the canvas goes meanwhile (the app closed with it open): a
+            // write waiting its turn isn't dropped, and brushes just brought in are kept
+            val kept = withContext(NonCancellable) {
+                brushLibraryWrites.withLock {
+                    libraryKeepWaiting.compareAndSet(s, null)
+                    runCatching { s.keepBrushes(brushesDir.path) }.getOrDefault(false)
+                }
             }
             libraryKept(kept)
         }
@@ -5729,7 +5828,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     s.exportPlugin(e.key, file.path)
                     file
                 } catch (x: MobileException) {
-                    Log.e(TAG, "exporting", x)
+                    AppLog.e(TAG, "exporting", x)
                     null
                 }
             }
@@ -5804,7 +5903,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 listOf(file)
             } catch (e: MobileException) {
-                Log.e(TAG, "exporting", e)
+                AppLog.e(TAG, "exporting", e)
                 emptyList()
             }
         }
@@ -5875,7 +5974,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 file
             } catch (e: MobileException) {
-                Log.e(TAG, "exporting the turntable", e)
+                AppLog.e(TAG, "exporting the turntable", e)
                 null
             }
         }
@@ -5979,7 +6078,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 file
             } catch (e: MobileException) {
-                Log.e(TAG, "exporting an animation", e)
+                AppLog.e(TAG, "exporting an animation", e)
                 null
             }
         } }
@@ -6004,7 +6103,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 if (jpeg) s.exportJpeg(file.path) else s.exportPng(file.path)
             } catch (e: MobileException) {
-                Log.e(TAG, "exporting", e)
+                AppLog.e(TAG, "exporting", e)
                 return@withContext null
             }
             file
@@ -6089,7 +6188,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val bytes = paletteStore.swatchesFile(i.toUInt()) ?: return@runCatching null
                 val base = p.name.filter { it.isLetterOrDigit() || it in " _-" }.trim().ifEmpty { "Palette" }
                 File(File(getApplication<Application>().cacheDir, "exports").apply { mkdirs() }, "$base.swatches").also { it.writeBytes(bytes) }
-            }.onFailure { Log.e(TAG, "sharing a palette", it) }.getOrNull()
+            }.onFailure { AppLog.e(TAG, "sharing a palette", it) }.getOrNull()
         }
     }
 
@@ -6123,6 +6222,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val c = colorRgb()
         val (r, g, b) = Triple(((c shr 16) and 0xFF) / 255f, ((c shr 8) and 0xFF) / 255f, (c and 0xFF) / 255f)
         session?.setColor(r, g, b)
+        // editing text, the letters chosen take it (and what is typed next): drawn again
+        if (textInfo != null) session?.let { s ->
+            s.editingText()?.let(s::layerText)?.let { now ->
+                if (now != textInfo) {
+                    textInfo = now
+                    renderText()
+                }
+            }
+        }
         if (colorNames) nameColorSoon()
         // recoloring, the area under the reticle takes the new colour
         val s = session
@@ -6186,8 +6294,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** [button] pressed: the modes it leaves behind end first (keeping what they made), as the core says; true if it goes on to do what it does. */
     private fun switchModes(button: ModeButton): Boolean {
-        val change = modeSwitch(button, openModes())
+        val open = openModes()
+        val change = modeSwitch(button, open)
         val end = change.end
+        // the selection button closing the selection tool lets go of the selection too
+        if (modeSwitchDeselects(button, open)) clearSelection()
         if (end.quickshape) endQuickShape()
         if (end.filling) endDropBand()
         if (end.recolor) endRecolor()
@@ -6704,7 +6815,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     // ---- selection ----
 
-    /** The selection button: opens or closes the selection tool (a selection made stays). */
+    /** The selection button: opens the selection tool, or closes it letting go of the selection. */
     fun toggleSelecting() {
         // open, it closes; else the other modes end
         if (!switchModes(ModeButton.Selection)) return
@@ -6866,7 +6977,11 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      * uptime [ms], by a pen or not ([pen]), pulled out [from] the button's centre or the swatch.
      */
     fun dropDragStart(at: Offset, swatch: Int? = null, pen: Boolean = false, ms: Long = android.os.SystemClock.uptimeMillis(), from: Offset = at) {
-        if (swatch == null) closePanels()
+        if (swatch == null) {
+            closePanels()
+            // pulled down from the top edge: the system's bars it may show go again
+            hideSystemBars?.invoke()
+        }
         dropBandTimer?.cancel()
         dropSwatch = swatch
         dropDot = at to (swatch ?: colorRgb())
@@ -6935,6 +7050,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The dragged colour let go at [at] (null: somewhere it doesn't fill, like the top bar). */
     fun dropDragEnd(at: Offset?) {
+        if (dropSwatch == null) hideSystemBars?.invoke()
         val step = colourDrag?.now()
         colourDrag = null
         dropBlob = null
@@ -7367,7 +7483,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** What is drawn over the canvas follows the view each frame while it moves into place. */
-    private fun followView() {
+    fun followView() {
         val s = session ?: return
         settling?.cancel()
         settling = viewModelScope.launch {
@@ -7800,7 +7916,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     mkdirs()
                 }
                 s.exportChosenPngs(folder.path).map { File(it) }
-            }.onFailure { Log.e(TAG, "exporting layers", it) }.getOrDefault(emptyList())
+            }.onFailure { AppLog.e(TAG, "exporting layers", it) }.getOrDefault(emptyList())
         }
     }
 
@@ -8036,6 +8152,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         const val SINGLE_TOUCH_COMPANION = "single_touch_companion"
         const val TAP_ASSISTANCE = "tap_assistance"
 
+        /** Wide Color: Display P3 canvases show in wide colour where the screen takes it (see [wideColorByDefault]). */
+        const val WIDE_COLOR = "wide_color"
+
         /** The version whose start last said the 32-bit build isn't the one for this tablet. */
         const val WRONG_BUILD_SAID = "wrong_build_said"
 
@@ -8107,9 +8226,6 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         const val RAPID_UNDO_MIN_S = 0.1f
         const val RAPID_UNDO_MAX_S = 1.5f
         const val SELECTION_VISIBILITY = "selection_visibility"
-        /** The guide editor fits the canvas this far in from the window's sides, top and bottom (points). */
-        const val GUIDE_FIT_SIDE_DP = 40f
-        const val GUIDE_FIT_BAND = 0.2f
         /** The largest side a picture brought in is decoded at (pixels). */
         const val MAX_PICTURE = 4096
         /** How long a stroke is held still to snap (milliseconds), how still (points), and how near a handle a touch takes it. */

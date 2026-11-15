@@ -326,6 +326,31 @@ pub fn plugin_slider_along(slider: PluginSlider, value: f32) -> f32 {
     if range > 0.0 { ((value - slider.least) / range).clamp(0.0, 1.0) } else { 0.0 }
 }
 
+/// `slider`'s steps as choices, when every step has a name: shown as a menu of them, not as a
+/// slider, since nothing lies between them. Otherwise none.
+#[uniffi::export]
+pub fn plugin_slider_choices(slider: PluginSlider) -> Vec<String> {
+    let steps = if slider.step > 0.0 { ((slider.most - slider.least) / slider.step).round() } else { -1.0 };
+    let wanted = steps + 1.0;
+    if steps >= 1.0 && wanted <= slider.names.len() as f32 {
+        slider.names.iter().take(wanted as usize).cloned().collect()
+    } else {
+        Vec::new()
+    }
+}
+
+/// Which of `slider`'s choices `value` is.
+#[uniffi::export]
+pub fn plugin_slider_chosen(slider: PluginSlider, value: f32) -> u32 {
+    if slider.step > 0.0 { ((slider.stepped(value) - slider.least) / slider.step).round().max(0.0) as u32 } else { 0 }
+}
+
+/// The value of `slider`'s choice `index`.
+#[uniffi::export]
+pub fn plugin_slider_choice(slider: PluginSlider, index: u32) -> f32 {
+    slider.stepped(slider.least + index as f32 * slider.step)
+}
+
 /// `value` on `slider` as it reads, to as many places as its step needs.
 #[uniffi::export]
 pub fn plugin_slider_shown(slider: PluginSlider, value: f32) -> String {
@@ -611,6 +636,13 @@ impl Plugins {
                 self.hooks.brush_keys(&plugin.id, plugin.brush_controls.iter().map(|c| c.key.clone()).collect());
                 // the kinds of layer it adds, for the sessions' layers of them to go through it
                 self.hooks.layer_kinds(&plugin.id, plugin.layer_kinds.clone());
+                // its brush engines, for brush files and the brushes made of them
+                if hooks.contains(&Hook::Brushes)
+                    && let Some(store) = store
+                {
+                    let engines = plugin_file::read_brush_engines(store, &plugin.id, &plugin.version);
+                    self.hooks.brush_engines(&plugin.id, engines);
+                }
                 // a picker's picture, for the sessions to draw
                 if hooks.contains(&Hook::Picker)
                     && let Some(text) =
@@ -648,7 +680,9 @@ impl Plugins {
         let store = self.store.as_deref().ok_or(Stop::Damaged)?;
         let (hooks, bytes) = plugin_file::read_code(store, id, version).ok_or(Stop::Damaged)?;
         let kept = plugin_file::read_kept(store, id);
-        Ok((Running::start_told(&bytes, values, &hooks, permissions, kept.as_deref())?, hooks))
+        let mut running = Running::start_told(&bytes, values, &hooks, permissions, kept.as_deref())?;
+        running.own(id);
+        Ok((running, hooks))
     }
 
     /// What `running`, a copy of `id`'s code that has just acted, says to keep: kept with the
@@ -1266,6 +1300,13 @@ impl Plugins {
         self.hooks().interface_scale(width, height)
     }
 
+    /// Whether a plugin keeps the interface clear of the status bar and the screen's cutouts, a
+    /// camera's: the app then lays it out inside them. Where there are none, as on a desktop, it
+    /// changes nothing.
+    pub fn keep_clear(&self) -> bool {
+        self.hooks().keep_clear()
+    }
+
     /// Whether a plugin draws in-betweens: Animation Assist's frame options then offer In-between
     /// ([`crate::CanvasSession::add_inbetween`]).
     pub fn tweens(&self) -> bool {
@@ -1561,6 +1602,26 @@ mod tests {
         assert_eq!(plugin_slider_shown(sound.clone(), 0.0), "By brush");
         assert_eq!(plugin_slider_shown(sound.clone(), 1.2), "Eraser");
         assert_eq!(plugin_slider_shown(sound, 2.0), "Pencil");
+    }
+
+    #[test]
+    fn a_slider_named_at_every_step_is_a_choice() {
+        let names = ["Eraser", "Pencil", "Pen"].map(str::to_owned).to_vec();
+        let sound = PluginSlider { least: 1.0, most: 3.0, step: 1.0, at_least: None, names, ..gap_slider() };
+        assert_eq!(plugin_slider_choices(sound.clone()), ["Eraser", "Pencil", "Pen"]);
+        assert_eq!(plugin_slider_chosen(sound.clone(), 1.0), 0);
+        assert_eq!(plugin_slider_chosen(sound.clone(), 3.0), 2);
+        assert_eq!(plugin_slider_chosen(sound.clone(), 9.0), 2);
+        assert_eq!(plugin_slider_choice(sound.clone(), 1), 2.0);
+        assert_eq!(plugin_slider_choice(sound.clone(), 7), 3.0);
+        // a step left unnamed, numbers, or a range of one: a slider still
+        let short = PluginSlider { most: 4.0, ..sound.clone() };
+        assert!(plugin_slider_choices(short).is_empty());
+        assert!(plugin_slider_choices(gap_slider()).is_empty());
+        let one = PluginSlider { most: 1.0, ..sound.clone() };
+        assert!(plugin_slider_choices(one).is_empty());
+        let flat = PluginSlider { step: 0.0, ..sound };
+        assert!(plugin_slider_choices(flat).is_empty());
     }
 
     #[test]
@@ -2209,6 +2270,10 @@ mod tests {
         assert_eq!(landing(&plugins), (UNTOUCHED.0 + 10.0, UNTOUCHED.1));
         assert!(plugins.set_slider("interface_size".to_owned(), 0.9).is_some());
         assert!((plugins.interface_scale(1600.0, 1000.0) - 0.9).abs() < 1e-6);
+        assert!(!plugins.keep_clear());
+        assert!(plugins.set_switch(format!("{SIZE}.clear"), true));
+        assert!(plugins.keep_clear());
+        assert!((plugins.interface_scale(1600.0, 1000.0) - 0.9).abs() < 1e-6, "the slider is its own");
         assert!(plugins.set_switch("eyedropper_layer".to_owned(), true));
         assert!(plugins.hooks().pick_layer());
         assert!(plugins.set_switch("paste_into_mask".to_owned(), true));

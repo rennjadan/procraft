@@ -3,7 +3,7 @@
 //! button, opacity, undo and redo, and a slider's panel while it is dragged).
 
 use egui::{Align2, Color32, Rect, Sense, Stroke, Ui, pos2, vec2};
-use procraft_core::{CanvasInfo, CanvasSession, ToolKind};
+use procraft_core::{CanvasInfo, CanvasSession, SideSliderTap, ToolKind, side_slider_drag_share, side_slider_tap};
 use resvg::tiny_skia;
 
 use crate::icons;
@@ -338,9 +338,11 @@ impl SideBar {
     }
 
     /// An upright slider moved by dragging anywhere on it: the thumb follows the pointer (not
-    /// jumping to it), 1 at the top. Moved, its panel shows while it moves; held still, it stays
-    /// up. Its notches (saved values) show as marks on the track; a value dragged near one is
-    /// pulled onto it, and a tap on one goes there. On a notch, the thumb shows a blue bar.
+    /// jumping to it), finer the farther out to the side the pointer goes, 1 at the top. Moved,
+    /// its panel shows while it moves; held still or its thumb tapped, it stays up; a tap
+    /// elsewhere on the track takes the thumb there. Its notches (saved values) show as marks on
+    /// the track; a value dragged near one is pulled onto it, and a tap on one goes there. On a
+    /// notch, the thumb shows a blue bar.
     fn slider(&mut self, ui: &Ui, look: &mut Look, session: &CanvasSession, which: Slider, rect: Rect, value: f32) {
         let size = which == Slider::Size;
         let travel = rect.height() - pc::THUMB_HEIGHT - pc::THUMB_INSET * 2.0;
@@ -359,23 +361,22 @@ impl SideBar {
                     self.panel = Some((which, false));
                 }
                 press.moved = true;
-                press.raw = (press.raw - dy / travel).clamp(0.0, 1.0);
+                // the farther out to the side the pointer is, the finer the thumb follows it
+                let across = response.interact_pointer_pos().map_or(0.0, |p| p.x - rect.center().x);
+                press.raw = (press.raw - dy / travel * side_slider_drag_share(across)).clamp(0.0, 1.0);
                 set(session.slider_notch_at(size, press.raw).unwrap_or(press.raw));
             }
         }
-        // a tap on a notch's mark goes to it
+        // a tap on the thumb opens the panel and keeps it up; elsewhere the thumb goes there (or
+        // onto a notch's mark there)
         if response.clicked()
             && let Some(p) = response.interact_pointer_pos()
         {
             let at = 1.0 - (p.y - rect.top() - pc::THUMB_INSET - pc::THUMB_HEIGHT / 2.0) / travel;
             let reach = pc::THUMB_HEIGHT / 2.0 / travel;
-            let notch = session
-                .slider_notches(size)
-                .into_iter()
-                .filter(|n| (n - at).abs() < reach)
-                .min_by(|a, b| (a - at).abs().total_cmp(&(b - at).abs()));
-            if let Some(n) = notch {
-                set(n);
+            match side_slider_tap(at, value, reach, session.slider_notches(size)) {
+                SideSliderTap::Panel => self.panel = Some((which, true)),
+                SideSliderTap::Jump { value } => set(value),
             }
         }
         if !response.is_pointer_button_down_on() && self.pressed.is_some_and(|p| p.which == which) {

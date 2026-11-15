@@ -200,6 +200,8 @@ pub struct Library {
     card_rects: Vec<(usize, Rect)>,
     /// The cards' brush strokes, drawn small, by library, set and place (none: it can't be).
     card_previews: HashMap<(u32, u32, u32), Option<TextureHandle>>,
+    /// Strokes forgotten in the middle of a frame that may still draw them: let go at the next.
+    card_retired: Vec<TextureHandle>,
     /// The cards' strokes still to draw, and those being drawn on a thread of their own (another
     /// library's brushes are read from its file, which can be large).
     card_wanted: Vec<(u32, u32, u32)>,
@@ -254,13 +256,19 @@ impl Library {
 
     /// Brush files' `(bytes, name)` read on a thread of their own, their brushes added to the
     /// library once read (`added`). `tell`: say that they came in (else only that they held none).
-    pub fn add_brushes(&mut self, files: Vec<(Vec<u8>, String)>, tell: bool) {
+    pub fn add_brushes(&mut self, session: &CanvasSession, files: Vec<(Vec<u8>, String)>, tell: bool) {
         if files.is_empty() {
             return;
         }
         let (done, importing) = std::sync::mpsc::channel();
+        // plugins' brush engines make theirs of the files there too
+        let engines = session.brush_engines();
         std::thread::spawn(move || {
-            let read = files.into_iter().filter_map(|(bytes, name)| read_any_brushes(&bytes, Some(name))).collect();
+            let read = files
+                .into_iter()
+                .filter_map(|(bytes, name)| read_any_brushes(&bytes, Some(name)))
+                .map(|read| engines.make(read))
+                .collect();
             let _ = done.send(read);
         });
         self.importing.push((importing, tell));
@@ -347,6 +355,8 @@ impl Library {
             pos2(left, top),
             vec2(LIBRARY_WIDTH, (screen.bottom() - BOTTOM_MARGIN - top).max(200.0)),
         );
+        // the cards' strokes forgotten last frame are drawn no more
+        self.card_retired.clear();
         if std::mem::take(&mut self.stale) {
             self.previews.clear();
             self.drawing = None;
@@ -826,7 +836,7 @@ impl Library {
             _ => {
                 let Some(file) = crate::files::pick_file("Import brushes") else { return };
                 self.shown_set = Some(shown);
-                self.add_brushes(vec![file], false);
+                self.add_brushes(session, vec![file], false);
             }
         }
     }

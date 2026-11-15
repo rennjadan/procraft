@@ -77,7 +77,8 @@ pub enum KeyShortcut {
 /// (Backspace) clears the layer, [ and ] the brush's size by 1%, G shows the canvas in perceptual
 /// greys (as Krita's soft proofing does). Alone: B paints, E erases, M the eyedropper, S
 /// selection, V transform, C the colours, X swaps them, L Layers, Space the QuickMenu, [ and ] the
-/// brush's size by 5% (with Shift 10%); U, D, J, K and 0 as with the command key.
+/// brush's size by 5% (with Shift 10%); U, D, J, K and 0 as with the command key. Off Apple's
+/// platforms Ctrl+Y redoes too ([`REDO_Y`]).
 #[uniffi::export]
 pub fn key_shortcut(key: String, command: bool, shift: bool, alt: bool, transforming: bool) -> Option<KeyShortcut> {
     use KeyShortcut::*;
@@ -86,6 +87,7 @@ pub fn key_shortcut(key: String, command: bool, shift: bool, alt: bool, transfor
         return match key.as_str() {
             "z" if shift => Some(Redo),
             "z" => Some(Undo),
+            "y" if REDO_Y && !shift => Some(Redo),
             "c" => Some(CopyLayer),
             "x" => Some(CutLayer),
             "v" => Some(Paste),
@@ -130,6 +132,11 @@ pub fn key_shortcut(key: String, command: bool, shift: bool, alt: bool, transfor
         _ => None,
     }
 }
+
+/// Whether Ctrl+Y redoes as well as Ctrl+Shift+Z: as Windows, Linux and Android have it, and so the
+/// undo and redo of a tablet's express keys and pens' buttons often send it. A Mac and an iPad
+/// redo with ⇧⌘Z alone.
+pub(crate) const REDO_Y: bool = !MAC;
 
 /// How far off (window pixels) the point an arrow nudges towards is: far enough that the nudge
 /// goes straight that way.
@@ -230,9 +237,13 @@ impl CanvasSession {
         self.view_gesture(pivot.0, pivot.1, 0.0, 0.0, zoom, turn);
     }
 
-    /// The key drag ends (the mouse let go, or its key).
+    /// The key drag ends (the mouse let go, or its key): a turn let go within 5° of a right angle
+    /// goes on onto it, as one by fingers does.
     pub fn key_drag_end(&self) {
-        self.shared.lock().key_drag = None;
+        let ended = self.shared.lock().key_drag.take();
+        if ended.is_some_and(|d| d.how == KeyDrag::Turn) {
+            self.settle_turn();
+        }
     }
 }
 
@@ -333,9 +344,11 @@ const fn command(key: &'static str) -> Press {
 /// as `holds`), what they do, and whether only the desktop has them. Where its presses each do
 /// something of their own (one smaller, one bigger), `each` says what, for a plugin to rebind each
 /// by itself; where the app's own work needs its keys as they are (held, they move the view), it is
-/// `fixed`, and no plugin rebinds it. A drag is fixed.
+/// `fixed`, and no plugin rebinds it. A drag is fixed. `not_mac`: presses that do it too off Apple's
+/// platforms, after its own.
 struct Entry {
     presses: &'static [Press],
+    not_mac: &'static [Press],
     drag: &'static str,
     holds: &'static [Press],
     does: &'static str,
@@ -345,7 +358,7 @@ struct Entry {
 }
 
 const fn entry(presses: &'static [Press], does: &'static str) -> Entry {
-    Entry { presses, drag: "", holds: &[], does, each: &[], desktop: false, fixed: false }
+    Entry { presses, not_mac: &[], drag: "", holds: &[], does, each: &[], desktop: false, fixed: false }
 }
 
 const fn desktop(presses: &'static [Press], does: &'static str) -> Entry {
@@ -353,7 +366,7 @@ const fn desktop(presses: &'static [Press], does: &'static str) -> Entry {
 }
 
 const fn drag(keys: &'static str, holds: &'static [Press], does: &'static str) -> Entry {
-    Entry { presses: &[], drag: keys, holds, does, each: &[], desktop: true, fixed: true }
+    Entry { presses: &[], not_mac: &[], drag: keys, holds, does, each: &[], desktop: true, fixed: true }
 }
 
 impl Entry {
@@ -365,6 +378,17 @@ impl Entry {
     const fn fixed(self) -> Entry {
         Entry { fixed: true, ..self }
     }
+
+    /// With `not_mac`, presses that do it too off Apple's platforms.
+    const fn not_mac(self, not_mac: &'static [Press]) -> Entry {
+        Entry { not_mac, ..self }
+    }
+
+    /// Its presses on a Mac (or an iPad) if `mac`, else elsewhere.
+    fn presses(&self, mac: bool) -> Vec<Press> {
+        let others = if mac { &[][..] } else { self.not_mac };
+        self.presses.iter().chain(others).copied().collect()
+    }
 }
 
 /// The list, by group ("{command}" in a drag's keys: the platform's command key).
@@ -373,7 +397,7 @@ const SHORTCUTS: &[(&str, &[Entry])] = &[
         "Edit",
         &[
             entry(&[command("z")], "Undo"),
-            entry(&[(true, true, false, "z")], "Redo"),
+            entry(&[(true, true, false, "z")], "Redo").not_mac(&[command("y")]),
             entry(&[command("c")], "Copy the layer"),
             entry(&[command("x")], "Cut the layer"),
             entry(&[command("v")], "Paste"),
@@ -491,8 +515,8 @@ fn combo(&(command, shift, alt, key): &Press) -> KeyCombo {
 
 /// The keyboard shortcuts, grouped, as a list to show: the canvas's (as [`key_shortcut`] has
 /// them), with the desktop's own too (its files, zooming and turning the view) if `desktop`; the
-/// keys written as a Mac's (⌘, ⇧, ⌥) if `mac`, else "Ctrl+", "Shift+", "Alt+". With a plugin
-/// rebinding keys, [`crate::Plugins::key_shortcut_list`] shows them as they are now.
+/// keys a Mac's (⌘, ⇧, ⌥, and only the presses it has) if `mac`, else "Ctrl+", "Shift+", "Alt+".
+/// With a plugin rebinding keys, [`crate::Plugins::key_shortcut_list`] shows them as they are now.
 #[uniffi::export]
 pub fn key_shortcut_list(desktop: bool, mac: bool) -> Vec<ShortcutGroup> {
     shortcut_list_now(desktop, mac, |_| None)
@@ -517,7 +541,7 @@ pub(crate) fn shortcut_list_now(
                         return Some(ShortcutRow { keys, combos: Vec::new(), does: e.does.into() });
                     }
                     let mut combos: Vec<KeyCombo> = Vec::new();
-                    for press in e.presses.iter().map(combo) {
+                    for press in e.presses(mac).iter().map(combo) {
                         let doing = if e.fixed { None } else { now(&press) };
                         for c in doing.unwrap_or_else(|| vec![press]) {
                             if !combos.contains(&c) {
@@ -545,8 +569,8 @@ pub(crate) const MAC: bool = cfg!(any(target_os = "macos", target_os = "ios"));
 /// what it does, its presses (each as [`KeyCombo::text`] writes it, a space between) and whether the
 /// app keeps its keys as they are (1) or a plugin may rebind them (0), a tab between each; the
 /// desktop's own too if `desktop`. A row whose presses each do something of their own is a line for
-/// each press; a drag is the keys it holds, kept.
-pub(crate) fn shortcuts_told(desktop: bool) -> String {
+/// each press; a drag is the keys it holds, kept. A Mac's (or an iPad's) presses only, if `mac`.
+pub(crate) fn shortcuts_told(desktop: bool, mac: bool) -> String {
     let mut told = String::new();
     for (heading, entries) in SHORTCUTS {
         for e in entries.iter().filter(|e| desktop || !e.desktop) {
@@ -554,14 +578,15 @@ pub(crate) fn shortcuts_told(desktop: bool) -> String {
                 let presses: Vec<String> = presses.iter().map(|p| combo(p).text()).collect();
                 told.push_str(&format!("{heading}\t{does}\t{}\t{}\n", presses.join(" "), u8::from(fixed)));
             };
-            if e.presses.is_empty() {
+            let presses = e.presses(mac);
+            if presses.is_empty() {
                 line(e.does, e.holds, true);
-            } else if e.each.len() == e.presses.len() {
-                for (does, press) in e.each.iter().zip(e.presses) {
+            } else if e.each.len() == presses.len() {
+                for (does, press) in e.each.iter().zip(&presses) {
                     line(does, std::slice::from_ref(press), e.fixed);
                 }
             } else {
-                line(e.does, e.presses, e.fixed);
+                line(e.does, &presses, e.fixed);
             }
         }
     }
@@ -583,7 +608,6 @@ mod tests {
         assert_eq!(key("z", true, true, false), Some(Redo));
         assert_eq!(key("v", true, false, false), Some(Paste));
         assert_eq!(key("g", true, false, false), Some(GreyView));
-        assert_eq!(key("y", true, false, false), None);
         assert_eq!(key("v", false, false, false), Some(Transform));
         assert_eq!(key("S", false, true, false), Some(Selection));
         assert_eq!(key("0", false, false, false), Some(Interface));
@@ -604,6 +628,51 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_y_redoes_too_off_apple_s_platforms() {
+        // Windows, Linux and Android redo with Ctrl+Y as well, and tablets' express keys send it for
+        // redo; a Mac and an iPad keep ⇧⌘Z alone
+        assert_eq!(REDO_Y, !MAC);
+        let y = if MAC { None } else { Some(Redo) };
+        assert_eq!(key("Y", true, false, false), y);
+        assert_eq!(key("y", true, true, false), None);
+        assert_eq!(key("y", false, false, false), None);
+        assert_eq!(key("z", true, true, false), Some(Redo));
+        // the lists say so: Ctrl+Y after Ctrl+Shift+Z, as a plugin is told it too
+        let redo = |list: Vec<ShortcutGroup>| list.iter().flat_map(|g| &g.rows).find(|r| r.does == "Redo").cloned();
+        let other = redo(key_shortcut_list(false, false)).unwrap();
+        assert_eq!(other.keys, "Ctrl+Shift+Z  Ctrl+Y");
+        assert_eq!(other.combos[1], KeyCombo::of("y", true, false, false));
+        assert_eq!(redo(key_shortcut_list(true, true)).map(|r| r.keys).as_deref(), Some("⇧⌘Z"));
+        assert!(shortcuts_told(false, false).contains("Edit\tRedo\tcommand+shift+z command+y\t0\n"));
+        assert!(shortcuts_told(true, true).contains("Edit\tRedo\tcommand+shift+z\t0\n"));
+    }
+
+    #[test]
+    fn the_keys_a_tablet_s_express_keys_send_do_what_they_say() {
+        // what pen tablets' buttons send as their drivers come set up: undo, redo both ways, the
+        // brush's size, the brush and the eraser, the QuickMenu (Space), the interface (Ctrl+0)
+        for (k, command, shift, does) in [
+            ("z", true, false, Undo),
+            ("z", true, true, Redo),
+            ("[", false, false, BrushSize { by: -0.05 }),
+            ("]", false, false, BrushSize { by: 0.05 }),
+            ("[", true, false, BrushSize { by: -0.01 }),
+            ("]", false, true, BrushSize { by: 0.10 }),
+            ("e", false, false, Erase),
+            ("b", false, false, Paint),
+            ("space", false, false, QuickMenu),
+            ("0", true, false, Interface),
+        ] {
+            assert_eq!(key(k, command, shift, false), Some(does), "{k} {command} {shift}");
+        }
+        assert_eq!(key("y", true, false, false), (!MAC).then_some(Redo));
+        // another app's step back (Ctrl+Alt+Z) is AltGr typing a Z here: nothing, not an undo
+        assert_eq!(key("z", true, false, true), None);
+        // Ctrl+1 is no shortcut of the canvas's
+        assert_eq!(key("1", true, false, false), None);
+    }
+
+    #[test]
     fn clearing_a_layer_takes_the_command_key() {
         for k in ["delete", "backspace"] {
             assert_eq!(key(k, true, false, false), Some(ClearLayer));
@@ -613,7 +682,7 @@ mod tests {
 
     #[test]
     fn the_list_shows_each_canvas_shortcut_as_the_keys_do_it() {
-        let list = key_shortcut_list(false, false);
+        let list = key_shortcut_list(false, MAC);
         let rows: Vec<&ShortcutRow> = list.iter().flat_map(|g| &g.rows).collect();
         // each press the list shows is one the canvas takes (the arrows while transforming)
         for row in &rows {
@@ -622,8 +691,9 @@ mod tests {
                 assert!(key_shortcut(c.key.clone(), c.command, c.shift, c.alt, true).is_some(), "{c:?}");
             }
         }
-        let keys = |does: &str| rows.iter().find(|r| r.does == does).map(|r| r.keys.clone());
-        assert_eq!(keys("Redo").as_deref(), Some("Ctrl+Shift+Z"));
+        let list = key_shortcut_list(false, false);
+        let keys = |does: &str| list.iter().flat_map(|g| &g.rows).find(|r| r.does == does).map(|r| r.keys.clone());
+        assert_eq!(keys("Undo").as_deref(), Some("Ctrl+Z"));
         assert_eq!(keys("Clear the layer").as_deref(), Some("Ctrl+Delete  Ctrl+Backspace"));
         // the desktop's own only on the desktop, a Mac's keys as its symbols
         assert_eq!(keys("Save"), None);
@@ -658,7 +728,7 @@ mod tests {
 
     #[test]
     fn a_plugin_is_told_each_shortcut_it_may_rebind_by_itself() {
-        let told = shortcuts_told(false);
+        let told = shortcuts_told(false, false);
         let lines: Vec<Vec<&str>> = told.lines().map(|l| l.split('\t').collect()).collect();
         assert!(lines.iter().all(|fields| fields.len() == 4), "{told}");
         let line = |does: &str| lines.iter().find(|f| f[1] == does).cloned();
@@ -671,7 +741,7 @@ mod tests {
         assert_eq!(line("Smaller or bigger by 1%"), None);
         // the desktop's own only on the desktop, its turning keys and drags kept as they are
         assert_eq!(line("Save"), None);
-        let desktop = shortcuts_told(true);
+        let desktop = shortcuts_told(true, false);
         assert!(desktop.contains("Files\tSave as\tcommand+shift+s\t0\n"), "{desktop}");
         assert!(desktop.contains("View\tZoom in\tcommand+=\t0\n"), "{desktop}");
         assert!(desktop.contains("View\tTurn the canvas 15° (with Shift, back)\tr shift+r\t1\n"), "{desktop}");
@@ -698,7 +768,7 @@ mod tests {
         let undo = row("Undo").unwrap();
         assert_eq!((undo.keys.as_str(), undo.combos.as_slice()), ("Ctrl+Y", std::slice::from_ref(&y)));
         assert_eq!(row("Duplicate the layer"), None);
-        assert_eq!(row("Redo").map(|r| r.keys), Some("Ctrl+Shift+Z".to_owned()));
+        assert_eq!(row("Redo").map(|r| r.keys), Some("Ctrl+Shift+Z  Ctrl+Y".to_owned()));
         assert_eq!(row("Zoom").map(|r| r.keys), Some("Ctrl+Space and drag".to_owned()));
         assert!(row("Turn the canvas 15° (with Shift, back)").is_some());
         // none rebound: as the plain list has it
@@ -843,6 +913,30 @@ mod tests {
         s.key_drag_move(x, y, false);
         assert!((degrees(&s) - 47.0).abs() < 1e-2, "{}", degrees(&s));
         s.key_drag_end();
+    }
+
+    #[test]
+    fn r_dragged_and_let_go_near_a_right_angle_turns_onto_it() {
+        let s = viewed();
+        let middle = view(&s).screen_to_canvas(Vec2::new(200.0, 200.0)).unwrap();
+        let (x, y) = round_middle(100.0, 0.0);
+        s.key_drag_begin(KeyDrag::Turn, x, y);
+        let (x, y) = round_middle(100.0, 93.0);
+        s.key_drag_move(x, y, false);
+        s.key_drag_end();
+        assert!(s.view_moving());
+        // within half a second it is on the right angle, turned about the middle
+        std::thread::sleep(std::time::Duration::from_secs_f32(0.5));
+        s.shared.lock().step_view_motion();
+        assert!((degrees(&s) - 90.0).abs() < 1e-3, "{}", degrees(&s));
+        let p = shown(&s, middle);
+        assert!((p.x - 200.0).abs() < 1e-2 && (p.y - 200.0).abs() < 1e-2, "{p:?}");
+        // a zoom let go leaves a turn as it is
+        s.view_gesture(200.0, 200.0, 0.0, 0.0, 1.0, 3f32.to_radians());
+        s.key_drag_begin(KeyDrag::Zoom, x, y);
+        s.key_drag_move(x + 10.0, y, false);
+        s.key_drag_end();
+        assert!(!s.view_moving() && (degrees(&s) - 93.0).abs() < 1e-3, "{}", degrees(&s));
     }
 
     #[test]

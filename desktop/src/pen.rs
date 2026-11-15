@@ -51,10 +51,19 @@ pub struct MousePen {
 /// The pen moving the mouse pointer now, while a tablet's pen is what moves it.
 static MOUSE_PEN: Mutex<Option<MousePen>> = Mutex::new(None);
 
-/// The pen's latest readings under X11, each with where it put the mouse pointer (window pixels),
-/// newest last: the mouse's moves come apart from them (winit's own, on another connection), and
-/// each takes the reading made where it is, not the latest, which may be ahead of it or behind.
-static MOUSE_PEN_TRAIL: Mutex<VecDeque<((f32, f32), MousePen)>> = Mutex::new(VecDeque::new());
+/// The pen's latest readings under X11 and through WinTab, newest last: the mouse's moves come
+/// apart from them (winit's own, on another connection or as other messages), and each takes the
+/// reading made where it is, not the latest, which may be ahead of it or behind.
+static MOUSE_PEN_TRAIL: Mutex<VecDeque<Reading>> = Mutex::new(VecDeque::new());
+
+/// A reading of the pen moving the mouse pointer: where it put the pointer (window pixels), and
+/// where the pen itself was, finer than the pointer's whole pixels, if its tablet says.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Reading {
+    pointer: (f32, f32),
+    pen: MousePen,
+    fine: Option<(f32, f32)>,
+}
 /// How many readings the trail keeps: more than come in while a slow frame is drawn.
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 const TRAIL: usize = 64;
@@ -97,18 +106,26 @@ pub fn roll(id: u64) -> Option<f32> {
     ROLLS.lock().ok()?.as_ref()?.get(&id).copied()
 }
 
+/// The pointer of the pen near the window, if one is: a tablet's pen moving the mouse pointer
+/// (Windows Ink off, read through WinTab; X11; a Mac), whose lean the mouse's samples carry, or
+/// else the pen pointer last heard from.
+fn near() -> Option<u64> {
+    if mouse_pen().is_some() {
+        return Some(MOUSE);
+    }
+    *LATEST.lock().ok()?
+}
+
 /// The direction the pen near the window leans (radians clockwise from screen-up), if a pen is
-/// near.
+/// near: the brush cursor turns with it as the stamps do.
 pub fn azimuth() -> Option<f32> {
-    let id = (*LATEST.lock().ok()?)?;
-    Some(lean(id).map_or(0.0, |(_, towards)| towards))
+    Some(lean(near()?).map_or(0.0, |(_, towards)| towards))
 }
 
 /// How far the barrel of the pen near the window is turned (radians clockwise), if a pen that
 /// gives it is near.
 pub fn barrel() -> Option<f32> {
-    let id = (*LATEST.lock().ok()?)?;
-    roll(id)
+    roll(near()?)
 }
 
 /// Pointer `id`'s lean and roll as they now are; it is the pen last heard from.
@@ -190,9 +207,10 @@ pub(crate) fn pen_on_screen(id: u64, on_screen: bool) {
     }
 }
 
-/// Whether the first and second barrel buttons of the pen near the window are held now.
+/// Whether the first and second barrel buttons of the pen near the window are held now: the
+/// tablet pen moving the mouse pointer's (WinTab) while there is one, else the system's.
 pub fn buttons_held() -> [bool; 2] {
-    let Some(id) = LATEST.lock().ok().and_then(|l| *l) else { return [false; 2] };
+    let Some(id) = near() else { return [false; 2] };
     let flags = FLAGS.lock().ok().and_then(|f| f.as_ref()?.get(&id).copied()).unwrap_or(0);
     [flags & FLAG_BARREL != 0, flags & FLAG_SECOND_BARREL != 0]
 }
@@ -212,19 +230,43 @@ pub fn mouse_pen() -> Option<MousePen> {
 /// pixels) if it was lately, else as last read; none while it isn't a pen that moves it.
 pub fn mouse_pen_at(at: (f32, f32)) -> Option<MousePen> {
     let latest = mouse_pen()?;
+    Some(reading_at(at).map_or(latest, |r| r.pen))
+}
+
+/// Where the tablet pen moving the mouse pointer was (window pixels, finer than the pointer's
+/// whole ones), as it was read with the pointer at `at` lately; none if it wasn't, or its tablet
+/// doesn't say. Windows gives the pointer in whole pixels, and a slow line drawn through them
+/// would go in steps.
+pub fn mouse_pen_fine_at(at: (f32, f32)) -> Option<(f32, f32)> {
+    mouse_pen()?;
+    reading_at(at)?.fine
+}
+
+/// The latest reading of the pen moving the mouse pointer made with the pointer at `at`.
+fn reading_at(at: (f32, f32)) -> Option<Reading> {
     let near = |p: (f32, f32)| (p.0 - at.0).abs() < 1e-3 && (p.1 - at.1).abs() < 1e-3;
-    let there = MOUSE_PEN_TRAIL.lock().ok().and_then(|t| t.iter().rev().find(|(p, _)| near(*p)).map(|(_, pen)| *pen));
-    Some(there.unwrap_or(latest))
+    MOUSE_PEN_TRAIL.lock().ok()?.iter().rev().find(|r| near(r.pointer)).copied()
 }
 
 /// The pen moving the mouse pointer was read with the pointer at `at`, window pixels.
 #[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
 fn keep_mouse_pen_at(at: (f32, f32), pen: MousePen) {
+    keep_reading(Reading { pointer: at, pen, fine: None });
+}
+
+/// The pen moving the mouse pointer was read with the pointer at `at`, itself at `fine` (window
+/// pixels, finer than whole ones) if its tablet says.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn keep_fine_mouse_pen_at(at: (f32, f32), pen: MousePen, fine: Option<(f32, f32)>) {
+    keep_reading(Reading { pointer: at, pen, fine });
+}
+
+fn keep_reading(reading: Reading) {
     if let Ok(mut trail) = MOUSE_PEN_TRAIL.lock() {
         if trail.len() >= TRAIL {
             trail.pop_front();
         }
-        trail.push_back((at, pen));
+        trail.push_back(reading);
     }
 }
 
@@ -838,8 +880,64 @@ mod tests {
         assert_eq!(pressure(921), None);
     }
 
+    /// The tests of what moves the mouse pointer, one at a time: it is the app's, not a test's.
+    fn mouse_pointer_tests() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: Mutex<()> = Mutex::new(());
+        ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[test]
+    fn the_brush_cursor_turns_with_a_tablets_pen_moving_the_mouse_pointer_as_with_the_systems_pen() {
+        let _one = mouse_pointer_tests();
+        let turned = |towards: f32| azimuth().is_some_and(|a| (a - towards.to_radians()).abs() < 1e-4);
+        // the system's pen (Windows Ink on), leaning right, its barrel turned
+        set_mouse_pen(None);
+        keep_pose(941, lean_of(30.0, 0.0), Some(0.5));
+        assert!(turned(90.0), "{:?}", azimuth());
+        assert_eq!(barrel(), Some(0.5));
+        // a tablet's pen moving the mouse pointer (WinTab with Windows Ink off), leaning towards
+        // the user: the cursor turns with it, as its stroke's stamps do; it gives no roll
+        let pen = MousePen { pressure: 0.3, eraser: false };
+        set_mouse_pen(Some((pen, lean_of(0.0, 30.0))));
+        assert!(turned(180.0), "{:?}", azimuth());
+        assert_eq!(lean(MOUSE).map(|(_, towards)| towards), azimuth());
+        assert_eq!(barrel(), None);
+        // the pen gone from the tablet: the pen last heard from before it
+        set_mouse_pen(None);
+        assert!(turned(90.0), "{:?}", azimuth());
+        pen_gone();
+        assert_eq!((azimuth(), barrel()), (None, None));
+    }
+
+    #[test]
+    fn the_buttons_held_are_the_tablet_pens_while_it_moves_the_mouse_pointer() {
+        let _one = mouse_pointer_tests();
+        // set as they are, not pressed: the presses another test counts stay as they are
+        let hold = |id: u64, flags: u32| {
+            FLAGS.lock().unwrap().get_or_insert_with(Default::default).insert(id, flags);
+        };
+        // the system's pen (Windows Ink on), its first button held
+        set_mouse_pen(None);
+        keep_pose(951, lean_of(0.0, 0.0), None);
+        hold(951, FLAG_BARREL);
+        assert_eq!(buttons_held(), [true, false]);
+        // a tablet's pen moving the mouse pointer (WinTab), its second button held: its own
+        let pen = MousePen { pressure: 0.3, eraser: false };
+        set_mouse_pen(Some((pen, lean_of(0.0, 0.0))));
+        hold(MOUSE, FLAG_SECOND_BARREL);
+        assert_eq!(buttons_held(), [false, true]);
+        // gone from the tablet: the system's pen again
+        set_mouse_pen(None);
+        hold(MOUSE, 0);
+        assert_eq!(buttons_held(), [true, false]);
+        hold(951, 0);
+        pen_gone();
+        assert_eq!(buttons_held(), [false, false]);
+    }
+
     #[test]
     fn the_mouse_pointer_takes_the_pens_reading_made_where_it_is() {
+        let _one = mouse_pointer_tests();
         let pen = |pressure| MousePen { pressure, eraser: false };
         set_mouse_pen(None);
         keep_mouse_pen_at((10.0, 20.0), pen(0.2));
@@ -859,8 +957,15 @@ mod tests {
         assert_eq!(mouse_pen_at((10.0, 20.0)), Some(pen(0.9)));
         // somewhere not yet read: as last read
         assert_eq!(mouse_pen_at((30.0, 20.0)), Some(pen(0.7)));
+        // where the pen was finer than the pointer's whole pixels, where its tablet says
+        assert_eq!(mouse_pen_fine_at((12.5, 20.0)), None, "X11's readings say nothing of it");
+        keep_fine_mouse_pen_at((15.0, 20.0), pen(0.7), Some((15.375, 19.75)));
+        assert_eq!(mouse_pen_fine_at((15.0, 20.0)), Some((15.375, 19.75)));
+        assert_eq!(mouse_pen_at((15.0, 20.0)), Some(pen(0.7)));
+        assert_eq!(mouse_pen_fine_at((16.0, 20.0)), None, "not read there");
         set_mouse_pen(None);
         assert_eq!(mouse_pen_at((12.5, 20.0)), None);
+        assert_eq!(mouse_pen_fine_at((15.0, 20.0)), None, "the mouse moves it");
         // the system's pen messages starting: what WinTab said a moment before is let go
         #[cfg(windows)]
         {

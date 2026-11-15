@@ -1,8 +1,9 @@
 //! The drawing guide's editor, as the Android app's (ui/GuideUi.kt): its title with Cancel and
-//! Done, the colour bar, the canvas fitted between them and the toolbar (the four kinds, the
-//! kind's look and assisted drawing), the guide's handles dragged on the canvas (a perspective
-//! guide's points added by a tap), the grid size typed on a keypad from its chip. The guide itself
-//! is the core's (guide.rs).
+//! Done, the colour bar, the canvas moved into the middle and the toolbar (the four kinds, the
+//! kind's look and assisted drawing), the guide's handles over the canvas, the grid size typed on a
+//! keypad from its chip. The canvas takes the pointers as it always does (input.rs): the core's
+//! touches drag the handles (a perspective guide's points added by a tap) and move and zoom the
+//! view, as the wheel and a trackpad's pinch do. The guide itself is the core's (guide.rs).
 
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use procraft_core::{CanvasSession, GuideInfo, GuideType, GuideUnit, SymmetryType};
@@ -51,12 +52,6 @@ const KEYPAD_UNITS: [(GuideUnit, &str); 4] = [
     (GuideUnit::Inches, "Inches"),
     (GuideUnit::Pixels, "Pixels"),
 ];
-/// The canvas fitted between a fifth of the window's height above and below, 40 in from the sides;
-/// a press within 30 of a handle takes it.
-const FIT_BAND: f32 = 0.2;
-const FIT_SIDE: f32 = 40.0;
-const REACH: f32 = 30.0;
-
 /// The colour bar's stops, as the engine's (dark through blue, green, orange, red, pink, white).
 const BAR: [u32; 21] = [
     0xFF05040A, 0xFF010C2C, 0xFF001857, 0xFF083984, 0xFF128BB6, 0xFF19C6CB, 0xFF1BD0B8, 0xFF2FD083, 0xFF67C064,
@@ -80,19 +75,9 @@ fn slider_to_size(v: f32) -> f32 {
     10.0 + v * v * 490.0
 }
 
-/// What a press on the canvas took: a vanishing point (by index), the centre, or the turning handle.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Grab {
-    Point(u32),
-    Centre,
-    Turn,
-    Nothing,
-}
-
 #[derive(Default)]
 pub struct GuideEditor {
     pub open: bool,
-    grab: Option<Grab>,
     symmetry_open: bool,
     /// The grid size's keypad, while it is up.
     keypad: Option<SizeKeypad>,
@@ -217,42 +202,30 @@ impl SizeKeypad {
 }
 
 impl GuideEditor {
-    /// Opens the editor (turning the guide on), the canvas fitted between its bars.
-    pub fn begin(&mut self, ctx: &egui::Context, session: &CanvasSession) {
+    /// Opens the editor (turning the guide on), the canvas moving into the middle of the window;
+    /// the canvas's touches work the guide until it closes.
+    pub fn begin(&mut self, session: &CanvasSession) {
         if !session.guide().on {
             session.set_guide_on(true);
         }
-        let screen = ctx.content_rect();
-        let ppp = ctx.pixels_per_point();
-        let (w, h) = (screen.width() * ppp, screen.height() * ppp);
-        let band = h * FIT_BAND;
-        session.guide_edit_begin(FIT_SIDE * ppp, band, w - FIT_SIDE * ppp, h - band);
+        session.guide_edit_begin();
+        session.set_touch_guide_editing(true);
         self.open = true;
         self.symmetry_open = false;
         self.keypad = None;
     }
 
     fn end(&mut self, session: &CanvasSession, keep: bool) {
+        session.set_touch_guide_editing(false);
         session.guide_edit_end(keep);
         self.open = false;
         self.symmetry_open = false;
         self.keypad = None;
     }
 
-    /// What a press at window pixel `p` takes.
-    fn grab(&mut self, session: &CanvasSession, g: &GuideInfo, p: Pos2, ppp: f32) -> Grab {
+    /// A touch came down on the canvas: symmetry's options close.
+    pub fn touched(&mut self) {
         self.symmetry_open = false;
-        if g.kind == GuideType::Perspective {
-            return session.touch_vanishing_point(p.x, p.y).map_or(Grab::Nothing, Grab::Point);
-        }
-        let near = |v: &[f32]| v.first().zip(v.get(1)).is_some_and(|(&x, &y)| pos2(x, y).distance(p) <= REACH * ppp);
-        if near(&g.handle) {
-            Grab::Turn
-        } else if near(&g.centre) {
-            Grab::Centre
-        } else {
-            Grab::Nothing
-        }
     }
 
     /// Shows the editor while it is open, the frost of what it shows added to `glass`; returns true
@@ -270,46 +243,24 @@ impl GuideEditor {
         let g = session.guide();
         let screen = ctx.content_rect();
         let ppp = ctx.pixels_per_point();
-        // the canvas: handles dragged, perspective points added; nothing paints
-        egui::Area::new(Id::unique("guide canvas")).fixed_pos(screen.min).order(Order::Middle).show(ctx, |ui| {
-            let response = ui.allocate_rect(screen, Sense::click_and_drag());
-            if response.is_pointer_button_down_on() {
-                let pointer = ui.input(|i| i.pointer.press_origin()).or(response.interact_pointer_pos());
-                if self.grab.is_none()
-                    && let Some(p) = pointer
-                {
-                    self.grab = Some(self.grab(session, &g, p * ppp, ppp));
-                }
-                if let (Some(grab), Some(p)) = (self.grab, response.interact_pointer_pos()) {
-                    let p = p * ppp;
-                    match grab {
-                        Grab::Point(i) => _ = session.move_vanishing_point(i, p.x, p.y),
-                        Grab::Centre => _ = session.move_guide_centre(p.x, p.y),
-                        Grab::Turn => _ = session.turn_guide(p.x, p.y),
-                        Grab::Nothing => {}
-                    }
-                }
-            } else {
-                self.grab = None;
+        // the handles, on the canvas (which takes the pointers as ever: nothing covers it)
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        let node = |at: Pos2, fill: u32| {
+            painter.circle_filled(at, 7.0, Color32::WHITE);
+            painter.circle_filled(at, 5.0, argb(fill));
+        };
+        if g.kind == GuideType::Perspective {
+            for &[x, y] in g.vanishing.as_chunks::<2>().0 {
+                node(pos2(x, y) / ppp, NODE_CENTRE);
             }
-            // the handles
-            let node = |at: Pos2, fill: u32| {
-                ui.painter().circle_filled(at, 7.0, Color32::WHITE);
-                ui.painter().circle_filled(at, 5.0, argb(fill));
-            };
-            if g.kind == GuideType::Perspective {
-                for &[x, y] in g.vanishing.as_chunks::<2>().0 {
-                    node(pos2(x, y) / ppp, NODE_CENTRE);
-                }
-            } else {
-                if let [x, y, ..] = g.handle.as_slice() {
-                    node(pos2(*x, *y) / ppp, NODE_TURN);
-                }
-                if let [x, y, ..] = g.centre.as_slice() {
-                    node(pos2(*x, *y) / ppp, NODE_CENTRE);
-                }
+        } else {
+            if let [x, y, ..] = g.handle.as_slice() {
+                node(pos2(*x, *y) / ppp, NODE_TURN);
             }
-        });
+            if let [x, y, ..] = g.centre.as_slice() {
+                node(pos2(*x, *y) / ppp, NODE_CENTRE);
+            }
+        }
         let mut ended = None;
         egui::Area::new(Id::unique("guide top")).fixed_pos(screen.min).order(Order::Foreground).show(ctx, |ui| {
             let band = Rect::from_min_size(screen.min, vec2(screen.width(), 82.0));

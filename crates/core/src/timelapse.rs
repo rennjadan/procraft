@@ -23,7 +23,7 @@ use crate::project::{PackageTimeLapse, file_error, write_atomically};
 /// The replay's and the video's frames a second.
 pub const TIME_LAPSE_FPS: u32 = 30;
 /// A frame's longest side kept, pixels.
-const FRAME_SIDE: u32 = 1280;
+pub(crate) const FRAME_SIDE: u32 = 1280;
 const JPEG_QUALITY: u8 = 85;
 /// A package's videos are made again as one rather than be more than this (while every frame is
 /// still a picture to make them of).

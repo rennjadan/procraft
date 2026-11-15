@@ -260,11 +260,13 @@ fun ColorPanel(vm: CanvasViewModel, arrowX: Dp, screenHeight: Dp, modifier: Modi
     val m = remember(c, vm.colourModel, place) { ModelColor(c, vm.colourModel, place) }
     // a swatch dragged out and let go over the panel itself fills nothing
     if (!background) androidx.compose.runtime.DisposableEffect(Unit) { onDispose { vm.dropAvoid = null } }
+    // (on the canvas: in the window, less what the interface keeps clear of)
+    val corner = LocalClearance.current.corner
     // dragged out by its grabber, it is not seen (nor its blur) until let go, the window floating
     val undocking = !background && vm.colorsUndocking
     val look = LocalPanelLook.current
     ProvidePanelLook(if (undocking) PanelLook(0f, look.scale, look.pivot) else look) {
-    Popover(PanelWidth, arrowX, (if (background) modifier else modifier.onGloballyPositioned { vm.dropAvoid = it.boundsInRoot() }).heightIn(max = screenHeight - Pc.BarHeight - 25.dp).alpha(if (undocking) 0f else 1f)) {
+    Popover(PanelWidth, arrowX, (if (background) modifier else modifier.onGloballyPositioned { vm.dropAvoid = it.boundsInRoot().translate(-corner) }).heightIn(max = screenHeight - Pc.BarHeight - 25.dp).alpha(if (undocking) 0f else 1f)) {
         Box {
             if (background) {
                 PanelHeader("Background", start = 20.dp, end = 12.dp, height = headerHeight, chevron = false) {
@@ -335,8 +337,10 @@ private val FloatingField = Color.White.copy(alpha = 0.06f)
 private fun UndockHandle(vm: CanvasViewModel, modifier: Modifier) {
     var origin by remember { mutableStateOf(Offset.Zero) }
     val density = LocalDensity.current
+    // where it is in the interface: in the window, less what the interface keeps clear of
+    val corner = LocalClearance.current.corner
     Box(
-        modifier.size(150.dp, 30.dp).onGloballyPositioned { origin = it.positionInRoot() }.pointerInput(vm) {
+        modifier.size(150.dp, 30.dp).onGloballyPositioned { origin = it.positionInRoot() - corner }.pointerInput(vm) {
             var total = Offset.Zero
             val grab = with(density) { Offset(FloatingGrab.x.toPx(), FloatingGrab.y.toPx()) }
             fun letGo() {
@@ -374,8 +378,11 @@ fun FloatingColors(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
     val m = remember(c, vm.colourModel) { ModelColor(c, vm.colourModel, vm.colourPlace) }
     val density = LocalDensity.current
     val height = if (vm.colorMode == ColorMode.DISC) 351.dp else 390.dp
-    // kept on the screen
-    val x = with(density) { at.x.toDp() }.coerceIn(0.dp, (maxWidth - FloatingWidth).coerceAtLeast(0.dp))
+    // kept on the screen, and clear of the side bar as the panels are
+    val clear = if (vm.showSideBar) Pc.SideBarWidth + Pc.PopoverGap else 0.dp
+    val least = if (vm.rightHanded) 0.dp else clear
+    val most = (maxWidth - FloatingWidth - if (vm.rightHanded) clear else 0.dp).coerceAtLeast(least)
+    val x = with(density) { at.x.toDp() }.coerceIn(least, most)
     val y = with(density) { at.y.toDp() }.coerceIn(0.dp, (maxHeight - height).coerceAtLeast(0.dp))
     Popover(
         FloatingWidth,

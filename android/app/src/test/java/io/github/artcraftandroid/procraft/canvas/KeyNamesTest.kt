@@ -28,4 +28,24 @@ class KeyNamesTest {
         assertNull(keyName(KeyEvent.KEYCODE_TAB))
         assertNull(keyCodeNamed("tab"))
     }
+
+    @Test
+    fun ctrlAndMetaAreBothTheCommandKey() {
+        val ctrl = KeyEvent.META_CTRL_ON or KeyEvent.META_CTRL_LEFT_ON
+        val meta = KeyEvent.META_META_ON or KeyEvent.META_META_RIGHT_ON
+        val shift = KeyEvent.META_SHIFT_ON or KeyEvent.META_SHIFT_LEFT_ON
+        val alt = KeyEvent.META_ALT_ON or KeyEvent.META_ALT_LEFT_ON
+        // undo, redo and the brush's size, as keyboards and tablets' express keys send them
+        assertEquals(KeyPress("z", true, false, false), keyPress(KeyEvent.KEYCODE_Z, ctrl))
+        assertEquals(KeyPress("z", true, false, false), keyPress(KeyEvent.KEYCODE_Z, meta))
+        assertEquals(KeyPress("z", true, true, false), keyPress(KeyEvent.KEYCODE_Z, ctrl or shift))
+        assertEquals(KeyPress("y", true, false, false), keyPress(KeyEvent.KEYCODE_Y, ctrl))
+        assertEquals(KeyPress("[", false, false, false), keyPress(KeyEvent.KEYCODE_LEFT_BRACKET, 0))
+        assertEquals(KeyPress("]", false, true, false), keyPress(KeyEvent.KEYCODE_RIGHT_BRACKET, shift))
+        assertEquals(KeyPress("e", false, false, false), keyPress(KeyEvent.KEYCODE_E, KeyEvent.META_NUM_LOCK_ON))
+        assertEquals(KeyPress("0", true, false, true), keyPress(KeyEvent.KEYCODE_0, ctrl or alt))
+        // a key the shortcuts don't name is no press of theirs, whatever is held
+        assertNull(keyPress(KeyEvent.KEYCODE_TAB, ctrl))
+        assertNull(keyPress(KeyEvent.KEYCODE_CTRL_LEFT, ctrl))
+    }
 }

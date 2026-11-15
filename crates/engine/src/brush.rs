@@ -89,6 +89,29 @@ impl FullGrain {
     }
 }
 
+/// The controls that move a stroke's colour or mix in the secondary colour: its jitter per stamp
+/// and per stroke, and its response to pressure and tilt.
+const COLOUR_DYNAMICS: [&str; 18] = [
+    "stamp_hue",
+    "stamp_saturation",
+    "stamp_lightness",
+    "stamp_darkness",
+    "stamp_secondary",
+    "stroke_hue",
+    "stroke_saturation",
+    "stroke_lightness",
+    "stroke_darkness",
+    "stroke_secondary",
+    "pressure_hue",
+    "pressure_saturation",
+    "pressure_brightness",
+    "pressure_secondary",
+    "tilt_hue",
+    "tilt_saturation",
+    "tilt_brightness",
+    "tilt_secondary",
+];
+
 /// What a brush file or the user's own picture gave a grain beyond the [`Source`] the brush holds
 /// of it.
 #[derive(Clone, Debug, PartialEq)]
@@ -597,6 +620,17 @@ pub struct Brush {
     /// A dual brush's second: its own stroke along the same path, whose coverage combines with
     /// this one's by `dual_blend` (the colour this one's).
     pub secondary: Option<Box<Brush>>,
+    /// What a brush engine outside the app keeps of it, if one made it (see [`OutsideBrush`]).
+    pub engine: Option<OutsideBrush>,
+}
+
+/// What a brush engine outside the app's own (a plugin's) keeps of a brush it draws: the engine's
+/// name (its plugin's id, a dot, its key) and its own data, kept as it is. While that engine is on
+/// it draws the brush's strokes; without it the brush draws as the rest of its settings say.
+#[derive(Clone, Debug, PartialEq)]
+pub struct OutsideBrush {
+    pub engine: String,
+    pub data: std::sync::Arc<[u8]>,
 }
 
 /// The stock images a brush's file names for its shape, grain, metalness and roughness (drawn with
@@ -746,6 +780,7 @@ impl Brush {
             reset_point: None,
             stock: StockImages::default(),
             secondary: None,
+            engine: None,
         }
     }
 
@@ -761,10 +796,14 @@ impl Brush {
     }
 
     /// The brush as a dual brush's second: drawn apart as coverage alone, its grain goes on stamp
-    /// by stamp, even one fixed to the canvas.
+    /// by stamp, even one fixed to the canvas; where its colour shows, it is the stroke's own,
+    /// nothing jittering or moving it.
     pub fn as_second(mut self) -> Brush {
         if self.grain.mode == GrainMode::Texturized {
             self.grain.mode = GrainMode::Moving;
+        }
+        for key in COLOUR_DYNAMICS {
+            self.extra.remove(key);
         }
         self
     }
@@ -911,6 +950,22 @@ mod tests {
         let mut b = Brush::round_pen();
         b.grain.mode = GrainMode::Texturized;
         assert_eq!(b.as_second().grain.mode, GrainMode::Moving);
+    }
+
+    #[test]
+    fn a_second_paints_the_stroke_s_own_colour() {
+        // its colour jitter, its response to pressure and tilt and its secondary colour all off
+        let mut b = Brush::round_pen();
+        for key in COLOUR_DYNAMICS {
+            b.set_setting(key, 0.5);
+        }
+        let second = b.as_second();
+        for key in COLOUR_DYNAMICS {
+            assert_eq!(second.setting(key), 0.0, "{key}");
+        }
+        let samples = [0.0f32, 30.0].map(|x| crate::input::Sample::at(crate::geom::Vec2::new(x, 0.0), 0.4, 0.0));
+        let stamps = crate::stroke::StrokeBuilder::new(second, 10.0, crate::input::Pointer::Stylus).add(&samples);
+        assert!(stamps.iter().all(|s| s.tint == crate::stroke::Tint::NONE && s.secondary == 0.0));
     }
 
     #[test]

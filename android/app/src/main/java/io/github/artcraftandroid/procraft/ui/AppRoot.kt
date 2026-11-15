@@ -48,9 +48,11 @@ import io.github.artcraftandroid.procraft.core.ToolKind
 /** The canvas screen: the canvas, the bars over it, and the panel that is open. */
 @Composable
 fun AppRoot(vm: CanvasViewModel) {
-    val interfaceSize = fittedInterfaceSize(vm.plugins, vm.pluginList)
+    // inside the status bar and the camera's cutout, while a plugin asks
+    val keptClear = clearance(vm.plugins, vm.pluginList)
+    val interfaceSize = fittedInterfaceSize(vm.plugins, vm.pluginList, keptClear)
     androidx.compose.runtime.SideEffect { vm.interfaceShownAt(interfaceSize) }
-    ProCraftTheme(interfaceSize) {
+    ProCraftTheme(interfaceSize, keptClear) {
         if (vm.screen == Screen.GALLERY) {
             ZoomingGallery(vm, overlay = false)
             // a share from the gallery shows its card there, and a file brought in its own
@@ -76,12 +78,13 @@ fun AppRoot(vm: CanvasViewModel) {
                 else -> vm.closeArtwork()
             }
         }
-        // panels over the canvas are frosted
+        // panels over the canvas are frosted (where it is on the screen: the window's corner, and
+        // in from it by what the interface keeps clear of)
         val window = androidx.compose.ui.platform.LocalView.current.rootView
-        androidx.compose.runtime.DisposableEffect(window) {
+        androidx.compose.runtime.DisposableEffect(window, keptClear) {
             vm.backdrops.windowOnScreen = {
                 val at = IntArray(2).also(window::getLocationOnScreen)
-                androidx.compose.ui.geometry.Offset(at[0].toFloat(), at[1].toFloat())
+                androidx.compose.ui.geometry.Offset(at[0].toFloat(), at[1].toFloat()) + keptClear.corner
             }
             onDispose { vm.backdrops.windowOnScreen = { androidx.compose.ui.geometry.Offset.Zero } }
         }
@@ -166,7 +169,7 @@ fun AppRoot(vm: CanvasViewModel) {
                         DisposableEffect(Unit) { onDispose { vm.sideBarBounds = null } }
                         SideBar(
                             vm,
-                            aside.then(fade).onGloballyPositioned { vm.sideBarBounds = it.boundsInWindow() },
+                            aside.then(fade).onGloballyPositioned { vm.sideBarBounds = it.boundsInWindow().translate(-keptClear.corner) },
                             right = vm.rightHanded,
                             trackHeight = sideBar.track,
                             shown = barsShown,
@@ -190,6 +193,9 @@ fun AppRoot(vm: CanvasViewModel) {
                 // the Reference window floats over the bars and the canvas's own marks; the panels,
                 // menus and pages opened later come over it
                 ReferenceWindow(vm)
+                // the colour panel dragged out by its grabber: a window over the canvas until closed,
+                // under the panels, which open over it
+                FloatingColors(vm, maxWidth, maxHeight)
                 // each panel hangs from its button: colour, layers, then the tool that opened the library;
                 // it grows out of its arrow as it opens and fades as it closes
                 PanelPresence(vm.panel, Panel.NONE, fading = vm.panelFading, onFaded = { vm.panelFading = false }) { shown, alpha, scale, origin ->
@@ -237,8 +243,6 @@ fun AppRoot(vm: CanvasViewModel) {
                         }
                     }
                 }
-                // the colour panel dragged out by its grabber: a window over the canvas until closed
-                FloatingColors(vm, maxWidth, maxHeight)
                 if (vm.transforming && !vm.barsHidden) {
                     TransformPopover(vm, maxWidth, maxHeight)
                     TransformNumeric(vm)

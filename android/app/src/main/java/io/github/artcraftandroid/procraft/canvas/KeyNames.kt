@@ -39,3 +39,16 @@ internal fun keyCodeNamed(name: String): Int? = when {
     name.length == 1 && name[0] in '0'..'9' -> KeyEvent.KEYCODE_0 + (name[0] - '0')
     else -> NAMED.firstOrNull { it.second == name }?.first
 }
+
+/** A key pressed with modifiers, as the shared shortcuts take it: the key's name and whether the command key, Shift and Alt are held. */
+internal data class KeyPress(val key: String, val command: Boolean, val shift: Boolean, val alt: Boolean)
+
+/** Ctrl and Meta: either is the command key (a Mac's ⌘), as a keyboard made for another system has one or the other. */
+private const val COMMAND_ON = KeyEvent.META_CTRL_ON or KeyEvent.META_META_ON
+
+/** The press [keyCode] is with a key event's [metaState], as the shared shortcuts take it; null for a key they don't name. */
+internal fun keyPress(keyCode: Int, metaState: Int): KeyPress? {
+    val key = keyName(keyCode) ?: return null
+    val held = { on: Int -> (metaState and on) != 0 }
+    return KeyPress(key, held(COMMAND_ON), held(KeyEvent.META_SHIFT_ON), held(KeyEvent.META_ALT_ON))
+}

@@ -262,10 +262,16 @@ private fun Adjustment.icon() = when (this) {
     Adjustment.PLUGIN -> PcIcons.Adjustments
 }
 
-/** The window's width, which the adjustment toolbars and the animation bar lay themselves out by (not its shape). */
+/**
+ * The window's width, which the adjustment toolbars and the animation bar lay themselves out by (not
+ * its shape), less what the interface keeps clear of across it.
+ */
 @Composable
-internal fun windowWidth(): Dp =
-    with(androidx.compose.ui.platform.LocalDensity.current) { androidx.compose.ui.platform.LocalWindowInfo.current.containerSize.width.toDp() }
+internal fun windowWidth(): Dp {
+    val clear = LocalClearance.current
+    val width = androidx.compose.ui.platform.LocalWindowInfo.current.containerSize.width - clear.left - clear.right
+    return with(androidx.compose.ui.platform.LocalDensity.current) { width.toDp() }
+}
 
 /**
  * Where each toolbar lays its sliders side by side (as measured in landscape; upright, stacked): the

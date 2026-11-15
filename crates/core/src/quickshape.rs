@@ -161,6 +161,8 @@ pub(crate) struct DrawnStroke {
     style: StrokeStyle,
     builder: StrokeBuilder,
     samples: Vec<Sample>,
+    /// What its randomness was seeded with: a brush engine draws it again the same.
+    seed: u32,
 }
 
 /// A shape kept, as it first snapped, or the stroke it gave way to: the canvas's undo steps once
@@ -204,6 +206,8 @@ pub(crate) struct LastStroke {
     pub(crate) samples: Vec<Sample>,
     /// Its builder as it began (a dual brush's first), for the line a shape is fitted to.
     pub(crate) line: StrokeBuilder,
+    /// What its randomness was seeded with.
+    pub(crate) seed: u32,
 }
 
 impl LastStroke {
@@ -218,7 +222,7 @@ impl LastStroke {
     /// The stroke as it can be laid again, given its input.
     fn laid_again(&self, samples: Vec<Sample>) -> Option<DrawnStroke> {
         let builder = self.fresh.clone()?;
-        Some(DrawnStroke { layer: self.layer, style: self.style, builder, samples })
+        Some(DrawnStroke { layer: self.layer, style: self.style, builder, samples, seed: self.seed })
     }
 }
 
@@ -289,11 +293,13 @@ impl State {
     fn back_to_stroke(&mut self) -> bool {
         self.flush();
         let Some(mut kept) = self.kept_shape.take().filter(|kept| self.still_stands(kept)) else { return false };
-        let guide = self.doc.stroke_guide();
         let Some(canvas) = self.canvas.as_mut() else { return false };
         canvas.undo();
         canvas.begin_stroke(kept.stroke.layer, kept.stroke.style);
-        let mut builder = kept.stroke.builder.clone();
+        // a brush engine's stroke drawn by it again, as it was
+        let mut builder = self.engine_again(kept.stroke.builder.clone(), kept.stroke.layer, kept.stroke.seed);
+        let guide = self.doc.stroke_guide();
+        let Some(canvas) = self.canvas.as_mut() else { return false };
         crate::draw_samples(canvas, &mut builder, None, &kept.stroke.samples, &guide);
         crate::close_stroke(canvas, builder, None, &guide);
         self.flush();
@@ -324,10 +330,12 @@ impl State {
     fn draw_shape(&mut self) {
         let (Some(edit), Some(old)) = (self.shape.as_ref(), self.stroke.as_ref()) else { return };
         // the outline is the path: nothing smooths it, or round its corners
-        let mut builder = StrokeBuilder::with_seed(old.brush().clone(), old.diameter(), old.pointer(), SHAPE_SEED)
+        let builder = StrokeBuilder::with_seed(old.brush().clone(), old.diameter(), old.pointer(), SHAPE_SEED)
             .scaled(self.brush_scale())
             .exact_path();
         let samples = edit.samples();
+        // a brush engine's stroke drawn by it along the shape
+        let mut builder = self.engine_again(builder, self.doc.current(), SHAPE_SEED);
         builder.add(&samples);
         let stamps = builder.finish();
         // with a symmetry guide on, its copies too, as the stroke had them and as it is kept

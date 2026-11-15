@@ -13,6 +13,15 @@ use crate::{
 };
 
 impl State {
+    /// Whether the window's surface asks for wide colour (see [`configure`]): only for a canvas
+    /// whose colours go past sRGB (Display P3, CMYK shown through Display P3, an imported profile),
+    /// and only while the app allows it. An sRGB canvas shows the same in either, so its window
+    /// stays plain sRGB: the layer screens' compositors handle best (a wide one has blurred the
+    /// interface over the canvas, or dulled the canvas while nothing moved, on some tablets).
+    pub(crate) fn wide_colour(&self) -> bool {
+        self.wide_colour_allowed && (self.doc.profile.is_p3() || self.doc.icc.is_some())
+    }
+
     /// Draws the whole canvas fitted and centred on black into `view` (`format`, `size` pixels,
     /// its colours shown in `screen`): Project canvas, on a second display.
     pub(crate) fn draw_fitted(

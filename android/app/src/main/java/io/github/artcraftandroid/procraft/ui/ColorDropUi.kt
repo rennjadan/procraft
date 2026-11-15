@@ -68,8 +68,10 @@ internal fun Modifier.dropSource(vm: CanvasViewModel, swatch: (() -> Int)? = nul
     val colour by rememberUpdatedState(swatch)
     var origin by remember { mutableStateOf(Offset.Zero) }
     var centre by remember { mutableStateOf(Offset.Zero) }
+    // on the canvas: in the window, less what the interface keeps clear of
+    val corner = LocalClearance.current.corner
     onGloballyPositioned {
-        origin = it.positionInRoot()
+        origin = it.positionInRoot() - corner
         centre = origin + Offset(it.size.width / 2f, it.size.height / 2f)
         // the colour button's centre: over the bars a dragged colour shrinks the further it is from it
         if (colour == null) vm.dropButton = centre

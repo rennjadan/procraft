@@ -395,6 +395,8 @@ impl ApplicationHandler for App {
                 return;
             }
         };
+        // the file dialogs open over it
+        files::dialogs_over(&window);
         // a pen's lean, which winit's touches leave out (on Wayland the whole pen)
         pen::watch(&window, self.wake.clone());
         // the brushes read while the gallery shows, so the first artwork opens without reading them
@@ -484,6 +486,8 @@ impl ApplicationHandler for App {
         // before winit closes the connection the pen is read on
         pen::stop();
         if std::mem::replace(&mut self.closed, true) {
+            // (the brushes kept since, if any, written whole)
+            files::finish_writing();
             return;
         }
         self.hide_while_opening();
@@ -777,7 +781,7 @@ impl App {
         screen.size_interface(self.ui.plugins(), Some(session.as_ref()));
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
-        let raw = screen.egui.take_egui_input(&screen.window);
+        let raw = screen.take_input();
         let full = &self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
@@ -826,13 +830,9 @@ impl App {
         }
         if std::mem::take(&mut self.ui.keep_brushes) {
             // off the window's thread: a library with many brushes brought in is tens of megabytes
-            // when something in it changed (a brush chosen only writes the choices)
-            let kept = Arc::clone(&session);
-            let thread = std::thread::Builder::new().name("procraft-keep-brushes".to_owned());
-            if let Err(e) = thread.spawn(move || files::keep_brushes(&kept)) {
-                log::warn!("keeping the brushes on a thread of their own: {e}");
-                files::keep_brushes(&session);
-            }
+            // when something in it changed (a brush chosen only writes the choices); waited for as
+            // the app ends
+            files::keep_brushes_meanwhile(&session);
         }
         for action in std::mem::take(&mut self.ui.actions) {
             self.act(action, &session);
@@ -845,7 +845,7 @@ impl App {
         self.last_frame = Instant::now();
         screen.size_interface(self.ui.plugins(), None);
         self.stroke_sound.follow(None, false);
-        let raw = screen.egui.take_egui_input(&screen.window);
+        let raw = screen.take_input();
         let mut asked = None;
         let (gallery, interface) = (&mut self.gallery, &mut self.ui);
         let closing = self.zoom.as_ref().filter(|z| !z.opening);

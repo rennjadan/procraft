@@ -159,7 +159,7 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// Shows a passing message with an OK button.
 pub fn say(text: &str) {
-    MessageDialog::new().set_level(MessageLevel::Info).set_title("ProCraft").set_description(text).show();
+    message().set_level(MessageLevel::Info).set_title("ProCraft").set_description(text).show();
 }
 
 /// Whether the file at `path` holds brushes, by its name (a zip by what it holds): ours (a brush,
@@ -231,7 +231,7 @@ pub fn tell(title: &str, text: &str) {
             return;
         }
     }
-    MessageDialog::new().set_level(MessageLevel::Error).set_title(title).set_description(text).show();
+    message().set_level(MessageLevel::Error).set_title(title).set_description(text).show();
 }
 
 /// Whether `program` can be run here.
@@ -283,6 +283,25 @@ pub fn exporting_since() -> Option<std::time::Instant> {
     writing.iter().filter(|(_, from_canvas, w)| *from_canvas && !w.is_finished()).map(|(since, ..)| *since).min()
 }
 
+/// Keeps `session`'s brushes on a thread of their own (a library with many brushes brought in is
+/// tens of megabytes), among the writes the app waits for as it ends: closed meanwhile, the
+/// library is written whole, not cut short and left as it was before.
+pub fn keep_brushes_meanwhile(session: &Arc<procraft_core::CanvasSession>) {
+    let kept = Arc::clone(session);
+    let thread = std::thread::Builder::new().name("procraft-keep-brushes".to_owned());
+    match thread.spawn(move || keep_brushes(&kept)) {
+        Ok(started) => {
+            let mut writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+            writing.retain(|(.., w)| !w.is_finished());
+            writing.push((std::time::Instant::now(), false, started));
+        }
+        Err(e) => {
+            log::warn!("keeping the brushes on a thread of their own: {e}");
+            keep_brushes(session);
+        }
+    }
+}
+
 /// Waits for the files still being written.
 pub fn finish_writing() {
     let writing = std::mem::take(&mut *WRITING.lock().unwrap_or_else(|e| e.into_inner()));
@@ -325,7 +344,7 @@ pub fn tell_what_was_told() {
 pub fn save_file(bytes: &[u8], name: &str, extension: &str, kind: &str) {
     let safe: String = name.chars().map(|c| if c.is_alphanumeric() || " _-".contains(c) { c } else { '_' }).collect();
     let safe = if safe.trim().is_empty() { "Brush".to_owned() } else { safe };
-    let Some(path) = FileDialog::new()
+    let Some(path) = dialog()
         .set_title(format!("Share {kind}"))
         .add_filter(kind, &[extension])
         .set_file_name(format!("{safe}.{extension}"))
@@ -341,7 +360,7 @@ pub fn save_file(bytes: &[u8], name: &str, extension: &str, kind: &str) {
 
 /// A sound the user picks (titled `title`): a WAV file, read whole, with its name.
 pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
-    let path = FileDialog::new().set_title(title).add_filter("Sounds", &["wav", "wave"]).pick_file()?;
+    let path = dialog().set_title(title).add_filter("Sounds", &["wav", "wave"]).pick_file()?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match std::fs::read(&path) {
         Ok(bytes) => Some((bytes, name)),
@@ -354,7 +373,7 @@ pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
 
 /// A file the user picks (titled `title`), read whole, with its name.
 pub fn pick_file(title: &str) -> Option<(Vec<u8>, String)> {
-    let path = FileDialog::new().set_title(title).pick_file()?;
+    let path = dialog().set_title(title).pick_file()?;
     let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     match std::fs::read(&path) {
         Ok(bytes) => Some((bytes, name)),
@@ -479,7 +498,7 @@ pub fn keep_preset_time_lapse(preset: &CanvasPreset, dir: &str) {
 /// A colour profile the user picks (an .icc file), added to those a canvas can be in; its name, or
 /// none (said so) if it isn't one.
 pub fn import_profile() -> Option<String> {
-    let path = FileDialog::new().set_title("Import").add_filter("Color profiles", &["icc", "icm"]).pick_file()?;
+    let path = dialog().set_title("Import").add_filter("Color profiles", &["icc", "icm"]).pick_file()?;
     let name = std::fs::read(path).ok().and_then(procraft_core::import_profile);
     if name.is_none() {
         tell("Can't import", "This file isn't a color profile.");
@@ -496,16 +515,13 @@ pub fn is_plugin_file(path: &Path) -> bool {
 
 /// A plugin file the user picks.
 pub fn pick_plugin() -> Option<PathBuf> {
-    FileDialog::new()
-        .set_title("Import")
-        .add_filter("ProCraft plugins", &["procraft-plugin", "procraftplugin"])
-        .pick_file()
+    dialog().set_title("Import").add_filter("ProCraft plugins", &["procraft-plugin", "procraftplugin"]).pick_file()
 }
 
 /// A picture the user picks (PNG, JPEG, WebP, GIF, BMP or TIFF), to make a new artwork of
 /// ([`picture_artwork`]).
 pub fn pick_picture() -> Option<PathBuf> {
-    FileDialog::new()
+    dialog()
         .set_title("Photo")
         .add_filter("Pictures", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff"])
         .pick_file()
@@ -576,7 +592,7 @@ pub fn pick_artwork_files(more: &[&str]) -> Option<Vec<PathBuf>> {
         "tiff",
     ];
     let all: Vec<&str> = artworks.iter().chain(more).copied().collect();
-    FileDialog::new().set_title("Import").add_filter("Artworks and models", &all).pick_files()
+    dialog().set_title("Import").add_filter("Artworks and models", &all).pick_files()
 }
 
 /// The artwork in the files `paths` (picked, or dropped on the gallery): a layered package, a
@@ -740,7 +756,7 @@ pub fn read_png(path: &Path) -> Result<ThumbnailImage, String> {
 
 /// Shows the app's name and version.
 pub fn about() {
-    MessageDialog::new()
+    message()
         .set_level(MessageLevel::Info)
         .set_title("ProCraft")
         .set_description(format!("Version {}", env!("PROCRAFT_VERSION")))
@@ -754,7 +770,7 @@ pub fn save(session: &Arc<CanvasSession>, ui: &mut Interface, ask: bool) {
     let path = match ui.path.clone().filter(|_| !ask) {
         Some(p) => p,
         None => {
-            let Some(p) = FileDialog::new()
+            let Some(p) = dialog()
                 .set_title("Save")
                 .add_filter("ProCraft artwork", &["procraft"])
                 .set_file_name(format!("{}.procraft", session.name()))
@@ -777,6 +793,45 @@ pub fn save(session: &Arc<CanvasSession>, ui: &mut Interface, ask: bool) {
 
 /// Writes the artwork as `format` where the user picks, its card showing how far it has come;
 /// cancelled, nothing is left there.
+/// The app's window, which the file dialogs belong to, and the thread that runs it.
+static DIALOG_PARENT: std::sync::OnceLock<(Arc<winit::window::Window>, std::thread::ThreadId)> =
+    std::sync::OnceLock::new();
+
+/// The app's `window`, once it is made (on its own thread): the file dialogs open over it from
+/// then on.
+pub fn dialogs_over(window: &Arc<winit::window::Window>) {
+    let _ = DIALOG_PARENT.set((Arc::clone(window), std::thread::current().id()));
+}
+
+/// The app's window, if this is the thread that runs it: a dialog owned by it from any other
+/// thread could wait on that thread while it waits on the dialog.
+#[cfg(windows)]
+fn dialog_parent() -> Option<&'static winit::window::Window> {
+    DIALOG_PARENT.get().filter(|(_, thread)| *thread == std::thread::current().id()).map(|(window, _)| &**window)
+}
+
+/// A file dialog. On Windows it belongs to the app's window, so it opens in front of it (full
+/// screen too) and the window waits behind it, never left blocked on a dialog that opened unseen
+/// behind it.
+pub fn dialog() -> FileDialog {
+    let dialog = FileDialog::new();
+    #[cfg(windows)]
+    if let Some(window) = dialog_parent() {
+        return dialog.set_parent(window);
+    }
+    dialog
+}
+
+/// A message box, belonging to the app's window as [`dialog`]s do.
+fn message() -> MessageDialog {
+    let message = MessageDialog::new();
+    #[cfg(windows)]
+    if let Some(window) = dialog_parent() {
+        return message.set_parent(window);
+    }
+    message
+}
+
 pub fn export(
     session: &Arc<CanvasSession>,
     format: Format,
@@ -791,7 +846,7 @@ pub fn export(
     if matches!(format, Format::LayerPngs | Format::ChosenLayerPngs | Format::ModelTextures) {
         let title =
             if format == Format::ModelTextures { "Share textures as PNG files" } else { "Share layers as PNG files" };
-        let Some(dir) = FileDialog::new().set_title(title).pick_folder() else { return };
+        let Some(dir) = dialog().set_title(title).pick_folder() else { return };
         let dir = dir.to_string_lossy().into_owned();
         writing(session, card, "Can't share", move |session| {
             match format {
@@ -803,7 +858,7 @@ pub fn export(
         });
         return;
     }
-    let Some(path) = FileDialog::new()
+    let Some(path) = dialog()
         .set_title(format!("Export {}", format.name()))
         .add_filter(format.name(), &[format.extension()])
         .set_file_name(format!("{}.{}", export_file_name(session.name(), format.package()), format.extension()))
@@ -847,7 +902,7 @@ pub fn export_plugin(session: &Arc<CanvasSession>, key: &str, card: &mut crate::
     }
     let Some(export) = session.plugin_exports().into_iter().find(|e| e.key == key) else { return };
     let extension = export.extension.clone();
-    let Some(path) = FileDialog::new()
+    let Some(path) = dialog()
         .set_title(format!("Export {}", export.label))
         .add_filter(export.label.as_str(), &[extension.as_str()])
         .set_file_name(format!("{}.{extension}", export_file_name(session.name(), false)))
@@ -929,7 +984,7 @@ pub fn share_artworks(
     let extension = format.extension();
     let file_name = |name: &str| export_file_name(name.to_owned(), false);
     let targets: Vec<(procraft_core::GalleryArtwork, PathBuf)> = if let [one] = list {
-        let Some(path) = FileDialog::new()
+        let Some(path) = dialog()
             .set_title(format!("Share {}", format.name()))
             .add_filter(format.name(), &[extension])
             .set_file_name(format!("{}.{extension}", file_name(&one.name)))
@@ -939,7 +994,7 @@ pub fn share_artworks(
         };
         vec![(one.clone(), with_extension(path, extension))]
     } else {
-        let Some(dir) = FileDialog::new().set_title(format!("Share as {}", format.name())).pick_folder() else {
+        let Some(dir) = dialog().set_title(format!("Share as {}", format.name())).pick_folder() else {
             return;
         };
         let mut used = std::collections::HashSet::new();

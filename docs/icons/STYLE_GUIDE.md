@@ -1,7 +1,7 @@
 # ProCraft icon style guide
 
-The rules for ProCraft's interface icons, every one of them our own drawing. `LucideIcons` keeps the
-Lucide set beside them.
+The rules for ProCraft's interface icons, every one of them drawn for ProCraft: by us, or by a
+contributor. `LucideIcons` keeps the Lucide set beside them.
 
 ## Where an icon comes from
 
@@ -16,6 +16,10 @@ Lucide set beside them.
   invention rather than a common metaphor, pick a different, plain idea.
 - **Every drawing is recorded.** Its master SVG lives in `assets/icons/procraft/`, it is made by
   `tools/icons/draw_icons.py`, and it has a line in `ATTRIBUTION.md` as original work.
+- **A contributor's drawing** keeps its own SVG in `assets/icons/contributed/<who>/`, on this grid
+  and under the same first rule. `draw_icons.py` rounds its corners to the set's smallest round and
+  places it in its slot like ours; it is checked to weigh what its neighbours do where it is shown,
+  and `ATTRIBUTION.md` credits who drew it.
 
 ## Grid and shapes
 
@@ -41,8 +45,8 @@ Lucide set beside them.
 | Control | Idea |
 |---|---|
 | Actions | an open-end wrench with a hole in its handle |
-| Adjustments | a wand with a banded tip and three sparkles |
-| Selection | a selection's four corner marks around a solid square |
+| Adjustments | a wand with a banded tip and three sparkles (lork's drawing) |
+| Selection | a dashed curve: a selection's marching path (lork's drawing) |
 | Transform | a solid arrow pointing up and to the right |
 | Paint | a round brush: handle, ferrule, bristles |
 | Smudge | a fingertip pressing on a smear |
@@ -65,7 +69,7 @@ Lucide set beside them.
 
 | Control | Idea |
 |---|---|
-| Automatic | the Adjustments wand |
+| Automatic | a wand with a banded tip and three sparkles |
 | Freehand | a lasso's loop with its tail |
 | Rectangle / Ellipse | a dashed rectangle / ellipse |
 | Add / Subtract | a plus / minus cut out of a disc |
@@ -162,6 +166,7 @@ Lucide set beside them.
 | Statistics | a pie chart with one slice pulled out |
 | New brush | the Paint brush with a plus beside it |
 | New set | a folder with a plus cut out of it |
+| New layer | a single sheet with a plus cut out of it |
 | Libraries | three volumes on a shelf, the last leaning |
 | New library | two volumes on a shelf, a plus beside them |
 | Share (menus) | the Actions tab's tray and rising arrow |
@@ -244,7 +249,7 @@ Each of the 48 is the object its name says, drawn plainly in this guide's shapes
 `tools/icons/draw_icons.py`, in the picker's order). Where the name is a way of working, the icon is
 its tool: Sketching a pencil, Inking an ink bottle, Painting the palette, Airbrushing a spray can,
 Charcoals a stick of charcoal, Textures the pitted Grain tile. Brush, Wand and Checkmark are the
-bar's brush, the Adjustments wand and Done's tick.
+bar's brush, the Automatic wand and Done's tick.
 
 ## Blend modes
 

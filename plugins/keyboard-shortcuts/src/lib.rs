@@ -15,7 +15,7 @@ use kit::app::Panel;
 use kit::keys::{Press, Shortcut, Taken};
 
 kit::key_shortcut!(|press| state().bindings.taken(press), |press| state().bindings.keys_for(press));
-kit::key_shortcuts!(|list| state().bindings.shortcuts = list);
+kit::key_shortcuts!(|list| state().bindings.told(list));
 kit::kept!(|data| state().bindings.read(data));
 kit::actions!(|_| {
     // the list from its first page, what it binds as it is
@@ -33,17 +33,34 @@ const PAGE: usize = 13;
 const LABEL: usize = 40;
 const OPTION: usize = 24;
 
-/// The app's shortcuts, and those bound anew: each by its first key as it came (written as the app
-/// writes a press), with its keys now.
+/// The app's shortcuts with each one's name (see [`name`], worked out once as they are told: a
+/// press looks through them all), and those bound anew: each by its name, with its keys now.
 #[derive(Default)]
 struct Bindings {
     shortcuts: Vec<Shortcut>,
+    names: Vec<Option<String>>,
     bound: Vec<(String, Vec<Press>)>,
 }
 
 impl Bindings {
     const fn new() -> Bindings {
-        Bindings { shortcuts: Vec::new(), bound: Vec::new() }
+        Bindings { shortcuts: Vec::new(), names: Vec::new(), bound: Vec::new() }
+    }
+
+    /// The app's shortcuts as it tells them, their names with them.
+    fn told(&mut self, shortcuts: Vec<Shortcut>) {
+        self.names = shortcuts.iter().map(name).collect();
+        self.shortcuts = shortcuts;
+    }
+
+    /// The name of shortcut `at`, if it has one.
+    fn name_of(&self, at: usize) -> Option<&str> {
+        self.names.get(at).and_then(Option::as_deref)
+    }
+
+    /// Whether a shortcut is named `named`.
+    fn known(&self, named: &str) -> bool {
+        self.names.iter().any(|n| n.as_deref() == Some(named))
     }
 }
 
@@ -66,7 +83,7 @@ impl Bindings {
     /// The keys shortcut `at` has now.
     fn now(&self, at: usize) -> Vec<Press> {
         let Some(shortcut) = self.shortcuts.get(at) else { return Vec::new() };
-        match name(shortcut).as_deref().and_then(|n| self.bound_to(n)) {
+        match self.name_of(at).and_then(|n| self.bound_to(n)) {
             Some(presses) => presses.clone(),
             None => shortcut.presses.clone(),
         }
@@ -77,16 +94,12 @@ impl Bindings {
     /// key with Shift as it is without it). Anything else is as it is.
     fn taken(&self, press: &Press) -> Taken {
         for (named, presses) in &self.bound {
-            let known = self.shortcuts.iter().any(|s| name(s).as_deref() == Some(named.as_str()));
-            if known && presses.contains(press) {
+            if presses.contains(press) && self.known(named) {
                 return Press::read(named).map_or(Taken::AsItIs, Taken::As);
             }
         }
         let gone = |press: &Press| {
-            self.came_with(press).is_some_and(|at| {
-                let shortcut = self.shortcuts.get(at);
-                shortcut.and_then(name).is_some_and(|n| self.bound_to(&n).is_some())
-            })
+            self.came_with(press).is_some_and(|at| self.name_of(at).is_some_and(|n| self.bound_to(n).is_some()))
         };
         if self.came_with(press).is_some() {
             return if gone(press) { Taken::Nothing } else { Taken::AsItIs };
@@ -97,8 +110,7 @@ impl Bindings {
     /// The keys that now do what `press` does as it came: none if it is as it came.
     fn keys_for(&self, press: &Press) -> Option<Vec<Press>> {
         let at = self.came_with(press)?;
-        let named = self.shortcuts.get(at).and_then(name)?;
-        self.bound_to(&named).cloned()
+        self.bound_to(self.name_of(at)?).cloned()
     }
 
     /// `press` bound to shortcut `at`, in place of the keys it had: what it was taken from, if it
@@ -107,11 +119,11 @@ impl Bindings {
         if let Some(kept) = self.shortcuts.iter().find(|s| s.fixed && s.presses.contains(&press)) {
             return Err(format!("That key stays as it is: {}.", kept.does));
         }
-        let Some(named) = self.shortcuts.get(at).and_then(name) else { return Ok(None) };
+        let Some(named) = self.name_of(at).map(str::to_owned) else { return Ok(None) };
         let mut from = None;
         // another shortcut with it gives it up, keeping its other keys
         for other in 0..self.shortcuts.len() {
-            let Some(other_name) = self.shortcuts.get(other).and_then(name) else { continue };
+            let Some(other_name) = self.name_of(other).map(str::to_owned) else { continue };
             if other == at || !self.now(other).contains(&press) {
                 continue;
             }
@@ -125,7 +137,7 @@ impl Bindings {
 
     /// Shortcut `at` with no keys.
     fn unbind(&mut self, at: usize) {
-        if let Some(named) = self.shortcuts.get(at).and_then(name) {
+        if let Some(named) = self.name_of(at).map(str::to_owned) {
             self.set(&named, Vec::new());
         }
     }
@@ -133,7 +145,7 @@ impl Bindings {
     /// Shortcut `at` with its keys as they came, taken back from any other bound to them.
     fn reset(&mut self, at: usize) {
         let Some(shortcut) = self.shortcuts.get(at).cloned() else { return };
-        let Some(named) = name(&shortcut) else { return };
+        let Some(named) = self.name_of(at).map(str::to_owned) else { return };
         self.bound.retain(|(n, _)| *n != named);
         for (_, presses) in &mut self.bound {
             presses.retain(|p| !shortcut.presses.contains(p));
@@ -152,10 +164,10 @@ impl Bindings {
 
     /// A shortcut back to its keys as they came is no longer bound anew.
     fn settle(&mut self) {
-        let shortcuts = &self.shortcuts;
+        let (shortcuts, names) = (&self.shortcuts, &self.names);
         self.bound.retain(|(named, presses)| {
-            let came = shortcuts.iter().find(|s| name(s).as_deref() == Some(named.as_str()));
-            came.is_none_or(|s| s.presses != *presses)
+            let came = names.iter().position(|n| n.as_deref() == Some(named.as_str()));
+            came.and_then(|at| shortcuts.get(at)).is_none_or(|s| s.presses != *presses)
         });
     }
 
@@ -233,7 +245,8 @@ impl State {
     /// (a group of more goes on over pages of its own), eight pages at most.
     fn pages(&self) -> Vec<(String, Vec<usize>)> {
         let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
-        for (at, shortcut) in self.bindings.shortcuts.iter().enumerate().filter(|(_, s)| name(s).is_some()) {
+        let named = |at: &usize| self.bindings.name_of(*at).is_some();
+        for (at, shortcut) in self.bindings.shortcuts.iter().enumerate().filter(|(at, _)| named(at)) {
             match groups.iter_mut().find(|(group, _)| *group == shortcut.group) {
                 Some((_, rows)) => rows.push(at),
                 None => groups.push((&shortcut.group, vec![at])),
@@ -381,7 +394,9 @@ mod tests {
                     Tools\tHue, Saturation, Brightness\tu command+u\t0\n\
                     Tools\tPaint\tb\t0\n\
                     View\tTurn the canvas\tr shift+r\t1\n";
-        Bindings { shortcuts: kit::keys::read_shortcuts(told), bound: Vec::new() }
+        let mut bindings = Bindings::new();
+        bindings.told(kit::keys::read_shortcuts(told));
+        bindings
     }
 
     #[test]

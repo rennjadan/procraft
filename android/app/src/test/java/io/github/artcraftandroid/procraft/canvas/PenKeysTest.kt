@@ -80,4 +80,20 @@ class PenKeysTest {
         assertEquals(second to first, buttons.next(second, penIn = true))
         assertEquals(0 to second, buttons.next(0, penIn = true))
     }
+
+    @Test
+    fun a_button_held_over_the_canvas_isn_t_let_go_by_touch_events_that_leave_it_out() {
+        val first = MotionEvent.BUTTON_STYLUS_PRIMARY
+        val buttons = PenButtons()
+        // held while hovering
+        assertEquals(first to 0, buttons.next(first, penIn = true))
+        // the pen touches and moves, its events without the button: still held
+        assertEquals(0 to 0, buttons.next(0, penIn = true, touching = true))
+        assertEquals(0 to 0, buttons.next(0, penIn = true, touching = true))
+        // lifted (or hovering) without it: let go
+        assertEquals(0 to first, buttons.next(0, penIn = true))
+        // pressed while touching still counts at once
+        assertEquals(first to 0, buttons.next(first, penIn = true, touching = true))
+        assertEquals(0 to first, buttons.next(0, penIn = true))
+    }
 }

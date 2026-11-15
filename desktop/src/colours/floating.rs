@@ -55,9 +55,9 @@ impl Colours {
                 _ => self.floating_grab = None,
             }
         }
-        // kept on the screen
+        // kept on the screen, and clear of the side bar as the panels are
         let screen = ctx.content_rect();
-        at.x = at.x.clamp(screen.left(), (screen.right() - WIDTH).max(screen.left()));
+        at.x = floating_x(at.x, screen, crate::panel::side_bar_shown_at(ctx));
         at.y = at.y.clamp(screen.top(), (screen.bottom() - height).max(screen.top()));
         self.floating = Some(at);
         let rect = Rect::from_min_size(at, vec2(WIDTH, height));
@@ -67,7 +67,8 @@ impl Colours {
         let mut closed = !self.modal() && crate::ui::escape(ctx);
         let mut hex_row = Rect::NOTHING;
         let mut kind_button = Rect::NOTHING;
-        egui::Area::new(egui::Id::unique("floating colours")).fixed_pos(rect.min).order(egui::Order::Foreground).show(
+        // under the panels, which open over it, however it was last touched
+        egui::Area::new(egui::Id::unique("floating colours")).fixed_pos(rect.min).order(egui::Order::Middle).show(
             ctx,
             |ui| {
                 // the canvas under it takes no touch
@@ -320,4 +321,35 @@ fn floating_tiles(ui: &Ui, n: usize, filled: &[(usize, u32)], at: Rect) -> Optio
         }
     }
     taken
+}
+
+/// Where the floating window's left edge goes for `x` asked: on the `screen`, and clear of the
+/// side bar (if it shows, on whichever side) by the gap the panels keep from it.
+fn floating_x(x: f32, screen: Rect, side_bar: Option<Rect>) -> f32 {
+    let (mut left, mut right) = (screen.left(), screen.right());
+    if let Some(bar) = side_bar {
+        if bar.center().x < screen.center().x {
+            left = left.max(bar.right() + crate::panel::POPOVER_GAP);
+        } else {
+            right = right.min(bar.left() - crate::panel::POPOVER_GAP);
+        }
+    }
+    x.clamp(left, (right - WIDTH).max(left))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_floating_window_keeps_clear_of_the_side_bar() {
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(1200.0, 800.0));
+        let left_bar = Rect::from_min_size(pos2(0.0, 200.0), vec2(51.0, 400.0));
+        assert_eq!(floating_x(0.0, screen, Some(left_bar)), 51.0 + crate::panel::POPOVER_GAP);
+        assert_eq!(floating_x(0.0, screen, None), 0.0);
+        assert_eq!(floating_x(500.0, screen, Some(left_bar)), 500.0);
+        let right_bar = Rect::from_min_size(pos2(1149.0, 200.0), vec2(51.0, 400.0));
+        assert_eq!(floating_x(5000.0, screen, Some(right_bar)), 1149.0 - crate::panel::POPOVER_GAP - WIDTH);
+        assert_eq!(floating_x(5000.0, screen, None), 1200.0 - WIDTH);
+    }
 }

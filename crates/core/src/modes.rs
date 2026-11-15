@@ -145,9 +145,29 @@ pub fn mode_switch(button: ModeButton, open: Modes) -> ModeSwitch {
     }
 }
 
+/// Whether pressing `button` with the modes `open` also lets go of the selection: the Selection
+/// button, while the selection tool is open, deselects as it closes the tool.
+#[uniffi::export]
+pub fn mode_switch_deselects(button: ModeButton, open: Modes) -> bool {
+    button == ModeButton::Selection && open.selection
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_selection_button_deselects_as_it_closes_the_selection_tool() {
+        let selecting = open(|m| m.selection = true);
+        assert!(mode_switch_deselects(ModeButton::Selection, selecting));
+        assert_eq!(mode_switch(ModeButton::Selection, selecting), ModeSwitch { end: selecting, goes_on: false });
+        // opening it, or leaving it by another button, keeps what is selected
+        assert!(!mode_switch_deselects(ModeButton::Selection, NONE));
+        assert!(!mode_switch_deselects(ModeButton::Selection, open(|m| m.transform = true)));
+        for other in [ModeButton::Tool, ModeButton::Transform, ModeButton::Panel { colour: false }] {
+            assert!(!mode_switch_deselects(other, selecting));
+        }
+    }
 
     const ALL: Modes = Modes {
         quickshape: true,

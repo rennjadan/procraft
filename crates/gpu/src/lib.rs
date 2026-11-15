@@ -16,10 +16,10 @@ use std::sync::{Arc, OnceLock};
 pub use canvas::plugin_filter::{FilterCode, FilterProgram, FilterRun, read_filter};
 pub use canvas::plugin_picture::{PictureCode, PictureProgram, PictureStop, read_picture};
 pub use canvas::{
-    Backdrop, Canvas, DisplayLut, Filter, FineThumbnail, LayerThumbnailStep, LiquifyMode, LiquifyStamp,
-    PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample, SecondStroke, SelectionLook, SharedStroke,
-    SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid, Target, Thumbnail, most_resident, read_texture,
-    start_reading, textures_bytes,
+    Backdrop, Canvas, DisplayLut, Filter, FineThumbnail, LayerThumbnailStep, LiquifyMode, LiquifyStamp, MOST_TIPS,
+    PendingAlphas, PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample, SecondStroke, SelectionLook,
+    SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid, Target, Thumbnail, TipKind,
+    most_resident, read_texture, start_reading, textures_bytes,
 };
 pub use kept::keep_pipelines_in;
 pub use lighting::Lighting;
@@ -289,6 +289,10 @@ impl Gpu {
     }
 
     fn create(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>) -> Result<Gpu, GpuError> {
+        // a driver's own description can run over several lines: one line in the log
+        fn one_line(text: &str) -> String {
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        }
         // each stage timed in the log: on a slow driver, where a start stopped shows
         let started = std::time::Instant::now();
         // every GPU the backend sees, for the log (a laptop's two, a driver's own name and version)
@@ -300,7 +304,7 @@ impl Gpu {
                 info.backend,
                 info.device_type,
                 info.driver,
-                info.driver_info
+                one_line(&info.driver_info)
             );
         }
         log::info!("the GPUs listed in {} ms", started.elapsed().as_millis());
@@ -317,7 +321,7 @@ impl Gpu {
             "GPU: {} ({:?}, driver {}), chosen in {} ms",
             info.name,
             info.backend,
-            info.driver_info,
+            one_line(&info.driver_info),
             chosen.elapsed().as_millis()
         );
         let made = std::time::Instant::now();
@@ -327,10 +331,8 @@ impl Gpu {
         }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("procraft"),
-            // where the GPU has them: dual-source blending for strokes that build up only to their
-            // transfer, and the pipelines' compiled form to keep between runs
-            required_features: adapter.features()
-                & (wgpu::Features::DUAL_SOURCE_BLENDING | wgpu::Features::PIPELINE_CACHE),
+            // where the GPU has it: the pipelines' compiled form to keep between runs
+            required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
             // the adapter's own limits, so large canvases fit where the GPU allows them
             required_limits: adapter.limits(),
             // memory taken in small blocks (a few MB up to 64): a block of each kind, once made,
@@ -343,10 +345,6 @@ impl Gpu {
         log::info!("the GPU's device made in {} ms", made.elapsed().as_millis());
         // new canvases and crops kept to what its textures can be
         procraft_engine::document::set_gpu_texture_most(device.limits().max_texture_dimension_2d);
-        log::info!(
-            "GPU capped strokes (dual-source blending): {}",
-            device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)
-        );
         // a validation error must never take the app down: log it instead
         let errors = Arc::new(AtomicU64::new(0));
         let counter = Arc::clone(&errors);
@@ -472,12 +470,6 @@ impl Gpu {
     /// GPU validation errors so far (each one is logged); tests expect none.
     pub fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
-    }
-
-    /// Whether strokes that build up only to their transfer (the uniformed glaze) can be drawn
-    /// exactly (with dual-source blending); else their transfer is taken into each stamp.
-    pub fn caps_transfer(&self) -> bool {
-        self.device.features().contains(wgpu::Features::DUAL_SOURCE_BLENDING)
     }
 
     pub fn max_texture_size(&self) -> u32 {

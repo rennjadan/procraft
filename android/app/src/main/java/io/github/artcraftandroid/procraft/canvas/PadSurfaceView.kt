@@ -2,10 +2,10 @@ package io.github.artcraftandroid.procraft.canvas
 
 import android.annotation.SuppressLint
 import android.content.Context
-import android.util.Log
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
+import io.github.artcraftandroid.procraft.AppLog
 import io.github.artcraftandroid.procraft.core.CanvasSession
 import io.github.artcraftandroid.procraft.core.MobileException
 import io.github.artcraftandroid.procraft.core.PenSample
@@ -47,7 +47,7 @@ class PadSurfaceView(context: Context, private val vm: CanvasViewModel) : Surfac
             uncoverWhenDrawn(pad)
         } catch (e: MobileException) {
             NativeWindows.release(id)
-            Log.e("ProCraft", "attaching the pad", e)
+            AppLog.e("ProCraft", "attaching the pad", e)
         }
     }
 

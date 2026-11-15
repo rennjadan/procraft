@@ -54,7 +54,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.Panel
+import io.github.artcraftandroid.procraft.core.SideSliderTap
 import io.github.artcraftandroid.procraft.core.ToolKind
+import io.github.artcraftandroid.procraft.core.sideSliderDragShare
+import io.github.artcraftandroid.procraft.core.sideSliderTap
 
 private val SliderLeft = 5.dp
 private val SizeTrackTop = 6.dp
@@ -343,9 +346,11 @@ private fun SliderPanel(vm: CanvasViewModel, which: CanvasViewModel.SliderPanel,
 
 /**
  * An upright slider moved by dragging anywhere on it: the thumb follows the finger (relative,
- * not jump-to-touch), 1 at the top. Moved, its [panel] shows while it moves; held still, it stays up.
- * Its [notches] (saved values) show as marks on the track; a value dragged near one is pulled onto
- * it, and a tap on one goes there. On a notch, the thumb shows a blue bar.
+ * not jump-to-touch), finer the farther out to the side the finger goes, 1 at the top. Moved, its
+ * [panel] shows while it moves; held still or its thumb tapped, it stays up; a tap elsewhere on
+ * the track takes the thumb there. Its [notches] (saved values) show as marks on the track; a
+ * value dragged near one is pulled onto it, and a tap on one goes there. On a notch, the thumb
+ * shows a blue bar.
  */
 @Composable
 fun BrushSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier = Modifier, panel: SliderPanelHooks? = null, notches: List<Float> = emptyList(), height: Dp = Pc.SliderHeight) {
@@ -384,7 +389,9 @@ fun BrushSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier = Mo
                             if (!moved) hooks?.show(false)
                             moved = true
                             last = c.position.y
-                            raw = (raw - dy / travel).coerceIn(0f, 1f)
+                            // the farther out to the side the finger is, the finer the thumb follows
+                            val across = (c.position.x - size.width / 2f).toDp().value
+                            raw = (raw - dy / travel * sideSliderDragShare(across)).coerceIn(0f, 1f)
                             change(near(raw) ?: raw)
                         }
                         c.consume()
@@ -394,11 +401,15 @@ fun BrushSlider(value: Float, onChange: (Float) -> Unit, modifier: Modifier = Mo
                         while (!lifted && !moved) lifted = !follow()
                     }
                     if (!lifted && !moved) hooks?.show(true)
-                    // a tap on a notch's mark goes to it
+                    // a tap on the thumb opens the panel and keeps it up; elsewhere the thumb goes
+                    // there (or onto a notch's mark there)
                     if (lifted && !moved && !taken) {
                         val inset = Pc.ThumbInset.toPx()
                         val at = 1f - (down.position.y - inset - Pc.ThumbHeight.toPx() / 2f) / travel
-                        near(at, Pc.ThumbHeight.toPx() / 2f / travel)?.let { change(it) }
+                        when (val tap = sideSliderTap(at, current, Pc.ThumbHeight.toPx() / 2f / travel, marks)) {
+                            is SideSliderTap.Panel -> hooks?.show(true)
+                            is SideSliderTap.Jump -> change(tap.value)
+                        }
                     }
                     while (!lifted) lifted = !follow()
                     if (taken) hooks?.show(true) else if (moved) hooks?.hide()

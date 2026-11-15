@@ -26,11 +26,15 @@ internal class PenButtons {
     /**
      * The buttons pressed and let go ([PEN_BUTTONS] bits) since the last event, by this one's
      * [buttonState]. An event without the pen in it ([penIn] false: a hand's touch, whose buttons read
-     * as none held) changes nothing, or a hand landing while a button is held would let it go.
+     * as none held) changes nothing, or a hand landing while a button is held would let it go. While
+     * the pen is [touching], a button that goes missing isn't let go yet: some pens' touch events
+     * leave out a button their hover shows held, which would hand the eraser back as the stroke
+     * begins. It is let go as the pen lifts or hovers without it (a stroke begun with it held
+     * erases to its end either way).
      */
-    fun next(buttonState: Int, penIn: Boolean): Pair<Int, Int> {
+    fun next(buttonState: Int, penIn: Boolean, touching: Boolean = false): Pair<Int, Int> {
         if (!penIn) return 0 to 0
-        val now = buttonState and PEN_BUTTONS
+        val now = (buttonState and PEN_BUTTONS) or (if (touching) held else 0)
         val change = (now and held.inv()) to (held and now.inv())
         held = now
         return change

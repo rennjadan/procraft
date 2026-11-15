@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.Rect
+import io.github.artcraftandroid.procraft.AppLog
 import io.github.artcraftandroid.procraft.core.PackageTimeLapse
 import io.github.artcraftandroid.procraft.core.timeLapseBitsPerPixel
 import io.github.artcraftandroid.procraft.core.timeLapseFps
@@ -55,9 +56,9 @@ class TimeLapse(artwork: File) {
         get() = core.recording()
         set(on) = core.setRecording(on)
 
-    /** Keeps a frame (premultiplied RGBA, [width] × [height]) unless it is the same as the last. */
-    fun record(rgba: ByteArray, width: Int, height: Int) {
-        core.record(rgba, width.toUInt(), height.toUInt())
+    /** Keeps [session]'s canvas as the next frame, unless it is the same as the last; the picture never leaves the core. */
+    fun recordFrom(session: io.github.artcraftandroid.procraft.core.CanvasSession) {
+        session.recordTimeLapse(core)
     }
 
     /** What to tell, once, when the time-lapse couldn't be written (the storage full, say); null otherwise. */
@@ -94,12 +95,12 @@ class TimeLapse(artwork: File) {
                 reading = clip.path to r
             }
         } catch (e: Exception) {
-            android.util.Log.e("ProCraft", "a time-lapse's video", e)
+            AppLog.e("ProCraft", "a time-lapse's video", e)
             return null
         }
         val at = i - clip.first.toInt()
         val frames = runCatching { retriever.getFramesAtIndex(at, minOf(CLIP_RUN, clip.frames.toInt() - at)) }
-            .onFailure { android.util.Log.w("ProCraft", "a time-lapse video's frames by number", it) }.getOrNull().orEmpty()
+            .onFailure { AppLog.w("ProCraft", "a time-lapse video's frames by number", it) }.getOrNull().orEmpty()
         if (frames.isEmpty()) return frameAtTime(retriever, at, clip.frames.toInt())
         decoded?.second?.forEach { it.recycle() }
         decoded = i to frames
@@ -111,7 +112,7 @@ class TimeLapse(artwork: File) {
         val length = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()?.times(1000)
             ?: (frames * 1_000_000L / FPS)
         retriever.getFrameAtTime(at * length / frames, android.media.MediaMetadataRetriever.OPTION_CLOSEST)
-    }.onFailure { android.util.Log.w("ProCraft", "a time-lapse video's frame by time", it) }.getOrNull()
+    }.onFailure { AppLog.w("ProCraft", "a time-lapse video's frame by time", it) }.getOrNull()
 
     /** The videos read again next time (they changed), and the one being read let go. */
     private fun forgetClips() = synchronized(clipLock) {
@@ -241,7 +242,7 @@ class TimeLapse(artwork: File) {
         }
         forgetClips()
         if (!readable) {
-            android.util.Log.w("ProCraft", "the time-lapse's videos can't be read here: their pictures stay")
+            AppLog.w("ProCraft", "the time-lapse's videos can't be read here: their pictures stay")
             return
         }
         val gone = core.dropClipFrames()
@@ -272,7 +273,7 @@ class TimeLapse(artwork: File) {
                     i += run
                 }
             } catch (e: Exception) {
-                android.util.Log.e("ProCraft", "a time-lapse's video", e)
+                AppLog.e("ProCraft", "a time-lapse's video", e)
                 frames = 0
             } finally {
                 retriever.release()

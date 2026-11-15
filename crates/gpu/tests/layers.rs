@@ -366,6 +366,178 @@ fn a_clipped_layer_follows_its_base_s_mask() {
     assert_eq!(composite_at(&gpu, &mut doc, &mut canvas, 1, 8), left);
 }
 
+/// Lays `rgb` on `layer` fading in across the canvas: clear at the left, full at the right (a soft
+/// edge: its alpha up 17 levels a column).
+fn ramp(canvas: &mut Canvas, layer: LayerId, rgb: [u8; 3]) {
+    let mut px = vec![0u8; (W * W * 4) as usize];
+    for (i, p) in px.chunks_mut(4).enumerate() {
+        let a = (i as u32 % W) * 17;
+        for (c, v) in p.iter_mut().zip(rgb) {
+            *c = ((u32::from(v) * a + 127) / 255) as u8;
+        }
+        p[3] = a as u8;
+    }
+    canvas.write_layer(layer, px);
+}
+
+/// The composite's row `y`.
+fn row(gpu: &Gpu, doc: &mut Document, canvas: &mut Canvas, y: u32) -> Vec<[u8; 4]> {
+    (0..W).map(|x| composite_at(gpu, doc, canvas, x, y)).collect()
+}
+
+/// Whether two rows are within `slack` of each other, every channel.
+fn rows_near(a: &[[u8; 4]], b: &[[u8; 4]], slack: u8) -> bool {
+    a.iter().flatten().zip(b.iter().flatten()).all(|(p, q)| p.abs_diff(*q) <= slack)
+}
+
+const TEAL: [f32; 3] = [40.0 / 255.0, 140.0 / 255.0, 150.0 / 255.0];
+
+#[test]
+fn a_layer_clipped_to_a_soft_edge_shows_as_alpha_lock_paints() {
+    let Some((gpu, mut doc, mut canvas)) = setup() else { return };
+    doc.background = TEAL;
+    // white fading in from the left, red clipped to it
+    let base = doc.current();
+    ramp(&mut canvas, base, [255, 255, 255]);
+    let clipped = doc.add_layer();
+    fill(&mut canvas, &doc, clipped, [220, 40, 60]);
+    assert!(doc.set_clipped(clipped, true));
+    canvas.invalidate();
+    let shown = row(&gpu, &mut doc, &mut canvas, 8);
+    // where the white is a third: the red a third over the teal, no white in it
+    eprintln!("clipped at a third: {:?}", shown[5]);
+    assert!(rows_near(&shown[5..6], &[[100, 107, 120, 255]], 1), "{:?}", shown[5]);
+    // the same red painted onto the white, alpha-locked
+    assert!(doc.set_visible(clipped, false));
+    assert!(doc.set_alpha_lock(base, true));
+    fill(&mut canvas, &doc, base, [220, 40, 60]);
+    let locked = row(&gpu, &mut doc, &mut canvas, 8);
+    eprintln!("alpha-locked at a third: {:?}", locked[5]);
+    assert!(rows_near(&shown, &locked, 1), "clipped {shown:?}\nlocked {locked:?}");
+}
+
+#[test]
+fn a_multiply_layer_clipped_to_a_soft_base_multiplies_the_base_alone() {
+    let Some((gpu, mut doc, mut canvas)) = setup() else { return };
+    doc.background = TEAL;
+    let base = doc.current();
+    ramp(&mut canvas, base, [230, 200, 60]);
+    let top = doc.add_layer();
+    let blue = [120u8, 180, 250];
+    fill(&mut canvas, &doc, top, blue);
+    canvas.render(&gpu, &mut doc, None);
+    let unclipped = canvas.texture_bytes();
+    assert!(doc.set_clipped(top, true));
+    canvas.invalidate();
+    canvas.render(&gpu, &mut doc, None);
+    // a clipping group of normal layers takes one texture more, of a blend mode two
+    let per = u64::from(W * W * 4);
+    assert_eq!(canvas.texture_bytes(), unclipped + per);
+    assert!(doc.set_blend(top, BlendMode::Multiply));
+    canvas.invalidate();
+    canvas.render(&gpu, &mut doc, None);
+    assert_eq!(canvas.texture_bytes(), unclipped + 2 * per);
+    // the blue multiplies the base's own colour, then that shows as much as the base does over
+    // the teal (which the blue leaves as it is)
+    let stored = canvas.read_layer(&gpu, base).unwrap();
+    let shown = row(&gpu, &mut doc, &mut canvas, 8);
+    for (x, got) in shown.iter().enumerate() {
+        let p = &stored[(8 * W as usize + x) * 4..][..4];
+        let a = f32::from(p[3]) / 255.0;
+        for c in 0..3 {
+            let cb = if p[3] == 0 { 0.0 } else { f32::from(p[c]) / f32::from(p[3]) };
+            let want = (cb * f32::from(blue[c]) / 255.0 * a + TEAL[c] * (1.0 - a)) * 255.0;
+            assert!((f32::from(got[c]) - want).abs() <= 1.5, "at {x}: {got:?}, channel {c} wants {want}");
+        }
+    }
+}
+
+#[test]
+fn merging_layers_clipped_to_a_soft_base_keeps_the_picture() {
+    let Some((gpu, mut doc, mut canvas)) = setup() else { return };
+    doc.background = TEAL;
+    // blue at the left, under a half-faded white fading in from the left; red clipped to the
+    // white all over, and a multiplied yellow clipped over the red
+    let under = doc.current();
+    paint(&mut canvas, &doc, under, [30, 30, 200], Vec2::new(3.0, 8.0), 5.0, StrokeTool::Paint);
+    let base = doc.add_layer();
+    ramp(&mut canvas, base, [255, 255, 255]);
+    assert!(doc.set_opacity(base, 0.8));
+    let red = doc.add_layer();
+    fill(&mut canvas, &doc, red, [220, 40, 60]);
+    assert!(doc.set_clipped(red, true));
+    let yellow = doc.add_layer();
+    fill(&mut canvas, &doc, yellow, [250, 230, 90]);
+    assert!(doc.set_blend(yellow, BlendMode::Multiply));
+    assert!(doc.set_clipped(yellow, true));
+    canvas.invalidate();
+    let shown = row(&gpu, &mut doc, &mut canvas, 8);
+    // all three into the blue at once
+    let before = doc.clone();
+    canvas.merge_layers(vec![base, red, yellow], under, before, None);
+    assert!(doc.finish_merge_chosen(under, &[base, red, yellow]));
+    let merged = row(&gpu, &mut doc, &mut canvas, 8);
+    assert!(rows_near(&shown, &merged, 2), "shown {shown:?}\nmerged {merged:?}");
+    canvas.undo();
+    canvas.render(&gpu, &mut doc, None);
+    assert_eq!(doc.layers().len(), 4);
+    // one at a time: the yellow into the red (both clipped), the red into the white
+    let before = doc.clone();
+    canvas.merge_down(yellow, red, before, None);
+    assert!(doc.finish_merge_down(yellow));
+    let merged = row(&gpu, &mut doc, &mut canvas, 8);
+    assert!(rows_near(&shown, &merged, 2), "shown {shown:?}\ninto the red {merged:?}");
+    let before = doc.clone();
+    canvas.merge_down(red, base, before, None);
+    assert!(doc.finish_merge_down(red));
+    let merged = row(&gpu, &mut doc, &mut canvas, 8);
+    assert!(rows_near(&shown, &merged, 2), "shown {shown:?}\ninto the white {merged:?}");
+}
+
+#[test]
+fn a_clipping_group_worked_on_composites_around_caches_as_whole() {
+    let Some((gpu, _, _)) = setup() else { return };
+    let docs = [Document::new(W, W), Document::new(W, W)];
+    let canvases = [Canvas::new(&gpu, &docs[0]).unwrap(), Canvas::new(&gpu, &docs[1]).unwrap()];
+    let mut t = Twins { docs, canvases };
+    t.canvases[0].set_cache_composites(true);
+    // bottom up: green; white fading in, with red and an overlay clipped to it; grey at the top
+    let bottom = t.docs[0].current();
+    t.each(|doc, canvas| {
+        doc.background = TEAL;
+        paint(canvas, doc, bottom, [40, 200, 40], Vec2::new(4.0, 4.0), 5.0, StrokeTool::Paint);
+        let base = doc.add_layer();
+        ramp(canvas, base, [255, 255, 255]);
+        let red = doc.add_layer();
+        paint(canvas, doc, red, [220, 40, 60], Vec2::new(9.0, 9.0), 6.0, StrokeTool::Paint);
+        assert!(doc.set_clipped(red, true));
+        let overlay = doc.add_layer();
+        fill(canvas, doc, overlay, [30, 120, 220]);
+        assert!(doc.set_blend(overlay, BlendMode::Overlay));
+        assert!(doc.set_clipped(overlay, true));
+        let top = doc.add_layer();
+        paint(canvas, doc, top, [90, 90, 90], Vec2::new(13.0, 13.0), 2.0, StrokeTool::Paint);
+        doc.set_current(red);
+        canvas.invalidate();
+    });
+    t.same(&gpu, 2, "as made");
+    assert!(t.canvases[0].composites_cached(), "made around caches");
+    // a stroke open on the clipped layer, then on the base (erasing), shows live in the group
+    let ids: Vec<LayerId> = t.docs[0].layers().iter().map(|l| l.id).collect();
+    let (base, red) = (ids[1], ids[2]);
+    for (layer, tool) in [(red, StrokeTool::Paint), (base, StrokeTool::Erase)] {
+        t.each(|doc, canvas| {
+            doc.set_current(layer);
+            canvas.begin_stroke(layer, StrokeStyle::new(tool, [0.1, 0.3, 0.9], 1.0));
+            canvas.add_stamps(&[Stamp::round(Vec2::new(10.0, 6.0), 3.0, 1.0)]);
+        });
+        t.same(&gpu, 2, "a stroke open");
+        assert!(t.canvases[0].composites_cached());
+        t.each(|_, canvas| canvas.end_stroke());
+        t.same(&gpu, 2, "the stroke ended");
+    }
+}
+
 #[test]
 fn duplicate_delete_and_undo_keep_pixels() {
     let Some((gpu, mut doc, mut canvas)) = setup() else { return };

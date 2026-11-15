@@ -16,7 +16,8 @@ A plugin holds one or both of these:
   that change the artwork ([actions](#actions)), show a [panel](#panels) of its own, draw the colour
   panel's Classic picker ([`picker`](#picker)), make a kind of artwork of its own
   ([artworks of its own](#artworks-of-its-own)), or add a kind of layer whose strokes it keeps
-  ([layers of its own](#layers-of-its-own)).
+  ([layers of its own](#layers-of-its-own)), or be a brush engine for brush files of other apps
+  ([brush engines of its own](#brush-engines-of-its-own)).
 - **A [filter](#filters)**, which adds a new adjustment. It's a function the GPU runs over a layer.
 
 The samples are in [`plugins/`](../plugins). `touch-offset` is the smallest with code and `vector-layers`
@@ -58,9 +59,10 @@ plugin do.
 
 `hooks` lists the hooks the code uses, and only a plugin that holds `"hooks"` may have it. Code
 needs at least one hook, one action (see [Actions](#actions)), one kind of artwork (see
-[Artworks of its own](#artworks-of-its-own)) or one kind of layer (see
-[Layers of its own](#layers-of-its-own)). `interface` is 1 here; actions, permissions, panels,
-the `picker` hook and kinds of artwork need 2, and kinds of layer 3.
+[Artworks of its own](#artworks-of-its-own)), one kind of layer (see
+[Layers of its own](#layers-of-its-own)) or one brush engine (see
+[Brush engines of its own](#brush-engines-of-its-own)). `interface` is 1 here; actions, permissions, panels,
+the `picker` hook and kinds of artwork need 2, kinds of layer 3, and brush engines 4.
 
 `id` must have at least two dotted parts, and can't start with `procraft.` or end with `.stopped`.
 `permissions` lists what code may reach when someone taps one of its actions. Leave it empty unless
@@ -139,9 +141,24 @@ back an answer, and the app checks that answer before using it. Changing the art
 
 At a hook, nothing but the numbers the hook hands it (the two that tell of an event: the functions
 its permissions give, as an action). A module imports only the app's functions its
-`permissions` give (see [Actions](#actions)), so it has no files, no network and no clock. A module
-that imports anything else is refused. A function it exports for a hook it didn't list is never
-called.
+`permissions` give (see [Actions](#actions)) and the [utilities](#utilities), so it has no files, no
+network and no clock. A module that imports anything else is refused. A function it exports for a
+hook it didn't list is never called.
+
+### Utilities
+
+Any module may import these from `"procraft"`, without a permission, and call them at a hook as in
+an action (interface 4). They do work on bytes the module hands over, many times faster than the
+module's own code would in the app:
+
+| Function | Does |
+|---|---|
+| `inflate(from: i32, len: i32, kind: i32) -> i32` | Unpacks the `len` bytes at `from`, raw deflate (`kind` 0) or zlib (1): their length unpacked, -1 if they don't unpack or unpack to more than 256 MiB |
+| `decode_image(from: i32, len: i32) -> i64` | Decodes the PNG or JPEG at `from`: its width, and its height times 2^32; 0 if it isn't one |
+| `read_answer(to: i32) -> i32` | Writes what the last of the two made at `to` (unpacked bytes, or the picture as RGBA, 8 bits a channel, not premultiplied, rows from the top): 1 if it did |
+
+What one makes waits for `read_answer` until the next call to either, so a module makes room for it
+first, by its length or size.
 
 ### The crate
 
@@ -226,6 +243,17 @@ procraft_interface_scale(width: f32, height: f32) -> f32
 
 An answer outside .5 to 2 stops the plugin. The app may show less than the answer, so that every page
 stays in reach on a small window.
+
+### `keep_clear`
+
+Whether the interface keeps clear of the status bar and the screen's cutouts, such as a phone's camera
+(not 0). The app then lays everything out inside them, the canvas too, and leaves the rest black. The
+status bar's room is kept even while the bar is hidden, so a swipe that shows it for a moment moves
+nothing. Where there is neither, as on a desktop, it changes nothing.
+
+```
+procraft_keep_clear() -> i32
+```
 
 ### `paste_mask`
 
@@ -799,13 +827,15 @@ While the plugin is on, the Layers panel's + offers each kind beside a plain lay
 `label`. A plugin can list up to four kinds. The import screen says the plugin can add kinds of layer.
 
 `badge` is optional. It is what the kind's layers show in the corner of their thumbnails, drawn in
-white over a small dark box. Its numbers are places in that box, 0 to 1 across and down:
+white over a small dark box, and what the + shows beside the kind's name, drawn larger in the menu's
+colour. Its numbers are places in that box, 0 to 1 across and down:
 
 - `lines`: up to eight, each up to 32 points, x then y. A line goes straight from point to point, or
   with `"curved": true` it is cubic curves: a start, then two handles and an end for each curve.
 - `dots`: up to eight small squares, x then y.
 
-Without a badge, or while the plugin is off or gone, the layer shows a plug.
+Without a badge, the + and the kind's layers show a plug, as do its layers while the plugin is off or
+gone.
 
 `exports` is optional too: up to four files the plugin makes of an artwork's layers of the kind. While
 the plugin is on and the artwork has a layer of the kind, Share Image lists each under its `label`,
@@ -976,6 +1006,126 @@ the eraser does, and what a selection takes:
   wide as its brush where the pen pressed), each fill its region, and each mask hiding what is under
   it in its layer.
 
+## Brush engines of its own
+
+Code can be a brush engine (interface 4): it reads brush files of a kind the app doesn't draw as
+their own app does, and draws the brushes it makes of them itself. The app hands it each stroke's
+input and lays the dabs it answers on the GPU, as it lays its own stamps, so the size and opacity
+sliders, the colour, the eraser and smudge tools, undo and every layer work as with any brush. The
+manifest lists its engines:
+
+```json
+  "compat": { "procraft": { "interface": 4 } },
+  "permissions": ["panel", "brush.data"],
+  "actions": [{ "key": "studio", "label": "Its brush studio" }],
+  "brush_engines": [
+    { "key": "pens", "label": "Pen brushes", "accepts": ["pens"], "studio": "studio" }
+  ]
+```
+
+A plugin can list up to four engines. `accepts` names the endings of the files each reads, one to
+eight, each a few lower-case letters or digits. `studio` is optional: the key of one of its actions,
+which needs the `panel` permission. The import screen says the plugin can read brush files and draw
+their brushes its own way.
+
+- A brush file whose name ends as an engine on accepts goes to that engine as the app imports it
+  (a file with no name, to every engine on). Each brush the engine makes joins the brush of its name
+  the app read of the file, or comes in on a round brush. The app keeps the engine's data with it, in
+  the library, as it is.
+- With the plugin off or gone, such a brush draws as the app read it.
+- With `studio`, opening the brush studio on such a brush runs that action instead, its panel the
+  brush's studio. The `brush.data` permission gives it the brush's data, and takes it back changed.
+
+Its module exports:
+
+```
+procraft_brush_in(len: i32) -> i32                   // where `len` bytes go, for the next call
+procraft_brush_out() -> i32                          // where an answer is
+procraft_brush_import(engine: i32, len: i32) -> i32  // a file: the brushes made of it, its length
+procraft_brush_load(engine: i32, len: i32) -> i32    // a brush: how it looks, its length; -1 not one
+procraft_brush_begin(len: i32) -> i32                // a stroke starts: its number; -1 load it first
+procraft_brush_add(stroke: i32, len: i32) -> i32     // its samples: how many dabs
+procraft_brush_end(stroke: i32) -> i32               // it ends: how many dabs
+```
+
+`engine` is the engine's place in `brush_engines`. Everything goes as records, as layers' items do.
+
+- `procraft_brush_import` is handed the file's name (field 1, UTF-8) and its bytes (field 2). It
+  answers with a field 1 for each brush it makes: its name (field 1), its data (field 2) and, if it
+  has one, its preview as a PNG (field 3). A long call, with 256 MiB of memory.
+- `procraft_brush_load` is handed the app's id for a brush (field 1, u64), its data (field 2) and,
+  if the app holds how the brush looks already, field 3 (u8 1): the engine reads the brush to draw
+  it and answers nothing. Otherwise it answers how the brush looks, which the app keeps on the
+  disk with the plugin, for the brush's data, until the plugin is imported again:
+  - field 1 for each of its tips: its width (field 1, u32), height (field 2, u32) and pixels
+    (field 3, a byte each, how much it paints; four with field 7), at most 255. Dabs pick one each.
+  - field 7, what its tips are (u8): 0 masks, as above; else RGBA pictures (straight, rows from
+    the top) that paint as far as they are opaque: 1 in their own colours, 2 in the colour at the
+    lightness their grey says (a middle grey keeps the colour's own, as far as the dab's lightness
+    strength goes), 3 in a colour between the colour (black) and the secondary colour (white).
+  - field 9 (u8 1), its dabs move paint, as a smudge's do (see flag 16 below), whatever the tool
+    but the eraser.
+  - field 8, how often it wants the pen while it holds still (f32 ms, at least 4), as an airbrush
+    lays dabs by time: until the pen lifts, the app hands it the pen as it last was, at the time
+    then, every half of that.
+  - field 2, how its dabs build up (u8): 0 each laid over the last, 1 each towards its opacity by its
+    flow, never past it and never back.
+  - field 3, the blend mode it lays its stroke with (u32, the layers' modes in the order the Layers
+    panel lists them from Normal 0, Multiply 1, Darken 2 ...; 29 behind).
+  - field 4, 1 if it erases whatever the tool.
+  - field 5, a texture each dab reads where it lands: a picture as a tip's fields 1 to 3, how many
+    canvas pixels each of its pixels takes (field 4, f32), and how it combines with a dab (field 5,
+    u32): 32 multiply, 33 subtract, 34 darken, 35 overlay, 36 colour dodge, 37 colour burn, 38 linear
+    dodge, 39 linear burn, 40 hard mix, 41 softer hard mix, 42 height, 43 linear height, 44 and 45
+    the heights weighed as image editors weigh them, each at the dab's strength; 48 on the same,
+    softly (the strength taking the texture away, not the paint); 46 its grey the dab's colour's
+    lightness (as a lightness tip's), 47 its grey a colour between the colour and the secondary
+    colour, mixed in at the dab's strength.
+  - field 6, a second stroke along the same path whose coverage combines with the first's, as a
+    dual brush's does: its tips (field 1 each), how they build up (field 2) and how it combines
+    (field 3, u32, a blend mode's number, or 27 and 28 for heights).
+- `procraft_brush_begin` is handed the brush's id (field 1), the colour and the secondary colour
+  (fields 2 and 3, three f32, sRGB 0..1), the size the slider asks for (field 4, canvas pixels) and
+  where it starts for the brush (field 10), the opacity slider (field 5), the tool (field 6, u8: 0
+  paint, 1 erase, 2 smudge), the pointer (field 7, u8: 0 finger, 1 pen, 2 mouse), a seed (field 8,
+  u32) and how far the canvas is turned on screen (field 9, f32 radians).
+- `procraft_brush_add` is handed samples, 32 bytes each as layers' items hold them: x, y (canvas
+  pixels), pressure (through the app's pressure curve), tilt, azimuth and roll (radians), then the
+  milliseconds since the stroke's first sample as a 64-bit float.
+- Dabs come back 96 bytes each, twenty-four 32-bit numbers: x, y, its diameter (the longer side of its
+  tip, canvas pixels), its angle (radians, clockwise), its squash (0..1 across its angle), its
+  opacity and flow (0..1), its tip (u32), flags (u32: 1 mirrored across, 2 mirrored down, 4 its own
+  colour, 8 for the second stroke, 16 it moves the paint under where the stroke's last dab lay to
+  where it lies, 32 that paint made one colour first, 64 that colour weighed by the dab's tip, 128
+  the colour it mixes in clear, taking paint away), its
+  colour (three f32, sRGB 0..1, with flag 4), the texture's
+  strength in it (0..1), how far the texture is moved where it reads it (x, y), how strongly a
+  lightness tip shows (0..1), a threshold that makes its tip hard (0 none; 0..1: what is over it
+  paints fully, what is under it by more than the next number's share of it not at all), that
+  share; with flag 16, the share of what it lays that is its colour (the colour, or its own with
+  flag 4) and, with flag 32, the share of its reach around where the last lay that the one colour
+  is picked from (0 its middle, 1 all of it, 3 at most); then four 0s. With flag 16 the opacity is
+  how far it lays what it moves; the first dab of such a stroke only marks its place.
+
+A stroke's start, a batch of samples and its end may each take 40,000,000 steps, for at most a
+quarter of a second; a load 2,000,000,000, for 10 seconds. A stroke laid this way shows no
+prediction of where the pen goes next. The brush's preview in the library is a stroke the engine
+draws, and the engine's stroke goes on through what redraws a stroke: QuickShape, a layer of its own
+laying its strokes again, painting on a 3D model. A brush file the app writes keeps the engine's
+name and data (in its folder `Engine`), so the brush comes back as it was.
+
+The `brush.data` permission gives these functions, which answer while the brush studio of one of
+the plugin's own brushes is open (or for the current brush, if the plugin's engine made it):
+
+| Function | Does |
+|---|---|
+| `brush_data_len() -> i32` | The brush's data's length, -1 for none |
+| `read_brush_data(to: i32) -> i32` | Writes the data at `to`: 1 if it did |
+| `write_brush_data(from: i32, len: i32) -> i32` | The brush's data from now on: 1 if taken |
+
+`plugins/krita-brushes` is one to start from: it reads Krita's presets and bundles, draws Krita's
+pixel brush, and edits a brush in a Krita brush studio of its own.
+
 ## Filters
 
 A filter shows under Adjustments in a Plugins row while its plugin is on. It redraws the current layer
@@ -1110,9 +1260,9 @@ and have `Plugins::with_bundled` add none. What was added stays, as if imported.
 a filter's function, what a filter is given, the kinds of control, and the app's functions. Interface
 2 added actions, permissions, panels, the picture of the `picker` hook and kinds of artwork; later,
 within it, the `key_shortcut` hook, panels that show keys or ask for a key press, and what a plugin
-keeps. Interface 3 added kinds of layer. What a
-hook calls stays as it's written here, and the app keeps every interface's template, so a plugin goes
-on working as it was written.
+keeps. Interface 3 added kinds of layer, and interface 4 brush engines, the `brush.data` permission
+and the utilities. What a hook calls stays as it's written here, and the app keeps every interface's
+template, so a plugin goes on working as it was written.
 
 Something that needs more uses a newer interface number, and an older app says it needs a newer
 ProCraft. So does an app that doesn't have a hook a plugin lists, or something `holds` names.

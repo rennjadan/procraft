@@ -38,6 +38,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
@@ -133,9 +134,11 @@ fun GuideOverlay(vm: CanvasViewModel) {
 
 /**
  * The guide editor over the canvas: its title with Cancel and Done, the colour bar, the canvas
- * fitted between them and the toolbar (kinds, look and assisted drawing), the guide's handles
- * dragged on the canvas, and the grid size typed on a keypad from its chip.
+ * moved into the middle and the toolbar (kinds, look and assisted drawing), the guide's handles
+ * dragged on the canvas (and the canvas moved and zoomed by two fingers), and the grid size typed
+ * on a keypad from its chip.
  */
+@OptIn(androidx.compose.ui.ExperimentalComposeUiApi::class)
 @Composable
 fun GuideEditor(vm: CanvasViewModel) {
     if (!vm.guideEditing) return
@@ -145,21 +148,12 @@ fun GuideEditor(vm: CanvasViewModel) {
     val open = keypad?.takeIf { g.kind == GuideType.GRID || g.kind == GuideType.ISOMETRIC }
     BackHandler(open != null) { keypad = null }
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        // the canvas: handles dragged, perspective points added; nothing paints
-        Box(Modifier.fillMaxSize().pointerInput(Unit) {
-            awaitEachGesture {
-                val down = awaitFirstDown()
-                down.consume()
-                val grab = vm.guideGrab(down.position)
-                while (true) {
-                    val ev = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                    if (!ev.pressed) break
-                    vm.guideDrag(grab, ev.position)
-                    ev.consume()
-                }
-            }
-        })
-        Box(Modifier.fillMaxWidth().height(82.dp).background(GuideTop)) {
+        // the canvas: its touches passed on to it as they come, where the shared touches drag the
+        // handles (a perspective tap adds a point) and move and zoom the view; nothing paints, and
+        // nothing under the editor takes them
+        Box(Modifier.fillMaxSize().pointerInteropFilter { e -> vm.canvasTouch?.invoke(e) ?: true })
+        // the bars take their own touches
+        Box(Modifier.fillMaxWidth().height(82.dp).background(GuideTop).pointerInput(Unit) { detectTapGestures { } }) {
             Text("Drawing Guides", color = GuideTitle, fontSize = 20.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.offset(32.dp, 27.dp))
             Row(Modifier.align(Alignment.TopEnd).padding(top = 20.dp, end = 20.dp), verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.size(73.dp, 43.dp).clip(CircleShape).background(GuideButton).border(1.dp, GuideButtonEdge, CircleShape).tap { vm.closeGuideEditor(keep = false) },
@@ -174,7 +168,7 @@ fun GuideEditor(vm: CanvasViewModel) {
         }
         ColorBar(g.hue, Modifier.offset(y = 84.dp)) { vm.setGuideLook(hue = it) }
         if (g.kind == GuideType.PERSPECTIVE && g.vanishing.isEmpty()) {
-            Box(Modifier.offset(y = 94.dp).fillMaxWidth().height(24.dp).background(GuideNote), contentAlignment = Alignment.Center) {
+            Box(Modifier.offset(y = 94.dp).fillMaxWidth().height(24.dp).background(GuideNote).pointerInput(Unit) { detectTapGestures { } }, contentAlignment = Alignment.Center) {
                 Text("Tap to create vanishing points", color = GuideTitle, fontSize = 12.sp, maxLines = 1)
             }
         }
