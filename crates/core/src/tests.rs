@@ -13835,3 +13835,37 @@ fn a_long_session_keeps_the_app_s_thread_quick() {
     assert!(last <= first * 4.0 + 2.0, "the app's thread's calls grew slower: 99% {first:.3} ms, then {last:.3} ms");
     assert!(most < crate::held::LONG_WAIT.as_secs_f64() * 1000.0, "a call on the app's thread took {most:.0} ms");
 }
+
+#[test]
+fn a_painted_layer_traced_becomes_a_vector_layer_that_looks_as_it_did_and_goes_back_to_pixels() {
+    let Some((s, _plugins, dir)) = vector_session(120, "trace") else { return };
+    let pixel = s.add_layer();
+    s.select_layer(pixel);
+    for y in [30.0, 60.0, 90.0] {
+        stroke_across(&s, y, 10.0, 110.0);
+    }
+    let before = layer_rgba(&s, pixel);
+    assert_eq!(s.plain_layer_ids().first(), Some(&pixel));
+    assert_eq!(s.vectorize_layer(pixel, VECTOR_KIND), Some(true));
+    assert_eq!(s.plugin_layer_kind(pixel).as_deref(), Some(VECTOR_KIND));
+    let items = vector_items(&s, pixel);
+    assert!(!items.is_empty() && items.iter().all(|i| i.region.is_some()), "{} items", items.len());
+    // laid again from the fills, it looks as it did: nearly every pixel's coverage close
+    let after = layer_rgba(&s, pixel);
+    let off = before
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(after.as_chunks::<4>().0)
+        .filter(|(a, b)| a[3].abs_diff(b[3]) > 96)
+        .count();
+    assert!(off * 100 < 120 * 120 * 3, "{off} pixels differ");
+    // a layer already vector isn't traced again; switched off, it is pixels as it shows
+    assert_eq!(s.vectorize_layer(pixel, VECTOR_KIND), Some(false));
+    // (the canvas's first layer, empty, is still plain)
+    assert_eq!(s.layers_of_kind(VECTOR_KIND.to_owned()), (1, 1));
+    assert_eq!(s.rasterize_layers_of(VECTOR_KIND.to_owned()), 1);
+    assert_eq!(s.plugin_layer_kind(pixel), None);
+    assert_eq!(layer_rgba(&s, pixel), after);
+    let _ = std::fs::remove_dir_all(&dir);
+}
