@@ -473,9 +473,10 @@ impl Interface {
     /// The interface for a frame. Escape closes what is open (each popover, panel, menu, alert and
     /// page sees to it, taking it with [`escape`]); one nothing took turns the canvas back upright,
     /// unless it only let go of a field (egui drops the field's keys as the frame begins).
-    /// In full screen, whether the taskbar is swiped in from the top edge (else the bottom).
-    pub fn taskbar_from_top(&self) -> bool {
-        self.prefs.taskbar_from_top
+    /// In full screen, the edge the taskbar is swiped in from: the top (true) or the bottom, or
+    /// none with the swipe off.
+    pub fn taskbar_swipe(&self) -> Option<bool> {
+        self.prefs.taskbar_swipe.then_some(self.prefs.taskbar_from_top)
     }
 
     pub fn show(&mut self, ui: &mut Ui, session: &std::sync::Arc<CanvasSession>, input: &mut Input) {
@@ -2542,7 +2543,6 @@ impl Interface {
                         self.open = None;
                     }
                     Some(Act::About) => crate::files::about(),
-                    Some(Act::CheckUpdates) => crate::update::check_now(),
                     Some(Act::GestureControls) => {
                         self.open = None;
                         self.gesture_controls.open = true;
@@ -2582,7 +2582,7 @@ impl Interface {
                         | Act::PenCross
                         | Act::SharpLayers
                         | Act::TaskbarEdge
-                        | Act::UpdatesMode
+                        | Act::TaskbarSwipe
                         | Act::ProjectCanvas
                         | Act::ResetInput,
                     )

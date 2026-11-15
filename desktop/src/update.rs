@@ -2,7 +2,7 @@
 //! (`PROCRAFT_UPDATE_REPO` and its build number `PROCRAFT_BUILD`, given by the build workflow,
 //! whose builds are Renn's version with the original developer's newest work merged in).
 //!
-//! Prefs' Updates setting says what happens when a newer build is out:
+//! The Updates setting (the gallery's + list) says what happens when a newer build is out:
 //! - Automatic (as it starts): it is downloaded quietly, and installed when ProCraft closes.
 //! - Ask first: ProCraft asks; yes saves, closes, installs and opens it again.
 //! - Off: nothing, unless Check for updates now is tapped (which asks).
@@ -44,9 +44,24 @@ static APP: OnceLock<(Arc<Window>, EventLoopProxy<()>)> = OnceLock::new();
 /// How long between looks while the app stays open.
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Prefs' Updates setting.
-pub fn set_mode(mode: u8) {
-    MODE.store(mode.min(OFF), Ordering::Relaxed);
+/// The Updates setting (in the gallery's + list), kept between runs ("updates" in the app's
+/// folder).
+pub fn mode() -> u8 {
+    static READ: std::sync::Once = std::sync::Once::new();
+    READ.call_once(|| {
+        let kept = std::fs::read_to_string(crate::files::app_dir().join("updates")).unwrap_or_default();
+        if let Ok(m) = kept.trim().parse::<u8>() {
+            MODE.store(m.min(OFF), Ordering::Relaxed);
+        }
+    });
+    MODE.load(Ordering::Relaxed)
+}
+
+/// The Updates setting on to the next: Automatic, Ask first, Off.
+pub fn next_mode() {
+    let next = (mode() + 1) % 3;
+    MODE.store(next, Ordering::Relaxed);
+    crate::files::keep_text("updates", &format!("{next}\n"));
 }
 
 /// Whether the app should close now for an update (asked once).
@@ -68,14 +83,14 @@ fn built() -> Option<(u64, &'static str)> {
 
 /// Starts looking, a moment after the app opens and then every few hours, on a thread of its own.
 pub fn start(window: Arc<Window>, wake: EventLoopProxy<()>) {
+    let _ = APP.set((window, wake));
     if !available() || std::env::var_os("PROCRAFT_BACKGROUND").is_some() {
         return;
     }
-    let _ = APP.set((window, wake));
     let spawned = std::thread::Builder::new().name("procraft-update".to_owned()).spawn(|| {
         std::thread::sleep(Duration::from_secs(8));
         loop {
-            if MODE.load(Ordering::Relaxed) != OFF {
+            if mode() != OFF {
                 look(false);
             }
             std::thread::sleep(EVERY);
@@ -86,7 +101,7 @@ pub fn start(window: Arc<Window>, wake: EventLoopProxy<()>) {
     }
 }
 
-/// Check for updates now (Prefs): it says what it found, and asks before installing.
+/// Check for updates (the gallery's + list): it says what it found, and asks before installing.
 pub fn check_now() {
     if !available() {
         say("This copy of ProCraft doesn't update itself (it wasn't built for updates).");
@@ -94,6 +109,26 @@ pub fn check_now() {
     }
     if let Err(e) = std::thread::Builder::new().name("procraft-update-now".to_owned()).spawn(|| look(true)) {
         log::warn!("update: {e}");
+    }
+}
+
+/// Closes the app as its close button would and opens it again (the artworks' folder moved).
+pub fn restart() {
+    let reopened = std::env::current_exe()
+        .map_err(|e| e.to_string())
+        .and_then(|exe| {
+            spawn_hidden(&format!(
+                "Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; Start-Process -FilePath '{}'",
+                std::process::id(),
+                quoted(&exe.to_string_lossy())
+            ))
+        });
+    match (reopened, APP.get()) {
+        (Ok(()), Some((_, wake))) if cfg!(windows) => {
+            READY.store(true, Ordering::Relaxed);
+            let _ = wake.send_event(());
+        }
+        _ => say("Close and open ProCraft again to use the new folder."),
     }
 }
 
@@ -156,7 +191,7 @@ fn look_once(asked: bool) -> Result<(), String> {
         }
         return Ok(());
     }
-    let automatic = !asked && MODE.load(Ordering::Relaxed) == AUTOMATIC;
+    let automatic = !asked && mode() == AUTOMATIC;
     if !automatic
         && !question(&format!(
             "A new version of ProCraft is ready.\n\nInstall it now? ProCraft will save, close, update \

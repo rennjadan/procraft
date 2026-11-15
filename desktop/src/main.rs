@@ -447,9 +447,9 @@ impl ApplicationHandler for App {
             self.projection_event(event);
             return;
         }
-        let from_top = self.ui.taskbar_from_top();
+        let edge = self.ui.taskbar_swipe();
         let events = match self.screen.as_ref() {
-            Some(screen) => self.full.event(&screen.window, event, from_top),
+            Some(screen) => self.full.event(&screen.window, event, edge),
             None => vec![event],
         };
         // the veil following a finger, or easing, wants frames

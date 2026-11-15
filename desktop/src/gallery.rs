@@ -43,6 +43,11 @@ const LIGHT_CHIP: u32 = 0xFFD6D6D6;
 /// "New canvas" (21 above it, 20 below), and the presets' most before they scroll.
 const NEW_HEADER: f32 = 21.0 + 31.0 + 20.0;
 const PRESETS_MOST: f32 = 376.0;
+/// Above the New canvas list, apart from it: the app's own rows (updates and the artworks'
+/// folder), each this tall, and all they take with the gap under them.
+const APP_ROWS: usize = 4;
+const APP_ROW: f32 = 44.0;
+const APP_SECTION: f32 = 14.0 + APP_ROWS as f32 * APP_ROW + 4.0;
 /// A preset row swiped left: how far it slides, and the Edit and Delete it shows.
 const PRESET_REVEAL: f32 = 159.0;
 const PRESET_BEHIND: u32 = 0xFFD6D6D6;
@@ -337,7 +342,7 @@ const DROPPED: (f32, f32) = (1.0, 0.25);
 
 impl Gallery {
     pub fn new() -> Gallery {
-        let store = ArtworkStore::open(crate::files::app_dir().join("artworks").to_string_lossy().into_owned());
+        let store = ArtworkStore::open(crate::files::artworks_dir().to_string_lossy().into_owned());
         let presets = presets_from_json(std::fs::read_to_string(presets_path()).ok());
         let mut gallery = Gallery {
             store,
@@ -1848,15 +1853,64 @@ impl Gallery {
         let list_height = (45.0 + 45.0 * self.presets.len().saturating_sub(1) as f32).min(PRESETS_MOST);
         // a row more for each kind of artwork a plugin makes
         let kinds_height = self.kinds.len() as f32 * (9.5 + 38.0);
-        let height = panel::ARROW_HEIGHT + NEW_HEADER + 38.0 + 9.5 + list_height + kinds_height + 30.0;
+        let height = panel::ARROW_HEIGHT + APP_SECTION + NEW_HEADER + 38.0 + 9.5 + list_height + kinds_height + 30.0;
         let rect = Rect::from_min_size(pos2(left, screen.top() + 56.5), vec2(NEW_WIDTH, height));
         let mut asked = None;
         let mut close = false;
         egui::Area::new(Id::unique("new canvas")).fixed_pos(screen.min).order(Order::Foreground).show(ctx, |ui| {
             close = ui.allocate_rect(screen, Sense::click()).clicked();
             ui.interact(rect, ui.scope_id().with("panel"), Sense::click_and_drag());
-            let body = panel::solid_frame(ui, look, "new canvas", rect, arrow, false, 32.0, LIGHT_PANEL);
+            let framed = panel::solid_frame(ui, look, "new canvas", rect, arrow, false, 32.0, LIGHT_PANEL);
             let ink = argb(LIGHT_TEXT);
+            // the app's own rows first, apart from making a canvas: updates and the artworks' folder
+            let group = Rect::from_min_size(
+                pos2(framed.left() + 9.0, framed.top() + 14.0),
+                vec2(NEW_WIDTH - 18.0, APP_ROWS as f32 * APP_ROW),
+            );
+            ui.painter().rect_filled(group, 19.0, argb(LIGHT_ROW));
+            let folder_name = crate::files::artworks_dir()
+                .parent()
+                .and_then(|p| p.file_name())
+                .map_or_else(|| "ProCraft".to_owned(), |n| n.to_string_lossy().into_owned());
+            let rows: [(&str, String); APP_ROWS] = [
+                ("Check for updates", String::new()),
+                ("Updates", crate::update::mode_name(crate::update::mode()).to_owned()),
+                ("Artwork folder", folder_name),
+                ("Open artwork folder", String::new()),
+            ];
+            for (k, (label, value)) in rows.iter().enumerate() {
+                let line = Rect::from_min_size(
+                    pos2(group.left(), group.top() + k as f32 * APP_ROW),
+                    vec2(group.width(), APP_ROW),
+                );
+                if k > 0 {
+                    let edge =
+                        Rect::from_min_size(pos2(line.left() + 16.0, line.top()), vec2(line.width() - 16.0, 1.0));
+                    ui.painter().rect_filled(edge, 0, argb(LIGHT_SEPARATOR));
+                }
+                let mut right = line.right() - 16.0;
+                if !value.is_empty() {
+                    let galley = one_line(ui, value, 15.0, Weight::Regular, argb(SIZE), 150.0);
+                    right -= galley.size().x;
+                    ui.painter().galley(pos2(right, line.center().y - galley.size().y / 2.0), galley, ink);
+                }
+                let galley = one_line(ui, label, 17.0, Weight::Regular, ink, right - 8.0 - (line.left() + 17.0));
+                ui.painter().galley(pos2(line.left() + 17.0, line.center().y - galley.size().y / 2.0), galley, ink);
+                if ui.interact(line, ui.scope_id().with(("app row", k)), Sense::click()).clicked() {
+                    match k {
+                        0 => crate::update::check_now(),
+                        1 => crate::update::next_mode(),
+                        2 => {
+                            if crate::files::choose_artworks_dir() {
+                                crate::update::restart();
+                            }
+                        }
+                        _ => crate::files::open_artworks_dir(),
+                    }
+                }
+            }
+            // the New canvas list under them
+            let body = Rect::from_min_max(pos2(framed.left(), framed.top() + APP_SECTION), framed.max);
             text(
                 ui.painter(),
                 pos2(body.left() + 23.0, body.top() + 21.0),

@@ -125,10 +125,8 @@ pub enum Act {
     SharpLayers,
     /// The edge the taskbar is swiped in from in full screen: the top or the bottom.
     TaskbarEdge,
-    /// Updates: Automatic, Ask first or Off, in turn.
-    UpdatesMode,
-    /// Looks for an update now.
-    CheckUpdates,
+    /// The taskbar swipe in full screen on or off.
+    TaskbarSwipe,
     ProjectCanvas,
     ResetInput,
 }
@@ -388,6 +386,14 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
             let visibility = prefs.selection_visibility;
             vec![
                 vec![
+                    Switch("Swipe to show taskbar", prefs.taskbar_swipe, Some(Act::TaskbarSwipe)),
+                    Button(
+                        "Taskbar swipe from",
+                        Some(if prefs.taskbar_from_top { "Top" } else { "Bottom" }),
+                        prefs.taskbar_swipe.then_some(Act::TaskbarEdge),
+                    ),
+                ],
+                vec![
                     Switch("Light interface", prefs.light_interface, Some(Act::LightInterface)),
                     Switch("Right-hand interface", prefs.right_handed, Some(Act::RightHanded)),
                     Button(
@@ -397,6 +403,7 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     ),
                     Switch("Project canvas", prefs.project_canvas, Some(Act::ProjectCanvas)),
                     Switch("Brush cursor", prefs.brush_cursor, Some(Act::BrushCursor)),
+                    Switch("Pen crosshair (+)", prefs.pen_cross, Some(Act::PenCross)),
                     Button("Advanced cursor settings", None, Some(Act::Page(Page::Cursor))),
                 ],
                 vec![
@@ -404,13 +411,6 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     Button("Gesture controls", None, Some(Act::GestureControls)),
                     Button("Plugins", None, Some(Act::Page(Page::Plugins))),
                     Switch("Sharp vector layers when zoomed", prefs.sharp_layers, Some(Act::SharpLayers)),
-                    Button("Updates", Some(crate::update::mode_name(prefs.updates)), Some(Act::UpdatesMode)),
-                    Button("Check for updates now", None, Some(Act::CheckUpdates)),
-                    Button(
-                        "Taskbar swipe",
-                        Some(if prefs.taskbar_from_top { "From top" } else { "From bottom" }),
-                        Some(Act::TaskbarEdge),
-                    ),
                 ],
                 vec![
                     Slide(
@@ -610,8 +610,7 @@ impl Actions {
                         let rows = 20.0
                             + group_height(&smoothing_rows(prefs))
                             + 16.0
-                            + 2.0 * ROW_HEIGHT
-                            + 1.0
+                            + ROW_HEIGHT
                             + 24.0
                             + 19.0
                             + curve
@@ -706,14 +705,15 @@ impl Actions {
                 prefs.sharp_layers = !prefs.sharp_layers;
                 Some(Act::Prefs)
             }
+            Some(Tapped::Act(Act::TaskbarSwipe)) => {
+                prefs.taskbar_swipe = !prefs.taskbar_swipe;
+                Some(Act::Prefs)
+            }
             Some(Tapped::Act(Act::TaskbarEdge)) => {
                 prefs.taskbar_from_top = !prefs.taskbar_from_top;
                 Some(Act::Prefs)
             }
-            Some(Tapped::Act(Act::UpdatesMode)) => {
-                prefs.updates = (prefs.updates.min(crate::update::OFF) + 1) % 3;
-                Some(Act::Prefs)
-            }
+
             Some(Tapped::Act(Act::ProjectCanvas)) => {
                 prefs.project_canvas = !prefs.project_canvas;
                 Some(Act::Prefs)
@@ -1085,10 +1085,7 @@ impl Actions {
                     ui.add_space(16.0);
                     // with no filtering it has nothing to do
                     let can = (prefs.motion_filtering > 0.0).then_some(Act::TipAttachment);
-                    let tip = [
-                        Row::Switch("Tip Attachment", prefs.tip_attached, can),
-                        Row::Switch("Pen crosshair", prefs.pen_cross, Some(Act::PenCross)),
-                    ];
+                    let tip = [Row::Switch("Tip Attachment", prefs.tip_attached, can)];
                     tapped = tapped.or(group_view(ui, &tip, 1, &mut self.swipes).0);
                     ui.add_space(24.0);
                     let (label, _) = ui.allocate_exact_size(vec2(width, 19.0), Sense::hover());

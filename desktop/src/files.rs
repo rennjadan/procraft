@@ -143,6 +143,73 @@ fn first_use(dir: &Path, old: &Path) {
     }
 }
 
+/// Where the gallery's artworks are kept: the folder chosen in the gallery's + list, else
+/// "artworks" in the app's folder. One chosen since the last run takes what was in the last one
+/// with it (copied, then the old taken away), before the gallery reads it.
+pub fn artworks_dir() -> PathBuf {
+    let usual = app_dir().join("artworks");
+    let text = std::fs::read_to_string(app_dir().join(ARTWORKS_FOLDER)).unwrap_or_default();
+    let line = |key: &str| text.lines().find_map(|l| l.strip_prefix(key)).map(|p| PathBuf::from(p.trim()));
+    let Some(to) = line("path ").filter(|p| !p.as_os_str().is_empty()) else { return usual };
+    if let Some(from) = line("from ") {
+        let apart = !to.starts_with(&from) && !from.starts_with(&to);
+        if apart && from.is_dir() {
+            match copy_tree(&from, &to) {
+                Ok(()) => {
+                    if let Err(e) = std::fs::remove_dir_all(&from) {
+                        log::warn!("taking away {} after moving it: {e}", from.display());
+                    }
+                }
+                Err(e) => {
+                    log::warn!("moving the artworks to {}: {e}", to.display());
+                    return from;
+                }
+            }
+        }
+        keep_text(ARTWORKS_FOLDER, &format!("path {}\n", to.display()));
+    }
+    let _ = std::fs::create_dir_all(&to);
+    to
+}
+
+/// The file naming the folder chosen for the artworks.
+const ARTWORKS_FOLDER: &str = "artworks_folder";
+
+/// Asks for a folder for the gallery's artworks; true if one was chosen, the artworks to move
+/// there when the app next opens (a "ProCraft Artworks" folder inside it, kept apart).
+pub fn choose_artworks_dir() -> bool {
+    let Some(picked) = rfd::FileDialog::new().set_title("Choose where ProCraft keeps your artworks").pick_folder()
+    else {
+        return false;
+    };
+    let to = if picked.file_name().is_some_and(|n| n == "ProCraft Artworks") {
+        picked
+    } else {
+        picked.join("ProCraft Artworks")
+    };
+    let from = artworks_dir();
+    if to == from {
+        return false;
+    }
+    keep_text(ARTWORKS_FOLDER, &format!("path {}\nfrom {}\n", to.display(), from.display()));
+    true
+}
+
+/// Shows the artworks' folder in the system's file manager.
+pub fn open_artworks_dir() {
+    let dir = artworks_dir();
+    let opener = if cfg!(windows) {
+        "explorer"
+    } else if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
+        log::warn!("opening {}: {e}", dir.display());
+    }
+}
+
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for entry in std::fs::read_dir(from)? {

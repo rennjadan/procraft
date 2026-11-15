@@ -13,8 +13,9 @@ use winit::window::Window;
 
 use crate::files;
 
-/// How far in from the edge a swipe has to start (points).
-const EDGE_ZONE: f64 = 24.0;
+/// How far in from the edge a swipe has to start (points): a little way in, as Windows keeps the
+/// very edge for its own swipes.
+const EDGE_ZONE: f64 = 44.0;
 /// How far in it travels before it counts as a pull and not a tap (points).
 const PULL_START: f64 = 10.0;
 /// How far in a pull goes to bring the veil all the way (points), and the part of that past which
@@ -128,6 +129,7 @@ impl FullScreen {
 
     /// The taskbar up, the veil easing the rest of the way in.
     fn reveal(&mut self) {
+        log::info!("taskbar swipe: the taskbar shown");
         self.revealed = true;
         self.returned = None;
         self.settle_to(1.0, EASE_IN_S);
@@ -157,12 +159,13 @@ impl FullScreen {
     /// Watches the touches (a pen's too) and clicks for the pull in from the edge and for the app
     /// being used again. Returns the events for the app: none while a touch is held back, those
     /// held back once it turns out not to be a pull, or the event as it came.
-    pub(crate) fn event(&mut self, window: &Window, event: WindowEvent, from_top: bool) -> Vec<WindowEvent> {
-        if !self.wanted || window.fullscreen().is_none() {
+    /// `edge` is the edge the swipe comes from: the top (true) or the bottom, or none with it off.
+    pub(crate) fn event(&mut self, window: &Window, event: WindowEvent, edge: Option<bool>) -> Vec<WindowEvent> {
+        let Some(from_top) = edge.filter(|_| self.wanted && window.fullscreen().is_some()) else {
             self.edge = None;
             self.pull = None;
             return vec![event];
-        }
+        };
         let points = window.scale_factor().max(0.1);
         let height = f64::from(window.inner_size().height);
         // how far in from the edge `at` is, from `start`
@@ -241,6 +244,7 @@ impl FullScreen {
                         return Vec::new();
                     }
                     if self.edge.is_none() && self.pull.is_none() && in_zone(t.location) {
+                        log::info!("taskbar swipe: a touch at the edge ({:.0}, {:.0})", t.location.x, t.location.y);
                         self.edge = Some(Edge { id: t.id, start: t.location, held: vec![event] });
                         return Vec::new();
                     }
