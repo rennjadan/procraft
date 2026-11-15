@@ -466,6 +466,11 @@ impl Interface {
     /// The interface for a frame. Escape closes what is open (each popover, panel, menu, alert and
     /// page sees to it, taking it with [`escape`]); one nothing took turns the canvas back upright,
     /// unless it only let go of a field (egui drops the field's keys as the frame begins).
+    /// In full screen, whether the taskbar is swiped in from the top edge (else the bottom).
+    pub fn taskbar_from_top(&self) -> bool {
+        self.prefs.taskbar_from_top
+    }
+
     pub fn show(&mut self, ui: &mut Ui, session: &std::sync::Arc<CanvasSession>, input: &mut Input) {
         let typing = self.typing;
         self.show_frame(ui, session, input);
@@ -2538,6 +2543,7 @@ impl Interface {
                         | Act::BrushCursor
                         | Act::PenCross
                         | Act::SharpLayers
+                        | Act::TaskbarEdge
                         | Act::ProjectCanvas
                         | Act::ResetInput,
                     )

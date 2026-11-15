@@ -442,12 +442,116 @@ impl ApplicationHandler for App {
             self.projection_event(event);
             return;
         }
-        let Some(event) = (match self.screen.as_ref() {
-            Some(screen) => self.full.event(&screen.window, event),
-            None => Some(event),
-        }) else {
+        let from_top = self.ui.taskbar_from_top();
+        let events = match self.screen.as_ref() {
+            Some(screen) => self.full.event(&screen.window, event, from_top),
+            None => vec![event],
+        };
+        // the veil following a finger, or easing, wants frames
+        if self.full.moving()
+            && let Some(screen) = &self.screen
+        {
+            screen.window.request_redraw();
+        }
+        for event in events {
+            self.app_event(event_loop, event);
+        }
+    }
+
+    /// A pen read by the app itself moved: its touches and hovering, as winit's would come.
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, (): ()) {
+        // (the start's watch asks too)
+        startup::answered();
+        let Some(window) = self.screen.as_ref().map(|s| (s.window.id(), s.window.scale_factor())) else { return };
+        for event in pen::take_events(window.1) {
+            self.window_event(event_loop, window.0, event);
+        }
+    }
+
+    /// The app ending without its window closed first (a Mac's Quit, from the app menu or
+    /// Cmd+Q, ends it with no close asked): the artwork open kept as closing the window keeps it.
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // the backend did its run: the next starts on it again
+        startup::gpu_ended();
+        // before winit closes the connection the pen is read on
+        pen::stop();
+        if std::mem::replace(&mut self.closed, true) {
+            return;
+        }
+        self.hide_while_opening();
+        if !self.leave_artwork() {
+            log::error!("the artwork open couldn't be kept as the app ended");
+        }
+        files::finish_writing();
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // files opened from the Finder meanwhile come in as files dropped on the window do
+        #[cfg(target_os = "macos")]
+        {
+            let opened = finder::take();
+            if !opened.is_empty() {
+                self.dropped.extend(opened);
+                if let Some(screen) = &self.screen {
+                    screen.window.request_redraw();
+                }
+            }
+        }
+        if self.screen.as_ref().is_some_and(|s| s.gpu.is_lost()) {
+            self.gpu_lost(event_loop);
+            return;
+        }
+        if let Some(fine) = self.screen.as_mut().and_then(Screen::canvases_made) {
+            self.canvases_made(fine, event_loop);
+            // the gallery's note that they are being made goes
+            if let Some(screen) = &self.screen {
+                screen.window.request_redraw();
+            }
+        }
+        // what the files written meanwhile had to say; looked at again soon while any is writing
+        files::tell_what_was_told();
+        if files::still_writing() {
+            let soon = Instant::now() + Duration::from_millis(250);
+            self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
+        }
+        self.sync_projection(event_loop);
+        let Some(screen) = self.screen.as_ref() else { return };
+        let Some(session) = self.session.as_ref() else {
+            // the gallery: only the interface's own wants
+            match self.again {
+                Some(due) if Instant::now() >= due => screen.window.request_redraw(),
+                Some(due) => {
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(due));
+                    return;
+                }
+                None => {}
+            }
+            event_loop.set_control_flow(ControlFlow::Wait);
             return;
         };
+        let mut deadline = self.input.next_deadline(session);
+        // the touches' waits (a hold, a repeat) run out
+        if self.input.tick(session) || !self.input.commands.is_empty() {
+            screen.window.request_redraw();
+        } else if let Some(due) =
+            self.again.or_else(|| (session.wants_frame() && !screen.minimised()).then(Instant::now))
+        {
+            // what moves by itself (the selection's bands, a fade) draws once a refresh, not as
+            // fast as frames can be made
+            let due = due.max(self.last_frame + frame_gap(&screen.window));
+            if Instant::now() >= due {
+                screen.window.request_redraw();
+            } else {
+                deadline = Some(deadline.map_or(due, |d| d.min(due)));
+            }
+        }
+        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
+    }
+}
+
+impl App {
+    /// A window event for the app itself, past the full screen's swipe.
+    fn app_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         let Some(event) = self.tap_assist(event) else { return };
         let Some(screen) = self.screen.as_mut() else { return };
         let session = self.session.clone();
@@ -549,98 +653,6 @@ impl ApplicationHandler for App {
         }
     }
 
-    /// A pen read by the app itself moved: its touches and hovering, as winit's would come.
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, (): ()) {
-        // (the start's watch asks too)
-        startup::answered();
-        let Some(window) = self.screen.as_ref().map(|s| (s.window.id(), s.window.scale_factor())) else { return };
-        for event in pen::take_events(window.1) {
-            self.window_event(event_loop, window.0, event);
-        }
-    }
-
-    /// The app ending without its window closed first (a Mac's Quit, from the app menu or
-    /// Cmd+Q, ends it with no close asked): the artwork open kept as closing the window keeps it.
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        // the backend did its run: the next starts on it again
-        startup::gpu_ended();
-        // before winit closes the connection the pen is read on
-        pen::stop();
-        if std::mem::replace(&mut self.closed, true) {
-            return;
-        }
-        self.hide_while_opening();
-        if !self.leave_artwork() {
-            log::error!("the artwork open couldn't be kept as the app ended");
-        }
-        files::finish_writing();
-    }
-
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // files opened from the Finder meanwhile come in as files dropped on the window do
-        #[cfg(target_os = "macos")]
-        {
-            let opened = finder::take();
-            if !opened.is_empty() {
-                self.dropped.extend(opened);
-                if let Some(screen) = &self.screen {
-                    screen.window.request_redraw();
-                }
-            }
-        }
-        if self.screen.as_ref().is_some_and(|s| s.gpu.is_lost()) {
-            self.gpu_lost(event_loop);
-            return;
-        }
-        if let Some(fine) = self.screen.as_mut().and_then(Screen::canvases_made) {
-            self.canvases_made(fine, event_loop);
-            // the gallery's note that they are being made goes
-            if let Some(screen) = &self.screen {
-                screen.window.request_redraw();
-            }
-        }
-        // what the files written meanwhile had to say; looked at again soon while any is writing
-        files::tell_what_was_told();
-        if files::still_writing() {
-            let soon = Instant::now() + Duration::from_millis(250);
-            self.again = Some(self.again.map_or(soon, |due| due.min(soon)));
-        }
-        self.sync_projection(event_loop);
-        let Some(screen) = self.screen.as_ref() else { return };
-        let Some(session) = self.session.as_ref() else {
-            // the gallery: only the interface's own wants
-            match self.again {
-                Some(due) if Instant::now() >= due => screen.window.request_redraw(),
-                Some(due) => {
-                    event_loop.set_control_flow(ControlFlow::WaitUntil(due));
-                    return;
-                }
-                None => {}
-            }
-            event_loop.set_control_flow(ControlFlow::Wait);
-            return;
-        };
-        let mut deadline = self.input.next_deadline(session);
-        // the touches' waits (a hold, a repeat) run out
-        if self.input.tick(session) || !self.input.commands.is_empty() {
-            screen.window.request_redraw();
-        } else if let Some(due) =
-            self.again.or_else(|| (session.wants_frame() && !screen.minimised()).then(Instant::now))
-        {
-            // what moves by itself (the selection's bands, a fade) draws once a refresh, not as
-            // fast as frames can be made
-            let due = due.max(self.last_frame + frame_gap(&screen.window));
-            if Instant::now() >= due {
-                screen.window.request_redraw();
-            } else {
-                deadline = Some(deadline.map_or(due, |d| d.min(due)));
-            }
-        }
-        event_loop.set_control_flow(deadline.map_or(ControlFlow::Wait, ControlFlow::WaitUntil));
-    }
-}
-
-impl App {
     /// Shows `session` in the window, in place of the artwork open.
     fn show(&mut self, session: Arc<CanvasSession>) {
         let Some(screen) = self.screen.as_mut() else { return };
@@ -758,8 +770,10 @@ impl App {
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
         let raw = screen.egui.take_egui_input(&screen.window);
+        let full = &self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
+            full.paint(ui.ctx());
             // opening: the gallery over it, growing from the artwork's picture
             if let Some(zoom) = self.zoom.as_ref().filter(|z| z.opening) {
                 zoom.over_canvas(ui.ctx(), &mut self.gallery, &mut self.ui.look);
@@ -839,8 +853,10 @@ impl App {
         let waited = screen.canvases_waited();
         // (on OpenGL from the first frame, which stays while they are made)
         let getting_ready = waited.is_some_and(|w| w >= CANVASES_SLOW) || screen.canvases_later();
+        let full = &self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             interface.style_once(ui.ctx());
+            full.paint(ui.ctx());
             // closing: the gallery settling back into place, the canvas fading over it
             // otherwise in its place (a closing zoom cut short leaves nothing behind)
             match closing {

@@ -123,6 +123,8 @@ pub enum Act {
     PenCross,
     /// Vector layers drawn again sharp when zoomed in, or left as their pixels.
     SharpLayers,
+    /// The edge the taskbar is swiped in from in full screen: the top or the bottom.
+    TaskbarEdge,
     ProjectCanvas,
     ResetInput,
 }
@@ -398,6 +400,11 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     Button("Gesture controls", None, Some(Act::GestureControls)),
                     Button("Plugins", None, Some(Act::Page(Page::Plugins))),
                     Switch("Sharp vector layers when zoomed", prefs.sharp_layers, Some(Act::SharpLayers)),
+                    Button(
+                        "Taskbar swipe",
+                        Some(if prefs.taskbar_from_top { "From top" } else { "From bottom" }),
+                        Some(Act::TaskbarEdge),
+                    ),
                 ],
                 vec![
                     Slide(
@@ -679,6 +686,10 @@ impl Actions {
             }
             Some(Tapped::Act(Act::SharpLayers)) => {
                 prefs.sharp_layers = !prefs.sharp_layers;
+                Some(Act::Prefs)
+            }
+            Some(Tapped::Act(Act::TaskbarEdge)) => {
+                prefs.taskbar_from_top = !prefs.taskbar_from_top;
                 Some(Act::Prefs)
             }
             Some(Tapped::Act(Act::ProjectCanvas)) => {
