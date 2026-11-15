@@ -1229,6 +1229,18 @@ impl Document {
         id
     }
 
+    /// Makes plain painted layer `id` a layer of a plugin's `kind` with `data` (its pixels as they
+    /// are, to be laid again from the data): false if it isn't a plain painted layer.
+    pub fn make_plugin_layer(&mut self, id: LayerId, kind: String, data: Option<std::sync::Arc<Vec<u8>>>) -> bool {
+        match self.layer_mut(id) {
+            Some(l) if l.kind == LayerKind::Paint && l.text.is_none() && l.plugin.is_none() => {
+                l.plugin = Some(PluginLayer { kind, data });
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Keeps `data` as the plugin's data for its layer `id`; false if `id` isn't a plugin's layer.
     pub fn set_plugin_data(&mut self, id: LayerId, data: Option<std::sync::Arc<Vec<u8>>>) -> bool {
         self.layer_mut(id).and_then(|l| l.plugin.as_mut()).map(|p| p.data = data).is_some()

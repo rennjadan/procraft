@@ -89,6 +89,7 @@ mod text_draw;
 mod text_runs;
 mod timelapse;
 mod touch;
+mod trace;
 mod transform;
 mod tween;
 #[cfg(target_os = "android")]

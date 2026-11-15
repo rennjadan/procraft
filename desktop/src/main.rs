@@ -280,6 +280,7 @@ fn main() {
         interface_touches: input::InterfaceTouches::default(),
         closed: false,
         full: full_screen::FullScreen::kept(),
+        vectorizing: None,
     };
     // a panic on the window's thread ends the app: said, rather than the window just vanishing
     // (its message and place are in the log already)
@@ -348,6 +349,17 @@ struct App {
     /// Full screen as F11 makes it, the taskbar covered, and a swipe up from the bottom edge to
     /// show the taskbar for a while (see [`FullScreen`]).
     full: full_screen::FullScreen,
+    /// The artwork being traced into vector layers, a layer a frame (see [`App::vectorize_step`]).
+    vectorizing: Option<Vectorizing>,
+}
+
+/// Tracing an artwork's layers into vector ones: the vector kind, the layers left (top first),
+/// how many there were, and whether its veil has shown yet (so the first layer waits a frame).
+struct Vectorizing {
+    kind: String,
+    left: Vec<u64>,
+    total: usize,
+    shown: bool,
 }
 
 /// The app's icon, for the window's title bar and the task bar.
@@ -584,6 +596,68 @@ impl ApplicationHandler for App {
 }
 
 impl App {
+    /// Vector Artwork switched on: the artwork saved, a copy of it made beside it named
+    /// "<its name> Vector" and opened in its place, and its layers traced there one a frame (the
+    /// original stays as it was).
+    fn vectorize_start(&mut self, session: &Arc<CanvasSession>, kind: String) {
+        let left = session.plain_layer_ids();
+        if left.is_empty() {
+            self.ui.layers_notice("No layers to make vector".into());
+            return;
+        }
+        if !self.keep_artwork() {
+            return;
+        }
+        let Some(dir) = self.artwork.clone() else { return };
+        let store = Arc::clone(&self.gallery.store);
+        let copy = store.duplicate(dir.clone());
+        let parent = std::path::Path::new(&dir).parent().map(|p| p.to_string_lossy().into_owned());
+        let folder = parent.filter(|p| *p != store.root());
+        let name = store
+            .list(folder)
+            .into_iter()
+            .find_map(|e| match e {
+                procraft_core::GalleryEntry::Artwork { artwork } if artwork.dir == dir => Some(artwork.name),
+                _ => None,
+            })
+            .unwrap_or_else(|| "Untitled Artwork".to_owned());
+        store.rename(copy.clone(), format!("{} Vector", name.trim()));
+        // the copy is what is open from now on (saved as it changes there)
+        session.stop_autosave();
+        Arc::clone(session).start_autosave(copy.clone());
+        self.ui.artwork_dir = Some(copy.clone());
+        self.artwork = Some(copy);
+        self.gallery.refresh();
+        let total = left.len();
+        self.vectorizing = Some(Vectorizing { kind, left, total, shown: false });
+    }
+
+    /// The next layer traced (after the veil saying so has shown); at the end, saved and said.
+    fn vectorize_step(&mut self, session: &Arc<CanvasSession>) {
+        let Some(v) = self.vectorizing.as_mut() else { return };
+        if !std::mem::replace(&mut v.shown, true) {
+            self.again = Some(Instant::now());
+            return;
+        }
+        if let Some(id) = v.left.first().copied() {
+            v.left.remove(0);
+            if session.vectorize_layer(id, &v.kind).is_none() {
+                // the plugin isn't on, or stopped: what is done stays
+                v.left.clear();
+            }
+            self.again = Some(Instant::now());
+            return;
+        }
+        let total = v.total;
+        self.vectorizing = None;
+        self.keep_artwork();
+        self.gallery.refresh();
+        self.ui.layers_notice(format!(
+            "Saved as a Vector copy: {total} layer{} made vector",
+            if total == 1 { "" } else { "s" }
+        ));
+    }
+
     /// A window event for the app itself, past the full screen's swipe.
     fn app_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
         let Some(event) = self.tap_assist(event) else { return };
@@ -765,7 +839,9 @@ impl App {
         self.imported();
         self.artwork_read();
         self.photo_read();
-        let Some(screen) = self.screen.as_mut() else { return };
+        if self.screen.is_none() {
+            return;
+        }
         let Some(session) = self.session.clone() else {
             self.gallery_frame();
             return;
@@ -783,6 +859,23 @@ impl App {
         {
             self.ui.share_animated_from_gallery(format);
         }
+        // the Layers menu's Vector Artwork switched, and a layer traced a frame meanwhile
+        if self.opening.is_none()
+            && let Some((on, kind)) = self.ui.take_vector_request()
+        {
+            if on {
+                self.vectorize_start(&session, kind);
+            } else {
+                let n = session.rasterize_layers_of(kind);
+                self.ui.layers_notice(format!("{n} layer{} made pixels again", if n == 1 { "" } else { "s" }));
+            }
+        }
+        self.vectorize_step(&session);
+        let vectorizing = self.vectorizing.as_ref().map(|v| {
+            let at = (v.total - v.left.len() + 1).min(v.total);
+            format!("Making vector layers\u{2026} {at} of {}", v.total)
+        });
+        let Some(screen) = self.screen.as_mut() else { return };
         let slow = self.opening.as_ref().is_some_and(|(since, _)| since.elapsed() >= SLOW_OPENING)
             || self.importing.as_ref().is_some_and(|i| i.since.elapsed() >= SLOW_OPENING);
         // the gallery stays as it is until there is a canvas to zoom into
@@ -812,7 +905,9 @@ impl App {
             if let Some(zoom) = self.zoom.as_ref().filter(|z| z.opening) {
                 zoom.over_canvas(ui.ctx(), &mut self.gallery, &mut self.ui.look);
             }
-            if slow {
+            if let Some(words) = &vectorizing {
+                veil(ui.ctx(), words);
+            } else if slow {
                 veil(ui.ctx(), opening);
             } else if exporting {
                 veil(ui.ctx(), "Exporting…");

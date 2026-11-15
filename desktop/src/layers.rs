@@ -176,6 +176,9 @@ pub struct Layers {
     pub plugin_actions: Vec<procraft_core::PluginAction>,
     /// The kinds of layer the plugins on add, which the + offers beside a plain layer.
     pub layer_kinds: Vec<procraft_core::PluginKind>,
+    /// The title menu's Vector Artwork switched: on (every layer traced into a copy of the artwork
+    /// named "… Vector") or off (every vector layer made pixels again), with the vector kind.
+    pub vector_request: Option<(bool, String)>,
     pub run_action: Option<String>,
     /// Layer Opacity asked for the current layer (two fingers tapped on its row).
     pub layer_opacity: bool,
@@ -626,7 +629,20 @@ impl Layers {
         backdrops: &mut Vec<f32>,
     ) {
         let ink = menu::INK;
-        let mut entries = vec![Entry::Item(&icons::MENU_SELECT_ALL, "Select All", ink), menu::DIVIDER];
+        let mut entries = Vec::new();
+        // the whole artwork vector or not, while vector layers' plugin is on
+        let vector = self.layer_kinds.iter().find(|k| k.key.ends_with(".vector")).map(|k| k.key.clone());
+        let vector_on = vector.as_ref().is_some_and(|kind| {
+            let (of, plain) = session.layers_of_kind(kind.clone());
+            of > 0 && plain == 0
+        });
+        if vector.is_some() {
+            let label = if vector_on { VECTOR_ON } else { VECTOR_OFF };
+            entries.push(Entry::Item(&icons::MENU_CHECK_CIRCLE, label, ink));
+            entries.push(menu::DIVIDER);
+        }
+        entries.push(Entry::Item(&icons::MENU_SELECT_ALL, "Select All", ink));
+        entries.push(menu::DIVIDER);
         if picked {
             entries.push(Entry::Item(&icons::MENU_GROUP, "Group", ink));
             entries.push(Entry::Item(&icons::MENU_MERGE, "Merge", ink));
@@ -655,6 +671,7 @@ impl Layers {
         let Some(Entry::Item(_, label, _)) = tapped.and_then(|i| entries.get(i)) else { return };
         self.title_menu.close();
         match *label {
+            VECTOR_ON | VECTOR_OFF => self.vector_request = vector.map(|kind| (!vector_on, kind)),
             "Select All" => _ = session.pick_all_layers(),
             "Group" => _ = session.group_picked(),
             "Merge" => _ = session.merge_picked(),
@@ -2052,6 +2069,10 @@ impl Pinch {
         }
     }
 }
+
+/// The Layers title menu's Vector Artwork switch, as it shows.
+const VECTOR_ON: &str = "Vector Artwork: On";
+const VECTOR_OFF: &str = "Vector Artwork: Off";
 
 #[cfg(test)]
 mod tests {

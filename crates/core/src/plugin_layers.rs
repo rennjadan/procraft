@@ -2402,6 +2402,101 @@ impl CanvasSession {
     }
 }
 
+/// Tracing layers into vector ones, and back (not for the mobile apps' bindings).
+impl CanvasSession {
+    /// The plain painted layers (unlocked, not text) tracing would make vector, top first.
+    pub fn plain_layer_ids(&self) -> Vec<u64> {
+        let st = self.shared.lock();
+        st.doc
+            .layers()
+            .iter()
+            .rev()
+            .filter(|l| {
+                l.kind == procraft_engine::document::LayerKind::Paint
+                    && l.text.is_none()
+                    && l.plugin.is_none()
+                    && !l.locked
+            })
+            .map(|l| l.id.0)
+            .collect()
+    }
+
+    /// Traces plain painted layer `id` into a vector layer of a plugin's `kind` whose items are
+    /// fills: its paint grouped into colours and followed as filled shapes (see `trace`), the layer
+    /// laid again from them. Some(false) if it isn't such a layer; none while no plugin on adds
+    /// `kind` (or it stopped).
+    pub fn vectorize_layer(&self, id: u64, kind: &str) -> Option<bool> {
+        let id = LayerId(id);
+        let (pixels, size) = {
+            let mut st = self.shared.lock();
+            let plain = st.doc.layer(id).is_some_and(|l| {
+                l.kind == procraft_engine::document::LayerKind::Paint && l.text.is_none() && l.plugin.is_none()
+            });
+            if !plain {
+                return Some(false);
+            }
+            let size = (st.doc.width(), st.doc.height());
+            (st.layer_pixels(id), size)
+        };
+        let Some(pixels) = pixels else { return Some(false) };
+        // traced with the canvas let go: a big layer takes a moment
+        let shapes = crate::trace::trace(&pixels, size.0, size.1, crate::trace::Detail::default());
+        let records: Vec<Vec<u8>> = shapes.iter().map(crate::trace::fill_item).collect();
+        let answer = {
+            let st = self.shared.lock();
+            st.hooks.as_ref().and_then(|hooks| {
+                hooks.on_layer(kind, |running, index| {
+                    if !running.layer_load(index, &[])? {
+                        return Ok(None);
+                    }
+                    for record in &records {
+                        running.layer_add(record)?;
+                    }
+                    let after = running.layer_save(MOST_DATA)?;
+                    let drawn = running.layer_draw(MOST_DRAWN)?;
+                    Ok(Some((after, drawn)))
+                })
+            })
+        };
+        let (after, drawn) = answer.flatten()?;
+        let data = Some(Arc::new(after));
+        if self.change("make vector", |d| d.make_plugin_layer(id, kind.to_owned(), data).then_some(())).is_none() {
+            return Some(false);
+        }
+        let mut st = self.shared.lock();
+        st.flush();
+        let items = read_drawn(&drawn);
+        st.lay_items_again(id, &items, "make vector");
+        st.revision += 1;
+        self.shared.frame(&mut st);
+        Some(true)
+    }
+
+    /// Every layer of a plugin's `kind` made a plain layer, its pixels as they show, as one step:
+    /// how many.
+    pub fn rasterize_layers_of(&self, kind: String) -> u32 {
+        self.change("rasterize", |d| {
+            let ids: Vec<LayerId> =
+                d.layers().iter().filter(|l| l.plugin.as_ref().is_some_and(|p| p.kind == kind)).map(|l| l.id).collect();
+            let n = ids.into_iter().filter(|id| d.rasterize(*id)).count();
+            (n > 0).then_some(n as u32)
+        })
+        .unwrap_or(0)
+    }
+
+    /// How many layers are a plugin's `kind`, and how many are plain painted ones (not text).
+    pub fn layers_of_kind(&self, kind: String) -> (u32, u32) {
+        let st = self.shared.lock();
+        let layers = st.doc.layers();
+        let of = layers.iter().filter(|l| l.plugin.as_ref().is_some_and(|p| p.kind == kind)).count();
+        let plain = layers
+            .iter()
+            .filter(|l| l.kind == procraft_engine::document::LayerKind::Paint && l.text.is_none() && l.plugin.is_none())
+            .count();
+        (of as u32, plain as u32)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
