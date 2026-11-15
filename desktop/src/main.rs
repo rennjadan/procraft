@@ -66,6 +66,7 @@ mod touch_keyboard;
 mod transform;
 mod transform_numeric;
 mod ui;
+mod update;
 mod video;
 mod zoom;
 
@@ -432,6 +433,8 @@ impl ApplicationHandler for App {
             .map_or(FALLBACK_CANVAS, |s| (s.width, s.height));
         // the app opens on the gallery
         screen.window.request_redraw();
+        // a newer build of this copy looked for, a moment after it opens
+        update::start(Arc::clone(&screen.window), self.wake.clone());
         self.screen = Some(screen);
     }
 
@@ -462,6 +465,11 @@ impl ApplicationHandler for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, (): ()) {
         // (the start's watch asks too)
         startup::answered();
+        // an update downloaded and its installer waiting: the app closes as its close button would
+        if update::take_ready() {
+            self.app_event(event_loop, WindowEvent::CloseRequested);
+            return;
+        }
         let Some(window) = self.screen.as_ref().map(|s| (s.window.id(), s.window.scale_factor())) else { return };
         for event in pen::take_events(window.1) {
             self.window_event(event_loop, window.0, event);

@@ -8,6 +8,9 @@ const PROPERTIES: &str = "../android/gradle.properties";
 fn main() {
     println!("cargo:rerun-if-changed={PROPERTIES}");
     println!("cargo:rerun-if-changed=../assets/app-icon/procraft.ico");
+    // the build number and repository updates come from (the build workflow's)
+    println!("cargo:rerun-if-env-changed=PROCRAFT_BUILD");
+    println!("cargo:rerun-if-env-changed=PROCRAFT_UPDATE_REPO");
     let version = std::fs::read_to_string(PROPERTIES)
         .ok()
         .and_then(|text| text.lines().find_map(|l| l.trim().strip_prefix("procraft.version=").map(str::to_owned)))
