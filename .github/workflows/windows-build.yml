@@ -74,7 +74,8 @@ jobs:
         env:
           KEY: ${{ steps.up.outputs.key }}
         run: |
-          last="$(gh release view --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null | sed -n 's/^KEY: //p' | tr -d '\r')"
+          # (none yet: nothing to compare)
+          last="$( (gh release view --repo "$GITHUB_REPOSITORY" --json body -q .body 2>/dev/null || true) | sed -n 's/^KEY: //p' | tr -d '\r')"
           if [ "$GITHUB_EVENT_NAME" = schedule ] && [ "$last" = "$KEY" ]; then
             echo "skip=true" >>"$GITHUB_OUTPUT"
             echo "Nothing new: no build" >>"$GITHUB_STEP_SUMMARY"
