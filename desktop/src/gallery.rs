@@ -1216,13 +1216,14 @@ impl Gallery {
             area = area.vertical_scroll_offset(y);
         }
         let caught = self.glide.caught;
+        let stretch = self.glide.over;
         ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
             let shown = area.show(ui, |ui| {
                 let (all, _) = ui.allocate_exact_size(vec2(rect.width(), rows as f32 * pitch + 24.0), Sense::hover());
                 for (i, entry) in entries.iter().enumerate() {
                     let (row, column) = (i / columns, i % columns);
                     let cell = Rect::from_min_size(
-                        all.min + vec2(column as f32 * pitch, row as f32 * pitch),
+                        all.min + vec2(column as f32 * pitch, row as f32 * pitch - stretch),
                         vec2(pitch, pitch),
                     );
                     if !ui.is_rect_visible(cell) {
@@ -1891,8 +1892,13 @@ impl Gallery {
                 .parent()
                 .and_then(|p| p.file_name())
                 .map_or_else(|| "ProCraft".to_owned(), |n| n.to_string_lossy().into_owned());
+            // what the last look found shows beside it; while it works, frames keep coming
+            let (update_says, working) = crate::update::row_text();
+            if working {
+                ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            }
             let rows: [(&str, String); APP_ROWS] = [
-                ("Check for updates", String::new()),
+                ("Check for updates", update_says),
                 ("Updates", crate::update::mode_name(crate::update::mode()).to_owned()),
                 ("Artwork folder", folder_name),
                 ("Open artwork folder", String::new()),
@@ -1909,7 +1915,7 @@ impl Gallery {
                 }
                 let mut right = line.right() - 16.0;
                 if !value.is_empty() {
-                    let galley = one_line(ui, value, 15.0, Weight::Regular, argb(SIZE), 150.0);
+                    let galley = one_line(ui, value, 15.0, Weight::Regular, argb(SIZE), 220.0);
                     right -= galley.size().x;
                     ui.painter().galley(pos2(right, line.center().y - galley.size().y / 2.0), galley, ink);
                 }
@@ -1917,7 +1923,7 @@ impl Gallery {
                 ui.painter().galley(pos2(line.left() + 17.0, line.center().y - galley.size().y / 2.0), galley, ink);
                 if ui.interact(line, ui.scope_id().with(("app row", k)), Sense::click()).clicked() {
                     match k {
-                        0 => crate::update::check_now(),
+                        0 => crate::update::tap(),
                         1 => crate::update::next_mode(),
                         2 => {
                             if crate::files::choose_artworks_dir() {
@@ -2266,6 +2272,10 @@ const GLIDE_SLOWING: f32 = 3.2;
 const GLIDE_LEAST: f32 = 12.0;
 /// How far a press moves before it is told apart as a drag of the page or along it (points).
 const GLIDE_DECIDE: f32 = 6.0;
+/// How far a glide runs on past an end (points), and how quickly a stretched page springs back
+/// (a part of itself a second).
+const OVER_MOST: f32 = 48.0;
+const OVER_SPRING: f32 = 13.0;
 /// How long a flick's speed is measured over (seconds).
 const GLIDE_SPAN: f64 = 0.08;
 
@@ -2286,6 +2296,9 @@ struct Glide {
     last: Option<f64>,
     /// A press stopped the page gliding: it is no tap.
     caught: bool,
+    /// Pulled past its top (less than 0) or its end (more): the page stretches that far, and
+    /// springs back once let go.
+    over: f32,
 }
 
 impl Glide {
@@ -2325,7 +2338,18 @@ impl Glide {
                     }
                 }
             } else if self.dragging && delta.y != 0.0 {
-                self.y = (self.y - delta.y).clamp(0.0, self.most);
+                let to = self.y - delta.y + self.over;
+                let past = if to < 0.0 {
+                    to
+                } else if to > self.most {
+                    to - self.most
+                } else {
+                    0.0
+                };
+                self.y = to.clamp(0.0, self.most);
+                // past an end, the page stretches less the further it goes
+                let give = 1.0 - (self.over.abs() / (rect.height() * 0.5)).min(0.9);
+                self.over = if past == 0.0 { 0.0 } else { self.over + (past - self.over) * 0.5 * give };
                 self.moves.push((now, delta.y));
                 moved = true;
             }
@@ -2355,6 +2379,9 @@ impl Glide {
             self.y += self.speed * step;
             self.speed *= (-GLIDE_SLOWING * step).exp();
             if self.y <= 0.0 || self.y >= self.most {
+                // a glide reaching an end runs on past it a little, and springs back
+                let push = (self.speed * 0.035).clamp(-OVER_MOST, OVER_MOST);
+                self.over = if self.y <= 0.0 { push.min(0.0) } else { push.max(0.0) };
                 self.y = self.y.clamp(0.0, self.most);
                 self.speed = 0.0;
             }
@@ -2362,6 +2389,14 @@ impl Glide {
             ui.ctx().request_repaint();
         } else if !self.dragging {
             self.speed = 0.0;
+        }
+        // let go past an end, it springs back
+        if !self.dragging && self.over != 0.0 {
+            self.over *= (-OVER_SPRING * dt).exp();
+            if self.over.abs() < 0.3 {
+                self.over = 0.0;
+            }
+            ui.ctx().request_repaint();
         }
         moved.then_some(self.y)
     }

@@ -4,8 +4,12 @@
 //!
 //! The Updates setting (the gallery's + list) says what happens when a newer build is out:
 //! - Automatic (as it starts): it is downloaded quietly, and installed when ProCraft closes.
-//! - Ask first: ProCraft asks; yes saves, closes, installs and opens it again.
-//! - Off: nothing, unless Check for updates now is tapped (which asks).
+//! - Ask first: the gallery's Check for updates row says one is ready; a tap saves, closes,
+//!   installs and opens it again.
+//! - Off: nothing, unless Check for updates is tapped.
+//!
+//! What it finds shows in that row itself (no window of its own over the app): checking, up to
+//! date, ready, downloading, or what went wrong.
 //!
 //! It looks a moment after the app opens and every few hours while it stays open. Windows asks to
 //! allow the installer each time. Only the installed copy updates: a portable one, or one built
@@ -40,6 +44,57 @@ static LOOKING: AtomicBool = AtomicBool::new(false);
 static WAITING: Mutex<Option<String>> = Mutex::new(None);
 /// The window the questions show over, and how to wake the app to close.
 static APP: OnceLock<(Arc<Window>, EventLoopProxy<()>)> = OnceLock::new();
+
+/// What the gallery's Check for updates row says.
+#[derive(Clone, Debug, PartialEq)]
+enum Status {
+    Idle,
+    Checking,
+    UpToDate,
+    /// A newer build is out (its tag and installer), not yet downloaded.
+    Ready {
+        tag: String,
+        url: String,
+    },
+    Downloading,
+    /// Downloaded: it installs when ProCraft closes.
+    Waiting,
+    NotInstalled,
+    Failed(String),
+}
+
+static STATUS: Mutex<Status> = Mutex::new(Status::Idle);
+/// The original developer's newest work isn't in the latest build (it clashes with Renn's).
+static DEVELOPER_WAITING: AtomicBool = AtomicBool::new(false);
+
+fn set(status: Status) {
+    if let Ok(mut s) = STATUS.lock() {
+        *s = status;
+    }
+    if let Some((window, _)) = APP.get() {
+        window.request_redraw();
+    }
+}
+
+fn status() -> Status {
+    STATUS.lock().map(|s| s.clone()).unwrap_or(Status::Idle)
+}
+
+/// What the Check for updates row says beside it, and whether it is still working (frames wanted).
+pub fn row_text() -> (String, bool) {
+    let developer = if DEVELOPER_WAITING.load(Ordering::Relaxed) { " (developer's changes waiting)" } else { "" };
+    match status() {
+        Status::Idle if !available() => ("Not available".to_owned(), false),
+        Status::Idle => (String::new(), false),
+        Status::Checking => ("Checking\u{2026}".to_owned(), true),
+        Status::UpToDate => (format!("Up to date{developer}"), false),
+        Status::Ready { .. } => ("Ready \u{2014} tap to install".to_owned(), false),
+        Status::Downloading => ("Downloading\u{2026}".to_owned(), true),
+        Status::Waiting => ("Installs when you close".to_owned(), false),
+        Status::NotInstalled => ("Only the installed copy".to_owned(), false),
+        Status::Failed(e) => (format!("Couldn't check: {}", e.chars().take(40).collect::<String>()), false),
+    }
+}
 
 /// How long between looks while the app stays open.
 const EVERY: Duration = Duration::from_secs(6 * 60 * 60);
@@ -107,13 +162,18 @@ pub fn start(window: Arc<Window>, wake: EventLoopProxy<()>) {
     }
 }
 
-/// Check for updates (the gallery's + list): it says what it found, and asks before installing.
-pub fn check_now() {
+/// Check for updates tapped (the gallery's + list): with a build ready, it is installed now
+/// (saved, closed, installed, opened again); else it looks.
+pub fn tap() {
     if !available() {
-        say("This copy of ProCraft doesn't update itself (it wasn't built for updates).");
+        set(Status::Idle);
         return;
     }
-    if let Err(e) = std::thread::Builder::new().name("procraft-update-now".to_owned()).spawn(|| look(true)) {
+    let ready = matches!(status(), Status::Ready { .. });
+    let spawned = std::thread::Builder::new()
+        .name("procraft-update-now".to_owned())
+        .spawn(move || if ready { install_now() } else { look(true) });
+    if let Err(e) = spawned {
         log::warn!("update: {e}");
     }
 }
@@ -135,7 +195,7 @@ pub fn restart() {
             READY.store(true, Ordering::Relaxed);
             let _ = wake.send_event(());
         }
-        _ => say("Close and open ProCraft again to use the new folder."),
+        _ => log::info!("update: close and open ProCraft again to use the new artwork folder"),
     }
 }
 
@@ -156,14 +216,14 @@ fn look(asked: bool) {
     if LOOKING.swap(true, Ordering::Relaxed) {
         return;
     }
-    let outcome = look_once(asked);
-    LOOKING.store(false, Ordering::Relaxed);
-    if let Err(e) = outcome {
-        log::info!("update: {e}");
-        if asked {
-            say(&format!("Couldn't check for updates: {e}"));
-        }
+    if asked || !matches!(status(), Status::Waiting) {
+        set(Status::Checking);
     }
+    if let Err(e) = look_once(asked) {
+        log::info!("update: {e}");
+        set(Status::Failed(e.lines().next().unwrap_or_default().to_owned()));
+    }
+    LOOKING.store(false, Ordering::Relaxed);
 }
 
 fn look_once(asked: bool) -> Result<(), String> {
@@ -172,52 +232,61 @@ fn look_once(asked: bool) -> Result<(), String> {
     let folder = exe.parent().ok_or("no folder")?.to_string_lossy().into_owned();
     let (newer, tag, url, waiting_developer) = match latest(repo, &folder)? {
         Found::NotInstalled => {
-            if asked {
-                say("Only the installed ProCraft updates itself; this copy runs from another folder.");
-            }
+            set(Status::NotInstalled);
             return Ok(());
         }
         Found::Release { build: newer, tag, url, waiting_developer } => (newer, tag, url, waiting_developer),
     };
-    let developer_note = if waiting_developer {
-        "\n\nThe original developer's newest changes clash with yours, so they aren't in it yet: ask \
-         Claude to merge them."
-    } else {
-        ""
-    };
+    DEVELOPER_WAITING.store(waiting_developer, Ordering::Relaxed);
     if newer <= build {
-        if asked {
-            say(&format!("ProCraft is up to date.{developer_note}"));
-        }
+        set(Status::UpToDate);
         return Ok(());
     }
     let waiting = WAITING.lock().ok().and_then(|w| w.clone());
     if waiting.as_deref() == Some(tag.as_str()) {
-        if asked {
-            say("The update is downloaded, and installs when you close ProCraft.");
+        set(Status::Waiting);
+        return Ok(());
+    }
+    // Automatic: downloaded now, installed when the app closes; else it waits for a tap
+    if !asked && mode() == crate::update::AUTOMATIC {
+        set(Status::Downloading);
+        download_and_wait(&tag, &url, &exe, false)?;
+        set(Status::Waiting);
+    } else {
+        set(Status::Ready { tag, url });
+    }
+    Ok(())
+}
+
+/// The build ready installed now: downloaded, then the app saves, closes, installs and opens again.
+fn install_now() {
+    let Status::Ready { tag, url } = status() else { return };
+    set(Status::Downloading);
+    let outcome =
+        std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| download_and_wait(&tag, &url, &exe, true));
+    match outcome {
+        Ok(()) => {
+            READY.store(true, Ordering::Relaxed);
+            if let Some((_, wake)) = APP.get() {
+                let _ = wake.send_event(());
+            }
         }
-        return Ok(());
+        Err(e) => set(Status::Failed(e)),
     }
-    let automatic = !asked && mode() == AUTOMATIC;
-    if !automatic
-        && !question(&format!(
-            "A new version of ProCraft is ready.\n\nInstall it now? ProCraft will save, close, update \
-             and open again (Windows will ask to allow the installer).{developer_note}"
-        ))
-    {
-        return Ok(());
-    }
-    // downloaded first, so nothing closes for an update that can't be had
+}
+
+/// Downloads release `tag`'s installer (`url`), and leaves a helper waiting for the app to close
+/// to install it (then, `reopen`, to open `exe` again).
+fn download_and_wait(tag: &str, url: &str, exe: &std::path::Path, reopen: bool) -> Result<(), String> {
     let msi = std::env::temp_dir().join(format!("procraft-{tag}.msi"));
     let target = quoted(&msi.to_string_lossy());
     powershell(&format!(
         "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; \
          Invoke-WebRequest -Uri '{}' -OutFile '{target}' -UseBasicParsing -TimeoutSec 900",
-        quoted(&url)
+        quoted(url)
     ))?;
-    // the helper: waits for the app to close, installs, and (asked) opens it again
     let reopen =
-        if automatic { String::new() } else { format!("Start-Process -FilePath '{}'", quoted(&exe.to_string_lossy())) };
+        if reopen { format!("Start-Process -FilePath '{}'", quoted(&exe.to_string_lossy())) } else { String::new() };
     let helper = format!(
         "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; \
          Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{target}\"', '/qn', '/norestart') -Verb RunAs -Wait; \
@@ -226,13 +295,7 @@ fn look_once(asked: bool) -> Result<(), String> {
     );
     spawn_hidden(&helper)?;
     if let Ok(mut w) = WAITING.lock() {
-        *w = Some(tag);
-    }
-    if !automatic {
-        READY.store(true, Ordering::Relaxed);
-        if let Some((_, wake)) = APP.get() {
-            let _ = wake.send_event(());
-        }
+        *w = Some(tag.to_owned());
     }
     Ok(())
 }
@@ -273,24 +336,6 @@ if ($r.body -match 'UPSTREAM-CONFLICT') {{ 'DEVELOPER-WAITING' }}"#,
 /// `text` inside a PowerShell single-quoted string.
 fn quoted(text: &str) -> String {
     text.replace('\'', "''")
-}
-
-fn dialog(text: &str) -> rfd::MessageDialog {
-    let dialog =
-        rfd::MessageDialog::new().set_level(rfd::MessageLevel::Info).set_title("ProCraft update").set_description(text);
-    // over the app, which is full screen
-    match APP.get() {
-        Some((window, _)) => dialog.set_parent(window.as_ref()),
-        None => dialog,
-    }
-}
-
-fn say(text: &str) {
-    dialog(text).set_buttons(rfd::MessageButtons::Ok).show();
-}
-
-fn question(text: &str) -> bool {
-    dialog(text).set_buttons(rfd::MessageButtons::YesNo).show() == rfd::MessageDialogResult::Yes
 }
 
 #[cfg(windows)]
