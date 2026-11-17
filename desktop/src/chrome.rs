@@ -513,7 +513,7 @@ fn slider_panel(
 }
 
 /// What a stamp's picture (`side` pixels square) is known by, to make its texture once.
-fn stamp_key(stamp: &[u8], side: usize) -> u64 {
+pub fn stamp_key(stamp: &[u8], side: usize) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     side.hash(&mut h);

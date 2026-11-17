@@ -677,13 +677,44 @@ impl CanvasSession {
         }
     }
 
-    /// Why `adjustment` can't start on the current layer, if it can't: as [`Self::why_blocked`],
-    /// and Liquify turns away a layer whose alpha is locked.
+    /// Why `adjustment` can't start, if it can't: as [`Self::why_blocked`]. Liquify works on
+    /// every layer chosen (those in a chosen group too) and turns them away while the alpha of
+    /// one is locked; the others work on one layer, so a group current or several layers chosen
+    /// say so.
     pub fn why_not_adjusted(&self, adjustment: crate::adjust_menu::Adjustment) -> Option<Blocked> {
         self.why_blocked().or_else(|| {
-            let liquify = adjustment == crate::adjust_menu::Adjustment::Liquify;
-            (liquify && self.layers().iter().any(|l| l.current && l.alpha_lock)).then_some(Blocked::AlphaLocked)
+            if adjustment == crate::adjust_menu::Adjustment::Liquify {
+                self.alpha_locked_chosen().map(|_| Blocked::AlphaLocked)
+            } else {
+                self.why_not_one_layer()
+            }
         })
+    }
+
+    /// Why the current layer can't be copied, or cut (`cut`), if it can't: what is copied is one
+    /// layer's, so a group current or several layers chosen say so; a cut changes the layer, so
+    /// also as [`Self::why_blocked`].
+    pub fn why_not_copied(&self, cut: bool) -> Option<Blocked> {
+        let why = if cut { self.why_blocked() } else { None };
+        why.or_else(|| self.why_not_one_layer())
+    }
+
+    /// The first layer Liquify would work on whose alpha is locked (what it turns away), if any.
+    pub fn alpha_locked_chosen(&self) -> Option<u64> {
+        let st = self.shared.lock();
+        let layers = st.edited_layers();
+        layers.into_iter().find(|id| st.doc.layer(*id).is_some_and(|l| l.alpha_lock)).map(|id| id.0)
+    }
+
+    /// Why what works on one layer at a time can't: several layers are chosen, or a group is
+    /// current.
+    fn why_not_one_layer(&self) -> Option<Blocked> {
+        let st = self.shared.lock();
+        if st.doc.chosen().len() > 1 {
+            Some(Blocked::Several)
+        } else {
+            st.doc.layer(st.doc.current()).is_some_and(|l| l.kind == LayerKind::Group).then_some(Blocked::Group)
+        }
     }
 
     /// Why a change to the current layer would go unseen, if it would (what a hidden alert
@@ -1166,6 +1197,37 @@ impl CanvasSession {
     }
 }
 
+impl crate::State {
+    /// The layers an edit of what is chosen works on (a transform, Liquify): with several chosen
+    /// or a group current, every paint layer chosen or in a chosen group; else the current layer.
+    /// Only those that can change: unlocked, shown, and not drawn from data (`also` lets one of
+    /// those in).
+    pub(crate) fn edited_layers_but(&self, also: impl Fn(LayerId) -> bool) -> Vec<LayerId> {
+        let doc = &self.doc;
+        let changes = |l: &procraft_engine::document::Layer| {
+            (!doc.is_locked(l.id) && l.visible && !l.drawn_from_data()) || also(l.id)
+        };
+        let chosen = doc.chosen();
+        let current = doc.current();
+        let group = doc.layer(current).is_some_and(|l| l.kind == LayerKind::Group);
+        if chosen.len() > 1 || group {
+            doc.layers()
+                .iter()
+                .filter(|l| l.kind == LayerKind::Paint && changes(l))
+                .filter(|l| chosen.iter().any(|c| *c == l.id || doc.is_inside(l.id, *c)))
+                .map(|l| l.id)
+                .collect()
+        } else {
+            doc.layer(current).filter(|l| changes(l)).map(|_| current).into_iter().collect()
+        }
+    }
+
+    /// [`State::edited_layers_but`] with none let in.
+    pub(crate) fn edited_layers(&self) -> Vec<LayerId> {
+        self.edited_layers_but(|_| false)
+    }
+}
+
 /// Why the current layer takes no change (see [`CanvasSession::why_blocked`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum Blocked {
@@ -1180,9 +1242,11 @@ pub enum Blocked {
     MeshLocked,
     /// A group that doesn't show (as [`Blocked::Hidden`] is a layer).
     GroupHidden,
-    /// A group is current where a stroke or a fill takes a layer
-    /// ([`CanvasSession::why_unpainted`]).
+    /// A group is current where a stroke, a fill, an adjustment or a copy takes a layer
+    /// ([`CanvasSession::why_unpainted`], [`CanvasSession::why_not_adjusted`]).
     Group,
+    /// Several layers are chosen where an adjustment or a copy takes one.
+    Several,
     /// Liquify on a layer whose alpha is locked ([`CanvasSession::why_not_adjusted`]).
     AlphaLocked,
 }

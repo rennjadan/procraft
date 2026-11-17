@@ -886,6 +886,26 @@ impl CanvasSession {
             .collect()
     }
 
+    /// The selection tool closes: a freehand path still open is closed into the selection. With
+    /// Color Fill on (`colour_fill`), what is selected is then filled with the paint colour and the
+    /// selection ends with it, as one undo step that brings the selection back when undone; but a
+    /// path that had to be closed here is left unfilled, the selection kept. True if the selection
+    /// or the layer changed (the app reads them again).
+    pub fn close_selection_tool(&self, colour_fill: bool) -> bool {
+        let open = self.touches().freehand.len() >= 3;
+        self.close_freehand();
+        if !colour_fill || open {
+            return open;
+        }
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let filled = st.colour_fill_and_end();
+        if filled {
+            self.shared.frame(st);
+        }
+        filled
+    }
+
     /// Closes the freehand path into a selection (fewer than three points are dropped).
     pub fn close_freehand(&self) {
         let (path, join) = {
@@ -2202,12 +2222,21 @@ impl CanvasSession {
                 }
             }
             Mode::Select => {
+                let (how, start) = (t.selecting, t.down_at);
                 drop(t);
                 if !cancelled {
                     let at = last_of(&samples).map(|s| ((s.x, s.y), s.time_ms));
                     if let Some((at, ms)) = at {
                         self.select_step(at, ms, true, &mut out);
                     }
+                } else if let Some(how) = how.filter(|how| how.kind == SelectKind::Automatic)
+                    && self.take_back_colour_drag()
+                {
+                    // a colour selection being slid goes with its touch, its threshold left as it
+                    // began; the app's showing of it ends
+                    let (x, y) = start;
+                    out.push(TouchCommand::SelectionThreshold { x, y, threshold: how.threshold, done: true });
+                    out.push(TouchCommand::SelectionChanged);
                 }
             }
             Mode::Transform => {

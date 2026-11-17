@@ -167,6 +167,8 @@ impl Menu {
         if alpha < 1.0 || scale != 1.0 {
             ctx.request_repaint();
         }
+        // at the size a plugin gives popovers and menus, from where it hangs
+        let scale = scale * crate::panel::part_scale(ctx, procraft_core::InterfacePart::Menus);
         if self.open {
             // the rest of the window takes no presses while it is open
             let screen = ctx.content_rect();

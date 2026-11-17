@@ -126,7 +126,7 @@ internal fun Modifier.dropSource(vm: CanvasViewModel, swatch: (() -> Int)? = nul
                         vm.dropDragMove(at, c.uptimeMillis)
                     }
                     // let go on the top bar, it is put back
-                    vm.dropDragEnd(at.takeIf { lifted && it.y > Pc.BarHeight.toPx() })
+                    vm.dropDragEnd(at.takeIf { lifted && it.y > Pc.barShown.value * vm.density })
                 }
             }
         }
@@ -186,7 +186,7 @@ fun DropBandUi(vm: CanvasViewModel) {
     val what = kept[0]
     val ink = if (Pc.light) Color(0xFF222222) else Color(0xFFC5C5C5)
     val blue = Pc.tinted(if (Pc.light) Color(0xFF0A8CFD) else Color(0xFF0076FD))
-    BoxWithConstraints(Modifier.offset(y = Pc.BarHeight).fillMaxWidth().clipToBounds()) {
+    BoxWithConstraints(Modifier.offset(y = Pc.barShown).fillMaxWidth().clipToBounds()) {
         val width = maxWidth
         Column(Modifier.graphicsLayer { translationY = -(1f - shown.value) * size.height }) {
             Box(Modifier.fillMaxWidth().height(32.dp).background(if (Pc.light) BandLight else BandDark), contentAlignment = Alignment.Center) {

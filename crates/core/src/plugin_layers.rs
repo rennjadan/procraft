@@ -314,6 +314,9 @@ pub(crate) struct Item {
     pub(crate) scale: f32,
     pub(crate) rotation: f32,
     pub(crate) seen_at: f32,
+    /// The canvas's zoom, if the input came in whole screen pixels (its points evened out over
+    /// the steps).
+    pub(crate) whole_pixels: Option<f32>,
     pub(crate) alpha_lock: bool,
     pub(crate) input: InputSettings,
     pub(crate) symmetry: Option<Symmetry>,
@@ -474,7 +477,8 @@ impl Item {
         r.field(field::SEED, &self.seed.to_le_bytes());
         r.field(field::POINTER, &[pointer_number(self.pointer)]);
         r.floats(field::SCALE, &[self.scale]);
-        r.floats(field::VIEW, &[self.rotation, self.seen_at]);
+        // (the third, 0 for input read finer, after the two that came first)
+        r.floats(field::VIEW, &[self.rotation, self.seen_at, self.whole_pixels.unwrap_or(0.0)]);
         r.field(field::ALPHA_LOCK, &[u8::from(self.alpha_lock)]);
         let i = &self.input;
         let mut input = Vec::new();
@@ -537,6 +541,7 @@ impl Item {
             scale: 1.0,
             rotation: 0.0,
             seen_at: 1.0,
+            whole_pixels: None,
             alpha_lock: false,
             input: InputSettings::default(),
             symmetry: None,
@@ -603,6 +608,10 @@ impl Item {
                     if let Some([rotation, seen_at]) = floats::<2>(bytes) {
                         (item.rotation, item.seen_at) = (rotation, seen_at.clamp(1e-4, 1e4));
                     }
+                    item.whole_pixels = floats::<3>(bytes)
+                        .map(|[_, _, zoom]| zoom)
+                        .filter(|zoom| *zoom > 0.0)
+                        .map(|z| z.clamp(1e-4, 1e4));
                 }
                 field::ALPHA_LOCK => item.alpha_lock = bytes.first().is_some_and(|b| *b != 0),
                 field::INPUT => item.input = input_of(bytes).unwrap_or_default(),
@@ -911,6 +920,7 @@ fn input_of(bytes: &[u8]) -> Option<InputSettings> {
         pressure_curve: if points.len() >= 2 { Curve::new(&points) } else { Curve::linear() },
         speed_distance: speed_distance.clamp(0.25, 1.0),
         tip_attached,
+        tilt_known: true,
     })
 }
 
@@ -963,7 +973,7 @@ impl Recording {
         item.started = 0.0;
         item.seed = crate::quickshape::SHAPE_SEED;
         item.input = InputSettings::default();
-        (item.rotation, item.seen_at) = (0.0, 1.0);
+        (item.rotation, item.seen_at, item.whole_pixels) = (0.0, 1.0, None);
         item.shape = Some(Arc::new((kind, nodes.to_vec())));
     }
 
@@ -1105,6 +1115,7 @@ impl State {
         tool: ToolKind,
         pointer: PointerKind,
         seed: u32,
+        whole_pixels: Option<f32>,
         samples: &[Sample],
     ) {
         self.recording = None;
@@ -1132,6 +1143,7 @@ impl State {
             scale,
             rotation: self.view.map_or(0.0, |v| v.rotation()),
             seen_at: self.view.map_or(1.0, |v| v.zoom()) / self.display_scale,
+            whole_pixels,
             alpha_lock: self.doc.layer(layer).is_some_and(|l| l.alpha_lock),
             input: self.input.clone(),
             symmetry: Symmetry::of(&self.doc.stroke_guide()),
@@ -1485,6 +1497,10 @@ impl State {
                 .with_input(item.input.clone())
                 .on_view_turned(item.rotation)
                 .seen_at(item.seen_at);
+            let builder = match item.whole_pixels {
+                Some(zoom) => builder.read_in_whole_pixels(zoom),
+                None => builder,
+            };
             if exact { builder.exact_path() } else { builder }
         };
         let mut builder = make(brush.clone(), diameter * scale, item.seed);
@@ -1507,6 +1523,7 @@ impl State {
                 _ => 1,
             },
             seed: item.seed,
+            under_at: None,
             turn: item.rotation,
         };
         let hooks = self.hooks.clone().filter(|_| brush.engine.is_some());
@@ -2523,6 +2540,7 @@ mod tests {
             scale: 2.0,
             rotation: 0.5,
             seen_at: 0.25,
+            whole_pixels: Some(0.5),
             alpha_lock: true,
             input: InputSettings {
                 stabilization: 0.2,

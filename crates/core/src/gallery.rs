@@ -17,8 +17,9 @@ const STACK: &str = "Stack";
 /// The stack the gallery's recovery puts what it finds in.
 const RECOVERED: &str = "Recovered Artworks";
 
-/// A saved artwork: its folder, its name and size, and when it was last changed (milliseconds
-/// since 1970).
+/// A saved artwork: its folder, its name and size, when it was last changed (milliseconds since
+/// 1970), and how many quarter turns clockwise it shows turned by (its thumbnail is kept so), as
+/// its canvas was left.
 #[derive(Clone, Debug, PartialEq, uniffi::Record)]
 pub struct GalleryArtwork {
     pub dir: String,
@@ -26,6 +27,7 @@ pub struct GalleryArtwork {
     pub width: u32,
     pub height: u32,
     pub modified_ms: i64,
+    pub turns: u32,
 }
 
 /// Something the gallery shows: an artwork, or a stack of them (in their own order).
@@ -139,6 +141,7 @@ fn read_artwork(dir: &Path) -> Option<GalleryArtwork> {
         width: side("width"),
         height: side("height"),
         modified_ms: modified(&file),
+        turns: json.get("turns").and_then(serde_json::Value::as_u64).map_or(0, |t| (t % 4) as u32),
     })
 }
 

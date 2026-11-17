@@ -386,6 +386,10 @@ impl Input {
         self.down.retain(|d| *d != id);
         self.down.push(id);
         self.canvas_pressed = true;
+        // a pen's stroke goes by its lean only if its driver says how it leans
+        if matches!(kind, PointerKind::Stylus | PointerKind::StylusEraser) {
+            session.set_pen_tilt_known(crate::pen::lean(id).is_some());
+        }
         let out = session.touch_down(id, kind, self.sample(id, at, pressure));
         self.take(out);
     }
@@ -1094,5 +1098,105 @@ mod tests {
         let finger = WindowEvent::Touch(Touch { device_id, phase, location, force: None, id: 7011 });
         send(&mut input, &session, &finger);
         assert!(input.pressing() && !input.pressing_from_afar());
+    }
+
+    /// A brush file (`BRUSH_FILE`) drawn through the desktop's input by a tablet's pen moving the
+    /// mouse pointer, read in whole pixels (WinTab giving nothing finer), on a 2048 px canvas fitted
+    /// to a 1920 by 1080 window: a circle, a triangle, a square and hatching, at 150 px a second,
+    /// the pointer moved as the pen reaches each next pixel. Each is drawn twice: above as a stroke
+    /// takes input it isn't told comes in whole pixels (its first sample half a pixel off them, the
+    /// rest whole), below as it is. The artwork goes to `PROCRAFT_DUMP/whole-pixels.png`.
+    /// `BRUSH_FILE=x.brush PROCRAFT_DUMP=dir cargo test -p procraft-desktop dump_whole_pixel_strokes -- --ignored`
+    #[test]
+    #[ignore]
+    fn dump_whole_pixel_strokes() {
+        let (Ok(file), Ok(dir)) = (std::env::var("BRUSH_FILE"), std::env::var("PROCRAFT_DUMP")) else { return };
+        let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+        let session = CanvasSession::new(2048, 2048);
+        session.set_display_scale(1.0);
+        session.use_gpu(gpu);
+        session.show_in(1920, 1080);
+        let name = std::path::Path::new(&file).file_name().map(|n| n.to_string_lossy().into_owned());
+        let set = session.import_any_brushes(std::fs::read(&file).unwrap(), name, 0).unwrap();
+        assert!(session.select_brush(set, 0));
+        session.set_color(0.0, 0.0, 0.0);
+        TABLET_PEN.with(|p| p.set(Some(crate::pen::MousePen { pressure: 0.6, eraser: false })));
+        let mut input = Input { read_mouse_pen: tablet_pen, ..Input::default() };
+        let m = session.view_matrix();
+        eprintln!("zoom {}", m[0].hypot(m[1]));
+        // canvas pixel (x, y) on the window
+        let shown = |(x, y): (f32, f32)| (m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]);
+        let device_id = DeviceId::dummy();
+        let moved = |(x, y): (f32, f32)| WindowEvent::CursorMoved {
+            device_id,
+            position: PhysicalPosition::new(f64::from(x), f64::from(y)),
+        };
+        let press = |state| WindowEvent::MouseInput { device_id, state, button: MouseButton::Left };
+        // a stroke through `corners` (canvas pixels), or round a circle
+        let mut draw = |path: &dyn Fn(f32) -> (f32, f32), told: bool| {
+            let length: f32 = (1..=400)
+                .map(|i| {
+                    let (a, b) = (shown(path((i - 1) as f32 / 400.0)), shown(path(i as f32 / 400.0)));
+                    (a.0 - b.0).hypot(a.1 - b.1)
+                })
+                .sum();
+            let (x, y) = shown(path(0.0));
+            let mut last = (x.round(), y.round());
+            send(&mut input, &session, &moved(if told { last } else { (last.0 + 0.5, last.1) }));
+            send(&mut input, &session, &press(ElementState::Pressed));
+            let begun = Instant::now();
+            let steps = (length * 4.0) as usize;
+            for i in 1..=steps {
+                let (x, y) = shown(path(i as f32 / steps as f32));
+                let at = (x.round(), y.round());
+                if at != last {
+                    // when the pen gets there
+                    let due = Duration::from_secs_f32(i as f32 / 4.0 / 150.0);
+                    while begun.elapsed() < due {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    send(&mut input, &session, &moved(at));
+                    last = at;
+                }
+            }
+            send(&mut input, &session, &press(ElementState::Released));
+        };
+        let along = |corners: Vec<(f32, f32)>| {
+            move |t: f32| {
+                let pieces = (corners.len() - 1) as f32;
+                let at = (t * pieces).min(pieces - 1e-4);
+                let (i, f) = (at.floor() as usize, at.fract());
+                let (a, b) = (corners[i], corners[i + 1]);
+                (a.0 + (b.0 - a.0) * f, a.1 + (b.1 - a.1) * f)
+            }
+        };
+        for (row, told) in [(560.0f32, false), (1360.0, true)] {
+            draw(
+                &|t: f32| {
+                    let a = std::f32::consts::TAU * t;
+                    (560.0 + 130.0 * a.cos(), row + 120.0 * a.sin())
+                },
+                told,
+            );
+            draw(
+                &along(vec![(820.0, row + 120.0), (950.0, row - 130.0), (1080.0, row + 120.0), (820.0, row + 120.0)]),
+                told,
+            );
+            draw(
+                &along(vec![
+                    (1160.0, row - 110.0),
+                    (1380.0, row - 115.0),
+                    (1385.0, row + 110.0),
+                    (1165.0, row + 115.0),
+                    (1160.0, row - 110.0),
+                ]),
+                told,
+            );
+            for k in 0..6 {
+                let x = 1480.0 + 30.0 * k as f32;
+                draw(&along(vec![(x, row + 80.0), (x + 120.0, row - 80.0)]), told);
+            }
+        }
+        session.export_png(format!("{dir}/whole-pixels.png")).unwrap();
     }
 }

@@ -37,7 +37,8 @@ pub enum Anchor {
 /// Nodes, by kind: a line's two ends; a polyline's corners; an arc's start, middle and end, then
 /// the centre of the ellipse it is a stretch of and the ends of two conjugate half-axes of that; an
 /// ellipse's or circle's centre and the four ends of its axes; a polygon's corners; a curve's
-/// anchors, each but the last followed by the two controls of the span it starts.
+/// anchors, each but the last followed by the two controls of the span it starts (a closed curve's
+/// last anchor its first again, see [`Shape::closed_curve`]).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Shape {
     pub kind: ShapeKind,
@@ -165,18 +166,40 @@ impl Shape {
         }
     }
 
+    /// Whether it is a curve that comes back round to where it began, its last anchor its first
+    /// again (a plugin fits one to a closed stroke): that anchor is one, its two places moving as
+    /// one and its controls either side a pair, as any other anchor's are.
+    pub fn closed_curve(&self) -> bool {
+        let n = self.nodes.len();
+        self.kind == ShapeKind::Curve && n >= 7 && (n - 1).is_multiple_of(3) && self.nodes.first() == self.nodes.last()
+    }
+
     /// Moves one of the curve's nodes, a control taking the one the other side of its anchor with it
     /// (mirrored, so the curve stays smooth through there) unless `mirror` is off. An anchor moves
     /// alone.
     fn move_curve_handle(&mut self, index: usize, to: Vec2, mirror: bool) {
+        let closed = self.closed_curve();
+        let last = self.nodes.len().saturating_sub(1);
         let Some(slot) = self.nodes.get_mut(index) else { return };
         *slot = to;
+        if closed && (index == 0 || index == last) {
+            if let Some(other) = self.nodes.get_mut(if index == 0 { last } else { 0 }) {
+                *other = to;
+            }
+            return;
+        }
         if index.is_multiple_of(3) || !mirror {
             return;
         }
-        // a control starts the span after its anchor at 3i+1, or ends the one before it at 3i-1
+        // a control starts the span after its anchor at 3i+1, or ends the one before it at 3i-1;
+        // round a closed curve's join, the first span's starts its pair and the last span's ends it
         let (anchor, pair) =
             if index % 3 == 1 { (index - 1, index.checked_sub(2)) } else { (index + 1, Some(index + 2)) };
+        let pair = match pair {
+            None if closed => Some(last - 1),
+            Some(p) if closed && p > last => Some(1),
+            p => p,
+        };
         let Some(about) = self.nodes.get(anchor).copied() else { return };
         if let Some(other) = pair.and_then(|p| self.nodes.get_mut(p)) {
             *other = about * 2.0 - to;
@@ -203,8 +226,17 @@ impl Shape {
         if self.kind != ShapeKind::Curve || !at.is_multiple_of(3) {
             return;
         }
+        // a closed curve's first anchor is its last too: the span before it is the last
+        let last = self.nodes.len().saturating_sub(1);
+        let closed = self.closed_curve();
+        let at = if closed && at == last { 0 } else { at };
+        let (before_at, back_at) = if closed && at == 0 {
+            (last.checked_sub(3), last.checked_sub(1))
+        } else {
+            (at.checked_sub(3), at.checked_sub(1))
+        };
         let Some(&here) = self.nodes.get(at) else { return };
-        let before = at.checked_sub(3).and_then(|i| self.nodes.get(i)).copied().unwrap_or(here);
+        let before = before_at.and_then(|i| self.nodes.get(i)).copied().unwrap_or(here);
         let after = self.nodes.get(at + 3).copied().unwrap_or(here);
         let (back, ahead) = match to {
             Anchor::Broken => return,
@@ -213,7 +245,7 @@ impl Shape {
                 here + (after - here).normalized_or(Vec2::ZERO) * (here.distance(after) / 3.0),
             ),
             Anchor::Smooth => {
-                let was_back = at.checked_sub(1).and_then(|i| self.nodes.get(i)).copied().unwrap_or(here);
+                let was_back = back_at.and_then(|i| self.nodes.get(i)).copied().unwrap_or(here);
                 let was_ahead = self.nodes.get(at + 1).copied().unwrap_or(here);
                 let mut way = ((was_ahead - here).normalized_or(Vec2::ZERO)
                     + (here - was_back).normalized_or(Vec2::ZERO))
@@ -230,7 +262,7 @@ impl Shape {
                 (here - way * reach, here + way * reach)
             }
         };
-        if let Some(slot) = at.checked_sub(1).and_then(|i| self.nodes.get_mut(i)) {
+        if let Some(slot) = back_at.and_then(|i| self.nodes.get_mut(i)) {
             *slot = back;
         }
         if let Some(slot) = self.nodes.get_mut(at + 1) {
@@ -297,8 +329,12 @@ impl Shape {
     }
 
     /// What a shape still held turns and grows about: an open shape's start, a closed shape's
-    /// centre.
+    /// centre (a closed curve's, its anchors').
     pub fn pivot(&self) -> Vec2 {
+        if self.closed_curve() {
+            let anchors: Vec<Vec2> = self.nodes.iter().step_by(3).skip(1).copied().collect();
+            return centroid(&anchors);
+        }
         match self.kind {
             ShapeKind::Line | ShapeKind::Polyline | ShapeKind::Arc | ShapeKind::Curve => {
                 self.nodes.first().copied().unwrap_or(Vec2::ZERO)
@@ -1127,6 +1163,55 @@ mod tests {
         // a stroke that is no polyline is left as it was
         let line = vec![Vec2::ZERO, Vec2::new(100.0, 1.0)];
         assert_eq!(with_curve(recognise(&line), &line), recognise(&line));
+    }
+
+    #[test]
+    fn a_closed_curve_s_join_is_one_anchor() {
+        // four anchors round a square-ish loop, the first again at the end
+        let a = [Vec2::new(0.0, 0.0), Vec2::new(100.0, 0.0), Vec2::new(100.0, 100.0), Vec2::new(0.0, 100.0)];
+        let mut nodes = Vec::new();
+        for i in 0..4 {
+            let (here, next) = (a[i], a[(i + 1) % 4]);
+            nodes.extend([
+                here,
+                here + (next - a[(i + 3) % 4]) * (1.0 / 6.0),
+                next - (a[(i + 2) % 4] - here) * (1.0 / 6.0),
+            ]);
+        }
+        nodes.push(a[0]);
+        let curve = Shape { kind: ShapeKind::Curve, nodes };
+        let last = curve.nodes.len() - 1;
+        assert!(curve.closed_curve());
+        assert_eq!(curve.outline().last(), curve.outline().first());
+        // held, it turns about its middle, not about where it began
+        assert_eq!(curve.pivot(), Vec2::new(50.0, 50.0));
+        let turned = curve.moved_with(curve.pivot(), Vec2::new(100.0, 50.0), Vec2::new(50.0, 100.0));
+        assert!(turned.closed_curve());
+        // its first anchor dragged takes its last along: still closed
+        let mut moved = curve.clone();
+        moved.move_handle(0, Vec2::new(-20.0, -10.0));
+        assert_eq!((moved.nodes[0], moved.nodes[last]), (Vec2::new(-20.0, -10.0), Vec2::new(-20.0, -10.0)));
+        moved.move_handle(last, Vec2::new(5.0, 5.0));
+        assert!(moved.closed_curve() && moved.nodes[0] == Vec2::new(5.0, 5.0));
+        // a control either side of the join takes the other the other way
+        let mut moved = curve.clone();
+        moved.move_handle(1, Vec2::new(30.0, -30.0));
+        assert!((moved.nodes[last - 1] - Vec2::new(-30.0, 30.0)).length() < 1e-3, "{:?}", moved.nodes[last - 1]);
+        moved.move_handle(last - 1, Vec2::new(-10.0, 0.0));
+        assert!((moved.nodes[1] - Vec2::new(10.0, 0.0)).length() < 1e-3, "{:?}", moved.nodes[1]);
+        // made a corner there, its controls lie along the last span and the first
+        let mut corner = curve.clone();
+        corner.set_anchor(last, Anchor::Corner);
+        let toward =
+            |a: Vec2, b: Vec2, c: Vec2| (b - a).normalized_or(Vec2::ZERO).distance((c - a).normalized_or(Vec2::ZERO));
+        assert!(toward(corner.nodes[0], corner.nodes[last - 1], corner.nodes[last - 3]) < 1e-3);
+        assert!(toward(corner.nodes[0], corner.nodes[1], corner.nodes[3]) < 1e-3);
+        assert!(corner.closed_curve());
+        // an open curve is none, nor one whose ends only come near
+        let mut open = curve.clone();
+        open.nodes[last] = Vec2::new(0.0, 1.0);
+        assert!(!open.closed_curve());
+        assert_eq!(open.pivot(), open.nodes[0]);
     }
 
     fn wobbly_circle(r: f32, squash: f32, n: usize) -> Vec<Vec2> {

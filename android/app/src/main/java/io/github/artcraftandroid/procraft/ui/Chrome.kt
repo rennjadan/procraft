@@ -45,6 +45,7 @@ import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathFillType
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
@@ -90,7 +91,8 @@ fun TopBar(vm: CanvasViewModel, modifier: Modifier = Modifier) {
             }
             ActionButton(PcIcons.Actions, "Actions", fit.button, selected = vm.panel == Panel.ACTIONS) { vm.toggle(Panel.ACTIONS) }
             ActionButton(PcIcons.Adjustments, "Adjustments", fit.button, selected = vm.panel == Panel.ADJUSTMENTS || vm.adjustment != null || vm.opacityLayer != null || vm.recoloring) { vm.adjustmentsPressed() }
-            ActionButton(PcIcons.Selection, "Selection", fit.button, selected = vm.selecting, glyph = 33.dp) { vm.toggleSelecting() }
+            // lit while the selection tool is open, or while something is selected
+            ActionButton(PcIcons.Selection, "Selection", fit.button, selected = vm.selecting || vm.hasSelection, glyph = 33.dp) { vm.toggleSelecting() }
             ActionButton(PcIcons.Transform, "Transform", fit.button, selected = vm.transforming, glyph = 44.dp) { vm.toggleTransform() }
         }
         // the layers and colour panels take the highlight from the current tool while open
@@ -473,7 +475,8 @@ private val NotchMark = Color(0x1AFFFFFF)
 
 /**
  * The brush's outline where the pen paints or hovers, in the brush's own shape (the round tip's a
- * circle): a thin dark line with a light edge, or in the colour painted with.
+ * circle): a thin dark line with a light edge, or in the colour painted with. Hovering, the brush's
+ * stamp fills it in the colour, as strong as the brush paints, if its Hover fill says so.
  */
 @Composable
 fun BrushCursor(vm: CanvasViewModel) {
@@ -484,13 +487,30 @@ fun BrushCursor(vm: CanvasViewModel) {
     val style = vm.cursorStyle
     val paint = CanvasSpace.color(vm.colorRgb())
     val shape = vm.cursorShape
+    val turn = vm.cursorTurn
+    val fill = vm.cursorFill.takeIf { vm.cursorHovering }
+    val strength = vm.opacity.coerceIn(0f, 1f)
     androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
-        // its loops across the brush's diameter, about where it is
+        // the stamp under the outline, across the brush's diameter, turned as the stamps are
+        if (fill != null) {
+            rotate(Math.toDegrees(turn.toDouble()).toFloat(), pivot = at) {
+                drawImage(
+                    fill,
+                    dstOffset = androidx.compose.ui.unit.IntOffset((at.x - r).roundToInt(), (at.y - r).roundToInt()),
+                    dstSize = androidx.compose.ui.unit.IntSize((2f * r).roundToInt(), (2f * r).roundToInt()),
+                    alpha = strength,
+                    colorFilter = androidx.compose.ui.graphics.ColorFilter.tint(paint),
+                )
+            }
+        }
+        // its loops across the brush's diameter, about where it is, turned as the stamps are
+        val (sin, cos) = kotlin.math.sin(turn) to kotlin.math.cos(turn)
         val paths = shape.map { ring ->
             Path().apply {
                 for (i in 0 until ring.size / 2) {
-                    val x = at.x + ring[i * 2] * r * 2f
-                    val y = at.y + ring[i * 2 + 1] * r * 2f
+                    val (dx, dy) = ring[i * 2] to ring[i * 2 + 1]
+                    val x = at.x + (dx * cos - dy * sin) * r * 2f
+                    val y = at.y + (dx * sin + dy * cos) * r * 2f
                     if (i == 0) moveTo(x, y) else lineTo(x, y)
                 }
                 close()

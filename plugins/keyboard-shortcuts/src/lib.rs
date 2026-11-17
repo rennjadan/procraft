@@ -8,6 +8,10 @@
 //! group at a time; one tapped asks for the next key press, and has a way back to its keys as they
 //! came, or none. What it binds it keeps, so it holds through a restart; turned off, every key is
 //! as it came again.
+//!
+//! The app tells it the view's own moves too (zooming, fitting, turning and panning the canvas),
+//! which have no keys as they come: each by a press no keyboard sends, which a key bound to it is
+//! taken as. A turn goes by a step it keeps, chosen where the turning shortcuts take their keys.
 
 use std::sync::{Mutex, MutexGuard};
 
@@ -33,18 +37,51 @@ const PAGE: usize = 13;
 const LABEL: usize = 40;
 const OPTION: usize = 24;
 
+/// What the presses of the view's own moves start with: presses no keyboard sends, shown as none.
+const VIEW: &str = "view:";
+/// What the view's turning presses start with, the degrees after it (below 0: back).
+const TURN: &str = "view:turn:";
+/// The steps a turn may go by (degrees), and the one it goes by as it comes.
+const TURN_STEPS: [u32; 6] = [5, 10, 15, 30, 45, 90];
+const TURN_STEP: u32 = 15;
+/// What the step is kept under, among what it binds: no press reads so.
+const STEP_KEPT: &str = "Turn step";
+
+/// Whether `press` is a view's own move: no keyboard sends it.
+fn is_view(press: &Press) -> bool {
+    press.key.starts_with(VIEW)
+}
+
+/// Those of `presses` a keyboard sends.
+fn sent(presses: &[Press]) -> Vec<Press> {
+    presses.iter().filter(|p| !is_view(p)).cloned().collect()
+}
+
+/// Whether the shortcut named `named` turns the canvas: back (true) if its degrees are below 0.
+fn turns(named: &str) -> Option<bool> {
+    let degrees: i32 = named.strip_prefix(TURN)?.parse().ok()?;
+    Some(degrees < 0)
+}
+
 /// The app's shortcuts with each one's name (see [`name`], worked out once as they are told: a
-/// press looks through them all), and those bound anew: each by its name, with its keys now.
-#[derive(Default)]
+/// press looks through them all), and those bound anew: each by its name, with its keys now; and
+/// the step a turn goes by (degrees).
 struct Bindings {
     shortcuts: Vec<Shortcut>,
     names: Vec<Option<String>>,
     bound: Vec<(String, Vec<Press>)>,
+    turn_step: u32,
+}
+
+impl Default for Bindings {
+    fn default() -> Bindings {
+        Bindings::new()
+    }
 }
 
 impl Bindings {
     const fn new() -> Bindings {
-        Bindings { shortcuts: Vec::new(), names: Vec::new(), bound: Vec::new() }
+        Bindings { shortcuts: Vec::new(), names: Vec::new(), bound: Vec::new(), turn_step: TURN_STEP }
     }
 
     /// The app's shortcuts as it tells them, their names with them.
@@ -80,12 +117,21 @@ impl Bindings {
         self.bound.iter().find(|(n, _)| n == name).map(|(_, presses)| presses)
     }
 
-    /// The keys shortcut `at` has now.
+    /// The keys shortcut `at` has now (a keyboard's: a view's own move as it came has none).
     fn now(&self, at: usize) -> Vec<Press> {
         let Some(shortcut) = self.shortcuts.get(at) else { return Vec::new() };
         match self.name_of(at).and_then(|n| self.bound_to(n)) {
             Some(presses) => presses.clone(),
-            None => shortcut.presses.clone(),
+            None => sent(&shortcut.presses),
+        }
+    }
+
+    /// The press that does what the shortcut named `named` does: its first key as it came, or for a
+    /// turn, the turn by the step chosen.
+    fn done_by(&self, named: &str) -> Option<Press> {
+        match turns(named) {
+            Some(back) => Press::read(&format!("{TURN}{}{}", if back { "-" } else { "" }, self.turn_step)),
+            None => Press::read(named),
         }
     }
 
@@ -95,7 +141,7 @@ impl Bindings {
     fn taken(&self, press: &Press) -> Taken {
         for (named, presses) in &self.bound {
             if presses.contains(press) && self.known(named) {
-                return Press::read(named).map_or(Taken::AsItIs, Taken::As);
+                return self.done_by(named).map_or(Taken::AsItIs, Taken::As);
             }
         }
         let gone = |press: &Press| {
@@ -171,9 +217,10 @@ impl Bindings {
         });
     }
 
-    /// What it binds, to keep: a line a shortcut, its name, a tab, then its keys a space apart.
+    /// What it binds, to keep: a line a shortcut, its name, a tab, then its keys a space apart; and
+    /// a turn's step, if it isn't as it came, under [`STEP_KEPT`].
     fn written(&self) -> Vec<u8> {
-        let lines: Vec<String> = self
+        let mut lines: Vec<String> = self
             .bound
             .iter()
             .map(|(named, presses)| {
@@ -181,12 +228,17 @@ impl Bindings {
                 format!("{named}\t{}", keys.join(" "))
             })
             .collect();
+        if self.turn_step != TURN_STEP {
+            lines.push(format!("{STEP_KEPT}\t{}", self.turn_step));
+        }
         lines.join("\n").into_bytes()
     }
 
     /// What it kept, as [`Bindings::written`] writes it, each line that reads as one.
     fn read(&mut self, data: &[u8]) {
         let text = String::from_utf8_lossy(data);
+        let step = text.lines().find_map(|line| line.strip_prefix(STEP_KEPT)?.strip_prefix('\t')?.parse().ok());
+        self.turn_step = step.filter(|s| TURN_STEPS.contains(s)).unwrap_or(TURN_STEP);
         self.bound = text
             .lines()
             .filter_map(|line| {
@@ -207,6 +259,7 @@ enum Row {
     AsItCame,
     NoKeys,
     Back,
+    TurnStep,
     Nothing,
 }
 
@@ -285,8 +338,7 @@ impl State {
         panel = panel.choice("Shortcuts", &names, self.page);
         self.rows.push(Row::Page);
         for &at in pages.get(self.page).map(|(_, rows)| rows.as_slice()).unwrap_or_default() {
-            let does = self.bindings.shortcuts.get(at).map(|s| short(&s.does, LABEL)).unwrap_or_default();
-            panel = panel.keys(&does, &self.bindings.now(at));
+            panel = panel.keys(&self.label(at), &self.bindings.now(at));
             self.rows.push(Row::Shortcut(at));
         }
         if !self.bindings.bound.is_empty() {
@@ -300,16 +352,33 @@ impl State {
         panel
     }
 
+    /// What shortcut `at` does, as its row in the list says: a turn with its step.
+    fn label(&self, at: usize) -> String {
+        let Some(shortcut) = self.bindings.shortcuts.get(at) else { return String::new() };
+        if self.bindings.name_of(at).and_then(turns).is_some() {
+            return short(&format!("{} ({}°)", shortcut.does, self.bindings.turn_step), LABEL);
+        }
+        short(&shortcut.does, LABEL)
+    }
+
     fn waiting_panel(&mut self, at: usize) -> Panel {
         let Some(shortcut) = self.bindings.shortcuts.get(at) else { return self.list_panel() };
         let mut panel = Panel::new(&short(&shortcut.does, LABEL))
             .text("Press the new keys. Escape goes back.")
             .keys("Now", &self.bindings.now(at))
-            .keys("As it came", &shortcut.presses)
+            .keys("As it came", &sent(&shortcut.presses))
             .button("No keys")
             .button("Back")
             .key_press();
         self.rows = vec![Row::Nothing, Row::Nothing, Row::AsItCame, Row::NoKeys, Row::Back];
+        // a turn's step, for both ways round
+        if self.bindings.name_of(at).and_then(turns).is_some() {
+            let steps: Vec<String> = TURN_STEPS.iter().map(|s| format!("{s}°")).collect();
+            let steps: Vec<&str> = steps.iter().map(String::as_str).collect();
+            let chosen = TURN_STEPS.iter().position(|&s| s == self.bindings.turn_step).unwrap_or(0);
+            panel = panel.choice("Step", &steps, chosen);
+            self.rows.push(Row::TurnStep);
+        }
         if let Some(note) = &self.note {
             panel = panel.text(note);
             self.rows.push(Row::Nothing);
@@ -353,6 +422,12 @@ impl State {
             (Row::Back, _) => {
                 self.waiting = None;
                 self.note = None;
+            }
+            (Row::TurnStep, _) => {
+                if let Some(&step) = TURN_STEPS.get(value.max(0.0) as usize) {
+                    self.bindings.turn_step = step;
+                    self.changed();
+                }
             }
             _ => {}
         }
@@ -496,5 +571,108 @@ mod tests {
         state.pressed(Press::new("escape"));
         assert_eq!(state.waiting, None);
         assert!(state.bindings.bound.is_empty());
+    }
+
+    /// A tablet's shortcuts, a few of them, with the view's own moves as the app tells them there.
+    fn tablet() -> Bindings {
+        let told = "Edit\tUndo\tcommand+z\t0\n\
+                    Tools\tTransforming: move it left\tleft\t0\n\
+                    View\tGrey view, to check values\tcommand+g\t0\n\
+                    View\tZoom in\tview:zoom-in\t0\n\
+                    View\tZoom out\tview:zoom-out\t0\n\
+                    View\tFit the canvas\tview:fit\t0\n\
+                    View\tTurn the canvas a step\tview:turn:15\t0\n\
+                    View\tTurn it back a step\tview:turn:-15\t0\n\
+                    View\tPan left\tview:pan-left\t0\n";
+        let mut bindings = Bindings::new();
+        bindings.told(kit::keys::read_shortcuts(told));
+        bindings
+    }
+
+    /// Where the shortcut that does `does` is.
+    fn at(b: &Bindings, does: &str) -> usize {
+        b.shortcuts.iter().position(|s| s.does == does).unwrap()
+    }
+
+    #[test]
+    fn the_view_s_own_moves_have_no_keys_until_bound_and_then_are_taken_as_their_press() {
+        let mut b = tablet();
+        let zoom = at(&b, "Zoom in");
+        assert_eq!(b.now(zoom), Vec::<Press>::new());
+        assert_eq!(b.taken(&press("command+=")), Taken::AsItIs);
+        assert_eq!(b.keys_for(&press("view:zoom-in")), None);
+        assert_eq!(b.bind(zoom, press("command+=")), Ok(None));
+        assert_eq!(b.taken(&press("command+=")), Taken::As(press("view:zoom-in")));
+        assert_eq!(b.now(zoom), [press("command+=")]);
+        assert_eq!(b.keys_for(&press("view:zoom-in")), Some(vec![press("command+=")]));
+        // an arrow taken from moving what is transformed
+        let left = at(&b, "Pan left");
+        assert_eq!(b.bind(left, press("left")), Ok(Some("Transforming: move it left".to_owned())));
+        assert_eq!(b.taken(&press("left")), Taken::As(press("view:pan-left")));
+        // back as it came: no keys again, and the arrow moves what is transformed
+        b.reset(left);
+        assert_eq!(b.now(left), Vec::<Press>::new());
+        assert_eq!(b.taken(&press("left")), Taken::Nothing, "the arrow went with the binding");
+        b.reset(at(&b, "Transforming: move it left"));
+        assert_eq!(b.taken(&press("left")), Taken::AsItIs);
+        // kept and read back
+        let mut again = tablet();
+        again.read(&b.written());
+        assert_eq!(again.taken(&press("command+=")), Taken::As(press("view:zoom-in")));
+    }
+
+    #[test]
+    fn a_turn_goes_by_the_step_chosen_both_ways_round_and_keeps_it() {
+        let mut b = tablet();
+        b.bind(at(&b, "Turn the canvas a step"), press("r")).unwrap();
+        b.bind(at(&b, "Turn it back a step"), press("shift+r")).unwrap();
+        assert_eq!(b.taken(&press("r")), Taken::As(press("view:turn:15")));
+        assert_eq!(b.taken(&press("shift+r")), Taken::As(press("view:turn:-15")));
+        b.turn_step = 10;
+        assert_eq!(b.taken(&press("r")), Taken::As(press("view:turn:10")));
+        assert_eq!(b.taken(&press("shift+r")), Taken::As(press("view:turn:-10")));
+        let kept = b.written();
+        assert!(String::from_utf8_lossy(&kept).ends_with("\nTurn step\t10"));
+        let mut again = tablet();
+        again.read(&kept);
+        assert_eq!(again.turn_step, 10);
+        assert_eq!(again.bound, b.bound, "the step is no binding");
+        assert_eq!(again.taken(&press("shift+r")), Taken::As(press("view:turn:-10")));
+        // a step it doesn't offer is the one it came with; as it came, it isn't written
+        again.read(b"Turn step\t7");
+        assert_eq!(again.turn_step, TURN_STEP);
+        assert!(again.written().is_empty());
+    }
+
+    #[test]
+    fn the_view_page_lists_the_moves_with_no_keys_and_a_turn_chooses_its_step() {
+        let mut state = State { bindings: tablet(), ..State::new() };
+        let pages = state.pages();
+        let view = pages.iter().position(|(name, _)| name == "View").unwrap();
+        state.list_panel();
+        state.touched(0, view as f32);
+        let json = state.list_panel().json();
+        assert!(json.contains(r#"{"type":"keys","label":"Zoom in","keys":[]}"#), "{json}");
+        assert!(json.contains(r#"{"type":"keys","label":"Turn the canvas a step (15°)","keys":[]}"#), "{json}");
+        assert!(!json.contains("view:"), "{json}");
+        // tapped, a turn asks for its keys and offers its steps
+        let turn = state.rows.iter().position(|r| *r == Row::Shortcut(at(&state.bindings, "Turn it back a step")));
+        state.touched(turn.unwrap(), 1.0);
+        let json = state.waiting_panel(state.waiting.unwrap()).json();
+        assert!(json.contains(r#"{"type":"keys","label":"As it came","keys":[]}"#), "{json}");
+        assert!(json.contains(r#""label":"Step","options":["5°","10°","15°","30°","45°","90°"],"chosen":2"#), "{json}");
+        let step = state.rows.iter().position(|r| *r == Row::TurnStep).unwrap();
+        state.touched(step, 1.0);
+        assert_eq!(state.bindings.turn_step, 10);
+        assert!(state.waiting.is_some(), "still asking for its keys");
+        state.pressed(press("shift+r"));
+        assert_eq!(state.bindings.taken(&press("shift+r")), Taken::As(press("view:turn:-10")));
+        let json = state.list_panel().json();
+        assert!(json.contains(r#""label":"Turn it back a step (10°)","keys":["shift+r"]"#), "{json}");
+        // another shortcut's waiting panel has no step
+        state
+            .touched(state.rows.iter().position(|r| *r == Row::Shortcut(at(&state.bindings, "Zoom in"))).unwrap(), 1.0);
+        let json = state.waiting_panel(state.waiting.unwrap()).json();
+        assert!(!json.contains("Step"), "{json}");
     }
 }

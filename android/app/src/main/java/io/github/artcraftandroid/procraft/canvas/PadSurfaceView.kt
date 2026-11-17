@@ -84,7 +84,9 @@ class PadSurfaceView(context: Context, private val vm: CanvasViewModel) : Surfac
                 strokePointer = e.getPointerId(0)
                 // the first stroke of one's own takes the sample scribble's place
                 pad.beginOwnStroke()
-                pad.strokeBegin(kindOf(e), samples(e, 0))
+                val kind = kindOf(e)
+                if (kind != PointerKind.FINGER) pad.setPenTiltKnown(tiltKnown(e))
+                pad.strokeBegin(kind, samples(e, 0))
             }
             MotionEvent.ACTION_MOVE -> {
                 val i = e.findPointerIndex(strokePointer)

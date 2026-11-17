@@ -1126,13 +1126,16 @@ internal fun shareFile(context: Context, file: File, mime: String) {
     context.startActivity(shareSheet(context, send, listOf(file), mime))
 }
 
-/** The share sheet for [send], with saving [files] to the device always among its choices. */
+/**
+ * The share sheet for [send], with saving [files] to the device always among its choices, and to
+ * the gallery too for pictures and videos.
+ */
 private fun shareSheet(context: Context, send: Intent, files: List<File>, mime: String): Intent {
-    val save = android.content.pm.LabeledIntent(
-        io.github.artcraftandroid.procraft.SaveToDeviceActivity.intent(context, files, mime),
-        context.packageName,
-        "Save to device",
-        io.github.artcraftandroid.procraft.R.mipmap.ic_launcher,
-    )
-    return Intent.createChooser(send, null).putExtra(Intent.EXTRA_INITIAL_INTENTS, arrayOf<android.os.Parcelable>(save))
+    fun ours(intent: Intent, label: String) =
+        android.content.pm.LabeledIntent(intent, context.packageName, label, io.github.artcraftandroid.procraft.R.mipmap.ic_launcher)
+    val gallery = ours(io.github.artcraftandroid.procraft.SaveToGalleryActivity.intent(context, files, mime), "Save to Gallery")
+        .takeIf { io.github.artcraftandroid.procraft.savesToGallery(mime) }
+    val save = ours(io.github.artcraftandroid.procraft.SaveToDeviceActivity.intent(context, files, mime), "Save to device")
+    val choices = listOfNotNull(gallery, save).toTypedArray<android.os.Parcelable>()
+    return Intent.createChooser(send, null).putExtra(Intent.EXTRA_INITIAL_INTENTS, choices)
 }

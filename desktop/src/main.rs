@@ -255,6 +255,8 @@ fn main() {
         wake: event_loop.create_proxy(),
         started: Instant::now(),
         last_frame: Instant::now(),
+        input_frame: false,
+        gap: Duration::from_millis(15),
         again: None,
         finishing_since: None,
         stroke_sound: stroke_sound::StrokeSound::default(),
@@ -306,6 +308,10 @@ struct App {
     /// moving, or a hold to be timed).
     last_frame: Instant,
     again: Option<Instant>,
+    /// Input came that wants a frame sooner than the screen shows another after the last (see
+    /// [`frame_gap`]): drawn once it does. And that gap, as the last frame found it.
+    input_frame: bool,
+    gap: Duration,
     /// Since when a plugin has been finishing a fill.
     finishing_since: Option<Instant>,
     /// The strokes' sound, played while a plugin makes it.
@@ -563,8 +569,9 @@ impl ApplicationHandler for App {
         self.sync_projection(event_loop);
         let Some(screen) = self.screen.as_ref() else { return };
         let Some(session) = self.session.as_ref() else {
-            // the gallery: only the interface's own wants
-            match self.again {
+            // the gallery: only the interface's own wants, and input's once a refresh
+            let input = self.input_frame.then(|| self.last_frame + self.gap);
+            match [self.again, input].into_iter().flatten().min() {
                 Some(due) if Instant::now() >= due => screen.window.request_redraw(),
                 Some(due) => {
                     event_loop.set_control_flow(ControlFlow::WaitUntil(due));
@@ -579,12 +586,16 @@ impl ApplicationHandler for App {
         // the touches' waits (a hold, a repeat) run out
         if self.input.tick(session) || !self.input.commands.is_empty() {
             screen.window.request_redraw();
-        } else if let Some(due) =
-            self.again.or_else(|| (session.wants_frame() && !screen.minimised()).then(Instant::now))
-        {
-            // what moves by itself (the selection's bands, a fade) draws once a refresh, not as
-            // fast as frames can be made
-            let due = due.max(self.last_frame + frame_gap(&screen.window));
+        } else if let Some(due) = {
+            // what moves by itself (the selection's bands, a fade), and input that came meanwhile,
+            // draws once a refresh, not as fast as frames can be made
+            let wanted = ((session.wants_frame() || self.input_frame) && !screen.minimised()).then(Instant::now);
+            match (self.again, wanted) {
+                (Some(again), Some(wanted)) => Some(again.min(wanted)),
+                (again, wanted) => again.or(wanted),
+            }
+        } {
+            let due = due.max(self.last_frame + self.gap);
             if Instant::now() >= due {
                 screen.window.request_redraw();
             } else {
@@ -691,7 +702,7 @@ impl App {
         // egui counts every redraw as wanting another; the frames it does want come from its
         // repaint delay, paced in `about_to_wait`
         if response.repaint && event != WindowEvent::RedrawRequested {
-            screen.window.request_redraw();
+            redraw_paced(&screen.window, self.last_frame, self.gap, &mut self.input_frame);
         }
         // F11: the window fills its screen without its frame (a pen display's whole screen for
         // the canvas, as the tablet's), or goes back to a window
@@ -755,7 +766,7 @@ impl App {
                 let canvas = self.ui.canvas_rect;
                 let over = |p: (f32, f32)| blocked || screen.over_interface(p, canvas);
                 if self.input.on_event(&session, &event, response.consumed, over) {
-                    screen.window.request_redraw();
+                    redraw_paced(&screen.window, self.last_frame, self.gap, &mut self.input_frame);
                 }
             }
         }
@@ -847,6 +858,10 @@ impl App {
             return;
         };
         self.last_frame = Instant::now();
+        self.input_frame = false;
+        if let Some(screen) = self.screen.as_ref() {
+            self.gap = frame_gap(&screen.window);
+        }
         // the canvas made: drawn from now on; a slow one says it is opening
         if self.opening.as_ref().is_some_and(|(_, made)| made.is_finished())
             && let Some((_, made)) = self.opening.take()
@@ -960,6 +975,8 @@ impl App {
     fn gallery_frame(&mut self) {
         let Some(screen) = self.screen.as_mut() else { return };
         self.last_frame = Instant::now();
+        self.input_frame = false;
+        self.gap = frame_gap(&screen.window);
         screen.size_interface(self.ui.plugins(), None);
         self.stroke_sound.follow(None, false);
         let raw = screen.take_input();
@@ -1287,12 +1304,13 @@ impl App {
             }
             Ok(session) => {
                 let cell = self.gallery.picture_of(&dir);
+                let turns = session.shown_turns();
                 self.open_artwork(Arc::clone(&session), dir);
                 // the gallery zooms into its picture
                 if let (Some(cell), Some(screen)) = (cell, &self.screen) {
                     let size = screen.window.inner_size();
                     let scale = screen.window.scale_factor() as f32 * screen.egui.egui_ctx().zoom_factor();
-                    self.zoom = Some(zoom::Zoom::opening(&session, cell, (size.width, size.height), scale));
+                    self.zoom = Some(zoom::Zoom::opening(&session, cell, turns, (size.width, size.height), scale));
                 }
             }
             Err(e) => files::tell("Can't open the artwork", &e),
@@ -1504,11 +1522,13 @@ impl App {
         let opened = match action {
             Action::Gallery => {
                 if self.leave_artwork() {
-                    // the gallery zooms out of the artwork's picture
+                    // the gallery zooms out of the artwork's picture, as it will show (turned as its
+                    // canvas was left)
+                    let (info, turns) = (session.info(), session.shown_turns());
                     if let (Some(dir), Some(screen)) = (&self.artwork, &self.screen)
-                        && let Some(cell) = self.gallery.picture_of(dir)
+                        && let Some(cell) = self.gallery.picture_as(dir, (info.width, info.height), turns)
                     {
-                        self.zoom = Some(zoom::Zoom::closing(screen.egui.egui_ctx(), session, cell));
+                        self.zoom = Some(zoom::Zoom::closing(screen.egui.egui_ctx(), session, cell, turns));
                     }
                     self.session = None;
                     self.artwork = None;
@@ -1567,10 +1587,24 @@ impl App {
     }
 }
 
-/// The time between the screen's refreshes (a 60 Hz screen's when it can't be told).
+/// The least time between two frames: a tenth under the time between the screen's refreshes (a
+/// 60 Hz screen's when it can't be told), so a frame is ready for each as they drift, as the
+/// tablet's are.
 fn frame_gap(window: &Window) -> Duration {
     let millihertz = window.current_monitor().and_then(|m| m.refresh_rate_millihertz()).filter(|&m| m > 0);
-    Duration::from_secs_f64(1000.0 / f64::from(millihertz.unwrap_or(60_000)))
+    Duration::from_secs_f64(0.9 * 1000.0 / f64::from(millihertz.unwrap_or(60_000)))
+}
+
+/// Asks for a frame as input wants one: at once when the last was `gap` ago or more, else once it
+/// was (`later`, seen to in `about_to_wait`). A mouse or pen reports hundreds of moves a second:
+/// drawn as each came, where the window shows the newest frame without waiting for the screen,
+/// frames were drawn that never showed.
+fn redraw_paced(window: &Window, last_frame: Instant, gap: Duration, later: &mut bool) {
+    if Instant::now() >= last_frame + gap {
+        window.request_redraw();
+    } else {
+        *later = true;
+    }
 }
 
 #[cfg(test)]

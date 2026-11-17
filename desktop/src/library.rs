@@ -1653,10 +1653,17 @@ mod tests {
             self.library.brush_rects.first().map_or(0.0, |(_, r)| r.top())
         }
 
-        /// A point on a brush in the middle of the list.
+        /// A point on a brush in the middle of the list as it shows (a long set's further brushes
+        /// lie past the window).
         fn on_a_brush(&self) -> Pos2 {
-            let middle = self.library.brush_rects.len() / 3;
-            self.library.brush_rects.get(middle).map_or(Pos2::ZERO, |(_, r)| r.center())
+            let shown: Vec<Pos2> = self
+                .library
+                .brush_rects
+                .iter()
+                .map(|(_, r)| r.center())
+                .filter(|c| (0.0..700.0).contains(&c.y))
+                .collect();
+            shown.get(shown.len() / 3).copied().unwrap_or(Pos2::ZERO)
         }
     }
 

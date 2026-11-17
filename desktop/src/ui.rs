@@ -384,15 +384,12 @@ impl Interface {
         self.time_lapse.open(self.artwork_dir.as_deref(), session.edits());
         self.adjustments.menu_at = None;
         self.colours.send(session);
-        // as it was left, or fitted (Canvas Orientation Memory)
-        if !self.prefs.orientation_memory {
-            session.forget_saved_view();
-        }
         self.place_canvas(session, scale);
     }
 
     /// The artwork is put away (to the gallery, for another, or with the window): brushes coming
-    /// in from files are waited for, Recolor ends keeping what it filled, and Layer Opacity ends.
+    /// in from files are waited for, Recolor ends keeping what it filled, Layer Opacity ends, and
+    /// the selection tool closes (Color Fill filling what is selected).
     pub fn closing(&mut self, session: &CanvasSession) {
         // a plugin's panel goes with the artwork it was open over
         self.prefs.plugins.close_panel();
@@ -402,6 +399,7 @@ impl Interface {
         self.library.finish_importing(session);
         self.end_recolor(session);
         session.set_touch_layer_opacity(None);
+        self.selection.close(session);
     }
 
     /// A new artwork just started: without time-lapse if that is turned off.
@@ -595,7 +593,8 @@ impl Interface {
         let lit = Lit {
             actions: self.open == Some(Popover::Actions),
             transform: self.transform.on,
-            selection: self.selection.on,
+            // while the selection tool is open, or while something is selected
+            selection: self.selection.on || session.has_selection(),
             adjustments: self.open == Some(Popover::Adjustments)
                 || session.adjustment_shown().adjustment.is_some()
                 || session.recolor_on()
@@ -771,6 +770,7 @@ impl Interface {
             && !self.text.editing()
             && (adjusting.adjustment.is_none() || adjusting.pencil);
         crate::panel::side_bar_at(&ctx, self.side_bar_shown, self.prefs.right_handed);
+        crate::panel::set_part_scales(&ctx, &self.prefs.plugins);
         let taps = if side_bar {
             let modify_lit = session.pick_next();
             let right = self.prefs.right_handed;
@@ -847,6 +847,7 @@ impl Interface {
             let picker = self.prefs.plugins.picker_on().then(|| (Arc::clone(&self.prefs.plugins), Arc::clone(session)));
             self.colours.set_picker(picker);
         }
+        self.colours.set_floating_look(&self.prefs.plugins);
         self.colours.show_floating(&ctx, &mut self.look, session, &mut backdrops);
         // the colour model chosen on the panel, kept; the panel works in the one kept
         if let Some(model) = self.colours.model_chosen.take() {
@@ -1911,7 +1912,9 @@ impl Interface {
     /// As [`Self::cut_layer`]; whether anything was.
     fn layer_cut(&mut self, session: &CanvasSession) -> bool {
         self.open = None;
-        if !self.takes_changes(session) {
+        // one layer at a time: a group current or several chosen say so
+        let why = session.why_not_copied(true);
+        if !self.say_blocked(session, why) {
             return false;
         }
         let Some(cut) = session.cut_layer() else { return false };
@@ -1923,12 +1926,22 @@ impl Interface {
 
     /// The current layer (or what is selected of it) copied, to paste.
     fn copy_layer(&mut self, session: &CanvasSession) {
+        self.layer_copied(session);
+    }
+
+    /// As [`Self::copy_layer`]; whether anything was.
+    fn layer_copied(&mut self, session: &CanvasSession) -> bool {
         self.open = None;
-        if let Some(copied) = session.copy_layer() {
-            self.clipboard = Some(copied);
-            self.system_clipboard.copied_here(self.clipboard.as_ref());
-            self.overlays.notice("Layer copied", false);
+        // one layer at a time: a group current or several chosen say so
+        let why = session.why_not_copied(false);
+        if !self.say_blocked(session, why) {
+            return false;
         }
+        let Some(copied) = session.copy_layer() else { return false };
+        self.clipboard = Some(copied);
+        self.system_clipboard.copied_here(self.clipboard.as_ref());
+        self.overlays.notice("Layer copied", false);
+        true
     }
 
     /// The whole picture (or what is selected of it) copied, to paste.
@@ -1998,8 +2011,9 @@ impl Interface {
     /// What is selected copied and pasted as a new layer; nothing selected, the layer duplicated.
     fn duplicate_current(&mut self, session: &CanvasSession) {
         if session.has_selection() {
-            self.copy_layer(session);
-            self.paste_own(session, false);
+            if self.layer_copied(session) {
+                self.paste_own(session, false);
+            }
         } else if let Some(current) = session.layers().into_iter().find(|l| l.current)
             && session.duplicate_layer(current.id).is_none()
         {
@@ -2017,7 +2031,11 @@ impl Interface {
     /// As [`Self::takes_changes`], for why the current layer took nothing (`why`, if anything).
     fn say_blocked(&mut self, session: &CanvasSession, why: Option<Blocked>) -> bool {
         let Some(why) = why else { return true };
-        let Some(l) = session.layers().into_iter().find(|l| l.current) else { return true };
+        // Liquify's alert is about the layer chosen whose alpha is locked
+        let layers = session.layers();
+        let alpha_locked = (why == Blocked::AlphaLocked).then(|| session.alpha_locked_chosen()).flatten();
+        let shown = layers.iter().find(|l| Some(l.id) == alpha_locked).or_else(|| layers.iter().find(|l| l.current));
+        let Some(l) = shown.cloned() else { return true };
         let (title, message, icon, extra) = match why {
             Blocked::Locked => (
                 "Layer is locked",
@@ -2033,7 +2051,13 @@ impl Interface {
             ),
             Blocked::Group => (
                 "Group is selected",
-                format!("\u{201c}{}\u{201d} is a group: choose one of its layers to paint on.", l.name),
+                format!("\u{201c}{}\u{201d} is a group: choose one of the layers in it.", l.name),
+                &crate::icons::FOLDER,
+                None,
+            ),
+            Blocked::Several => (
+                "Several layers are chosen",
+                "This works on one layer at a time: choose just one.".to_owned(),
                 &crate::icons::FOLDER,
                 None,
             ),
@@ -2278,7 +2302,7 @@ impl Interface {
     fn switch_modes(&mut self, session: &CanvasSession, button: ModeButton) -> bool {
         let open = self.open_modes(session);
         let ModeSwitch { end, goes_on } = mode_switch(button, open);
-        if mode_switch_deselects(button, open) {
+        if mode_switch_deselects(button, open, self.selection.color_fill()) {
             self.selection.clear(session);
         }
         if end.quickshape {
@@ -2296,7 +2320,9 @@ impl Interface {
             session.set_touch_layer_opacity(None);
         }
         if end.transform {
+            // kept, it ends the selection too
             self.transform.end(session, true);
+            self.selection.changed(session);
         }
         if end.selection {
             self.selection.close(session);
@@ -2726,8 +2752,8 @@ impl Interface {
                 "s" => self.actions.push(if press.shift { Action::SaveAs } else { Action::Save }),
                 "n" => self.actions.push(Action::New),
                 "o" => self.actions.push(Action::Open),
-                "=" | "plus" => session.view_gesture(middle.x, middle.y, 0.0, 0.0, KEY_ZOOM, 0.0),
-                "-" => session.view_gesture(middle.x, middle.y, 0.0, 0.0, 1.0 / KEY_ZOOM, 0.0),
+                "=" | "plus" => session.view_gesture(middle.x, middle.y, 0.0, 0.0, procraft_core::KEY_ZOOM, 0.0),
+                "-" => session.view_gesture(middle.x, middle.y, 0.0, 0.0, 1.0 / procraft_core::KEY_ZOOM, 0.0),
                 "0" => session.settle_to_fit(),
                 _ => {
                     return self.canvas_press(ctx, session, info, press);
@@ -2792,6 +2818,13 @@ impl Interface {
             KeyShortcut::Nudge { dx, dy } => {
                 session.nudge_plugin_items(dx, dy);
             }
+            // the view's own moves a plugin took a press as
+            KeyShortcut::ZoomView { .. }
+            | KeyShortcut::TurnView { .. }
+            | KeyShortcut::PanView { .. }
+            | KeyShortcut::FitView => {
+                session.key_view(shortcut);
+            }
         }
     }
 
@@ -2809,9 +2842,6 @@ impl Interface {
         self.library.tool_changed();
     }
 }
-
-/// How far Ctrl with + or - zooms the canvas each time.
-const KEY_ZOOM: f32 = 1.25;
 
 /// Whether Escape was pressed this frame, for what is open to close: it counts as taken, so it
 /// doesn't also turn the canvas upright ([`Interface::show`]).

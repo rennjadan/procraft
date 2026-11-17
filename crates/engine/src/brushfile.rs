@@ -64,6 +64,33 @@ pub enum Texture {
     Stock { name: String, inverted: bool },
     /// An image in the file (PNG or JPEG bytes).
     Image { bytes: Vec<u8>, inverted: bool },
+    /// Our stand-in for a stock image, chosen already: what the stock library's own brushes, which
+    /// name no image, are drawn with.
+    Drawn(StandIn),
+}
+
+/// Our stand-in for a stock image: ours as [`Pick`] says, drawn to the stock image's measurements
+/// (kept under `key`, see [`crate::textures::stock_key`]), inverted as a brush that inverts the
+/// stock image has it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StandIn {
+    pub pick: Pick,
+    pub key: u64,
+    pub inverted: bool,
+}
+
+/// Which of ours stands in for a stock image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Pick {
+    /// The round tip at this hardness.
+    Round(f32),
+    /// The stamp's whole square (nothing, inverted).
+    Blank,
+    /// One of our shapes or grains (its place among them), or none.
+    Ours(Option<u32>),
+    /// Round dots on a lattice (its two sets of rows as their cycles across and down the tile), each
+    /// as big as the stock tip's ink there.
+    Halftone([(f32, f32); 2]),
 }
 
 /// Canvas pixels a stamp's square is across at the most size, for each 1 of the file's `maxSize`.

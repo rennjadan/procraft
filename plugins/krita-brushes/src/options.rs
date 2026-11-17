@@ -12,14 +12,17 @@ use crate::xml::Element;
 #[derive(Clone, Debug, Default)]
 pub struct Info {
     pub pressure: f32,
+    /// The most the pen has pressed in the stroke so far.
+    pub pressure_in: f32,
     /// Degrees the pen leans across and down (-60..60), and its barrel's turn (degrees).
     pub x_tilt: f32,
     pub y_tilt: f32,
     pub rotation: f32,
     /// 0..1, as Krita measures it.
     pub speed: f32,
-    /// Radians, the way the stroke goes.
+    /// Radians, the way the stroke goes; the way it went at its start.
     pub drawing_angle: f32,
+    pub locked_angle: f32,
     /// Canvas pixels drawn, milliseconds since the stroke began, dabs laid before this one.
     pub distance: f32,
     pub time: f32,
@@ -87,8 +90,11 @@ pub struct Sensor {
     /// For distance, time and fade: how long it takes to reach 1, and whether it starts again.
     length: f32,
     periodic: bool,
-    /// For the drawing angle: the angle added (degrees).
+    /// For the drawing angle: the angle added (degrees), the steps (degrees) of a fan of dabs
+    /// laid round a corner, and whether it keeps the way the stroke went at its start.
     angle_offset: f32,
+    fan: Option<f32>,
+    locked: bool,
 }
 
 /// Randomness for the fuzzy sensors: a dab's, and the stroke's for an option.
@@ -106,20 +112,27 @@ impl Sensor {
             v / length
         };
         match self.kind {
-            Kind::Pressure | Kind::PressureIn => info.pressure,
+            Kind::Pressure => info.pressure,
+            Kind::PressureIn => info.pressure_in,
             Kind::XTilt => 1.0 - info.x_tilt.abs() / 60.0,
             Kind::YTilt => 1.0 - info.y_tilt.abs() / 60.0,
             Kind::TiltDirection => 2.0 * tilt_direction(info) - 1.0,
             Kind::TiltElevation => tilt_elevation(info),
             Kind::Speed => info.speed,
-            Kind::DrawingAngle => wrap(0.5 + info.drawing_angle / std::f32::consts::TAU + self.angle_offset / 360.0),
+            Kind::DrawingAngle => {
+                let angle = if self.locked { info.locked_angle } else { info.drawing_angle };
+                wrap(0.5 + angle / std::f32::consts::TAU + self.angle_offset / 360.0)
+            }
             Kind::Rotation => info.rotation / 180.0,
             Kind::Distance => along(info.distance),
             Kind::Time => along(info.time),
             Kind::Fade => along(info.dab as f32),
             Kind::FuzzyDab => 2.0 * chance.dab() - 1.0,
             Kind::FuzzyStroke => 2.0 * chance.stroke(option) - 1.0,
-            Kind::Perspective | Kind::TangentialPressure => 1.0,
+            // no perspective assistant: 1, as in Krita without one; no airbrush wheel: 0, as a pen
+            // without one gives Krita
+            Kind::Perspective => 1.0,
+            Kind::TangentialPressure => 0.0,
         }
     }
 
@@ -182,28 +195,39 @@ struct Parts {
 
 impl CurveOption {
     /// The option `id` as `preset` keeps it (its keys after `prefix`, as a masking brush's are),
-    /// its strength `min..=max`; `checkable`: whether it can be switched off.
+    /// its strength `min..=max`; `checkable`: whether it can be switched off. Its sensors share one
+    /// curve (see [`common_curve`]) unless it says each has its own.
     pub fn read(preset: &Preset, prefix: &str, id: &str, checkable: bool, min: f32, max: f32) -> CurveOption {
         let key = |suffix: &str| format!("{prefix}{id}{suffix}");
         let checked = !checkable || preset.flag(&format!("{prefix}Pressure{id}"), false);
         let use_same = preset.flag(&key("UseSameCurve"), true);
-        let common = preset.get(&key("commonCurve")).and_then(Curve::parse);
+        let definition = preset.get(&key("Sensor")).unwrap_or("");
+        // the oldest presets kept one curve for all the sensors apart, where theirs keep none
+        let legacy = (!definition.contains("curve") && preset.flag(&format!("{prefix}Custom{id}"), false))
+            .then(|| preset.get(&format!("{prefix}Curve{id}")).unwrap_or(LINE));
         let mut sensors = Vec::new();
-        if let Some(root) = preset.element(&key("Sensor")) {
-            if root.attribute("id") == Some("sensorslist") {
-                for child in root.elements().filter(|e| e.name == "ChildSensor") {
-                    sensors.extend(sensor(child));
-                }
-            } else {
-                sensors.extend(sensor(&root));
-            }
+        for e in &sensor_elements(definition) {
+            sensors.extend(sensor(e));
         }
         if sensors.is_empty() {
-            sensors.push(Sensor { kind: Kind::Pressure, curve: None, length: 1.0, periodic: false, angle_offset: 0.0 });
+            sensors.push(Sensor {
+                kind: Kind::Pressure,
+                curve: None,
+                length: 1.0,
+                periodic: false,
+                angle_offset: 0.0,
+                fan: None,
+                locked: false,
+            });
         }
         if use_same {
+            let common = Curve::parse(&common_curve(preset, prefix, id));
             for s in &mut sensors {
                 s.curve = common.clone();
+            }
+        } else if let Some(curve) = legacy {
+            for s in &mut sensors {
+                s.curve = Curve::parse(curve);
             }
         }
         CurveOption {
@@ -276,26 +300,82 @@ impl CurveOption {
         if self.checked { self.size_like(info, chance, true) } else { self.strength }
     }
 
+    /// The steps (radians) of the fan of dabs it lays round a corner: where it is switched on and
+    /// follows the way the stroke goes with fan corners (not where that way is locked).
+    pub fn fan_step(&self) -> Option<f32> {
+        if !self.checked {
+            return None;
+        }
+        let s = self.sensors.iter().find(|s| s.kind == Kind::DrawingAngle)?;
+        s.fan.filter(|_| !s.locked).map(|step| step.max(1.0).to_radians())
+    }
+
     /// Whether anything about it changes from dab to dab.
     pub fn varies(&self) -> bool {
         self.checked && self.use_curve
     }
 }
 
+/// The straight curve, which changes nothing.
+const LINE: &str = "0,0;1,1;";
+
+/// The sensors a setting's XML lists: one, or a list of them.
+fn sensor_elements(definition: &str) -> Vec<Element> {
+    let Some(root) = crate::xml::parse(definition) else { return Vec::new() };
+    if root.attribute("id") == Some("sensorslist") {
+        root.elements().filter(|e| e.name == "ChildSensor").cloned().collect()
+    } else {
+        vec![root]
+    }
+}
+
+/// The curve option `id`'s sensors share, as Krita reads it: its `commonCurve` setting; else (a
+/// preset from before it kept one) the curve its last sensor keeps; else, where its sensors keep
+/// none, the one the oldest presets kept apart (`Custom` and `Curve`); else the straight line.
+pub fn common_curve(preset: &Preset, prefix: &str, id: &str) -> String {
+    let key = |suffix: &str| format!("{prefix}{id}{suffix}");
+    let definition = preset.get(&key("Sensor")).unwrap_or("");
+    let mut common = sensor_elements(definition)
+        .iter()
+        .rfind(|e| e.attribute("id").and_then(Kind::named).is_some())
+        .and_then(|e| e.child("curve").map(|c| c.text().trim().to_owned()))
+        .filter(|c| !c.is_empty())
+        .unwrap_or_else(|| LINE.to_owned());
+    if !definition.contains("curve") {
+        common = if preset.flag(&format!("{prefix}Custom{id}"), false) {
+            preset.get(&format!("{prefix}Curve{id}")).unwrap_or(LINE).trim().to_owned()
+        } else {
+            LINE.to_owned()
+        };
+    }
+    if let (true, Some(kept)) = (preset.flag(&key("UseSameCurve"), true), preset.get(&key("commonCurve"))) {
+        common = kept.trim().to_owned();
+    }
+    if common.is_empty() { LINE.to_owned() } else { common }
+}
+
 fn sensor(e: &Element) -> Option<Sensor> {
     let kind = Kind::named(e.attribute("id")?)?;
     let curve = e.child("curve").and_then(|c| Curve::parse(&c.text()));
-    let length = e.number("length").unwrap_or(match kind {
+    // how long distance, fade and time take to reach 1: the time's kept as its duration (ms)
+    let length = match kind {
+        Kind::Time => e.number("duration"),
+        _ => e.number("length"),
+    }
+    .map(f32::trunc)
+    .unwrap_or(match kind {
         Kind::Fade => 1000.0,
-        Kind::Time => 3000.0,
         _ => 30.0,
     });
     Some(Sensor {
         kind,
         curve,
         length,
-        periodic: e.attribute("periodic").is_some_and(|p| p == "1" || p == "true"),
+        periodic: e.attribute("periodic").is_some_and(|p| p.trim() == "1" || p.trim() == "true"),
         angle_offset: e.number("angleOffset").unwrap_or(0.0),
+        fan: (kind == Kind::DrawingAngle && e.number("fanCornersEnabled").is_some_and(|f| f != 0.0))
+            .then(|| e.number("fanCornersStep").unwrap_or(30.0).trunc()),
+        locked: kind == Kind::DrawingAngle && e.number("lockedAngleMode").is_some_and(|l| l != 0.0),
     })
 }
 
@@ -359,5 +439,67 @@ mod tests {
         let o = CurveOption::read(&p, "", "Opacity", true, 0.0, 1.0);
         let v = o.size_like(&Info { pressure: 0.5, ..Info::default() }, &mut Still, true);
         assert!((v - 0.4).abs() < 1e-4, "{v}");
+    }
+
+    #[test]
+    fn a_sensors_own_curve_is_shared_where_no_common_curve_is_kept() {
+        // as older presets keep it: the curve in the sensor alone
+        let p = preset(&[
+            ("PressureSize", "true"),
+            ("SizeSensor", r#"<params id="pressure"><curve>0,0.5;1,1;</curve></params>"#),
+            ("SizeUseSameCurve", "true"),
+        ]);
+        let size = CurveOption::read(&p, "", "Size", true, 0.0, 1.0);
+        let v = size.apply(&Info { pressure: 0.0, ..Info::default() }, &mut Still);
+        assert!((v - 0.5).abs() < 1e-3, "{v}");
+        assert_eq!(common_curve(&p, "", "Size"), "0,0.5;1,1;");
+        // a list's last sensor's, for all of them
+        let list = preset(&[
+            ("PressureSize", "true"),
+            (
+                "SizeSensor",
+                r#"<params id="sensorslist"><ChildSensor id="speed"><curve>0,1;1,1;</curve></ChildSensor><ChildSensor id="pressure"><curve>0,0.25;1,1;</curve></ChildSensor></params>"#,
+            ),
+        ]);
+        assert_eq!(common_curve(&list, "", "Size"), "0,0.25;1,1;");
+        // a kept common curve wins
+        let kept = preset(&[
+            ("SizeSensor", r#"<params id="pressure"><curve>0,0.5;1,1;</curve></params>"#),
+            ("SizecommonCurve", "0,1;1,0;"),
+        ]);
+        assert_eq!(common_curve(&kept, "", "Size"), "0,1;1,0;");
+    }
+
+    #[test]
+    fn the_oldest_presets_curve_kept_apart_is_taken() {
+        let p = preset(&[
+            ("PressureOpacity", "true"),
+            ("OpacitySensor", r#"<params id="pressure"/>"#),
+            ("CustomOpacity", "true"),
+            ("CurveOpacity", "0,0;0.5,1;"),
+        ]);
+        let o = CurveOption::read(&p, "", "Opacity", true, 0.0, 1.0);
+        let v = o.apply(&Info { pressure: 0.5, ..Info::default() }, &mut Still);
+        assert!((v - 1.0).abs() < 5e-3, "{v}");
+        // not where the sensor keeps a curve of its own
+        let own = preset(&[
+            ("OpacitySensor", r#"<params id="pressure"><curve>0,0;1,1;</curve></params>"#),
+            ("CustomOpacity", "true"),
+            ("CurveOpacity", "0,0;0.5,1;"),
+        ]);
+        assert_eq!(common_curve(&own, "", "Opacity"), "0,0;1,1;");
+    }
+
+    #[test]
+    fn time_runs_for_its_duration_and_pressure_in_holds_the_most() {
+        let p =
+            preset(&[("PressureSize", "true"), ("SizeSensor", r#"<params id="time" duration="200" periodic="0"/>"#)]);
+        let size = CurveOption::read(&p, "", "Size", true, 0.0, 1.0);
+        let v = size.apply(&Info { time: 100.0, ..Info::default() }, &mut Still);
+        assert!((v - 0.5).abs() < 1e-3, "{v}");
+        let p = preset(&[("PressureSize", "true"), ("SizeSensor", r#"<params id="pressurein"/>"#)]);
+        let size = CurveOption::read(&p, "", "Size", true, 0.0, 1.0);
+        let v = size.apply(&Info { pressure: 0.2, pressure_in: 0.9, ..Info::default() }, &mut Still);
+        assert!((v - 0.9).abs() < 1e-3, "{v}");
     }
 }

@@ -54,6 +54,14 @@ impl Preset {
                     }
                 }
                 "resources" => resources.extend(e.elements().filter_map(resource)),
+                // a filter brush's filter's own settings, kept apart
+                "filterconfig" => {
+                    for c in e.elements().flat_map(|c| std::iter::once(c).chain(c.elements())) {
+                        if let (true, Some(name)) = (c.name == "param", c.attribute("name")) {
+                            params.insert(format!("Filter/config/{name}"), c.text());
+                        }
+                    }
+                }
                 _ => {}
             }
         }

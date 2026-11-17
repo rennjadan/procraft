@@ -86,22 +86,25 @@ fun ProCraftTheme(interfaceSize: Float = 1f, clear: Clearance = Clearance(), con
     }
     MaterialTheme(colorScheme = darkColorScheme(primary = Pc.Accent), typography = typography) {
         val density = LocalDensity.current
+        val band = remember { BandColour() }
         CompositionLocalProvider(
             LocalDensity provides Density(density.density * interfaceSize, 1f),
             LocalConfiguration provides sizedScreen(interfaceSize, clear, density.density),
             LocalSizeSettled provides sizeSettled(interfaceSize),
             LocalTextStyle provides text,
             LocalClearance provides clear,
+            LocalBandColour provides band,
             androidx.compose.foundation.LocalIndication provides NoIndication,
         ) {
-            // the interface inside what it keeps clear of, the rest black; with nothing to keep
+            // the interface inside what it keeps clear of, the rest in the colour of what is under it
+            // (the top bar's, or a screen's own: see BandColour); with nothing to keep
             // clear of, the whole window, each part of it measured to it as the window's root does
             val inside = with(LocalDensity.current) {
                 androidx.compose.foundation.layout.PaddingValues(clear.left.toDp(), clear.top.toDp(), clear.right.toDp(), clear.bottom.toDp())
             }
             androidx.compose.foundation.layout.Box(
                 androidx.compose.ui.Modifier.fillMaxSize()
-                    .then(if (clear.none) androidx.compose.ui.Modifier else androidx.compose.ui.Modifier.background(androidx.compose.ui.graphics.Color.Black))
+                    .then(if (clear.none) androidx.compose.ui.Modifier else androidx.compose.ui.Modifier.background(band.colour ?: Pc.Bar.copy(alpha = 1f)))
                     .padding(inside),
                 propagateMinConstraints = true,
             ) { content() }
@@ -148,6 +151,28 @@ data class Clearance(val left: Int = 0, val top: Int = 0, val right: Int = 0, va
 
 /** What the interface keeps clear of, inside the theme: see [Clearance]. */
 val LocalClearance = staticCompositionLocalOf { Clearance() }
+
+/**
+ * The colour of the band the interface keeps clear of (see [Clearance]): the top bar's own while
+ * the canvas shows, or the colour a screen of its own gives with [ClearBandShows] (the gallery's
+ * background), so the band and what is under it read as one.
+ */
+class BandColour {
+    var colour by androidx.compose.runtime.mutableStateOf<androidx.compose.ui.graphics.Color?>(null)
+}
+
+/** The band's colour, inside the theme: see [BandColour]. */
+val LocalBandColour = staticCompositionLocalOf { BandColour() }
+
+/** While this is composed, the band kept clear of shows [colour] (a screen's own background). */
+@Composable
+fun ClearBandShows(colour: androidx.compose.ui.graphics.Color) {
+    val band = LocalBandColour.current
+    androidx.compose.runtime.DisposableEffect(band, colour) {
+        band.colour = colour
+        onDispose { if (band.colour == colour) band.colour = null }
+    }
+}
 
 /**
  * What the interface keeps clear of with [plugins] as they are ([changes] when they change): the
@@ -205,11 +230,37 @@ private fun sizedScreen(interfaceSize: Float, clear: Clearance, density: Float):
  */
 const val MATCHED_POPUP_TEXT = 0.85f
 
+/** How big the part of the interface being composed shows next to the rest, as [PartScaled] sized it. */
+val LocalPartScale = androidx.compose.runtime.staticCompositionLocalOf { 1f }
+
+/**
+ * [content] as [part] of the interface, at the size a plugin gives it next to the rest
+ * ([Pc.partScale]): its dp and sp are that much bigger or smaller, whatever part it is in.
+ */
+@Composable
+fun PartScaled(part: io.github.artcraftandroid.procraft.core.InterfacePart, content: @Composable () -> Unit) {
+    val scale = Pc.partScale(part)
+    val was = LocalPartScale.current
+    val density = LocalDensity.current
+    CompositionLocalProvider(
+        LocalDensity provides Density(density.density / was * scale, density.fontScale),
+        LocalPartScale provides scale,
+        content = content,
+    )
+}
+
+/** The density of a popup, its text scaled by [textScale]: the interface's, at the menus' size. */
+@Composable
+private fun popupDensity(textScale: Float): Density {
+    val menus = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.MENUS)
+    return Density(LocalDensity.current.density / LocalPartScale.current * menus, textScale)
+}
+
 /**
  * A popup whose text keeps one size whatever the system font scale. A popup is a window of its
  * own, composed with the system's font scale, so its text followed it where the rest of the
  * interface doesn't; this hands it the theme's density, its text scaled by [textScale], and the
- * theme's screen.
+ * theme's screen. It shows at the size a plugin gives popovers and menus.
  */
 @Composable
 fun PcPopup(
@@ -220,10 +271,11 @@ fun PcPopup(
     textScale: Float = 1f,
     content: @Composable () -> Unit,
 ) {
-    val density = Density(LocalDensity.current.density, textScale)
+    val density = popupDensity(textScale)
+    val menus = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.MENUS)
     val screen = LocalConfiguration.current
     androidx.compose.ui.window.Popup(alignment, offset, onDismissRequest, properties) {
-        CompositionLocalProvider(LocalDensity provides density, LocalConfiguration provides screen, content = content)
+        CompositionLocalProvider(LocalDensity provides density, LocalPartScale provides menus, LocalConfiguration provides screen, content = content)
     }
 }
 
@@ -236,9 +288,10 @@ fun PcPopup(
     textScale: Float = 1f,
     content: @Composable () -> Unit,
 ) {
-    val density = Density(LocalDensity.current.density, textScale)
+    val density = popupDensity(textScale)
+    val menus = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.MENUS)
     val screen = LocalConfiguration.current
     androidx.compose.ui.window.Popup(popupPositionProvider, onDismissRequest, properties) {
-        CompositionLocalProvider(LocalDensity provides density, LocalConfiguration provides screen, content = content)
+        CompositionLocalProvider(LocalDensity provides density, LocalPartScale provides menus, LocalConfiguration provides screen, content = content)
     }
 }

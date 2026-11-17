@@ -459,13 +459,18 @@ fn shape_number(kind: ShapeKind) -> i32 {
     }
 }
 
+/// The place in a curve's anchors' modes of its `k`th anchor: a closed curve's last is its first.
+fn mode_of(shape: &Shape, k: usize) -> usize {
+    if shape.closed_curve() && k == shape.nodes.len().saturating_sub(1) / 3 { 0 } else { k }
+}
+
 /// How each of a curve's anchors sits, for its handles to be drawn as.
 fn anchor_list(shape: &Shape, modes: &[Anchor]) -> Vec<QuickShapeAnchor> {
     if shape.kind != ShapeKind::Curve {
         return Vec::new();
     }
     (0..shape.nodes.len().saturating_sub(1) / 3 + 1)
-        .map(|k| match modes.get(k).copied().unwrap_or(Anchor::Smooth) {
+        .map(|k| match modes.get(mode_of(shape, k)).copied().unwrap_or(Anchor::Smooth) {
             Anchor::Smooth => QuickShapeAnchor::Smooth,
             Anchor::Broken => QuickShapeAnchor::Broken,
             Anchor::Corner => QuickShapeAnchor::Corner,
@@ -818,7 +823,7 @@ impl CanvasSession {
         // a control of an anchor set broken moves on its own; otherwise its pair follows it
         let anchor = match index % 3 {
             1 => (index - 1) / 3,
-            2 => (index + 1) / 3,
+            2 => mode_of(&edit.shape, (index + 1) / 3),
             _ => usize::MAX,
         };
         if edit.shape.kind == ShapeKind::Curve && edit.modes.get(anchor) == Some(&Anchor::Broken) {
@@ -843,7 +848,9 @@ impl CanvasSession {
         if edit.shape.kind != ShapeKind::Curve || !at.is_multiple_of(3) || at >= edit.shape.nodes.len() {
             return None;
         }
-        let k = at / 3;
+        // a closed curve's last anchor is its first
+        let k = mode_of(&edit.shape, at / 3);
+        let at = 3 * k;
         edit.held = None;
         edit.earlier.push(edit.shape.clone());
         edit.later.clear();

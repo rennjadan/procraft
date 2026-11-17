@@ -1744,6 +1744,9 @@ impl Studio {
         if response.drag_started() {
             self.pad_menu = false;
             pad.begin_own_stroke();
+            if let Some((id, _)) = pen {
+                pad.set_pen_tilt_known(crate::pen::lean(id).is_some());
+            }
             pad.stroke_begin(kind, vec![sample(p, None)]);
             self.pad_stroke = true;
         } else if self.pad_stroke && response.dragged() {
@@ -2882,7 +2885,9 @@ mod tests {
     #[test]
     fn a_dual_brush_s_secondary_card_held_offers_uncombine_which_asks_first() {
         let session = CanvasSession::new(64, 64);
-        assert!(session.select_brush(1, 0) && session.combine_brushes(1, 0, 1));
+        // in the set of ours from before, whose brushes are no dual brushes
+        let ours = session.brush_library().len() as u32 - 1;
+        assert!(session.select_brush(ours, 0) && session.combine_brushes(ours, 0, 1));
         let mut open = Open {
             ctx: egui::Context::default(),
             look: Look::default(),

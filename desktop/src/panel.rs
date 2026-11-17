@@ -27,6 +27,20 @@ struct SideBarPlace {
     right: bool,
 }
 
+/// How big each part of the interface shows next to the rest of it this frame, as the plugins say
+/// (in [`procraft_core::InterfacePart`]'s order), for what draws a part to read.
+pub fn set_part_scales(ctx: &egui::Context, plugins: &procraft_core::Plugins) {
+    use procraft_core::InterfacePart as P;
+    let scales = [P::Floating, P::Menus, P::SideBar, P::TopBar, P::Panels].map(|p| plugins.interface_part_scale(p));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("interface part scales"), scales));
+}
+
+/// How big `part` of the interface shows next to the rest of it this frame (1: as the rest).
+pub fn part_scale(ctx: &egui::Context, part: procraft_core::InterfacePart) -> f32 {
+    let scales = ctx.data(|d| d.get_temp::<[f32; 5]>(egui::Id::unique("interface part scales")));
+    scales.and_then(|s| s.get(part as usize).copied()).unwrap_or(1.0)
+}
+
 /// The side bar shows (or not) on the right (or the left), for the panels placed this frame.
 pub fn side_bar_at(ctx: &egui::Context, shown: bool, right: bool) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::unique("side bar place"), SideBarPlace { shown, right }));
@@ -96,10 +110,13 @@ pub fn frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, arrow_x: 
 }
 
 /// Draws a floating panel at `rect` (no arrow): the shadow round it, then its frosted body, whose
-/// blur goes into `backdrops` (window pixels).
-pub fn floating_frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, backdrops: &mut Vec<f32>) {
+/// blur goes into `backdrops` (window pixels). Its layer shows it `scale` times as big, from its
+/// top-left.
+pub fn floating_frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, scale: f32, backdrops: &mut Vec<f32>) {
     let ppp = ui.ctx().pixels_per_point();
-    backdrops.extend([rect.left(), rect.top(), rect.right(), rect.bottom(), POPOVER_CORNER].map(|v| v * ppp));
+    let shown = Rect::from_min_size(rect.min, rect.size() * scale);
+    let edges = [shown.left(), shown.top(), shown.right(), shown.bottom(), POPOVER_CORNER * scale];
+    backdrops.extend(edges.map(|v| v * ppp));
     backdrops.push(1.0);
     let shadow = egui::epaint::Shadow {
         offset: [0, 0],

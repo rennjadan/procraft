@@ -108,24 +108,41 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
     // whether the surface was last configured asking for wide colour
     let mut wide = false;
     let mut last_present: Option<Instant> = None;
+    // when the last frame was begun
+    let mut last_frame: Option<Instant> = None;
     let started = Instant::now();
     let mut pipelines_kept = false;
     loop {
         let (size, reconfigure, wants_wide) = {
             let mut st = shared.lock();
-            // a device lost draws nothing again: there is only its stopping to wait for
-            while !st.stop && (!st.needs_frame || st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
-                // a frame due later (the selection's bands drifting) comes then, unless asked sooner
-                match st.frame_due.filter(|_| !st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
-                    Some(at) => {
-                        if shared.wake.wait_until(&mut st, at).timed_out() {
-                            st.frame_due = None;
-                            st.needs_frame = true;
+            loop {
+                // a device lost draws nothing again: there is only its stopping to wait for
+                while !st.stop && (!st.needs_frame || st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
+                    // a frame due later (the selection's bands drifting) comes then, unless asked
+                    // sooner
+                    match st.frame_due.filter(|_| !st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
+                        Some(at) => {
+                            if shared.wake.wait_until(&mut st, at).timed_out() {
+                                st.frame_due = None;
+                                st.needs_frame = true;
+                            }
                         }
+                        None => shared.wake.wait(&mut st),
                     }
-                    None => shared.wake.wait(&mut st),
+                }
+                // no sooner after the last than the screen shows a new one: a frame drawn sooner
+                // would never be seen (while input comes faster than the screen refreshes), and on
+                // a slow GPU it would hold up the one that is. What comes meanwhile goes in it.
+                // (Work done a part a render, remaking the caches, goes on as fast as it can.)
+                let working = st.canvas.as_ref().is_some_and(procraft_gpu::Canvas::wants_render);
+                let spacing = st.frame_spacing.filter(|_| !working);
+                let next = last_frame.zip(spacing).map(|(at, spacing)| at + spacing);
+                match next {
+                    Some(at) if !st.stop && Instant::now() < at => _ = shared.wake.wait_until(&mut st, at),
+                    _ => break,
                 }
             }
+            last_frame = Some(Instant::now());
             shared.took_back();
             if st.stop {
                 break;

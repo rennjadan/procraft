@@ -12,6 +12,8 @@ use procraft_engine::curve::Curve;
 use procraft_engine::geom::Vec2;
 use procraft_engine::library::{BrushSet, SHELF};
 
+use crate::stock_library::{LEGACY_SET, LEGACY_SETS};
+
 use crate::{CanvasSession, State};
 
 /// A set in the library as it is now: the shipped sets as edited, and the user's own.
@@ -39,8 +41,8 @@ pub(crate) const IMPORTED_ICON: u32 = BRUSH_ICON;
 const ICON_NUMBERING: u32 = 2;
 
 /// The icons shipped sets start with, by name: the six first sets' own, then later sets' glyphs
-/// from the shared choice.
-const SHIPPED_ICONS: [(&str, u32); 21] = [
+/// from the shared choice; then the stock sets'.
+const SHIPPED_ICONS: [(&str, u32); 45] = [
     ("Sketching", 42),
     ("Inking", 43),
     ("Painting", 44),
@@ -62,6 +64,30 @@ const SHIPPED_ICONS: [(&str, u32); 21] = [
     ("Retro", 15),
     ("Vintage", 37),
     ("Luminance", 34),
+    ("Pencils", 42),
+    ("Pens", 10),
+    ("Inks", 43),
+    ("Markers", 27),
+    ("Pastels", 35),
+    ("Oils", 44),
+    ("Paints", 5),
+    ("Gouache", 0),
+    ("Watercolors", 13),
+    ("Charcoal", 46),
+    ("Basics", 12),
+    ("Lettering", 36),
+    ("Comics", 19),
+    ("Design", 11),
+    ("Grunge", 21),
+    ("Street Art", 45),
+    ("Digital", 15),
+    ("Creative", 40),
+    ("Artistic", 33),
+    ("Spraypaints", 35),
+    ("Materials", 9),
+    ("Water", 13),
+    ("Earth", 38),
+    ("Legacy", BRUSH_ICON),
 ];
 
 /// The icon a shipped set starts with, by its name (the brush icon for the rest).
@@ -75,18 +101,31 @@ pub(crate) fn shipped_icon_name(icon: u32) -> Option<&'static str> {
 }
 
 impl LibrarySet {
-    /// The library as it ships, its sets in shelf order.
+    /// The library as it ships: the stock sets in order, then ours from before in one set, theirs
+    /// in shelf order.
     pub(crate) fn shipped(sets: &[BrushSet]) -> Vec<LibrarySet> {
-        SHELF
+        let whole = |s: usize, set: &BrushSet| (0..set.brushes.len()).map(move |i| Some((s, i)));
+        let mut shelf: Vec<LibrarySet> = sets
             .iter()
-            .filter_map(|&s| sets.get(s).map(|set| (s, set)))
+            .enumerate()
+            .skip(LEGACY_SETS)
             .map(|(s, set)| LibrarySet {
                 name: set.name.to_owned(),
                 brushes: set.brushes.clone(),
-                origins: (0..set.brushes.len()).map(|i| Some((s, i))).collect(),
+                origins: whole(s, set).collect(),
                 icon: shipped_icon(set.name),
             })
-            .collect()
+            .collect();
+        let ours: Vec<(usize, &BrushSet)> = SHELF.iter().filter_map(|&s| sets.get(s).map(|set| (s, set))).collect();
+        if !ours.is_empty() {
+            shelf.push(LibrarySet {
+                name: LEGACY_SET.to_owned(),
+                brushes: ours.iter().flat_map(|(_, set)| set.brushes.iter().cloned()).collect(),
+                origins: ours.iter().flat_map(|&(s, set)| whole(s, set)).collect(),
+                icon: shipped_icon(LEGACY_SET),
+            });
+        }
+        shelf
     }
 }
 
@@ -276,7 +315,7 @@ impl Images<'_> {
             Images::Told => format!("{:016x}", source.id),
             Images::Filed(list) => {
                 let name = crate::brush_pictures::pixels_name(source.id);
-                let held = crate::brush_pictures::Held::Pixels(std::sync::Arc::clone(&source.pixels));
+                let held = crate::brush_pictures::Held::Pixels(source.pixels.shared());
                 list.borrow_mut().push((name.clone(), held));
                 format!("{}{name}", crate::brush_pictures::MARK)
             }
@@ -414,6 +453,8 @@ struct LastLibrary {
 /// is held already or there is none. Slow with many brushes brought in: call it off the main thread.
 #[uniffi::export]
 pub fn prepare_brushes(dir: String) {
+    // the brushes the app comes with first, kept or not
+    crate::stock_library::prepare();
     let (library, first) = crate::brush_libraries::file_in_use(std::path::Path::new(&dir));
     if holds(&LAST_LIBRARY, &library) || !library.is_file() {
         return;
@@ -631,17 +672,36 @@ impl State {
     /// `brush` as kept, as changed from what it started as (`from`), its images put as `images`
     /// says.
     fn saved_brush(&self, brush: &Brush, from: Option<(usize, usize)>, images: Images<'_>) -> SavedBrush {
-        let base = self.origin_brush(from);
+        self.saved_against(brush, from, &self.origin_brush(from), images)
+    }
+
+    /// `brush` as kept, as changed from `base` (what it started as, `from`); a dual brush's second
+    /// as changed from its origin's second, if that has one.
+    fn saved_against(
+        &self,
+        brush: &Brush,
+        from: Option<(usize, usize)>,
+        base: &Brush,
+        images: Images<'_>,
+    ) -> SavedBrush {
         let kept = |c: &Curve, b: &Curve| -> Vec<[f32; 2]> {
             if c == b { Vec::new() } else { c.points().iter().map(|p| [p.x, p.y]).collect() }
         };
         let image = |mine: Option<u32>, theirs: Option<u32>| (mine != theirs).then(|| mine.map_or(-1, i64::from));
         let text = |png: &Option<std::sync::Arc<[u8]>>| png.as_ref().map(|bytes| images.bytes(bytes));
         let source = |s: &Source| images.source(s);
+        // a shape or grain image of its own where its origin has another or none (one its origin
+        // has comes back from there; none where its origin has one is kept as nothing)
+        let own = |mine: &Option<Source>, theirs: &Option<Source>| match (mine, theirs) {
+            (Some(m), Some(t)) if m == t => None,
+            (Some(m), _) => Some(source(m)),
+            (None, Some(_)) => Some(String::new()),
+            (None, None) => None,
+        };
         SavedBrush {
             from,
             name: brush.name.clone(),
-            settings: brush.changes_from(&base).into_iter().collect(),
+            settings: brush.changes_from(base).into_iter().collect(),
             curve: kept(&brush.pressure_curve, &base.pressure_curve),
             size_curve: kept(&brush.size_curve, &base.size_curve),
             opacity_curve: kept(&brush.opacity_curve, &base.opacity_curve),
@@ -654,9 +714,9 @@ impl State {
                     .collect()
             }),
             // a stock shape's is made again from its name when the brush comes back
-            shape_source: brush.shape.source.as_ref().filter(|_| brush.stock.shape.is_none()).map(source),
+            shape_source: own(&brush.shape.source, &base.shape.source).filter(|_| brush.stock.shape.is_none()),
             // a stock grain's is made again from its name when the brush comes back
-            grain_source: brush.grain.source.as_ref().filter(|_| brush.stock.grain.is_none()).map(source),
+            grain_source: own(&brush.grain.source, &base.grain.source).filter(|_| brush.stock.grain.is_none()),
             grain_file: brush
                 .grain_file_now()
                 .map(|f| SavedGrainFile { width: f.width, full: f.full.as_ref().map(|g| (g.id, g.side)) }),
@@ -683,7 +743,10 @@ impl State {
             roughness_image: image(brush.roughness.image, base.roughness.image),
             metallic_stock: brush.stock.metallic.as_ref().map(|s| (s.name.clone(), s.inverted)),
             roughness_stock: brush.stock.roughness.as_ref().map(|s| (s.name.clone(), s.inverted)),
-            secondary: brush.secondary.as_ref().map(|s| Box::new(self.saved_brush(s, None, images))),
+            secondary: brush.secondary.as_ref().map(|s| {
+                let second = base.secondary.as_deref().cloned().unwrap_or_else(blank_brush);
+                Box::new(self.saved_against(s, None, &second, images))
+            }),
             engine: brush.engine.as_ref().map(|e| (e.engine.clone(), images.bytes(&e.data))),
         }
     }
@@ -727,8 +790,19 @@ impl State {
         b: SavedBrush,
         pictures: &std::collections::HashMap<String, crate::brush_pictures::Held>,
     ) -> Brush {
+        Self::restored_on(origin_in(shipped, b.from), shipped, b, pictures)
+    }
+
+    /// A kept brush made again from `brush`, what it started as (see [`Self::restored_from`]); a dual
+    /// brush's second from its origin's second, if that has one.
+    fn restored_on(
+        mut brush: Brush,
+        shipped: &[BrushSet],
+        b: SavedBrush,
+        pictures: &std::collections::HashMap<String, crate::brush_pictures::Held>,
+    ) -> Brush {
         let picture = |text: &str| crate::brush_pictures::bytes_of(text, pictures);
-        let mut brush = origin_in(shipped, b.from);
+        let origin_second = brush.secondary.take();
         // where its origin's size controls sit (a size kept there isn't written down)
         let origin_sizes = [("max_size", brush.setting("max_size")), ("min_size", brush.setting("min_size"))];
         if !b.name.trim().is_empty() {
@@ -838,7 +912,13 @@ impl State {
             signature: png(&a.signature),
         });
         brush.reset_point = b.reset.map(|r| ResetPoint::of(&Self::restored_from(shipped, *r.brush, pictures), r.made));
-        brush.secondary = b.secondary.map(|s| Box::new(Self::restored_from(shipped, *s, pictures)));
+        brush.secondary = b.secondary.map(|s| {
+            let second = match (s.from, origin_second) {
+                (None, Some(second)) => *second,
+                (from, _) => origin_in(shipped, from),
+            };
+            Box::new(Self::restored_on(second, shipped, *s, pictures))
+        });
         brush
     }
 
@@ -886,6 +966,44 @@ impl State {
     /// The first brush in the library, for a tool whose brush is gone.
     fn first_brush(&self) -> (usize, usize) {
         (self.library.iter().position(|s| !s.brushes.is_empty()).unwrap_or(0), 0)
+    }
+
+    /// The library's sets of ours from before as they shipped (by name, holding only brushes that
+    /// shipped in ours), as one set at its end; every place naming one of their brushes follows it.
+    /// Sets holding brushes of the user's own, or renamed, stay as they are.
+    pub(crate) fn fold_legacy_sets(&mut self) {
+        let names: Vec<&str> = self.shipped.iter().take(LEGACY_SETS).map(|set| set.name).collect();
+        let ours = |set: &LibrarySet| {
+            names.contains(&set.name.as_str()) && set.origins.iter().all(|o| o.is_some_and(|(s, _)| s < LEGACY_SETS))
+        };
+        if !self.library.iter().any(ours) {
+            return;
+        }
+        let mut legacy = LibrarySet {
+            name: LEGACY_SET.to_owned(),
+            brushes: Vec::new(),
+            origins: Vec::new(),
+            icon: shipped_icon(LEGACY_SET),
+        };
+        // each place's new one, the folded set's by their place in it (usize::MAX for the set)
+        let mut moves: std::collections::HashMap<(usize, usize), (usize, usize)> = std::collections::HashMap::new();
+        let mut library = Vec::new();
+        for (s, set) in std::mem::take(&mut self.library).into_iter().enumerate() {
+            if ours(&set) {
+                for (i, (brush, origin)) in set.brushes.into_iter().zip(set.origins).enumerate() {
+                    moves.insert((s, i), (usize::MAX, legacy.brushes.len()));
+                    legacy.brushes.push(brush);
+                    legacy.origins.push(origin);
+                }
+            } else {
+                moves.extend((0..set.brushes.len()).map(|i| ((s, i), (library.len(), i))));
+                library.push(set);
+            }
+        }
+        let at = library.len();
+        library.push(legacy);
+        self.library = library;
+        self.move_brush_refs(|place| moves.get(&place).map(|&(s, i)| (if s == usize::MAX { at } else { s }, i)));
     }
 
     /// Every place that names a brush by its position: the tools' brushes and the kept sliders.
@@ -1281,6 +1399,10 @@ impl CanvasSession {
     pub fn open_brushes(&self, dir: String) -> bool {
         let dir = std::path::PathBuf::from(dir);
         let (library, choices, loaded) = self.open_library_in_use(&dir);
+        // the choices first, places in the library as it was kept: what joins it may move them
+        if loaded && let Ok(text) = std::fs::read_to_string(&choices) {
+            self.load_brush_choices(text);
+        }
         let seen_file = dir.join(SEEN_FILE);
         let kept_seen = std::fs::read_to_string(&seen_file).ok();
         let seen: Vec<u32> = kept_seen
@@ -1294,9 +1416,12 @@ impl CanvasSession {
             (false, _) => self.shipped_brush_counts(),
         };
         if shipped != seen || kept_seen.is_none() {
-            // kept with them, or the next start would put the library back without them
+            // kept with them, or the next start would put the library back without them (and the
+            // choices, as they followed its brushes)
             if loaded {
                 self.save_brush_library_file(library.to_string_lossy().into_owned());
+                let _writing = library_writes();
+                Self::write_choices(&choices, &self.saved_brush_choices());
             }
             let text = shipped.iter().map(u32::to_string).collect::<Vec<_>>().join(",");
             let _ = std::fs::create_dir_all(&dir);
@@ -1307,9 +1432,6 @@ impl CanvasSession {
             if let Err(e) = kept {
                 log::error!("{e}");
             }
-        }
-        if loaded && let Ok(choices) = std::fs::read_to_string(choices) {
-            self.load_brush_choices(choices);
         }
         if loaded {
             // only with the library back can it be told which grains' and pictures' files nothing
@@ -1530,7 +1652,9 @@ impl CanvasSession {
     /// Adds to the library what shipped since it was kept. `seen` is how many brushes of each
     /// shipped set it has had the chance to hold (sets past its end hadn't shipped). A set's new
     /// brushes go at the end of the set holding its others (not at all if that set is gone); new
-    /// sets go at the end, in shelf order. Nothing the library holds already is added again.
+    /// stock sets go at the end, in shelf order, and new sets of ours from before into the Legacy
+    /// set. The first time the stock sets join, the library's sets of ours from before go into that
+    /// set (see [`State::fold_legacy_sets`]). Nothing the library holds already is added again.
     /// Returns how many brushes each set ships with now.
     pub fn add_shipped_brushes(&self, seen: Vec<u32>) -> Vec<u32> {
         let mut guard = self.shared.lock();
@@ -1553,17 +1677,51 @@ impl CanvasSession {
                 }
             }
         }
-        // sets it never had
-        let new: Vec<LibrarySet> = LibrarySet::shipped(&st.shipped)
-            .into_iter()
-            .filter(|set| {
-                set.origins.first().copied().flatten().is_some_and(|(s, _)| {
-                    s >= seen.len()
-                        && !st.library.iter().any(|l| l.origins.iter().flatten().any(|&(from, _)| from == s))
-                })
-            })
-            .collect();
+        // sets it never had: the stock sets at the end, in shelf order; ours from before (shipped
+        // after it was kept) into the set that holds ours
+        let had = |library: &[LibrarySet], s: usize| {
+            library.iter().any(|l| l.origins.iter().flatten().any(|&(from, _)| from == s))
+        };
+        let mut late = LibrarySet { name: LEGACY_SET.to_owned(), brushes: Vec::new(), origins: Vec::new(), icon: 0 };
+        let mut new = Vec::new();
+        for set in LibrarySet::shipped(&st.shipped) {
+            let Some((first, _)) = set.origins.first().copied().flatten() else { continue };
+            if first >= LEGACY_SETS {
+                if first >= seen.len() && !had(&st.library, first) {
+                    new.push(set);
+                }
+                continue;
+            }
+            for (brush, origin) in set.brushes.into_iter().zip(set.origins) {
+                let held = |o| st.library.iter().any(|l| l.origins.contains(&Some(o)));
+                if origin.is_some_and(|o| o.0 >= seen.len() && !held(o)) {
+                    late.brushes.push(brush);
+                    late.origins.push(origin);
+                }
+            }
+        }
         st.library.extend(new);
+        // the first time the stock sets join a library that had only ours from before, its sets of
+        // ours as they shipped go into one set after them, as a new library has them
+        if seen.len() <= LEGACY_SETS && st.shipped.len() > LEGACY_SETS {
+            st.fold_legacy_sets();
+        }
+        if !late.brushes.is_empty() {
+            let ours =
+                |l: &LibrarySet| l.name == LEGACY_SET && l.origins.iter().flatten().any(|&(s, _)| s < LEGACY_SETS);
+            match st.library.iter().rposition(ours) {
+                Some(at) => {
+                    if let Some(set) = st.library.get_mut(at) {
+                        set.brushes.extend(late.brushes);
+                        set.origins.extend(late.origins);
+                    }
+                }
+                None => {
+                    late.icon = shipped_icon(LEGACY_SET);
+                    st.library.push(late);
+                }
+            }
+        }
         Self::shipped_counts(&st.shipped)
     }
 
@@ -1576,29 +1734,39 @@ impl CanvasSession {
         let st = &mut *guard;
         let mut back = 0u32;
         for set in LibrarySet::shipped(&st.shipped) {
-            let Some(s) = set.origins.first().copied().flatten().map(|(s, _)| s) else { continue };
-            let fellows = |l: &LibrarySet| l.origins.iter().flatten().any(|&(from, _)| from == s);
-            let home = st
-                .library
-                .iter()
-                .position(|l| l.name == set.name && fellows(l))
-                .or_else(|| st.library.iter().position(fellows));
-            let Some(home) = home else {
+            // the shipped sets it holds (ours from before are several in one)
+            let members: Vec<usize> = set.origins.iter().flatten().map(|&(s, _)| s).collect();
+            let holds_members = |l: &LibrarySet| l.origins.iter().flatten().any(|(from, _)| members.contains(from));
+            if !st.library.iter().any(holds_members) {
                 back += set.brushes.len() as u32;
                 st.library.push(set);
                 continue;
-            };
-            for (brush, origin) in set.brushes.into_iter().zip(set.origins) {
+            }
+            let order = set.origins.clone();
+            let rank = |o: (usize, usize)| order.iter().position(|x| *x == Some(o));
+            for (brush, origin) in set.brushes.into_iter().zip(order.iter().copied()) {
                 let Some(origin) = origin else { continue };
                 if st.library.iter().any(|l| l.origins.contains(&Some(origin))) {
                     continue;
                 }
-                let Some(entry) = st.library.get_mut(home) else { break };
-                // after the last of its fellows that ships before it
+                // with its fellows of the set it shipped in (the one of the shipped set's name
+                // first), else with the others it ships among
+                let fellows = |l: &LibrarySet| l.origins.iter().flatten().any(|&(from, _)| from == origin.0);
+                let home = st
+                    .library
+                    .iter()
+                    .position(|l| l.name == set.name && fellows(l))
+                    .or_else(|| st.library.iter().position(fellows))
+                    .or_else(|| st.library.iter().position(|l| l.name == set.name && holds_members(l)))
+                    .or_else(|| st.library.iter().position(holds_members));
+                let Some(home) = home else { continue };
+                let Some(entry) = st.library.get_mut(home) else { continue };
+                // after the last of the brushes there that ships before it
+                let mine = rank(origin);
                 let at = entry
                     .origins
                     .iter()
-                    .rposition(|o| o.is_some_and(|(from, i)| from == s && i < origin.1))
+                    .rposition(|o| o.and_then(rank).zip(mine).is_some_and(|(theirs, mine)| theirs < mine))
                     .map_or(0, |p| p + 1)
                     .min(entry.brushes.len());
                 entry.brushes.insert(at, brush);
@@ -2155,11 +2323,13 @@ mod recent {
     #[test]
     fn a_brush_pinned_and_one_combined_into_it_show_once_in_the_recent_set() {
         let s = CanvasSession::new(32, 32);
-        s.shared.lock().note_recent((1, 0));
-        s.shared.lock().note_recent((1, 1));
-        assert!(s.pin_recent_brush(1, 0, true));
-        assert!(s.combine_brushes(1, 0, 1));
-        assert_eq!(places(&s), [(1, 0)]);
+        // in the set of ours from before, whose first brushes are no dual brushes
+        let l = s.brush_library().len() - 1;
+        s.shared.lock().note_recent((l, 0));
+        s.shared.lock().note_recent((l, 1));
+        assert!(s.pin_recent_brush(l as u32, 0, true));
+        assert!(s.combine_brushes(l as u32, 0, 1));
+        assert_eq!(places(&s), [(l as u32, 0)]);
     }
 
     #[test]
@@ -2227,5 +2397,76 @@ mod recent {
         assert!(t.load_brush_choices(s.saved_brush_choices()));
         assert_eq!(names(&t, &seen), was);
         assert_eq!(t.recent_brushes().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod stock {
+    use crate::CanvasSession;
+    use crate::stock_library::LEGACY_SETS;
+
+    /// The first stock brush drawn with a stand-in shape: its place in the library.
+    fn with_stand_in(s: &CanvasSession) -> (usize, usize) {
+        let st = s.shared.lock();
+        st.library
+            .iter()
+            .enumerate()
+            .find_map(|(set, l)| {
+                let i = l.brushes.iter().position(|b| b.shape.source.is_some())?;
+                l.origins.get(i).copied().flatten().filter(|o| o.0 >= LEGACY_SETS).map(|_| (set, i))
+            })
+            .expect("a stock brush with a stand-in shape")
+    }
+
+    #[test]
+    fn a_kept_stock_brush_is_its_origin_and_its_changes_not_a_copy_of_its_pictures() {
+        let s = CanvasSession::new(32, 32);
+        let (set, i) = with_stand_in(&s);
+        let json = s.saved_brush_library();
+        // 600-odd brushes as they ship: their origins, no pictures
+        assert!(json.len() < 200_000, "{} bytes", json.len());
+        assert!(!json.contains("shape_source") && !json.contains("grain_source"));
+        let t = CanvasSession::new(32, 32);
+        assert!(t.load_brush_library(json));
+        let (a, b) = (s.shared.lock(), t.shared.lock());
+        let (was, back) = (&a.library[set].brushes[i], &b.library[set].brushes[i]);
+        assert!(back.changes_from(was).is_empty(), "{:?}", back.changes_from(was));
+        assert_eq!(back.secondary.is_some(), was.secondary.is_some());
+        let (was, back) = (was.shape.source.as_ref().unwrap(), back.shape.source.as_ref().unwrap());
+        assert!(procraft_engine::brush::Pixels::same(&was.pixels, &back.pixels), "the shipped stand-in, shared");
+        assert_eq!(back.stand_in_for, was.stand_in_for);
+        // a dual brush's second comes back as its origin's second, sharing its stand-ins too
+        let (ds, di) = a
+            .library
+            .iter()
+            .enumerate()
+            .find_map(|(s, l)| {
+                let i =
+                    l.brushes.iter().position(|b| b.secondary.as_ref().is_some_and(|s| s.shape.source.is_some()))?;
+                Some((s, i))
+            })
+            .expect("a stock dual brush");
+        let (was, back) = (&a.library[ds].brushes[di], &b.library[ds].brushes[di]);
+        let (was, back) = (was.secondary.as_deref().unwrap(), back.secondary.as_deref().unwrap());
+        assert_eq!(back.name, was.name);
+        assert!(back.changes_from(was).is_empty(), "{:?}", back.changes_from(was));
+        let (was, back) = (was.shape.source.as_ref().unwrap(), back.shape.source.as_ref().unwrap());
+        assert!(procraft_engine::brush::Pixels::same(&was.pixels, &back.pixels));
+    }
+
+    #[test]
+    fn a_stock_brush_whose_shape_is_taken_away_keeps_it_away() {
+        let s = CanvasSession::new(32, 32);
+        let (set, i) = with_stand_in(&s);
+        {
+            let mut st = s.shared.lock();
+            let brush = &mut st.library[set].brushes[i];
+            brush.shape.source = None;
+            brush.shape.image = None;
+        }
+        let t = CanvasSession::new(32, 32);
+        assert!(t.load_brush_library(s.saved_brush_library()));
+        let st = t.shared.lock();
+        assert!(st.library[set].brushes[i].shape.source.is_none());
     }
 }

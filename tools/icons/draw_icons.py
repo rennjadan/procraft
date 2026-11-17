@@ -11,7 +11,7 @@ import math
 import os
 import re
 
-from shapely.affinity import rotate, translate
+from shapely.affinity import rotate, scale, translate
 from shapely.geometry import LineString, Point, Polygon, box
 from shapely.ops import unary_union
 
@@ -159,10 +159,50 @@ def contributed(who, name, weight=0.0, soft_by=0.15):
     return unary_union(drawn)
 
 
-# The contributed icons and who drew each. Their lines already weigh what the bar's glyphs' do where
-# they are shown (1.7 and 1.9 pt across; the glyphs they replaced 1.4 and 1.9, the rest of the bar
-# 2.9 to 4.4), so they get no weight.
-CONTRIBUTED_ICONS = {'adjustments': 'lork', 'selection': 'lork'}
+def lork_arrow():
+    """Transform: lork's arrow (the corners of assets/icons/contributed/lork/transform.svg) with its head
+    shortened along its line and its tail drawn out to meet it."""
+    tip, barb_l, barb_r = (19.41, 4.56), (5.78, 10.62), (13.43, 18.27)
+    notch_l, notch_r = (10.77, 11.67), (12.33, 13.27)
+    tail_end, tail_join, tail_r = (6.17, 17.85), (11.55, 12.47), 1.12
+    length = math.hypot(tip[0] - tail_end[0], tip[1] - tail_end[1])
+    u = ((tip[0] - tail_end[0]) / length, (tip[1] - tail_end[1]) / length)
+    ang = math.degrees(math.atan2(u[1], u[0]))
+    head = rotate(Polygon([tip, barb_r, notch_r, notch_l, barb_l]), -ang, origin=tip)
+    head = rotate(scale(head, 0.73, 1.0, origin=tip), ang, origin=tip)
+    tail = capsule(tail_end, (tail_join[0] + u[0] * 3.0, tail_join[1] + u[1] * 3.0), tail_r)
+    return soft(unary_union([soft(head, 0.3), tail]), 0.15)
+
+
+def lork_eraser_whole():
+    """Erase: lork's eraser (assets/icons/contributed/lork/erase.svg), its band's lower end drawn whole
+    (lork's long sides carried on to a rounded end, as at the top) instead of cut off flat."""
+    block = svg_parts(os.path.join(CONTRIBUTED, 'lork', 'erase.svg'))[0]
+    # the band's corners: the two at the cut beside the block, and the two at its end
+    a, b, c, d = (4.29, 13.25), (11.32, 20.28), (7.465, 24.135), (0.435, 17.105)
+    band = Polygon([a, b, c, d])
+    u = (math.sqrt(0.5), -math.sqrt(0.5))
+    near_cut = Polygon([(a[0] - u[0] * 2.5 - 9, a[1] - u[1] * 2.5 - 9), (a[0] - u[0] * 2.5 + 9, a[1] - u[1] * 2.5 + 9),
+                        (a[0] + u[0] * 9 + 9, a[1] + u[1] * 9 + 9), (a[0] + u[0] * 9 - 9, a[1] + u[1] * 9 - 9)])
+    band = unary_union([soft(band, 1.93), band.intersection(near_cut)])
+    return soft(unary_union([block, band]), 0.15)
+
+
+def lork_layers():
+    """Layers: lork's two sheets (assets/icons/contributed/lork/layers.svg), the back one set further
+    back up to the right."""
+    front = soft(box(3.33, 7.4, 16.5, 20.57), 1.3)
+    back = translate(soft(box(7.5, 3.43, 20.67, 16.6), 1.3), 2.1, -2.1).difference(front.buffer(GAP))
+    return soft(unary_union([front, back]), 0.15)
+
+
+# The contributed icons and who drew each, and those adjusted here (with what was done). Their lines
+# weigh about what the bar's glyphs' do where they are shown, so they get no weight.
+CONTRIBUTED_ICONS = {'adjustments': 'lork', 'selection': 'lork', 'brush': 'lork', 'transform': 'lork', 'erase': 'lork',
+                     'smudge': 'lork', 'layers': 'lork'}
+ADJUSTED = {'transform': (lork_arrow, 'its head shortened and its tail drawn out'),
+            'erase': (lork_eraser_whole, 'its lower end drawn whole'),
+            'layers': (lork_layers, 'its back sheet set further back')}
 
 
 def wrench():
@@ -180,14 +220,6 @@ def wand():
     return unary_union([shaft, star(18.6, 5.2, 3.3), star(11.2, 4.0, 2.0), star(20.2, 11.8, 1.8)])
 
 
-def arrow():
-    """Transform: a solid arrow pointing up and to the right."""
-    shaft = capsule((0, 0), (9.0, 0), 1.3)
-    head = soft(Polygon([(7.0, -5.0), (15.6, 0), (7.0, 5.0)]), 0.6)
-    shape = unary_union([shaft, head])
-    return along_diagonal(translate(shape, -7.8, 0), (12.0, 12.0))
-
-
 def paintbrush():
     """Paint: a round brush, its bristles down to the left."""
     bristles = unary_union([Point(5.6, 0).buffer(3.1, quad_segs=16), Point(0, 0).buffer(0.2)]).convex_hull
@@ -197,25 +229,8 @@ def paintbrush():
     return along_diagonal(unary_union([soft(bristles, 0.3), ferrule, handle]), (4.0, 20.0))
 
 
-def fingertip():
-    """Smudge: a fingertip pressing on a smear."""
-    finger = capsule((14.6, 2.6), (10.0, 12.4), 3.4)
-    crease = gap_across((12.9, 6.2), (-0.42, 0.91), 8)
-    finger = finger.difference(crease)
-    wave = LineString([(3.8 + 16.4 * t, 19.4 - 1.4 * math.sin(t * 2 * math.pi)) for t in [i / 40 for i in range(41)]])
-    return unary_union([finger, wave.buffer(1.3, quad_segs=10)])
-
-
-def eraser():
-    """Erase: an eraser block with a band, on a line."""
-    block = soft(box(0, -3.8, 14.5, 3.8), 1.2).difference(box(4.6, -5, 4.6 + GAP, 5))
-    block = translate(rotate(translate(block, -7.25, 0), -45, origin=(0, 0)), 12.0, 10.4)
-    line = capsule((3.5, 20.8), (20.5, 20.8), 1.0)
-    return unary_union([block, line])
-
-
 def layers():
-    """Layers: two stacked sheets, the top one solid."""
+    """Canvas information's Layers and Layer Select: two stacked sheets, the top one solid."""
     top = soft(Polygon([(12, 2.6), (21.4, 8.4), (12, 14.2), (2.6, 8.4)]), 1.0)
     under = LineString([(2.8, 14.2), (12, 19.9), (21.2, 14.2)]).buffer(1.2, quad_segs=10)
     return unary_union([top, under])
@@ -1701,8 +1716,7 @@ BLENDS = {'multiply': overlap_dark, 'darken': darken, 'shade': sunset, 'color-bu
 # drawn smaller than the box they're placed in: a bare symbol filling a tile's box is too heavy
 SHRINK = {'blend-subtract': 0.75, 'blend-divide': 0.85}
 DRAWINGS = {
-    'actions': wrench, 'transform': arrow,
-    'brush': paintbrush, 'smudge': fingertip, 'erase': eraser, 'layers': layers,
+    'actions': wrench,
     'undo': lambda: turning_arrow(False), 'redo': lambda: turning_arrow(True),
     'tabadd': plus, 'tabcanvas': canvas_tab, 'tabshare': share_tab, 'tabimport': import_tab, 'tabvideo': video_tab,
     'tabprefs': prefs_tab, 'tabhelp': help_tab,
@@ -1751,7 +1765,8 @@ DRAWINGS = {
     'recentset': hourglass, 'swipe-find': target, 'swipe-pin': upright_tack, 'swipe-unpin': struck_tack,
     'swipe-clear': broom, 'menuclear': broom, 'pinmark': upright_tack, 'alertquestion': question_disc,
 }
-DRAWINGS.update({name: (lambda who=who, name=name: contributed(who, name)) for name, who in CONTRIBUTED_ICONS.items()})
+DRAWINGS.update({name: ADJUSTED[name][0] if name in ADJUSTED else (lambda who=who, name=name: contributed(who, name))
+                 for name, who in CONTRIBUTED_ICONS.items()})
 DRAWINGS.update({f'set-{k}': draw for k, draw in enumerate(SET_ICONS)})
 DRAWINGS.update({f'blend-{k}': draw for k, draw in BLENDS.items()})
 
@@ -1790,7 +1805,8 @@ def main():
         shape = draw().simplify(0.02)
         if name in CONTRIBUTED_ICONS:
             who = CONTRIBUTED_ICONS[name]
-            origin = (f'drawn by {CONTRIBUTORS[who]}, placed from assets/icons/contributed/{who}/{name}.svg '
+            how = f'{ADJUSTED[name][1]}, ' if name in ADJUSTED else ''
+            origin = (f'drawn by {CONTRIBUTORS[who]}, {how}placed from assets/icons/contributed/{who}/{name}.svg '
                       'by tools/icons/draw_icons.py')
         else:
             origin = 'original, drawn by tools/icons/draw_icons.py'

@@ -304,7 +304,166 @@ pub fn library() -> Vec<BrushSet> {
             }
         }
     }
+    // and the brushes modelled on a familiar kind move the values they have of it a little
+    for brush in sets.iter_mut().flat_map(|set| set.brushes.iter_mut()) {
+        if let Some((_, keys)) = MOVES.iter().find(|(name, _)| *name == brush.name) {
+            move_a_little(brush, keys);
+        }
+    }
     sets
+}
+
+/// The brushes modelled on a familiar kind of brush, and the values each has of it that move a
+/// little (see [`crate::variant`]): tapers, mostly, and a few that give it its feel. Their
+/// switches and choices, their values of none and those at an end of their range stay.
+const MOVES: &[(&str, &[&str])] = &[
+    (
+        "6B Pencil",
+        &[
+            "pen_taper_end",
+            "pen_taper_opacity",
+            "pen_taper_tip",
+            "pen_taper_size",
+            "pen_taper_start",
+            "touch_taper_end",
+            "pen_taper_pressure",
+            "touch_taper_start",
+        ],
+    ),
+    ("Acrylic", &["pen_taper_end", "pen_taper_start", "touch_taper_end", "touch_taper_start"]),
+    ("Brush Pen", &["pen_taper_end", "pen_taper_start", "streamline", "touch_taper_end", "touch_taper_start"]),
+    (
+        "Chalk",
+        &[
+            "pen_taper_end",
+            "pen_taper_opacity",
+            "pen_taper_tip",
+            "pen_taper_size",
+            "pen_taper_start",
+            "streamline",
+            "touch_taper_end",
+            "touch_taper_opacity",
+            "touch_taper_tip",
+            "touch_taper_start",
+        ],
+    ),
+    (
+        "Charcoal Block",
+        &["pen_taper_end", "pen_taper_opacity", "pen_taper_start", "touch_taper_end", "touch_taper_start"],
+    ),
+    ("Clouds", &["pen_taper_end", "touch_taper_end"]),
+    ("Dry Brush", &["pen_taper_end", "pen_taper_start", "touch_taper_end", "touch_taper_start"]),
+    (
+        "Dry Ink",
+        &[
+            "streamline_pressure",
+            "pen_taper_end",
+            "pen_taper_tip",
+            "pen_taper_start",
+            "stabilization",
+            "touch_taper_start",
+        ],
+    ),
+    ("Flat Brush", &["touch_taper_end", "touch_taper_start"]),
+    ("Gouache", &["touch_taper_end", "touch_taper_start"]),
+    (
+        "HB Pencil",
+        &[
+            "pen_taper_end",
+            "pen_taper_opacity",
+            "pen_taper_tip",
+            "pen_taper_size",
+            "touch_taper_end",
+            "pen_taper_pressure",
+            "touch_taper_start",
+        ],
+    ),
+    ("Ink Bleed", &["pen_taper_end", "pen_taper_start", "touch_taper_end", "touch_taper_start"]),
+    (
+        "Lichen",
+        &[
+            "pen_taper_end",
+            "pen_taper_tip",
+            "pen_taper_size",
+            "pen_taper_start",
+            "pen_taper_pressure",
+            "touch_taper_start",
+        ],
+    ),
+    (
+        "Marker",
+        &[
+            "pen_taper_end",
+            "pen_taper_size",
+            "pen_taper_start",
+            "touch_taper_end",
+            "touch_taper_opacity",
+            "pen_taper_pressure",
+            "touch_taper_start",
+        ],
+    ),
+    (
+        "Monoline",
+        &[
+            "hover_pressure",
+            "pen_taper_end",
+            "pen_taper_size",
+            "pen_taper_start",
+            "streamline",
+            "touch_taper_end",
+            "touch_taper_size",
+            "touch_taper_start",
+        ],
+    ),
+    ("Oil Paint", &["pen_taper_start", "touch_taper_start"]),
+    ("Sable", &["pen_taper_end", "pen_taper_start", "touch_taper_end", "touch_taper_start"]),
+    ("Smoke", &["touch_taper_end", "touch_taper_start"]),
+    ("Soft Pastel", &["touch_taper_end", "touch_taper_start"]),
+    (
+        "Technical Pencil",
+        &[
+            "max_size",
+            "pen_taper_end",
+            "pen_taper_opacity",
+            "pen_taper_size",
+            "pen_taper_start",
+            "touch_taper_end",
+            "pen_taper_pressure",
+            "touch_taper_start",
+        ],
+    ),
+    ("Vine Charcoal", &["tilt_size", "pen_taper_end", "pen_taper_start", "touch_taper_end", "touch_taper_start"]),
+    (
+        "Willow Charcoal",
+        &["tilt_size", "pen_taper_end", "pen_taper_opacity", "pen_taper_start", "touch_taper_end", "touch_taper_start"],
+    ),
+];
+
+/// The top of a brush file's most size (its units, see `brushfile::set_sizes`): a brush there
+/// stays there.
+const FILE_MOST_SIZE: f32 = 4.0;
+
+/// `brush`'s values `keys` each moved by 1% to 3% as its name says, kept in its range (its most
+/// size, `max_size`, in a brush file's units).
+fn move_a_little(brush: &mut Brush, keys: &[&str]) {
+    use crate::variant::{moved, range, shifted};
+    for &key in keys {
+        let by = moved(&brush.name, key);
+        if key == "max_size" {
+            let unit = brush.size_unit();
+            let most = brush.max_size / unit;
+            let now = shifted(most, by, (0.0, FILE_MOST_SIZE));
+            if now != most {
+                brush.max_size = now * unit;
+            }
+            continue;
+        }
+        let value = brush.setting(key);
+        let now = shifted(value, by, range(key));
+        if now != value {
+            brush.set_setting(key, now);
+        }
+    }
 }
 
 /// The settings each row of [`TAPERS`] gives, in its order: the pen's start, end, size, opacity
@@ -2903,20 +3062,25 @@ mod tests {
 
     #[test]
     fn no_brush_smooths_more_than_the_pens_made_for_a_steady_line() {
+        // (the most, 0.67, moved by up to 3% as a brush modelled on a familiar kind moves it)
         for b in library().iter().flat_map(|s| &s.brushes) {
-            assert!(b.streamline <= 0.67, "{}: {}", b.name, b.streamline);
+            assert!(b.streamline <= 0.67 * 1.03, "{}: {}", b.name, b.streamline);
             assert!(b.pressure_smoothing == 0.0 || b.name == "Dry Ink", "{}: {}", b.name, b.pressure_smoothing);
         }
     }
 
     #[test]
     fn each_brush_the_taper_table_names_is_one_and_takes_its_row_and_those_made_from_it_keep_their_own() {
+        use crate::variant::{moved, range, shifted};
         let all: Vec<Brush> = library().into_iter().flat_map(|set| set.brushes).collect();
         for (name, values) in TAPERS {
             let named: Vec<&Brush> = all.iter().filter(|b| b.name == *name).collect();
             assert_eq!(named.len(), 1, "{name}");
+            // each value of its row, moved a little where it is one that moves
             for (key, &value) in TAPER_KEYS.into_iter().zip(values) {
-                assert_eq!(named[0].setting(key), value, "{name}: {key}");
+                let moves = MOVES.iter().any(|(n, keys)| n == name && keys.contains(&key));
+                let wanted = if moves { shifted(value, moved(name, key), range(key)) } else { value };
+                assert_eq!(named[0].setting(key), wanted, "{name}: {key}");
             }
         }
         // Letterpress, made from Monoline, keeps the tapers it was made with

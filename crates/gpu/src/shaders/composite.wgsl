@@ -116,12 +116,8 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
         let wet_a = min(s.a * (1.0 - lu.wet * 0.1 * edge), 1.0);
         s = s * (wet_a / s.a);
     } else if (lu.wet > 0.0 && s.a > 0.0) {
-        // on the canvas the paint pools: the coverage taken through a damped wave, which rises to
-        // full where the stroke is about 0.7 (a ring where it fades out) and settles back to
-        // about 0.78 where it is full; faint paint fades
-        let x = 4.5 * s.a;
-        let pooled = 1.0 - abs(sin(x) / x);
-        s = s * (mix(s.a, pooled, lu.wet) / s.a);
+        // on the canvas the paint pools (see pooled_over)
+        s = s * mix(1.0, pooled_over(s.a), lu.wet);
     }
     let built = s.a;
     if (lu.grain >= 0) {
@@ -157,14 +153,20 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
         if (lu.dual_threshold >= 0.0) {
             b = select(0.0, 1.0, b > lu.dual_threshold);
         }
-        let mode = lu.dual - 1u;
+        let mode = dual_mode(lu.dual);
         let a = dual_rise(dual_combine(s.a, b, mode), built, mode);
         // the first's colour; by Normal turned toward the second's (drawn in the stroke's colour)
         // as far as the second shows where the first laid little, so where the first fades out
         // the two meet smoothly, not at a seam of whatever colour the first's faintest paint
         // holds; the second's wherever the first left nothing
         let toward = select(select(0.0, clamp((1.0 - laid) * b, 0.0, 1.0), mode == 0u), 1.0, s.a <= 0.0);
-        let colour = mix(s.rgb / max(s.a, 1e-6), t.rgb / max(t.a, 1e-6), toward);
+        let first_colour = s.rgb / max(s.a, 1e-6);
+        let second_colour = t.rgb / max(t.a, 1e-6);
+        var colour = mix(first_colour, second_colour, toward);
+        if ((lu.dual & DUAL_CLASSIC) != 0u && s.a > 0.0) {
+            // the classic combine: the first's colour whole and the second's share added up
+            colour = (first_colour + second_colour * toward) / (1.0 + toward);
+        }
         s = vec4<f32>(colour * a, a);
     }
     // burnt edges show where the stroke is thin: where its paper grain or its second took paint
@@ -201,6 +203,11 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
         // where it reaches its alpha is marked by 1, so that clear can be laid down as well
         let t = textureLoad(stroke_tex, p, 0);
         return select(c0, vec4<f32>(t.rgb, t.a - 1.0), t.a >= 0.5);
+    }
+    if (lu.stroke_mode == 5u) {
+        // the same in a stroke of 8 bits a channel: its alpha a half more, halved
+        let t = textureLoad(stroke_tex, p, 0);
+        return select(c0, vec4<f32>(t.rgb, 2.0 * t.a - 1.0), t.a >= 0.25);
     }
     if (lu.stroke_mode != 0u) {
         let px = stroke_pixel(p);

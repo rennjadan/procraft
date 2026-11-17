@@ -1,9 +1,13 @@
 //! The Krita brush studio: a panel of the plugin's own (the app's `panel` permission) showing a
-//! Krita brush's settings as Krita names them, a page at a time: its tip, its spacing, its size,
-//! opacity and flow, its turn and squash, scatter and mirroring, colour and texture, each option with
-//! the sensor it follows and the curve it takes. The app opens it in place of its own brush studio
-//! for a brush this plugin's engine made; each change is written back to the brush (the app's
-//! `brush.data` permission) and draws from the next stroke on.
+//! Krita brush's settings as Krita names them, a page at a time, the pages its engine has: a pixel
+//! brush's tip, spacing, size, opacity and flow, turn and squash, scatter and mirroring, colour and
+//! texture; a colour smudge brush's smudge, its radius and colour rate; a sketch brush's lines; a
+//! spray brush's area, particles, their dynamics and colours; a tangent normal brush's tilt; a quick
+//! brush's own; a bristle brush's bristles and ink; a hatching brush's hatching; a curve brush's
+//! curves; a particle brush's particles; a grid brush's grid and colours. Each option comes with the
+//! sensor it follows and the curve it takes. The app opens
+//! it in place of its own brush studio for a brush this plugin's engine made; each change is
+//! written back to the brush (the app's `brush.data` permission) and draws from the next stroke on.
 
 use crate::curve::Curve;
 use crate::preset::{Preset, Resource};
@@ -64,9 +68,131 @@ fn close() {
     }
 }
 
-/// The pages, as the page row offers them.
-const PAGES: [&str; 8] =
-    ["Tip", "Spacing", "Size", "Opacity and flow", "Turn and squash", "Scatter and mirror", "Colour", "Texture"];
+/// What a page shows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Shows {
+    Tip,
+    Spacing,
+    Size,
+    OpacityFlow,
+    SizeOpacity,
+    TurnSquash,
+    Turn,
+    ScatterMirror,
+    Colour,
+    Texture,
+    Smudge,
+    SmudgeColour,
+    Tangent,
+    Sketch,
+    Lines,
+    Quick,
+    SprayArea,
+    Particles,
+    ShapeDynamics,
+    SprayColour,
+    Bristles,
+    Ink,
+    Hatching,
+    AngleCrosshatching,
+    SeparationThickness,
+    Curves,
+    CurveOptions,
+    Particles2,
+    Grid,
+    GridColour,
+    Chalk,
+    Dyna,
+    Deform,
+    Clone,
+    Filter,
+    ShapeFill,
+}
+
+/// A pixel brush's pages, as the page row offers them.
+const PIXEL_PAGES: [(Shows, &str); 8] = [
+    (Shows::Tip, "Tip"),
+    (Shows::Spacing, "Spacing"),
+    (Shows::Size, "Size"),
+    (Shows::OpacityFlow, "Opacity and flow"),
+    (Shows::TurnSquash, "Turn and squash"),
+    (Shows::ScatterMirror, "Scatter and mirror"),
+    (Shows::Colour, "Colour"),
+    (Shows::Texture, "Texture"),
+];
+
+/// The pages a brush of Krita's engine `paintop` has (each engine's own options), at most eight.
+fn pages(paintop: &str) -> &'static [(Shows, &'static str)] {
+    match paintop {
+        "colorsmudge" => &[
+            (Shows::Tip, "Tip"),
+            (Shows::Spacing, "Spacing"),
+            (Shows::SizeOpacity, "Size and opacity"),
+            (Shows::TurnSquash, "Turn and squash"),
+            (Shows::ScatterMirror, "Scatter and mirror"),
+            (Shows::Smudge, "Smudge"),
+            (Shows::SmudgeColour, "Radius and colour"),
+            (Shows::Texture, "Texture"),
+        ],
+        "tangentnormal" => &[
+            (Shows::Tip, "Tip"),
+            (Shows::Spacing, "Spacing"),
+            (Shows::Size, "Size"),
+            (Shows::OpacityFlow, "Opacity and flow"),
+            (Shows::TurnSquash, "Turn and squash"),
+            (Shows::ScatterMirror, "Scatter and mirror"),
+            (Shows::Tangent, "Tangent tilt"),
+            (Shows::Texture, "Texture"),
+        ],
+        "sketchbrush" => &[
+            (Shows::Tip, "Tip"),
+            (Shows::Sketch, "Sketch"),
+            (Shows::SizeOpacity, "Size and opacity"),
+            (Shows::Lines, "Lines"),
+            (Shows::Turn, "Turn"),
+        ],
+        "spraybrush" => &[
+            (Shows::SprayArea, "Spray area"),
+            (Shows::Particles, "Particles"),
+            (Shows::ShapeDynamics, "Shape dynamics"),
+            (Shows::SprayColour, "Colour"),
+            (Shows::SizeOpacity, "Size and opacity"),
+            (Shows::Turn, "Turn"),
+            (Shows::Tip, "Tip"),
+        ],
+        "roundmarker" => &[(Shows::Quick, "Quick brush"), (Shows::Size, "Size")],
+        "hairybrush" => &[
+            (Shows::Bristles, "Bristles"),
+            (Shows::Ink, "Ink"),
+            (Shows::SizeOpacity, "Size and opacity"),
+            (Shows::Turn, "Turn"),
+            (Shows::Tip, "Tip"),
+        ],
+        "hatchingbrush" => &[
+            (Shows::Tip, "Tip"),
+            (Shows::Spacing, "Spacing"),
+            (Shows::Hatching, "Hatching"),
+            (Shows::AngleCrosshatching, "Angle and crosshatching"),
+            (Shows::SeparationThickness, "Separation and thickness"),
+            (Shows::SizeOpacity, "Size and opacity"),
+        ],
+        "curvebrush" => &[(Shows::Curves, "Curves"), (Shows::CurveOptions, "Options")],
+        "particlebrush" => &[(Shows::Particles2, "Particles")],
+        "gridbrush" => &[(Shows::Grid, "Grid"), (Shows::GridColour, "Colour")],
+        "chalkbrush" => &[(Shows::Chalk, "Chalk")],
+        "dynabrush" => &[(Shows::Dyna, "Dyna")],
+        "deformbrush" => &[(Shows::Deform, "Deform"), (Shows::SizeOpacity, "Size and opacity"), (Shows::Turn, "Turn")],
+        "duplicate" => &[
+            (Shows::Tip, "Tip"),
+            (Shows::Clone, "Clone"),
+            (Shows::SizeOpacity, "Size and opacity"),
+            (Shows::Turn, "Turn"),
+        ],
+        "filter" => &[(Shows::Tip, "Tip"), (Shows::Filter, "Filter"), (Shows::SizeOpacity, "Size and opacity")],
+        "experimentbrush" => &[(Shows::ShapeFill, "Shape")],
+        _ => &PIXEL_PAGES,
+    }
+}
 
 /// The sensors an option can be set to follow here, by Krita's ids, and what the page calls them.
 const SENSORS: [(&str, &str); 8] = [
@@ -113,6 +239,15 @@ enum Does {
         per: f32,
     },
     Flag(String),
+    /// A curve setting of its own (not an option's), set to the chosen one.
+    PlainCurve(String),
+    /// A hatching's crosshatching style, kept as a flag for each.
+    HatchStyle,
+    /// A setting set to the chosen one of `values`.
+    Choose {
+        key: String,
+        values: &'static [&'static str],
+    },
     /// A brush element's attribute (its tip's, or its mask generator's).
     Attribute {
         child: bool,
@@ -127,6 +262,9 @@ enum Does {
     MirrorAxes,
     TextureMode,
     Reset,
+    /// A MyPaint brush's setting's base value (its place in MyPaint's list), and its eraser mode.
+    MyPaint(usize),
+    MyPaintEraser,
     Nothing,
 }
 
@@ -139,7 +277,94 @@ pub struct Studio {
     original: Option<String>,
     page: usize,
     rows: Vec<Does>,
+    /// A MyPaint brush's settings (its JSON), and as they came.
+    mypaint: Option<crate::json::Value>,
+    mypaint_original: Option<String>,
 }
+
+/// A MyPaint brush's pages, as Krita sorts its settings, each setting with Krita's name for it.
+const MYPAINT_PAGES: [(&str, &[(&str, &str)]); 8] = [
+    (
+        "Basic",
+        &[
+            ("radius_logarithmic", "Radius Logarithmic"),
+            ("radius_by_random", "Radius by Random"),
+            ("hardness", "Hardness"),
+            ("anti_aliasing", "Anti Aliasing"),
+            ("elliptical_dab_angle", "Elliptical Dab Angle"),
+            ("elliptical_dab_ratio", "Elliptical Dab Ratio"),
+            ("direction_filter", "Direction Filter"),
+            ("snap_to_pixel", "Snap To Pixel"),
+            ("pressure_gain_log", "Pressure Gain"),
+        ],
+    ),
+    (
+        "Color",
+        &[
+            ("change_color_h", "Change Color H"),
+            ("change_color_l", "Change Color L"),
+            ("change_color_v", "Change Color V"),
+            ("change_color_hsl_s", "Change Color HSL S"),
+            ("change_color_hsv_s", "Change Color HSV S"),
+            ("colorize", "Colorize"),
+            ("posterize", "Posterize"),
+            ("posterize_num", "Posterization Levels"),
+        ],
+    ),
+    (
+        "Speed",
+        &[
+            ("speed1_gamma", "Fine Speed Gamma"),
+            ("speed2_gamma", "Gross Speed Gamma"),
+            ("speed1_slowness", "Fine Speed Slowness"),
+            ("speed2_slowness", "Gross Speed Slowness"),
+            ("offset_by_speed", "Offset By Speed"),
+            ("offset_by_speed_slowness", "Offset by Speed Filter"),
+            ("offset_by_random", "Offset By Random"),
+        ],
+    ),
+    (
+        "Dabs",
+        &[
+            ("dabs_per_basic_radius", "Dabs Per Basic Radius"),
+            ("dabs_per_actual_radius", "Dabs Per Actual Radius"),
+            ("dabs_per_second", "Dabs per Second"),
+        ],
+    ),
+    (
+        "Opacity",
+        &[("opaque", "Opaque"), ("opaque_linearize", "Opaque Linearize"), ("opaque_multiply", "Opaque Multiply")],
+    ),
+    (
+        "Tracking",
+        &[
+            ("slow_tracking_per_dab", "Slow tracking per dab"),
+            ("slow_tracking", "Slow Tracking"),
+            ("tracking_noise", "Tracking Noise"),
+        ],
+    ),
+    (
+        "Smudge",
+        &[
+            ("smudge", "Smudge"),
+            ("smudge_length", "Smudge Length"),
+            ("smudge_length_log", "Smudge Length Multiplier"),
+            ("smudge_radius_log", "Smudge Radius Log"),
+            ("smudge_transparency", "Smudge Transparency"),
+            ("smudge_bucket", "Smudge Bucket"),
+        ],
+    ),
+    (
+        "Stroke",
+        &[
+            ("stroke_duration_logarithmic", "Stroke Duration log"),
+            ("stroke_holdtime", "Stroke Holdtime"),
+            ("stroke_threshold", "Stroke Threshold"),
+            ("custom_input", "Custom Input"),
+            ("custom_input_slowness", "Custom Input Slowness"),
+        ],
+    ),
+];
 
 impl Studio {
     /// Opens on the brush the app hands over.
@@ -158,9 +383,13 @@ impl Studio {
     fn read(&mut self, data: &[u8]) {
         self.files.clear();
         self.original = None;
+        self.mypaint = None;
+        self.mypaint_original = None;
         let mut text = None;
         for (id, value) in fields(data) {
             match id {
+                4 => self.mypaint = crate::json::parse(&String::from_utf8_lossy(value)),
+                5 => self.mypaint_original = Some(String::from_utf8_lossy(value).into_owned()),
                 1 => text = Some(String::from_utf8_lossy(value).into_owned()),
                 2 => {
                     let (mut name, mut bytes) = (String::new(), Vec::new());
@@ -185,6 +414,15 @@ impl Studio {
 
     /// The brush's data as it now is, written back to the app.
     fn save(&self) {
+        if let Some(json) = &self.mypaint {
+            let mut data = Record::new();
+            data.field(4, json.write().as_bytes());
+            if let Some(original) = &self.mypaint_original {
+                data.field(5, original.as_bytes());
+            }
+            write_data(&data.bytes());
+            return;
+        }
         let Some(p) = &self.preset else { return };
         let mut data = Record::new();
         data.field(1, p.to_xml().as_bytes());
@@ -202,8 +440,13 @@ impl Studio {
     /// A touch on row `row` with `value`.
     pub fn touched(&mut self, row: usize, value: f32) {
         let Some(does) = self.rows.get(row).cloned() else { return };
+        if self.mypaint.is_some() {
+            self.touched_mypaint(&does, value);
+            return;
+        }
         if does == Does::Page {
-            self.page = (value.max(0.0) as usize).min(PAGES.len() - 1);
+            let count = self.preset.as_ref().map_or(1, |p| pages(&p.paintop).len());
+            self.page = (value.max(0.0) as usize).min(count - 1);
             self.show();
             return;
         }
@@ -224,25 +467,161 @@ impl Studio {
         self.show();
     }
 
+    /// A touch on a MyPaint brush's page.
+    fn touched_mypaint(&mut self, does: &Does, value: f32) {
+        match does {
+            Does::Page => self.page = (value.max(0.0) as usize).min(MYPAINT_PAGES.len() - 1),
+            Does::Reset => {
+                if self.mypaint_original.is_none() {
+                    self.mypaint_original = self.mypaint.as_ref().map(crate::json::Value::write);
+                }
+                self.mypaint = self.mypaint_original.as_deref().and_then(crate::json::parse);
+                self.save();
+            }
+            Does::MyPaint(setting) => {
+                let name = crate::mypaint::SETTINGS.get(*setting).map_or("", |s| s.0);
+                self.set_mypaint(name, value);
+            }
+            Does::MyPaintEraser => self.set_mypaint("eraser", if value >= 0.5 { 1.0 } else { 0.0 }),
+            _ => {}
+        }
+        self.show();
+    }
+
+    /// A MyPaint brush's setting's base value set (the brush written back).
+    fn set_mypaint(&mut self, name: &str, value: f32) {
+        use crate::json::Value;
+        let Some(json) = self.mypaint.as_mut() else { return };
+        if self.mypaint_original.is_none() {
+            self.mypaint_original = Some(json.write());
+        }
+        let Some(settings) = json.entry("settings") else { return };
+        if !matches!(settings, Value::Object(_)) {
+            *settings = Value::Object(Vec::new());
+        }
+        let Some(setting) = settings.entry(name) else { return };
+        if !matches!(setting, Value::Object(_)) {
+            *setting = Value::Object(vec![("inputs".to_owned(), Value::Object(Vec::new()))]);
+        }
+        if let Some(base) = setting.entry("base_value") {
+            *base = Value::Number(f64::from(value));
+        }
+        if let Some(inputs) = setting.entry("inputs")
+            && !matches!(inputs, Value::Object(_))
+        {
+            *inputs = Value::Object(Vec::new());
+        }
+        self.save();
+    }
+
+    /// A MyPaint brush's page: each setting's base value, and the inputs it follows.
+    fn show_mypaint(&mut self) {
+        let Some(json) = self.mypaint.as_ref() else { return };
+        let brush = crate::mypaint::MyPaint::read(&json.write()).unwrap_or_else(crate::mypaint::MyPaint::defaults);
+        let mut page = Page::new("MyPaint brush");
+        self.page = self.page.min(MYPAINT_PAGES.len() - 1);
+        let names: Vec<&str> = MYPAINT_PAGES.iter().map(|(name, _)| *name).collect();
+        page.choice(Does::Page, "Page", &names, self.page);
+        let (_, settings) = MYPAINT_PAGES[self.page];
+        if self.page == 0 {
+            page.switch(Does::MyPaintEraser, "Eraser Mode", brush.erases());
+        }
+        for (name, label) in settings {
+            let Some(index) = crate::mypaint::SETTINGS.iter().position(|s| s.0 == *name) else { continue };
+            let (least, most) = crate::mypaint::RANGES[index];
+            let m = &brush.map[index];
+            page.slider(Does::MyPaint(index), label, least, most, (most - least) / 200.0, m.base, "");
+            if !m.constant() {
+                let inputs: Vec<&str> =
+                    m.curves.iter().filter_map(|(i, _)| crate::mypaint::INPUTS.get(*i).copied()).collect();
+                page.text(&format!("{label} follows {}", inputs.join(", ")));
+            }
+        }
+        page.button(Does::Reset, "Back to the brush as it came");
+        self.rows = page.does.clone();
+        show(&page.json());
+    }
+
     fn show(&mut self) {
+        if self.mypaint.is_some() {
+            return self.show_mypaint();
+        }
         let Some(p) = self.preset.as_ref() else { return };
         let mut page = Page::new(&p.name);
-        page.choice(Does::Page, "Page", &PAGES, self.page);
-        match self.page {
-            0 => tip_page(p, &mut page),
-            1 => spacing_page(p, &mut page),
-            2 => option_rows(p, &mut page, "Size", "Size", true),
-            3 => {
+        let all = pages(&p.paintop);
+        self.page = self.page.min(all.len() - 1);
+        let names: Vec<&str> = all.iter().map(|(_, name)| *name).collect();
+        page.choice(Does::Page, "Page", &names, self.page);
+        match all[self.page].0 {
+            Shows::Tip => tip_page(p, &self.files, &mut page),
+            Shows::Spacing => spacing_page(p, &mut page),
+            Shows::Size => option_rows(p, &mut page, "Size", "Size", true),
+            Shows::OpacityFlow => {
                 let wash = p.number("PaintOpAction", 2.0) != 1.0;
                 page.choice(Does::PaintingMode, "Painting mode", &["Build up", "Wash"], usize::from(wash));
                 option_rows(p, &mut page, "Opacity", "Opacity", false);
                 option_rows(p, &mut page, "Flow", "Flow", false);
             }
-            4 => {
+            Shows::SizeOpacity => {
+                option_rows(p, &mut page, "Size", "Size", true);
+                option_rows(p, &mut page, "Opacity", "Opacity", false);
+            }
+            Shows::TurnSquash => {
                 option_rows(p, &mut page, "Rotation", "Rotation", true);
                 option_rows(p, &mut page, "Ratio", "Ratio", true);
             }
-            5 => {
+            Shows::Turn => option_rows(p, &mut page, "Rotation", "Rotation", true),
+            Shows::Smudge => smudge_page(p, &mut page),
+            Shows::SmudgeColour => {
+                option_rows(p, &mut page, "SmudgeRadius", "Smudge radius", true);
+                option_rows(p, &mut page, "ColorRate", "Colour rate", true);
+                option_rows(p, &mut page, "Gradient", "Gradient", true);
+            }
+            Shows::Tangent => tangent_page(p, &mut page),
+            Shows::Sketch => sketch_page(p, &mut page),
+            Shows::Lines => {
+                option_rows(p, &mut page, "Line width", "Line width", true);
+                option_rows(p, &mut page, "Offset scale", "Offset scale", true);
+                option_rows(p, &mut page, "Density", "Density", true);
+            }
+            Shows::Quick => quick_page(p, &mut page),
+            Shows::SprayArea => spray_area_page(p, &mut page),
+            Shows::Particles => particles_page(p, &mut page),
+            Shows::ShapeDynamics => shape_dynamics_page(p, &mut page),
+            Shows::SprayColour => spray_colour_page(p, &mut page),
+            Shows::Bristles => bristles_page(p, &mut page),
+            Shows::Ink => ink_page(p, &mut page),
+            Shows::Hatching => hatching_page(p, &mut page),
+            Shows::AngleCrosshatching => {
+                option_rows(p, &mut page, "Angle", "Angle", true);
+                option_rows(p, &mut page, "Crosshatching", "Crosshatching", true);
+            }
+            Shows::SeparationThickness => {
+                option_rows(p, &mut page, "Separation", "Separation", true);
+                option_rows(p, &mut page, "Thickness", "Thickness", true);
+            }
+            Shows::Curves => curves_page(p, &mut page),
+            Shows::CurveOptions => {
+                option_rows(p, &mut page, "Line width", "Line width", true);
+                option_rows(p, &mut page, "Curves opacity", "Curves opacity", true);
+                option_rows(p, &mut page, "Opacity", "Opacity", false);
+            }
+            Shows::Particles2 => particle_page(p, &mut page),
+            Shows::Grid => grid_page(p, &mut page),
+            Shows::GridColour => grid_colour_page(p, &mut page),
+            Shows::Chalk => {
+                page.setting(p, "Chalk/radius", "Radius", (0.0, 100.0), 1.0, 5.0, " px");
+                page.flag(p, "Chalk/inkDepletion", "Ink runs out", false);
+                page.flag(p, "Chalk/opacity", "Opacity falls", false);
+                page.flag(p, "Chalk/saturation", "Saturation falls", false);
+                option_rows(p, &mut page, "Opacity", "Opacity", false);
+            }
+            Shows::Dyna => dyna_page(p, &mut page),
+            Shows::Deform => deform_page(p, &mut page),
+            Shows::Clone => clone_page(p, &mut page),
+            Shows::Filter => filter_page(p, &mut page),
+            Shows::ShapeFill => shape_page(p, &mut page),
+            Shows::ScatterMirror => {
                 option_rows(p, &mut page, "Scatter", "Scatter", true);
                 let (x, y) = (p.flag("Scattering/AxisX", true), p.flag("Scattering/AxisY", true));
                 let axes = match (x, y) {
@@ -260,11 +639,11 @@ impl Studio {
                 };
                 page.choice(Does::MirrorAxes, "Mirror", &["Across", "Down", "Both"], mirror);
             }
-            6 => {
+            Shows::Colour => {
                 option_rows(p, &mut page, "Darken", "Darken", true);
                 option_rows(p, &mut page, "Mix", "Mix", true);
             }
-            _ => texture_page(p, &mut page),
+            Shows::Texture => texture_page(p, &mut page),
         }
         self.rows = page.does.clone();
         show(&page.json());
@@ -358,6 +737,43 @@ impl Page {
         self.row(format!(r#"{{ "type": "button", "label": {} }}"#, quoted(label)), does);
     }
 
+    /// A slider for setting `key` of `p` (`otherwise` where it says none), shown as the setting
+    /// divided by `per`.
+    #[allow(clippy::too_many_arguments)]
+    fn setting(
+        &mut self,
+        p: &Preset,
+        key: &str,
+        label: &str,
+        (least, most): (f32, f32),
+        per: f32,
+        otherwise: f32,
+        unit: &str,
+    ) {
+        let value = p.number(key, otherwise) / per;
+        self.slider(Does::Number { key: key.to_owned(), per }, label, least, most, 1.0, value, unit);
+    }
+
+    /// A switch for flag `key` of `p`.
+    fn flag(&mut self, p: &Preset, key: &str, label: &str, otherwise: bool) {
+        self.switch(Does::Flag(key.to_owned()), label, p.flag(key, otherwise));
+    }
+
+    /// A choice of `names` for setting `key` of `p`, each written as the one of `values` at its place.
+    fn chosen(
+        &mut self,
+        p: &Preset,
+        key: &str,
+        label: &str,
+        names: &[&str],
+        values: &'static [&'static str],
+        otherwise: usize,
+    ) {
+        let now = p.get(key).map(str::trim);
+        let at = now.and_then(|v| values.iter().position(|x| *x == v)).unwrap_or(otherwise);
+        self.choice(Does::Choose { key: key.to_owned(), values }, label, names, at);
+    }
+
     fn json(&self) -> String {
         format!(r#"{{ "title": {}, "rows": [{}] }}"#, quoted(&self.title), self.rows.join(", "))
     }
@@ -368,7 +784,7 @@ fn tip_element(p: &Preset) -> Option<crate::xml::Element> {
     p.element("brush_definition")
 }
 
-fn tip_page(p: &Preset, page: &mut Page) {
+fn tip_page(p: &Preset, files: &[(String, Vec<u8>)], page: &mut Page) {
     let Some(tip) = tip_element(p) else {
         page.text("This brush's tip can't be read.");
         return;
@@ -406,7 +822,16 @@ fn tip_page(p: &Preset, page: &mut Page) {
         );
     } else {
         let file = tip.attribute("filename").unwrap_or("its picture");
-        page.text(&format!("A picture tip: {file}."));
+        // carried in the preset, or beside it
+        let plain = |n: &str| n.rsplit(['/', '\\']).next().unwrap_or(n).to_owned();
+        let carried = p.resource(file).is_some() || files.iter().any(|(n, _)| plain(n) == plain(file));
+        if carried {
+            page.text(&format!("A picture tip: {file}."));
+        } else {
+            page.text(&format!(
+                "A picture tip: {file}, which the file doesn't hold. As in Krita, its default tip stands in: round, 40 px across."
+            ));
+        }
         page.slider(set("scale", false, 0.01), "Scale", 1.0, 1000.0, 1.0, attr("scale", false) * 100.0, "%");
     }
     let degrees = attr("angle", false).to_degrees().rem_euclid(360.0);
@@ -476,6 +901,361 @@ fn texture_page(p: &Preset, page: &mut Page) {
     option_rows(p, page, "Texture/Strength/", "Strength", true);
 }
 
+/// A colour smudge brush's smudge: its length option, smearing or dulling, and how it lays.
+fn smudge_page(p: &Preset, page: &mut Page) {
+    option_rows(p, page, "SmudgeRate", "Smudge length", true);
+    page.chosen(p, "SmudgeRateMode", "Smudge mode", &["Smearing", "Dulling"], &["0", "1"], 0);
+    page.flag(p, "SmudgeRateSmearAlpha", "Smear alpha", true);
+    page.flag(p, "SmudgeRateUseNewEngine", "Use new smudge algorithm", false);
+    page.flag(p, "MergedPaint", "Overlay mode", false);
+    // (a lightness tip's: its paint kept with the layer, lit by how thick it is)
+    option_rows(p, page, "PaintThickness", "Paint thickness", true);
+    page.chosen(
+        p,
+        "PaintThicknessThicknessMode",
+        "Paint thickness mode",
+        &["Overwrite existing thickness", "Paint over existing thickness"],
+        &["1", "2"],
+        1,
+    );
+}
+
+/// A tangent normal brush's tilt: which way each channel goes, what turns it, how much it leans.
+fn tangent_page(p: &Preset, page: &mut Page) {
+    const AXES: [&str; 6] = ["X+", "X-", "Y+", "Y-", "Z+", "Z-"];
+    const AXIS_VALUES: &[&str] = &["0", "1", "2", "3", "4", "5"];
+    page.chosen(p, "Tangent/swizzleRed", "Red", &AXES, AXIS_VALUES, 0);
+    page.chosen(p, "Tangent/swizzleGreen", "Green", &AXES, AXIS_VALUES, 2);
+    page.chosen(p, "Tangent/swizzleBlue", "Blue", &AXES, AXIS_VALUES, 4);
+    page.chosen(
+        p,
+        "Tangent/directionType",
+        "Tilt options",
+        &["Tilt", "Direction", "Rotation", "Direction/Tilt Mix"],
+        &["0", "1", "2", "3"],
+        0,
+    );
+    page.setting(p, "Tangent/elevationSensitivity", "Elevation Sensitivity", (0.0, 100.0), 1.0, 100.0, "%");
+    page.setting(p, "Tangent/mixValue", "Direction/Tilt Mix Value", (0.0, 100.0), 1.0, 50.0, "%");
+}
+
+/// A sketch brush's lines: how far they reach out, how likely, how wide, and what they do.
+fn sketch_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "Sketch/offset", "Offset scale", (0.0, 200.0), 1.0, 30.0, "%");
+    page.setting(p, "Sketch/probability", "Density", (0.0, 100.0), 0.01, 0.5, "%");
+    page.setting(p, "Sketch/lineWidth", "Line width", (1.0, 100.0), 1.0, 1.0, " px");
+    page.flag(p, "Sketch/makeConnection", "Paint connection line", true);
+    page.flag(p, "Sketch/magnetify", "Magnetify", true);
+    page.flag(p, "Sketch/randomRGB", "Random RGB", false);
+    page.flag(p, "Sketch/randomOpacity", "Random opacity", false);
+    page.flag(p, "Sketch/distanceDensity", "Use distance density", true);
+    page.flag(p, "Sketch/distanceOpacity", "Distance opacity", false);
+}
+
+/// A quick brush's own settings: its diameter and spacing.
+fn quick_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "diameter", "Diameter", (1.0, 1000.0), 1.0, 30.0, " px");
+    let auto = p.flag("useAutoSpacing", false);
+    page.flag(p, "useAutoSpacing", "Auto spacing", false);
+    if auto {
+        page.setting(p, "autoSpacingCoeff", "Spacing", (10.0, 1000.0), 0.01, 1.0, "%");
+    } else {
+        page.setting(p, "spacing", "Spacing", (1.0, 1000.0), 0.01, 0.02, "%");
+    }
+    option_rows(p, page, "Spacing", "Spacing", true);
+}
+
+/// A spray brush's area: its size, shape, spacing and how many particles it lays, spread how.
+fn spray_area_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "Spray/diameter", "Diameter", (1.0, 1000.0), 1.0, 100.0, " px");
+    page.setting(p, "Spray/aspect", "Aspect ratio", (0.0, 200.0), 0.01, 1.0, "%");
+    page.setting(p, "Spray/rotation", "Angle", (0.0, 360.0), 1.0, 0.0, "°");
+    page.setting(p, "Spray/scale", "Scale", (0.0, 1000.0), 0.01, 1.0, "%");
+    page.setting(p, "Spray/spacing", "Spacing", (0.0, 500.0), 0.01, 0.5, "%");
+    page.flag(p, "Spray/jitterMovement", "Jitter movement", false);
+    page.setting(p, "Spray/jitterMoveAmount", "Jitter", (0.0, 500.0), 0.01, 0.0, "%");
+    page.flag(p, "Spray/useDensity", "Use density", false);
+    if p.flag("Spray/useDensity", false) {
+        page.setting(p, "Spray/coverage", "Coverage", (0.0, 100.0), 1.0, 10.0, "%");
+    } else {
+        page.setting(p, "Spray/particleCount", "Particles", (1.0, 1000.0), 1.0, 12.0, "");
+    }
+    let gaussian = match p.get("Spray/radialDistributionType").map(str::trim) {
+        Some("gaussian") => true,
+        Some(t) if !t.is_empty() => false,
+        _ => p.flag("Spray/gaussianDistribution", false),
+    };
+    page.choice(
+        Does::Choose { key: "Spray/radialDistributionType".to_owned(), values: &["uniform", "gaussian"] },
+        "Radial distribution",
+        &["Uniform", "Gaussian"],
+        usize::from(gaussian),
+    );
+    if gaussian {
+        page.setting(p, "Spray/radialDistributionStdDeviation", "Standard deviation", (1.0, 100.0), 0.01, 0.5, "%");
+    }
+    page.flag(p, "Spray/radialDistributionCenterBiased", "Center biased", true);
+}
+
+/// A spray brush's particles: their shape and size, or the brush's tip.
+fn particles_page(p: &Preset, page: &mut Page) {
+    let own = p.flag("SprayShape/enabled", true);
+    page.flag(p, "SprayShape/enabled", "Spray shape (off: the brush tip)", true);
+    if !own {
+        page.text("Each particle is the brush's tip (see Tip).");
+        return;
+    }
+    page.chosen(
+        p,
+        "SprayShape/shape",
+        "Shape",
+        &["Ellipse", "Rectangle", "Anti-aliased pixel", "Pixel"],
+        &["0", "1", "2", "3"],
+        0,
+    );
+    page.setting(p, "SprayShape/width", "Width", (1.0, 1000.0), 1.0, 6.0, " px");
+    page.setting(p, "SprayShape/height", "Height", (1.0, 1000.0), 1.0, 6.0, " px");
+    page.flag(p, "SprayShape/proportional", "Proportional", false);
+}
+
+/// A spray brush's particles' dynamics: their size and turn, at random, fixed or following.
+fn shape_dynamics_page(p: &Preset, page: &mut Page) {
+    // newer presets keep them under their own name
+    let newer = p.get("ShapeDynamicsVersion").is_some_and(|v| v.trim() != "2.2");
+    let at = |key: &str| if newer { format!("ShapeDynamics/{key}") } else { format!("SprayShape/{key}") };
+    if newer {
+        page.flag(p, &at("enabled"), "Shape dynamics", false);
+    }
+    page.flag(p, &at("randomSize"), "Random size", false);
+    page.flag(p, &at("fixedRotation"), "Fixed rotation", false);
+    page.setting(p, &at("fixedAngle"), "Fixed rotation angle", (0.0, 360.0), 1.0, 0.0, "°");
+    page.flag(p, &at("randomRotation"), "Randomize rotation", false);
+    page.setting(p, &at("randomRotationWeight"), "Randomize rotation weight", (0.0, 100.0), 0.01, 0.5, "%");
+    page.flag(p, &at("followCursor"), "Follow cursor", false);
+    page.setting(p, &at("followCursorWeigth"), "Follow cursor weight", (0.0, 100.0), 0.01, 0.5, "%");
+    page.flag(p, &at("followDrawingAngle"), "Follow drawing angle", false);
+    page.setting(p, &at("followDrawingAngleWeigth"), "Angle weight", (0.0, 100.0), 0.01, 0.5, "%");
+}
+
+/// A spray brush's particles' colours.
+fn spray_colour_page(p: &Preset, page: &mut Page) {
+    page.flag(p, "ColorOption/useRandomHSV", "Random HSV", false);
+    page.setting(p, "ColorOption/hue", "Hue", (-180.0, 180.0), 1.0, 0.0, "°");
+    page.setting(p, "ColorOption/saturation", "Saturation", (-100.0, 100.0), 1.0, 0.0, "%");
+    page.setting(p, "ColorOption/value", "Value", (-100.0, 100.0), 1.0, 0.0, "%");
+    page.flag(p, "ColorOption/useRandomOpacity", "Random opacity", false);
+    page.flag(p, "ColorOption/colorPerParticle", "Color per particle", false);
+    page.flag(p, "ColorOption/mixBgColor", "Mix with background color", false);
+}
+
+/// The hatching styles a hatching brush offers, by the flag Krita keeps each as (none the first).
+const HATCH_STYLES: [(&str, &str); 5] = [
+    ("Hatching/bool_nocrosshatching", "No crosshatching"),
+    ("Hatching/bool_perpendicular", "Perpendicular plane"),
+    ("Hatching/bool_minusthenplus", "-45° then +45°"),
+    ("Hatching/bool_plusthenminus", "+45° then -45°"),
+    ("Hatching/bool_moirepattern", "Moiré pattern"),
+];
+
+/// A choice of a curve for setting `key` (one of its own shown as such).
+fn curve_choice(p: &Preset, page: &mut Page, key: &str, label: &str) {
+    let curve = p.get(key).unwrap_or("0,0;1,1;").trim().to_owned();
+    let mut names: Vec<&str> = CURVES.iter().map(|(n, _)| *n).collect();
+    let at = CURVES.iter().position(|(_, c)| same_curve(c, &curve));
+    let chosen = at.unwrap_or_else(|| {
+        names.push("Its own");
+        names.len() - 1
+    });
+    page.choice(Does::PlainCurve(key.to_owned()), label, &names, chosen);
+}
+
+/// A bristle brush's bristles: how far apart, sheared, shaken, how many, and how they draw.
+fn bristles_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "HairyBristle/scale", "Scale", (-1000.0, 1000.0), 0.01, 2.0, "%");
+    page.setting(p, "HairyBristle/shear", "Shear", (-200.0, 200.0), 0.01, 0.0, "%");
+    page.setting(p, "HairyBristle/random", "Random offset", (-1000.0, 1000.0), 0.01, 2.0, "%");
+    page.setting(p, "HairyBristle/density", "Density", (0.0, 100.0), 1.0, 100.0, "%");
+    page.flag(p, "HairyBristle/threshold", "Threshold", false);
+    page.flag(p, "HairyBristle/isConnected", "Connect hairs", false);
+    page.flag(p, "HairyBristle/antialias", "Anti-aliasing", false);
+    page.flag(p, "HairyBristle/useCompositing", "Composite bristles", false);
+    page.flag(p, "HairyBristle/useMousePressure", "Mouse pressure", false);
+}
+
+/// A bristle brush's ink: whether it runs out, how fast, and what that takes away.
+fn ink_page(p: &Preset, page: &mut Page) {
+    page.flag(p, "HairyInk/enabled", "Ink depletion", false);
+    page.setting(p, "HairyInk/inkAmount", "Ink Amount", (1.0, 10000.0), 1.0, 1024.0, "");
+    curve_choice(p, page, "HairyInk/inkDepletionCurve", "Ink depletion curve");
+    page.flag(p, "HairyInk/useOpacity", "Opacity", true);
+    page.flag(p, "HairyInk/useSaturation", "Saturation", false);
+    page.flag(p, "HairyInk/useWeights", "Weighted saturation", false);
+    page.setting(p, "HairyInk/pressureWeights", "Pressure Weight", (0.0, 100.0), 1.0, 50.0, "%");
+    page.setting(p, "HairyInk/bristleLengthWeights", "Bristle Length Weight", (0.0, 100.0), 1.0, 50.0, "%");
+    page.setting(p, "HairyInk/bristleInkAmountWeight", "Bristle Ink Weight", (0.0, 100.0), 1.0, 50.0, "%");
+    page.setting(p, "HairyInk/inkDepletionWeight", "Ink Depletion Curve Weight", (0.0, 100.0), 1.0, 50.0, "%");
+    page.flag(p, "HairyInk/soak", "Soak ink", false);
+}
+
+/// A hatching brush's hatching: its lines' angle, separation and thickness, where they start, and
+/// how they cross.
+fn hatching_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "Hatching/angle", "Angle", (-90.0, 90.0), 1.0, -60.0, "°");
+    page.setting(p, "Hatching/separation", "Separation", (1.0, 30.0), 1.0, 6.0, " px");
+    page.setting(p, "Hatching/thickness", "Thickness", (1.0, 30.0), 1.0, 1.0, " px");
+    page.setting(p, "Hatching/origin_x", "Origin X", (-300.0, 300.0), 1.0, 50.0, " px");
+    page.setting(p, "Hatching/origin_y", "Origin Y", (-300.0, 300.0), 1.0, 50.0, " px");
+    let style = if p.flag("Hatching/bool_moirepattern", false) {
+        4
+    } else {
+        HATCH_STYLES.iter().take(4).position(|(key, _)| p.flag(key, *key == HATCH_STYLES[0].0)).unwrap_or(0)
+    };
+    let names: Vec<&str> = HATCH_STYLES.iter().map(|(_, n)| *n).collect();
+    page.choice(Does::HatchStyle, "Crosshatching", &names, style);
+    page.setting(p, "Hatching/separationintervals", "Input-based intervals", (2.0, 7.0), 1.0, 2.0, "");
+    page.flag(p, "Hatching/bool_antialias", "Antialiased lines", false);
+    page.flag(p, "Hatching/bool_opaquebackground", "Color background", false);
+    page.flag(p, "Hatching/bool_subpixelprecision", "Subpixel precision", false);
+}
+
+/// A curve brush's curves: their width, how many points they go through, how they bend.
+fn curves_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "Curve/lineWidth", "Line width", (1.0, 100.0), 1.0, 1.0, " px");
+    page.flag(p, "Curve/makeConnection", "Paint connection line", false);
+    page.setting(p, "Curve/strokeHistorySize", "History size", (2.0, 300.0), 1.0, 30.0, "");
+    page.flag(p, "Curve/smoothing", "Smoothing", false);
+    page.setting(p, "Curve/curvesOpacity", "Curves opacity", (0.0, 100.0), 0.01, 0.0, "%");
+}
+
+/// A particle brush's particles: how many, how many steps, how they are pulled.
+fn particle_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "Particle/count", "Particles", (1.0, 500.0), 1.0, 50.0, "");
+    page.setting(p, "Particle/iterations", "Iterations", (1.0, 200.0), 1.0, 10.0, "");
+    page.setting(p, "Particle/gravity", "Gravity", (-1000.0, 1000.0), 0.001, 0.989, "‰");
+    page.setting(p, "Particle/weight", "Opacity weight", (1.0, 100.0), 0.01, 0.2, "%");
+    page.setting(p, "Particle/scaleX", "dx scale", (-1000.0, 1000.0), 0.01, 0.3, "%");
+    page.setting(p, "Particle/scaleY", "dy scale", (-1000.0, 1000.0), 0.01, 0.3, "%");
+}
+
+/// A grid brush's grid: its reach, cells, offset, division and borders, and its cells' shape.
+fn grid_page(p: &Preset, page: &mut Page) {
+    page.setting(p, "Grid/diameter", "Diameter", (1.0, 999.0), 1.0, 25.0, " px");
+    page.setting(p, "Grid/gridWidth", "Grid width", (1.0, 999.0), 1.0, 25.0, " px");
+    page.setting(p, "Grid/gridHeight", "Grid height", (1.0, 999.0), 1.0, 25.0, " px");
+    page.setting(p, "Grid/scale", "Scale", (10.0, 1000.0), 0.01, 1.0, "%");
+    page.setting(p, "Grid/horizontalOffset", "Horizontal offset", (-50.0, 50.0), 1.0, 0.0, " px");
+    page.setting(p, "Grid/verticalOffset", "Vertical offset", (-50.0, 50.0), 1.0, 0.0, " px");
+    page.setting(p, "Grid/divisionLevel", "Division level", (0.0, 25.0), 1.0, 0.0, "");
+    page.flag(p, "Grid/pressureDivision", "Division by pressure", false);
+    page.setting(p, "Grid/verticalBorder", "Vertical border", (0.0, 100.0), 1.0, 0.0, " px");
+    page.setting(p, "Grid/horizontalBorder", "Horizontal border", (0.0, 100.0), 1.0, 0.0, " px");
+    page.flag(p, "Grid/randomBorder", "Jitter borders", false);
+    page.chosen(
+        p,
+        "GridShape/shape",
+        "Shape",
+        &["Ellipse", "Rectangle", "Line", "Pixel", "Anti-aliased pixel"],
+        &["0", "1", "2", "3", "4"],
+        0,
+    );
+}
+
+/// A dyna brush's weight and what it draws.
+fn dyna_page(p: &Preset, page: &mut Page) {
+    page.chosen(p, "Dyna/action", "Draws", &["Circles", "A ribbon", "Its outline", "Lines"], &["0", "1", "2", "3"], 0);
+    page.setting(p, "Dyna/mass", "Mass", (0.0, 100.0), 0.01, 0.5, "%");
+    page.setting(p, "Dyna/drag", "Drag", (0.0, 100.0), 0.01, 0.5, "%");
+    page.setting(p, "Dyna/width", "Width", (0.0, 1000.0), 0.01, 1.0, "%");
+    page.setting(p, "Dyna/widthRange", "Width range", (0.0, 100.0), 0.01, 0.0, "%");
+    page.setting(p, "Dyna/diameter", "Circles' diameter", (1.0, 100.0), 1.0, 6.0, " px");
+    page.flag(p, "Dyna/useTwoCirles", "Two circles", false);
+    page.flag(p, "Dyna/useFixedAngle", "Fixed angle", false);
+    page.setting(p, "Dyna/angle", "Angle", (0.0, 360.0), 1.0, 0.0, "°");
+    page.setting(p, "Dyna/lineCount", "Lines", (1.0, 200.0), 1.0, 10.0, "");
+    page.setting(p, "Dyna/lineSpacing", "Lines' spacing", (0.0, 100.0), 1.0, 1.0, "");
+    page.flag(p, "Dyna/enableLine", "A line along it", false);
+}
+
+/// A grid brush's cells' colours.
+fn grid_colour_page(p: &Preset, page: &mut Page) {
+    page.flag(p, "ColorOption/sampleInputColor", "Sample input layer", false);
+    page.flag(p, "ColorOption/fillBackground", "Fill background", false);
+    page.flag(p, "ColorOption/mixBgColor", "Mix with background color", false);
+    page.flag(p, "ColorOption/useRandomHSV", "Random HSV", false);
+    page.setting(p, "ColorOption/hue", "Hue", (-180.0, 180.0), 1.0, 0.0, "°");
+    page.setting(p, "ColorOption/saturation", "Saturation", (-100.0, 100.0), 1.0, 0.0, "%");
+    page.setting(p, "ColorOption/value", "Value", (-100.0, 100.0), 1.0, 0.0, "%");
+    page.flag(p, "ColorOption/useRandomOpacity", "Random opacity", false);
+    page.flag(p, "ColorOption/colorPerParticle", "Color per particle", false);
+}
+
+/// A deform brush's action and its own brush (Krita's deform options and brush size).
+fn deform_page(p: &Preset, page: &mut Page) {
+    page.chosen(
+        p,
+        "Deform/deformAction",
+        "Action",
+        &["Grow", "Shrink", "Swirl CW", "Swirl CCW", "Move", "Lens zoom in", "Lens zoom out", "Color deformation"],
+        &["1", "2", "3", "4", "5", "6", "7", "8"],
+        0,
+    );
+    page.setting(p, "Deform/deformAmount", "Deform amount", (0.0, 100.0), 0.01, 0.2, "%");
+    page.flag(p, "Deform/bilinear", "Bilinear interpolation", false);
+    page.flag(p, "Deform/useCounter", "Use counter", false);
+    page.flag(p, "Deform/useOldData", "Use undeformed image", false);
+    page.setting(p, "Brush/diameter", "Diameter", (1.0, 1000.0), 1.0, 20.0, " px");
+    page.setting(p, "Brush/aspect", "Aspect ratio", (1.0, 200.0), 0.01, 1.0, "%");
+    page.setting(p, "Brush/scale", "Scale", (0.0, 1000.0), 0.01, 1.0, "%");
+    page.setting(p, "Brush/rotation", "Rotation", (0.0, 360.0), 1.0, 0.0, "°");
+    page.setting(p, "Brush/spacing", "Spacing", (1.0, 1000.0), 0.01, 0.3, "%");
+    page.setting(p, "Brush/density", "Density", (0.0, 100.0), 0.01, 1.0, "%");
+    page.flag(p, "Brush/jitterMovementEnabled", "Jitter movement", false);
+    page.setting(p, "Brush/jitterMovement", "Jitter amount", (0.0, 500.0), 0.01, 0.0, "%");
+}
+
+/// A clone brush's options; its source is set by a tap.
+fn clone_page(p: &Preset, page: &mut Page) {
+    page.text("A tap sets where it clones from.");
+    page.flag(p, "Duplicateop/MoveSourcePoint", "Source point move", true);
+    page.flag(p, "Duplicateop/CloneFromProjection", "Clone from all visible layers", false);
+    page.flag(p, "Duplicateop/Healing", "Healing (not drawn)", false);
+}
+
+/// A filter brush's filter and its own settings, as far as they are drawn.
+fn filter_page(p: &Preset, page: &mut Page) {
+    let id = p.get("Filter/id").map(str::trim).unwrap_or("");
+    match id {
+        "gaussian blur" => {
+            page.text("Filter: Gaussian blur.");
+            page.setting(p, "Filter/config/horizRadius", "Horizontal radius", (0.0, 100.0), 1.0, 5.0, " px");
+            page.setting(p, "Filter/config/vertRadius", "Vertical radius", (0.0, 100.0), 1.0, 5.0, " px");
+        }
+        "blur" => {
+            page.text("Filter: Blur.");
+            page.setting(p, "Filter/config/halfWidth", "Half width", (0.0, 100.0), 1.0, 5.0, " px");
+            page.setting(p, "Filter/config/halfHeight", "Half height", (0.0, 100.0), 1.0, 5.0, " px");
+            page.setting(p, "Filter/config/strength", "Strength", (0.0, 100.0), 1.0, 100.0, "%");
+        }
+        "unsharp" => {
+            page.text("Filter: Unsharp mask.");
+            page.setting(p, "Filter/config/halfSize", "Half-size", (1.0, 100.0), 1.0, 1.0, " px");
+            page.setting(p, "Filter/config/amount", "Amount", (0.0, 1000.0), 0.01, 0.5, "%");
+        }
+        other => page.text(&format!("Filter \"{other}\": not drawn here.")),
+    }
+}
+
+/// A shape brush's options.
+fn shape_page(p: &Preset, page: &mut Page) {
+    page.text("Filled as the stroke ends.");
+    page.flag(p, "Experiment/speedEnabled", "Speed", false);
+    page.setting(p, "Experiment/speed", "Speed amount", (0.0, 100.0), 1.0, 42.0, "%");
+    page.flag(p, "Experiment/smoothing", "Smooth", false);
+    page.setting(p, "Experiment/smoothingValue", "Smoothing threshold", (0.0, 100.0), 1.0, 20.0, " px");
+    page.flag(p, "Experiment/windingFill", "Winding fill", false);
+    page.flag(p, "Experiment/hardEdge", "Hard edge", false);
+}
+
 /// An option's rows: whether it follows the pen (where it can be switched off), its strength, the
 /// sensor it follows and its curve.
 fn option_rows(p: &Preset, page: &mut Page, id: &str, label: &str, checkable: bool) {
@@ -486,9 +1266,17 @@ fn option_rows(p: &Preset, page: &mut Page, id: &str, label: &str, checkable: bo
     let (per, most, unit) = match id {
         "Rotation" => (1.0 / 180.0, 180.0, "°"),
         "Spacing" | "Scatter" => (0.01, 500.0, "%"),
+        // older presets keep the smudge radius in hundredths
+        "SmudgeRadius" if p.number("SmudgeRadiusVersion", 1.0) < 2.0 => (1.0, 300.0, "%"),
+        "SmudgeRadius" => (0.01, 300.0, "%"),
         _ => (0.01, 100.0, "%"),
     };
-    let strength = p.number(&format!("{id}Value"), if id == "Spacing" || id == "Scatter" { 5.0 } else { 1.0 });
+    let otherwise = match id {
+        "Spacing" | "Scatter" => 5.0,
+        "SmudgeRadius" => 3.0,
+        _ => 1.0,
+    };
+    let strength = p.number(&format!("{id}Value"), otherwise);
     page.slider(Does::Number { key: format!("{id}Value"), per }, label, 0.0, most, 1.0, strength / per, unit);
     let sensors = sensor_ids(p, id);
     let chosen = sensors.first().and_then(|s| SENSORS.iter().position(|(k, _)| k == s)).unwrap_or(0);
@@ -497,7 +1285,8 @@ fn option_rows(p: &Preset, page: &mut Page, id: &str, label: &str, checkable: bo
     if sensors.len() > 1 {
         page.text(&format!("{label} follows {} together.", sensors.join(", ")));
     }
-    let curve = p.get(&format!("{id}commonCurve")).unwrap_or("0,0;1,1;").trim().to_owned();
+    // the curve its sensors share, as the engine reads it
+    let curve = crate::options::common_curve(p, "", id);
     let mut names: Vec<&str> = CURVES.iter().map(|(n, _)| *n).collect();
     let at = CURVES.iter().position(|(_, c)| same_curve(c, &curve));
     let chosen = at.unwrap_or_else(|| {
@@ -534,6 +1323,22 @@ fn change(p: &mut Preset, does: &Does, value: f32) {
     match does {
         Does::Number { key, per } => set(p, key, number(value * per)),
         Does::Flag(key) => set(p, key, (value >= 0.5).to_string()),
+        Does::PlainCurve(key) => {
+            if let Some((_, curve)) = CURVES.get(value.max(0.0) as usize) {
+                set(p, key, (*curve).to_owned());
+            }
+        }
+        Does::HatchStyle => {
+            let chosen = (value.max(0.0) as usize).min(HATCH_STYLES.len() - 1);
+            for (i, (key, _)) in HATCH_STYLES.iter().enumerate() {
+                set(p, key, (i == chosen).to_string());
+            }
+        }
+        Does::Choose { key, values } => {
+            if let Some(v) = values.get(value.max(0.0) as usize) {
+                set(p, key, (*v).to_owned());
+            }
+        }
         Does::Attribute { child, name, per } => {
             if let Some(mut tip) = tip_element(p) {
                 let v = number(value * per);
@@ -552,6 +1357,9 @@ fn change(p: &mut Preset, does: &Does, value: f32) {
         }
         Does::Sensor(id) => {
             let Some((sensor, _)) = SENSORS.get(value.max(0.0) as usize) else { return };
+            // the curve shown stays: kept as the one they share, as the sensor it was kept in goes
+            let common = crate::options::common_curve(p, "", id);
+            set(p, &format!("{id}commonCurve"), common);
             set(p, &format!("{id}Sensor"), format!(r#"<!DOCTYPE params> <params id="{sensor}"/> "#));
             set(p, &format!("{id}UseSameCurve"), "true".to_owned());
             set(p, &format!("{id}UseCurve"), "true".to_owned());
@@ -586,7 +1394,7 @@ fn change(p: &mut Preset, does: &Does, value: f32) {
                 set(p, "Texture/Pattern/TexturingMode", mode.to_string());
             }
         }
-        Does::Page | Does::Reset | Does::Nothing => {}
+        Does::Page | Does::Reset | Does::MyPaint(_) | Does::MyPaintEraser | Does::Nothing => {}
     }
 }
 
@@ -645,9 +1453,217 @@ mod tests {
         studio.touched(curve, 5.0);
         assert_eq!(studio.preset.as_ref().unwrap().get("SizecommonCurve"), Some("0,1;1,0;"));
         // every page holds up as a panel
-        for page in 0..PAGES.len() {
+        for page in 0..PIXEL_PAGES.len() {
             studio.touched(0, page as f32);
             assert!(studio.rows.len() <= MOST_ROWS);
         }
+    }
+
+    #[test]
+    fn a_mypaint_brush_s_settings_change_on_its_pages() {
+        let json = r#"{"version": 3, "settings": {"hardness": {"base_value": 0.5, "inputs": {"pressure": [[0, 0], [1, 1]]}}}}"#;
+        let mut data = Record::new();
+        data.field(4, json.as_bytes());
+        let mut studio = Studio::default();
+        studio.read(&data.bytes());
+        studio.show();
+        let hardness = crate::mypaint::HARDNESS;
+        let row = studio.rows.iter().position(|d| *d == Does::MyPaint(hardness)).unwrap();
+        studio.touched(row, 0.75);
+        let brush = crate::mypaint::MyPaint::read(&studio.mypaint.as_ref().unwrap().write()).unwrap();
+        assert_eq!(brush.base(hardness), 0.75);
+        assert!(!brush.map[hardness].constant(), "its curve kept");
+        // a setting it didn't say comes in; the eraser switches; back as it came
+        studio.touched(0, 6.0);
+        let smudge = studio.rows.iter().position(|d| *d == Does::MyPaint(crate::mypaint::SMUDGE)).unwrap();
+        studio.touched(smudge, 0.5);
+        studio.touched(0, 0.0);
+        let eraser = studio.rows.iter().position(|d| *d == Does::MyPaintEraser).unwrap();
+        studio.touched(eraser, 1.0);
+        let brush = crate::mypaint::MyPaint::read(&studio.mypaint.as_ref().unwrap().write()).unwrap();
+        assert!(brush.base(crate::mypaint::SMUDGE) == 0.5 && brush.erases());
+        let reset = studio.rows.iter().position(|d| *d == Does::Reset).unwrap();
+        studio.touched(reset, 1.0);
+        let brush = crate::mypaint::MyPaint::read(&studio.mypaint.as_ref().unwrap().write()).unwrap();
+        assert!(brush.base(hardness) == 0.5 && !brush.erases());
+        for page in 0..MYPAINT_PAGES.len() {
+            studio.touched(0, page as f32);
+            assert!(studio.rows.len() <= MOST_ROWS);
+        }
+    }
+
+    /// The studio of a brush of `engine` with `params`, its pages each shown once, and the setting
+    /// the first row doing `wanted` on its page `page` writes when set to `value`.
+    fn set_on_page(engine: &str, params: &str, page: &str, wanted: fn(&Does) -> bool, value: f32) -> Preset {
+        let text = format!(
+            r#"<Preset name="E" paintopid="{engine}"><param name="brush_definition" type="string"><![CDATA[<Brush type="auto_brush" spacing="0.1"><MaskGenerator type="circle" id="default" diameter="40"/></Brush>]]></param>{params}</Preset>"#
+        );
+        let mut studio = Studio { preset: Preset::read(&text), ..Studio::default() };
+        studio.show();
+        let all = pages(engine);
+        assert!(all.len() <= 8, "{engine}: a choice holds at most eight");
+        for (at, (_, name)) in all.iter().enumerate() {
+            studio.touched(0, at as f32);
+            assert!(studio.rows.len() <= MOST_ROWS, "{engine}: {name}");
+        }
+        let at = all.iter().position(|(_, name)| *name == page).unwrap();
+        studio.touched(0, at as f32);
+        let row = studio.rows.iter().position(wanted).unwrap_or_else(|| panic!("{engine}: {page}"));
+        studio.touched(row, value);
+        studio.preset.unwrap()
+    }
+
+    /// Each engine's brush has its own settings on its own pages, each option with its sensor and
+    /// curve as a pixel brush's.
+    #[test]
+    fn each_engine_s_settings_are_on_its_pages() {
+        // colour smudge: dulling, and its smudge radius as older presets keep it (hundredths)
+        let p = set_on_page(
+            "colorsmudge",
+            "",
+            "Smudge",
+            |d| matches!(d, Does::Choose { key, .. } if key == "SmudgeRateMode"),
+            1.0,
+        );
+        assert_eq!(p.get("SmudgeRateMode"), Some("1"));
+        let p = set_on_page(
+            "colorsmudge",
+            "",
+            "Radius and colour",
+            |d| matches!(d, Does::Number { key, .. } if key == "SmudgeRadiusValue"),
+            50.0,
+        );
+        assert_eq!(p.number("SmudgeRadiusValue", 0.0), 50.0);
+        let p = set_on_page(
+            "colorsmudge",
+            "",
+            "Radius and colour",
+            |d| matches!(d, Does::Curve(id) if id == "ColorRate"),
+            5.0,
+        );
+        assert_eq!(p.get("ColorRatecommonCurve"), Some("0,1;1,0;"));
+        // tangent normal: the red channel down the Y axis
+        let p = set_on_page("colorsmudge", "", "Smudge", |d| matches!(d, Does::Flag(k) if k == "MergedPaint"), 1.0);
+        assert!(p.flag("MergedPaint", false));
+        let p = set_on_page(
+            "tangentnormal",
+            "",
+            "Tangent tilt",
+            |d| matches!(d, Does::Choose { key, .. } if key == "Tangent/swizzleRed"),
+            3.0,
+        );
+        assert_eq!(p.get("Tangent/swizzleRed"), Some("3"));
+        // sketch: its density, and its line width option's sensor
+        let p = set_on_page(
+            "sketchbrush",
+            "",
+            "Sketch",
+            |d| matches!(d, Does::Number { key, .. } if key == "Sketch/probability"),
+            80.0,
+        );
+        assert!((p.number("Sketch/probability", 0.0) - 0.8).abs() < 1e-5);
+        let p = set_on_page("sketchbrush", "", "Lines", |d| matches!(d, Does::Sensor(id) if id == "Line width"), 1.0);
+        assert!(p.get("Line widthSensor").is_some_and(|s| s.contains("speed")));
+        // spray: its diameter, gaussian spread, a pixel's shape, and newer presets' dynamics
+        let p = set_on_page(
+            "spraybrush",
+            "",
+            "Spray area",
+            |d| matches!(d, Does::Number { key, .. } if key == "Spray/diameter"),
+            250.0,
+        );
+        assert_eq!(p.number("Spray/diameter", 0.0), 250.0);
+        let p = set_on_page(
+            "spraybrush",
+            "",
+            "Spray area",
+            |d| matches!(d, Does::Choose { key, .. } if key == "Spray/radialDistributionType"),
+            1.0,
+        );
+        assert_eq!(p.get("Spray/radialDistributionType"), Some("gaussian"));
+        let p = set_on_page(
+            "spraybrush",
+            "",
+            "Particles",
+            |d| matches!(d, Does::Choose { key, .. } if key == "SprayShape/shape"),
+            3.0,
+        );
+        assert_eq!(p.get("SprayShape/shape"), Some("3"));
+        let newer = r#"<param name="ShapeDynamicsVersion" type="string"><![CDATA[2.3]]></param>"#;
+        let p = set_on_page(
+            "spraybrush",
+            newer,
+            "Shape dynamics",
+            |d| matches!(d, Does::Flag(k) if k == "ShapeDynamics/randomSize"),
+            1.0,
+        );
+        assert!(p.flag("ShapeDynamics/randomSize", false));
+        // a bristle brush's spread, a hatching's style, a curve's points, a particle's count and a
+        // grid's cells
+        let p = set_on_page(
+            "hairybrush",
+            "",
+            "Bristles",
+            |d| matches!(d, Does::Number { key, .. } if key == "HairyBristle/scale"),
+            500.0,
+        );
+        assert!((p.number("HairyBristle/scale", 0.0) - 5.0).abs() < 1e-4);
+        let p = set_on_page("hairybrush", "", "Ink", |d| matches!(d, Does::PlainCurve(_)), 5.0);
+        assert_eq!(p.get("HairyInk/inkDepletionCurve"), Some("0,1;1,0;"));
+        let p = set_on_page("hatchingbrush", "", "Hatching", |d| *d == Does::HatchStyle, 4.0);
+        assert!(p.flag("Hatching/bool_moirepattern", false) && !p.flag("Hatching/bool_nocrosshatching", true));
+        let p = set_on_page(
+            "hatchingbrush",
+            "",
+            "Separation and thickness",
+            |d| matches!(d, Does::Flag(k) if k == "PressureThickness"),
+            1.0,
+        );
+        assert!(p.flag("PressureThickness", false));
+        let p = set_on_page(
+            "curvebrush",
+            "",
+            "Curves",
+            |d| matches!(d, Does::Number { key, .. } if key == "Curve/strokeHistorySize"),
+            12.0,
+        );
+        assert_eq!(p.number("Curve/strokeHistorySize", 0.0), 12.0);
+        let p = set_on_page(
+            "particlebrush",
+            "",
+            "Particles",
+            |d| matches!(d, Does::Number { key, .. } if key == "Particle/count"),
+            80.0,
+        );
+        assert_eq!(p.number("Particle/count", 0.0), 80.0);
+        let p = set_on_page(
+            "gridbrush",
+            "",
+            "Grid",
+            |d| matches!(d, Does::Choose { key, .. } if key == "GridShape/shape"),
+            1.0,
+        );
+        assert_eq!(p.get("GridShape/shape"), Some("1"));
+        // chalk's radius, dyna's mass
+        let p = set_on_page(
+            "chalkbrush",
+            "",
+            "Chalk",
+            |d| matches!(d, Does::Number { key, .. } if key == "Chalk/radius"),
+            8.0,
+        );
+        assert_eq!(p.number("Chalk/radius", 0.0), 8.0);
+        let p =
+            set_on_page("dynabrush", "", "Dyna", |d| matches!(d, Does::Number { key, .. } if key == "Dyna/mass"), 40.0);
+        assert!((p.number("Dyna/mass", 0.0) - 0.4).abs() < 1e-5);
+        // the quick brush: its diameter
+        let p = set_on_page(
+            "roundmarker",
+            "",
+            "Quick brush",
+            |d| matches!(d, Does::Number { key, .. } if key == "diameter"),
+            64.0,
+        );
+        assert_eq!(p.number("diameter", 0.0), 64.0);
     }
 }

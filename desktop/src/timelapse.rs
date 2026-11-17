@@ -247,9 +247,13 @@ It can't be brought back."
                 let stop = Arc::new(AtomicBool::new(false));
                 let _stops = Stops(Arc::clone(&stop));
                 let frames = read_in_order(Arc::clone(&lapse), picks.clone(), Arc::clone(&stop));
-                let (_, first) = frames.recv().map_err(|_| "the first frame can't be read")?;
-                let (width, height) = (first.width, first.height);
-                let last = std::cell::RefCell::new(Some(first));
+                let first = frames.recv().map_err(|_| "no frame can be read")?;
+                let (width, height) = (first.1.width, first.1.height);
+                // the frame shown last, and the next read (ahead of the one wanted when those
+                // between couldn't be read)
+                let last = std::cell::RefCell::new(Some(first.1.clone()));
+                let ahead = std::cell::RefCell::new(Some(first));
+                let missed = std::cell::Cell::new(0u32);
                 let settings = lapse.settings();
                 let out = std::env::temp_dir().join("procraft-exports").join(format!("{name}.mp4"));
                 std::fs::create_dir_all(out.parent().unwrap_or(&out)).map_err(|e| e.to_string())?;
@@ -269,15 +273,34 @@ It can't be brought back."
                         }
                         let progress = n as f32 / picks.len().max(1) as f32;
                         done.store(progress.to_bits(), std::sync::atomic::Ordering::Relaxed);
-                        // the first was read already; one that can't be read, the one before again
-                        if n > 0
-                            && let Ok((_, frame)) = frames.recv()
-                        {
-                            *last.borrow_mut() = Some(frame);
+                        // read on to the frame wanted; one that can't be read (the reader leaves
+                        // it out), the one before again in its place
+                        let want = *picks.get(n)?;
+                        let mut next = ahead.borrow_mut();
+                        while next.as_ref().is_none_or(|(i, _)| *i < want) {
+                            match frames.recv() {
+                                Ok(read) => *next = Some(read),
+                                Err(_) => {
+                                    *next = None;
+                                    break;
+                                }
+                            }
+                        }
+                        if next.as_ref().is_some_and(|(i, _)| *i == want) {
+                            *last.borrow_mut() = next.take().map(|(_, frame)| frame);
+                        } else {
+                            missed.set(missed.get() + 1);
                         }
                         Some(on_white(last.borrow().as_ref()?, w, h))
                     },
                 )?;
+                if missed.get() > 0 {
+                    let text = format!(
+                        "{} frames of the time-lapse can't be read on this computer: the one before each shows in its place.",
+                        missed.get()
+                    );
+                    crate::files::tell_later("Time-lapse", &text);
+                }
                 Ok(out)
             })();
             told.ended(made.is_ok() && !told.cancelled());
@@ -389,14 +412,20 @@ fn read_in_order(lapse: Arc<TimeLapse>, wanted: Vec<u32>, stop: Arc<AtomicBool>)
                 }
                 !stop.load(Ordering::Relaxed) && wanted.get(next).is_some_and(|&n| n < end)
             });
-            if gone {
+            if gone || stop.load(Ordering::Relaxed) {
                 return;
             }
             if let Err(e) = read {
-                log::warn!("a time-lapse video: {e}");
+                log::warn!("a time-lapse video can't be read here ({}): {e}", clip.path);
             }
-            // frames the video didn't hold (fewer than noted): left out
-            while wanted.get(next).is_some_and(|&n| n < end) {
+            // frames the video didn't give (fewer than noted, or none it can be read for): their
+            // pictures where they are kept still, else left out
+            while let Some(&n) = wanted.get(next).filter(|&&n| n < end) {
+                if let Some(frame) = lapse.frame(n)
+                    && tx.send((n, frame)).is_err()
+                {
+                    return;
+                }
                 next += 1;
             }
         }
@@ -407,12 +436,16 @@ fn read_in_order(lapse: Arc<TimeLapse>, wanted: Vec<u32>, stop: Arc<AtomicBool>)
 /// `plan`'s frames as a video, fitted on white; one added to those before comes out their size.
 fn make_segment(lapse: &TimeLapse, plan: &procraft_core::SegmentPlan) -> Result<(u32, u32), String> {
     let settings = procraft_core::TimeLapseSettings { hevc: plan.hevc, ..lapse.settings() };
+    // the first frame that can be read (one that can't, the next)
+    let first = plan.frames.iter().find_map(|&i| lapse.frame(i).map(|f| (i, f))).ok_or("no frame can be read")?;
     let (width, height, side) = if plan.width > 0 && plan.height > 0 {
         (plan.width, plan.height, plan.width.max(plan.height))
     } else {
-        let first = lapse.frame(*plan.frames.first().ok_or("no frames")?).ok_or("the first frame can't be read")?;
-        (first.width, first.height, time_lapse_side(settings))
+        (first.1.width, first.1.height, time_lapse_side(settings))
     };
+    // a frame that can't be read shows the one before again, so every frame keeps its place
+    let shown = std::cell::Cell::new(first.0);
+    let missed = std::cell::Cell::new(0u32);
     let size = crate::video::write_mp4(
         std::path::Path::new(&plan.path),
         width,
@@ -422,8 +455,28 @@ fn make_segment(lapse: &TimeLapse, plan: &procraft_core::SegmentPlan) -> Result<
         settings.hevc,
         time_lapse_bits_per_pixel(settings),
         plan.frames.len(),
-        |n, w, h| Some(on_white(&lapse.frame(*plan.frames.get(n)?)?, w, h)),
+        |n, w, h| {
+            let i = *plan.frames.get(n)?;
+            let frame = match lapse.frame(i) {
+                Some(frame) => {
+                    shown.set(i);
+                    frame
+                }
+                None => {
+                    missed.set(missed.get() + 1);
+                    lapse.frame(shown.get())?
+                }
+            };
+            Some(on_white(&frame, w, h))
+        },
     )?;
+    if missed.get() > 0 {
+        log::warn!(
+            "{} of {} time-lapse frames couldn't be read: the one before each shows in its place",
+            missed.get(),
+            plan.frames.len()
+        );
+    }
     if plan.append && size != (plan.width, plan.height) {
         return Err("the encoder won't make it the size of those before".into());
     }
@@ -516,6 +569,8 @@ struct Ahead {
     next: u32,
     frames: Receiver<(u32, ThumbnailImage)>,
     waiting: Option<(u32, ThumbnailImage)>,
+    /// The reader is done: every frame it could read has come.
+    ended: bool,
     _stops: Stops,
 }
 
@@ -543,12 +598,24 @@ impl Replay {
         if off && (self.scrub.is_none() || self.began.elapsed() >= Duration::from_millis(100)) {
             let stop = Arc::new(AtomicBool::new(false));
             let frames = read_in_order(Arc::clone(lapse), (want..self.count).collect(), Arc::clone(&stop));
-            self.ahead = Some(Ahead { from: want, next: want, frames, waiting: None, _stops: Stops(stop) });
+            self.ahead =
+                Some(Ahead { from: want, next: want, frames, waiting: None, ended: false, _stops: Stops(stop) });
             self.began = Instant::now();
         }
         ctx.request_repaint_after(Duration::from_millis(16));
         let Some(ahead) = self.ahead.as_mut() else { return };
-        while let Some((i, frame)) = ahead.waiting.take().or_else(|| ahead.frames.try_recv().ok()) {
+        loop {
+            let read = match ahead.waiting.take() {
+                Some(read) => read,
+                None => match ahead.frames.try_recv() {
+                    Ok(read) => read,
+                    Err(e) => {
+                        ahead.ended = e == TryRecvError::Disconnected;
+                        break;
+                    }
+                },
+            };
+            let (i, frame) = read;
             ahead.next = i + 1;
             if i < want {
                 continue;
@@ -596,17 +663,20 @@ impl Replay {
                 let picture = Rect::from_center_size(screen.center(), vec2(w * k, h * k));
                 ui.painter().image(t.id(), picture, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             }
-            if self.count == 0 {
+            // nothing to show: nothing recorded, or what was can't be read here (kept, but not a
+            // video this computer decodes) or is gone
+            let unread = self.shown.is_none() && self.ahead.as_ref().is_some_and(|a| a.ended);
+            let empty = match lapse {
+                _ if self.count == 0 => Some("Nothing recorded yet"),
+                Some(t) if unread && !t.frame_kept(self.index) => {
+                    Some("Part of the time-lapse is missing from the artwork")
+                }
+                _ if unread => Some("The time-lapse can't be read on this device"),
+                _ => None,
+            };
+            if let Some(empty) = empty {
                 let ink = argb(EMPTY_INK);
-                text(
-                    ui.painter(),
-                    screen.center(),
-                    Align2::CENTER_CENTER,
-                    "Nothing recorded yet",
-                    17.0,
-                    Weight::Regular,
-                    ink,
-                );
+                text(ui.painter(), screen.center(), Align2::CENTER_CENTER, empty, 17.0, Weight::Regular, ink);
             }
             if response.drag_started()
                 && let Some(p) = response.interact_pointer_pos()

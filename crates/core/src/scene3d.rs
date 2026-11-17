@@ -3187,6 +3187,7 @@ impl State {
                     _ => 1,
                 },
                 seed,
+                under_at: None,
                 turn: 0.0,
             };
             (hooks, starting)
@@ -5412,7 +5413,10 @@ f 1/1 2/2",
         let small = 1024 + 1 + 2 * layers;
         let (bytes, _, made) = channel_bytes(&s);
         assert_eq!(made, [true, true]);
-        assert_eq!(bytes, 2 * (side * side * 8 + small) + side * side * 8);
+        // (on a GPU that can't draw into half floats a stroke keeps more: counted for half floats)
+        if s.shared.lock().gpu.as_ref().is_some_and(procraft_gpu::Gpu::draws_half_floats) {
+            assert_eq!(bytes, 2 * (side * side * 8 + small) + side * side * 8);
+        }
         s.stroke_end(vec![sample(110.0, 100.0, 50.0)]);
         frame(&s, 200);
         assert_eq!(channel_bytes(&s).0, bytes);

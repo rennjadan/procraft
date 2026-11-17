@@ -62,6 +62,56 @@ pub enum KeyShortcut {
         dx: f32,
         dy: f32,
     },
+    /// The canvas zoomed `by` times about the window's middle. This and the three after it are
+    /// the view's own moves, which only a plugin rebinding keys gives keys to (see [`VIEW_KEY`]);
+    /// [`CanvasSession::key_view`] does them.
+    ZoomView {
+        by: f32,
+    },
+    /// The canvas turned `by` radians clockwise about the window's middle.
+    TurnView {
+        by: f32,
+    },
+    /// The view moved a step across and down (`dx`, `dy`: -1, 0 or 1): the canvas goes the other
+    /// way.
+    PanView {
+        dx: f32,
+        dy: f32,
+    },
+    /// The whole canvas fitted in the window.
+    FitView,
+}
+
+/// What the presses of the view's own moves start with: presses no keyboard sends, which a plugin
+/// rebinding keys may take a press as on any platform (the desktop's own zooming and turning keys
+/// aside). `view:zoom-in` and `view:zoom-out` zoom by [`KEY_ZOOM`], `view:fit` fits the canvas,
+/// `view:turn:<degrees>` turns it (clockwise; below 0 back; at most a turn), and `view:pan-left`,
+/// `-right`, `-up` and `-down` move the view [`PAN_STEP`] that way.
+pub(crate) const VIEW_KEY: &str = "view:";
+
+/// How far the view's zooming keys zoom it each time, as the desktop's Ctrl with + and -.
+pub const KEY_ZOOM: f32 = 1.25;
+
+/// How far a press of a panning key moves the view (points).
+const PAN_STEP: f32 = 48.0;
+
+/// The view's move the press `name` (its key after [`VIEW_KEY`]) names, if it names one.
+fn view_shortcut(name: &str) -> Option<KeyShortcut> {
+    use KeyShortcut::{FitView, PanView, ZoomView};
+    let pan = |dx: f32, dy: f32| Some(PanView { dx, dy });
+    match name {
+        "zoom-in" => Some(ZoomView { by: KEY_ZOOM }),
+        "zoom-out" => Some(ZoomView { by: 1.0 / KEY_ZOOM }),
+        "fit" => Some(FitView),
+        "pan-left" => pan(-1.0, 0.0),
+        "pan-right" => pan(1.0, 0.0),
+        "pan-up" => pan(0.0, -1.0),
+        "pan-down" => pan(0.0, 1.0),
+        _ => {
+            let degrees: f32 = name.strip_prefix("turn:")?.parse().ok()?;
+            (degrees.is_finite() && degrees.abs() <= 360.0).then(|| KeyShortcut::TurnView { by: degrees.to_radians() })
+        }
+    }
 }
 
 /// The shortcut on `key`, if any: a letter or digit (either case), "[", "]", ";", "space",
@@ -78,11 +128,15 @@ pub enum KeyShortcut {
 /// greys (as Krita's soft proofing does). Alone: B paints, E erases, M the eyedropper, S
 /// selection, V transform, C the colours, X swaps them, L Layers, Space the QuickMenu, [ and ] the
 /// brush's size by 5% (with Shift 10%); U, D, J, K and 0 as with the command key. Off Apple's
-/// platforms Ctrl+Y redoes too ([`REDO_Y`]).
+/// platforms Ctrl+Y redoes too ([`REDO_Y`]). The view's own moves are presses no keyboard sends
+/// ([`VIEW_KEY`]), for a plugin to take a press as.
 #[uniffi::export]
 pub fn key_shortcut(key: String, command: bool, shift: bool, alt: bool, transforming: bool) -> Option<KeyShortcut> {
     use KeyShortcut::*;
     let key = key.to_lowercase();
+    if let Some(name) = key.strip_prefix(VIEW_KEY) {
+        return view_shortcut(name);
+    }
     if command && !alt {
         return match key.as_str() {
             "z" if shift => Some(Redo),
@@ -185,6 +239,35 @@ impl CanvasSession {
         let (w, h) = self.shared.lock().window_size;
         let turn = if back { -TURN_STEP } else { TURN_STEP };
         self.view_gesture(w as f32 / 2.0, h as f32 / 2.0, 0.0, 0.0, 1.0, turn);
+    }
+
+    /// Does a view's move a press was taken as ([`KeyShortcut::ZoomView`], `TurnView`, `PanView`
+    /// or `FitView`), about the window's middle; true if `shortcut` is one (fitting, the view
+    /// settles into place over [`CanvasSession::view_settle_seconds`]).
+    pub fn key_view(&self, shortcut: KeyShortcut) -> bool {
+        let (middle, step) = {
+            let st = self.shared.lock();
+            ((st.window_size.0 as f32 / 2.0, st.window_size.1 as f32 / 2.0), PAN_STEP * st.display_scale)
+        };
+        let fine = |v: f32| v.is_finite().then_some(v);
+        match shortcut {
+            KeyShortcut::ZoomView { by } => {
+                let Some(by) = fine(by).filter(|by| *by > 0.0) else { return true };
+                self.view_gesture(middle.0, middle.1, 0.0, 0.0, by, 0.0);
+            }
+            KeyShortcut::TurnView { by } => {
+                let Some(by) = fine(by) else { return true };
+                self.view_gesture(middle.0, middle.1, 0.0, 0.0, 1.0, by);
+            }
+            KeyShortcut::PanView { dx, dy } => {
+                let (Some(dx), Some(dy)) = (fine(dx), fine(dy)) else { return true };
+                let (dx, dy) = (dx.clamp(-1.0, 1.0), dy.clamp(-1.0, 1.0));
+                self.view_gesture(middle.0, middle.1, -dx * step, -dy * step, 1.0, 0.0);
+            }
+            KeyShortcut::FitView => self.settle_to_fit(),
+            _ => return false,
+        }
+        true
     }
 
     /// A mouse dragged with a key held goes down at (`x`, `y`) (window pixels): it does `how` until
@@ -345,7 +428,9 @@ const fn command(key: &'static str) -> Press {
 /// something of their own (one smaller, one bigger), `each` says what, for a plugin to rebind each
 /// by itself; where the app's own work needs its keys as they are (held, they move the view), it is
 /// `fixed`, and no plugin rebinds it. A drag is fixed. `not_mac`: presses that do it too off Apple's
-/// platforms, after its own.
+/// platforms, after its own. A view's own move (`view`) has presses no keyboard sends
+/// ([`VIEW_KEY`]): it has keys only as a plugin gives it them, and is listed only then; one the
+/// desktop has keys of its own for is the platforms' but the desktop's (`not_desktop`).
 struct Entry {
     presses: &'static [Press],
     not_mac: &'static [Press],
@@ -354,11 +439,24 @@ struct Entry {
     does: &'static str,
     each: &'static [&'static str],
     desktop: bool,
+    not_desktop: bool,
+    view: bool,
     fixed: bool,
 }
 
 const fn entry(presses: &'static [Press], does: &'static str) -> Entry {
-    Entry { presses, not_mac: &[], drag: "", holds: &[], does, each: &[], desktop: false, fixed: false }
+    Entry {
+        presses,
+        not_mac: &[],
+        drag: "",
+        holds: &[],
+        does,
+        each: &[],
+        desktop: false,
+        not_desktop: false,
+        view: false,
+        fixed: false,
+    }
 }
 
 const fn desktop(presses: &'static [Press], does: &'static str) -> Entry {
@@ -366,7 +464,11 @@ const fn desktop(presses: &'static [Press], does: &'static str) -> Entry {
 }
 
 const fn drag(keys: &'static str, holds: &'static [Press], does: &'static str) -> Entry {
-    Entry { presses: &[], not_mac: &[], drag: keys, holds, does, each: &[], desktop: true, fixed: true }
+    Entry { drag: keys, holds, desktop: true, fixed: true, ..entry(&[], does) }
+}
+
+const fn view(presses: &'static [Press], does: &'static str) -> Entry {
+    Entry { view: true, ..entry(presses, does) }
 }
 
 impl Entry {
@@ -377,6 +479,15 @@ impl Entry {
 
     const fn fixed(self) -> Entry {
         Entry { fixed: true, ..self }
+    }
+
+    const fn not_desktop(self) -> Entry {
+        Entry { not_desktop: true, ..self }
+    }
+
+    /// Whether the platform's list has it: the desktop's if `desktop`.
+    const fn on(&self, desktop: bool) -> bool {
+        if desktop { !self.not_desktop } else { !self.desktop }
     }
 
     /// With `not_mac`, presses that do it too off Apple's platforms.
@@ -413,6 +524,8 @@ const SHORTCUTS: &[(&str, &[Entry])] = &[
             entry(&[alone("b")], "Paint"),
             entry(&[alone("e")], "Erase"),
             entry(&[alone("m")], "Eyedropper: the next touch picks a colour"),
+            // held by itself, as the apps take it: never a shortcut's key, and no plugin's to rebind
+            entry(&[alone(MODIFY_KEY)], "The modify button □, as long as it is held").fixed(),
             entry(&[alone("s")], "Selection"),
             entry(&[alone("v")], "Transform"),
             entry(&[alone("u"), command("u")], "Hue, Saturation, Brightness"),
@@ -459,6 +572,19 @@ const SHORTCUTS: &[(&str, &[Entry])] = &[
             drag("R and drag", &[alone("r")], "Turn the canvas (with Shift, in 15° steps)"),
             desktop(&[alone("escape")], "Close what is open, or set the canvas upright").fixed(),
             desktop(&[alone("f11")], "Full screen, or back to a window").fixed(),
+            // the view's own moves, with keys only as a plugin gives them (off the desktop, its
+            // zooming and fitting too)
+            view(&[alone("view:zoom-in"), alone("view:zoom-out")], "Zoom in or out")
+                .each(&["Zoom in", "Zoom out"])
+                .not_desktop(),
+            view(&[alone("view:fit")], "Fit the canvas").not_desktop(),
+            view(&[alone("view:turn:15"), alone("view:turn:-15")], "Turn the canvas a step")
+                .each(&["Turn the canvas a step", "Turn it back a step"]),
+            view(
+                &[alone("view:pan-left"), alone("view:pan-right"), alone("view:pan-up"), alone("view:pan-down")],
+                "Pan",
+            )
+            .each(&["Pan left", "Pan right", "Pan up", "Pan down"]),
         ],
     ),
     (
@@ -472,9 +598,15 @@ const SHORTCUTS: &[(&str, &[Entry])] = &[
     ),
 ];
 
+/// The key the list says holds the modify button down while it is held by itself: Alt (a Mac's
+/// Option). The apps take it themselves, not as a press for [`key_shortcut`].
+pub(crate) const MODIFY_KEY: &str = "alt";
+
 /// How `key` (a name as [`key_shortcut`] takes it) is written: a Mac's symbols if `mac`.
 fn key_label(key: &str, mac: bool) -> String {
     match (key, mac) {
+        (MODIFY_KEY, false) => "Alt".into(),
+        (MODIFY_KEY, true) => "⌥".into(),
         ("delete", false) => "Delete".into(),
         ("delete", true) => "⌦".into(),
         ("backspace", false) => "Backspace".into(),
@@ -516,14 +648,16 @@ fn combo(&(command, shift, alt, key): &Press) -> KeyCombo {
 /// The keyboard shortcuts, grouped, as a list to show: the canvas's (as [`key_shortcut`] has
 /// them), with the desktop's own too (its files, zooming and turning the view) if `desktop`; the
 /// keys a Mac's (⌘, ⇧, ⌥, and only the presses it has) if `mac`, else "Ctrl+", "Shift+", "Alt+".
-/// With a plugin rebinding keys, [`crate::Plugins::key_shortcut_list`] shows them as they are now.
+/// With a plugin rebinding keys, [`crate::Plugins::key_shortcut_list`] shows them as they are now,
+/// the view's own moves among them once it gives them keys.
 #[uniffi::export]
 pub fn key_shortcut_list(desktop: bool, mac: bool) -> Vec<ShortcutGroup> {
     shortcut_list_now(desktop, mac, |_| None)
 }
 
 /// The list as [`key_shortcut_list`] has it, each press of a row a plugin may rebind replaced by
-/// the presses `now` says do what it did (none: still it). A row left with no press goes.
+/// the presses `now` says do what it did (none: still it; a view's own move's press, which no
+/// keyboard sends, none). A row left with no press goes.
 pub(crate) fn shortcut_list_now(
     desktop: bool,
     mac: bool,
@@ -534,7 +668,7 @@ pub(crate) fn shortcut_list_now(
         .filter_map(|(heading, entries)| {
             let rows: Vec<ShortcutRow> = entries
                 .iter()
-                .filter(|e| desktop || !e.desktop)
+                .filter(|e| e.on(desktop))
                 .filter_map(|e| {
                     if e.presses.is_empty() {
                         let keys = e.drag.replace("{command}", if mac { "⌘" } else { "Ctrl+" });
@@ -543,7 +677,8 @@ pub(crate) fn shortcut_list_now(
                     let mut combos: Vec<KeyCombo> = Vec::new();
                     for press in e.presses(mac).iter().map(combo) {
                         let doing = if e.fixed { None } else { now(&press) };
-                        for c in doing.unwrap_or_else(|| vec![press]) {
+                        let as_it_is = if e.view { Vec::new() } else { vec![press] };
+                        for c in doing.unwrap_or(as_it_is) {
                             if !combos.contains(&c) {
                                 combos.push(c);
                             }
@@ -570,10 +705,12 @@ pub(crate) const MAC: bool = cfg!(any(target_os = "macos", target_os = "ios"));
 /// app keeps its keys as they are (1) or a plugin may rebind them (0), a tab between each; the
 /// desktop's own too if `desktop`. A row whose presses each do something of their own is a line for
 /// each press; a drag is the keys it holds, kept. A Mac's (or an iPad's) presses only, if `mac`.
+/// The view's own moves are told by the presses no keyboard sends that name them ([`VIEW_KEY`]):
+/// a plugin gives them keys by taking presses as those.
 pub(crate) fn shortcuts_told(desktop: bool, mac: bool) -> String {
     let mut told = String::new();
     for (heading, entries) in SHORTCUTS {
-        for e in entries.iter().filter(|e| desktop || !e.desktop) {
+        for e in entries.iter().filter(|e| e.on(desktop)) {
             let mut line = |does: &str, presses: &[Press], fixed: bool| {
                 let presses: Vec<String> = presses.iter().map(|p| combo(p).text()).collect();
                 told.push_str(&format!("{heading}\t{does}\t{}\t{}\n", presses.join(" "), u8::from(fixed)));
@@ -684,10 +821,11 @@ mod tests {
     fn the_list_shows_each_canvas_shortcut_as_the_keys_do_it() {
         let list = key_shortcut_list(false, MAC);
         let rows: Vec<&ShortcutRow> = list.iter().flat_map(|g| &g.rows).collect();
-        // each press the list shows is one the canvas takes (the arrows while transforming)
+        // each press the list shows is one the canvas takes (the arrows while transforming), but
+        // Alt held by itself, which the apps take as the modify button
         for row in &rows {
             assert!(!row.combos.is_empty(), "{}", row.does);
-            for c in &row.combos {
+            for c in row.combos.iter().filter(|c| c.key != MODIFY_KEY) {
                 assert!(key_shortcut(c.key.clone(), c.command, c.shift, c.alt, true).is_some(), "{c:?}");
             }
         }
@@ -704,6 +842,30 @@ mod tests {
         assert_eq!(row("Save as").keys, "⇧⌘S");
         assert_eq!(row("Zoom").keys, "⌘Space and drag");
         assert!(row("Zoom").combos.is_empty());
+    }
+
+    #[test]
+    fn alt_held_by_itself_is_listed_as_the_modify_button() {
+        let row = |list: Vec<ShortcutGroup>| {
+            list.into_iter()
+                .find(|g| g.heading == "Tools")
+                .and_then(|g| g.rows.into_iter().find(|r| r.does.starts_with("The modify button □")))
+        };
+        for desktop in [false, true] {
+            let other = row(key_shortcut_list(desktop, false)).unwrap();
+            assert_eq!(other.keys, "Alt");
+            assert_eq!(other.combos, [KeyCombo::of(MODIFY_KEY, false, false, false)]);
+            assert_eq!(row(key_shortcut_list(desktop, true)).map(|r| r.keys).as_deref(), Some("⌥"));
+        }
+        // the key alone is no shortcut, and no plugin rebinds it: it stays the modify button
+        assert_eq!(key(MODIFY_KEY, false, false, false), None);
+        let told = shortcuts_told(false, false);
+        assert!(told.contains("Tools\tThe modify button □, as long as it is held\talt\t1\n"), "{told}");
+        let list = shortcut_list_now(false, false, |press| {
+            assert_ne!(press.key, MODIFY_KEY, "asked about the modify key");
+            None
+        });
+        assert!(row(list).is_some());
     }
 
     #[test]
@@ -951,6 +1113,107 @@ mod tests {
         let p = shown(&s, Vec2::new(50.0, 50.0));
         assert!((p.x - 200.0).abs() < 1e-2 && (p.y - 200.0).abs() < 1e-2, "{p:?}");
         assert!((view(&s).zoom() - 4.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn the_view_s_own_moves_are_presses_no_keyboard_sends() {
+        let view = |k: &str| key_shortcut(k.into(), false, false, false, false);
+        assert_eq!(view("view:zoom-in"), Some(ZoomView { by: KEY_ZOOM }));
+        assert_eq!(view("view:zoom-out"), Some(ZoomView { by: 1.0 / KEY_ZOOM }));
+        assert_eq!(view("view:fit"), Some(FitView));
+        assert_eq!(view("view:pan-left"), Some(PanView { dx: -1.0, dy: 0.0 }));
+        assert_eq!(view("view:pan-down"), Some(PanView { dx: 0.0, dy: 1.0 }));
+        assert_eq!(view("VIEW:turn:10"), Some(TurnView { by: 10f32.to_radians() }));
+        assert_eq!(view("view:turn:-7.5"), Some(TurnView { by: (-7.5f32).to_radians() }));
+        // modifiers make no difference; what names no move is none
+        assert_eq!(key_shortcut("view:fit".into(), true, true, true, true), Some(FitView));
+        for none in ["view:", "view:spin", "view:turn:", "view:turn:400", "view:turn:nan", "view:turn:inf", "view:fit2"]
+        {
+            assert_eq!(view(none), None, "{none}");
+        }
+        // each reads as a press a plugin may answer with
+        for press in ["view:zoom-in", "view:pan-right", "view:turn:-15", "view:turn:-360"] {
+            assert!(KeyCombo::read(press).is_some(), "{press}");
+        }
+    }
+
+    #[test]
+    fn a_plugin_is_told_the_view_s_moves_with_the_desktop_s_own_left_out() {
+        let tablet = shortcuts_told(false, false);
+        for line in [
+            "View\tZoom in\tview:zoom-in\t0\n",
+            "View\tZoom out\tview:zoom-out\t0\n",
+            "View\tFit the canvas\tview:fit\t0\n",
+            "View\tTurn the canvas a step\tview:turn:15\t0\n",
+            "View\tTurn it back a step\tview:turn:-15\t0\n",
+            "View\tPan left\tview:pan-left\t0\n",
+            "View\tPan down\tview:pan-down\t0\n",
+        ] {
+            assert!(tablet.contains(line), "{line:?} in {tablet}");
+        }
+        // the desktop zooms and fits by keys of its own, told as they are
+        let desktop = shortcuts_told(true, false);
+        assert!(desktop.contains("View\tZoom in\tcommand+=\t0\n"));
+        assert!(!desktop.contains("view:zoom") && !desktop.contains("view:fit"), "{desktop}");
+        assert!(desktop.contains("View\tTurn the canvas a step\tview:turn:15\t0\n"));
+        assert!(desktop.contains("View\tPan up\tview:pan-up\t0\n"));
+        // each told press is a shortcut of the canvas's
+        for fields in tablet.lines().map(|l| l.split('\t').collect::<Vec<_>>()) {
+            for c in KeyCombo::read_all(fields[2]).unwrap().iter().filter(|c| c.key.starts_with(VIEW_KEY)) {
+                assert!(key_shortcut(c.key.clone(), false, false, false, false).is_some(), "{c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_list_shows_the_view_s_moves_only_with_keys_a_plugin_gave_them() {
+        let has =
+            |list: &[ShortcutGroup], does: &str| list.iter().flat_map(|g| &g.rows).find(|r| r.does == does).cloned();
+        // as the app comes, none
+        for desktop in [false, true] {
+            let list = key_shortcut_list(desktop, false);
+            assert!(has(&list, "Pan").is_none() && has(&list, "Turn the canvas a step").is_none());
+            assert!(list.iter().flat_map(|g| &g.rows).all(|r| r.combos.iter().all(|c| !c.key.starts_with(VIEW_KEY))));
+        }
+        assert!(has(&key_shortcut_list(false, false), "Zoom in or out").is_none());
+        // a plugin gave zooming in = and panning left ←: those show, the rest stay out
+        let list = shortcut_list_now(false, false, |press| match press.text().as_str() {
+            "view:zoom-in" => Some(vec![KeyCombo::of("=", false, false, false)]),
+            "view:pan-left" => Some(vec![KeyCombo::of("left", false, false, false)]),
+            _ => None,
+        });
+        let zoom = has(&list, "Zoom in or out").unwrap();
+        assert_eq!((zoom.keys.as_str(), zoom.combos.len()), ("+", 1));
+        assert_eq!(has(&list, "Pan").map(|r| r.keys), Some("←".to_owned()));
+        assert!(has(&list, "Fit the canvas").is_none() && has(&list, "Turn the canvas a step").is_none());
+    }
+
+    #[test]
+    fn a_view_s_move_moves_the_view_about_the_middle() {
+        let s = viewed();
+        let middle = view(&s).screen_to_canvas(Vec2::new(200.0, 200.0)).unwrap();
+        assert!(s.key_view(ZoomView { by: 2.0 }));
+        assert!((view(&s).zoom() - 8.0).abs() < 1e-3, "{}", view(&s).zoom());
+        assert!(s.key_view(TurnView { by: 10f32.to_radians() }));
+        assert!((degrees(&s) - 10.0).abs() < 1e-3, "{}", degrees(&s));
+        let p = shown(&s, middle);
+        assert!((p.x - 200.0).abs() < 1e-2 && (p.y - 200.0).abs() < 1e-2, "{p:?}");
+        // panning left, the canvas goes right: 48 points, two pixels each
+        assert!(s.key_view(PanView { dx: -1.0, dy: 0.0 }));
+        let p = shown(&s, middle);
+        assert!((p.x - 296.0).abs() < 1e-2 && (p.y - 200.0).abs() < 1e-2, "{p:?}");
+        // what makes no sense moves nothing; another shortcut isn't one
+        let before = view(&s);
+        assert!(s.key_view(ZoomView { by: f32::NAN }) && s.key_view(ZoomView { by: 0.0 }));
+        assert!(s.key_view(TurnView { by: f32::INFINITY }) && s.key_view(PanView { dx: f32::NAN, dy: 1.0 }));
+        assert_eq!(view(&s), before);
+        assert!(!s.key_view(Undo));
+        // fitted, it settles upright with the whole canvas in the window
+        assert!(s.key_view(FitView));
+        assert!(s.view_moving());
+        std::thread::sleep(std::time::Duration::from_secs_f32(s.view_settle_seconds()));
+        s.shared.lock().step_view_motion();
+        assert!(degrees(&s).abs() < 1e-3 && (view(&s).zoom() - 4.0).abs() < 1e-3, "{}", view(&s).zoom());
     }
 
     #[test]

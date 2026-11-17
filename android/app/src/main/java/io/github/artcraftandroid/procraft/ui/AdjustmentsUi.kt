@@ -860,7 +860,7 @@ private fun LiquifyPanelAndMenus(vm: CanvasViewModel, screenWidth: Dp, screenHei
                 Spacer(Modifier.height(4.dp))
                 Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(MenuGroup).padding(vertical = 8.dp)) {
                     val amount = if (vm.liquifyAmount >= 1f) "Max" else "${(vm.liquifyAmount * 100).roundToInt()}%"
-                    SliderRow("Amount", vm.liquifyAmount, amount) { vm.changeLiquifyAmount(it) }
+                    SliderRow("Amount", vm.liquifyAmount, amount, onEnd = vm::letGoLiquifyAmount) { vm.changeLiquifyAmount(it) }
                 }
             }
         }

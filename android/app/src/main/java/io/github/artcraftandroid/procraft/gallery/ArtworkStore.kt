@@ -13,9 +13,19 @@ sealed interface GalleryEntry {
     val modified: Long
 }
 
-/** A saved artwork: its folder (see the native library's `project.rs` for what is inside). */
-data class Artwork(override val dir: File, override val name: String, val width: Int, val height: Int, override val modified: Long) : GalleryEntry {
+/**
+ * A saved artwork: its folder (see the native library's `project.rs` for what is inside), and how
+ * many quarter turns clockwise it shows turned by, as its canvas was left.
+ */
+data class Artwork(override val dir: File, override val name: String, val width: Int, val height: Int, override val modified: Long, val turns: Int = 0) : GalleryEntry {
+    /** Its thumbnail, turned as it shows. */
     val thumbnail: File get() = File(dir, "thumbnail.png")
+
+    /** Its width over its height as it shows (turned on its side, the other way). */
+    val ratio: Float get() {
+        val upright = if (width > 0 && height > 0) width.toFloat() / height else 0.75f
+        return if (turns % 2 != 0) 1f / upright else upright
+    }
 }
 
 /** Artworks kept together: a folder holding their folders, in their own order. */
@@ -66,7 +76,7 @@ class ArtworkStore(val root: File) {
 
     fun renameStack(s: Stack, name: String) = core.renameStack(s.dir.path, name)
 
-    private fun artwork(a: GalleryArtwork) = Artwork(File(a.dir), a.name, a.width.toInt(), a.height.toInt(), a.modifiedMs)
+    private fun artwork(a: GalleryArtwork) = Artwork(File(a.dir), a.name, a.width.toInt(), a.height.toInt(), a.modifiedMs, a.turns.toInt())
 
     private fun entry(e: CoreGalleryEntry): GalleryEntry = when (e) {
         is CoreGalleryEntry.Artwork -> artwork(e.artwork)

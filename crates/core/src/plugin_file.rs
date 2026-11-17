@@ -23,7 +23,7 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 4;
+const INTERFACE: u32 = 6;
 /// What ids of our own start with: no file may claim one.
 const OWN_PREFIX: &str = "procraft.";
 /// The file, its entries, one entry, all of them unpacked, and the manifest, in bytes.
@@ -37,6 +37,11 @@ const MOST_SHADER: usize = 64 << 10;
 pub(crate) const FILTER_CODE: &str = "filter.wgsl";
 /// A picker's picture's code in its folder (code on the `picker` hook brings it).
 pub(crate) const PICTURE_CODE: &str = "picture.wgsl";
+/// Where each of the filters a plugin lists keeps its code, as `<key>.wgsl`.
+const FILTERS_FOLDER: &str = "filters";
+/// The most filters a plugin lists, and plugins it takes the place of.
+const MOST_FILTERS: usize = 8;
+const MOST_REPLACES: usize = 16;
 /// How far an entry may shrink in the archive, from this size on: text never gets near it.
 const MOST_RATIO: usize = 100;
 const RATIO_FROM: usize = 64 << 10;
@@ -44,6 +49,9 @@ const RATIO_FROM: usize = 64 << 10;
 const MOST_DEPTH: usize = 8;
 const MOST_PATH: usize = 200;
 const MOST_CONTROLS: usize = 8;
+/// Controls, for code written to interface 6 or later that holds no filter (a filter has room for
+/// eight values).
+const MOST_CONTROLS_6: usize = 16;
 /// File controls, besides: each a file someone picks (so far a sound), kept with the plugin.
 const MOST_FILES: usize = 8;
 /// The folder in a plugin's home where the files picked for its file controls are kept.
@@ -83,6 +91,7 @@ pub(crate) enum Refusal {
     OtherApp,
     NewerInstalled,
     Clash,
+    Replaced,
     NotKept,
 }
 
@@ -102,6 +111,7 @@ impl Refusal {
             Refusal::OtherApp => "This plugin isn't for ProCraft.",
             Refusal::NewerInstalled => "A newer version of this plugin is already imported.",
             Refusal::Clash => "Another plugin already holds a setting this one needs.",
+            Refusal::Replaced => "A plugin already here takes this one's place.",
             Refusal::NotKept => "This plugin couldn't be saved.",
         }
     }
@@ -125,6 +135,8 @@ pub(crate) struct Manifest {
     pub publisher: String,
     pub description: String,
     pub experimental: bool,
+    /// The interface it is written to (see [`crate::plugin_run`]).
+    pub interface: u32,
     /// Where its code steps in, if it holds any.
     pub hooks: Vec<Hook>,
     pub controls: Vec<PluginControl>,
@@ -139,7 +151,59 @@ pub(crate) struct Manifest {
     /// The brush engines it has (interface 4).
     pub brush_engines: Vec<crate::plugin_brushes::BrushEngine>,
     pub permissions: Vec<crate::plugin_commands::PluginPermission>,
+    /// Which switch each control and action comes under, its filters and what it takes the place of.
+    pub shape: Shape,
     files: Vec<Listed>,
+}
+
+/// What a manifest says beyond what its card lists: the switch each control and action comes
+/// under, if any (each by its place: shown, listed and run only while that switch is on), the
+/// filters it lists, and the plugins it takes the place of.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Shape {
+    pub under: Vec<Option<usize>>,
+    pub action_under: Vec<Option<usize>>,
+    /// None for a plugin with one filter, in `filter.wgsl`.
+    pub filters: Vec<ListedFilter>,
+    pub replaces: Vec<Replaced>,
+}
+
+/// A filter of several a plugin lists: what opens it (`<id>.<key>`), its name under Adjustments,
+/// its code in the plugin's folder, its controls by their place (its panel's, and `v.<key>` each),
+/// and the switch it comes under.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ListedFilter {
+    pub id: String,
+    pub label: String,
+    pub code: String,
+    pub controls: Vec<usize>,
+    pub under: Option<usize>,
+}
+
+/// A plugin another takes the place of, by its id: the switch its being on turns on, and each of
+/// its controls by the key its value was kept under, with the place of the control taking it.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Replaced {
+    pub id: String,
+    pub switch: Option<usize>,
+    pub controls: Vec<(String, usize)>,
+}
+
+impl Shape {
+    /// Whether whatever comes under `under` shows, in a plugin whose controls are `controls`: that
+    /// switch is on, and any it comes under.
+    pub(crate) fn shows(&self, under: Option<usize>, controls: &[PluginControl]) -> bool {
+        let mut next = under;
+        // (a switch comes under another at most, as read)
+        for _ in 0..3 {
+            let Some(at) = next else { return true };
+            if !matches!(controls.get(at), Some(PluginControl::Switch { control }) if control.on) {
+                return false;
+            }
+            next = self.under.get(at).copied().flatten();
+        }
+        false
+    }
 }
 
 /// A plugin file read and checked, ready to keep.
@@ -207,6 +271,33 @@ struct RawManifest {
     layer_kinds: Vec<RawKind>,
     #[serde(default)]
     brush_engines: Vec<RawEngine>,
+    #[serde(default)]
+    filters: Vec<RawFilter>,
+    #[serde(default)]
+    replaces: Vec<RawReplaced>,
+}
+
+/// A filter of several in one plugin (interface 5): its key, its name under Adjustments, the keys
+/// of its controls, and the switch it comes under. Its code is `filters/<key>.wgsl`.
+#[derive(Deserialize)]
+struct RawFilter {
+    key: String,
+    label: String,
+    #[serde(default)]
+    controls: Vec<String>,
+    #[serde(default)]
+    under: Option<String>,
+}
+
+/// A plugin this one takes the place of: its id, the key of the switch its being on turns on, and
+/// its controls' keys, each with the key of the control here that takes its value.
+#[derive(Deserialize)]
+struct RawReplaced {
+    id: String,
+    #[serde(default)]
+    switch: Option<String>,
+    #[serde(default)]
+    controls: std::collections::BTreeMap<String, String>,
 }
 
 /// A brush engine a plugin has: its key, what it is called, and the endings of the names of the
@@ -315,6 +406,9 @@ struct RawAction {
     label: String,
     #[serde(default)]
     place: Option<String>,
+    /// The key of the switch it comes under.
+    #[serde(default)]
+    under: Option<String>,
 }
 
 /// The most actions a plugin may list.
@@ -399,6 +493,9 @@ struct RawControl {
     /// A setting the app used to have, whose kept value this control takes over.
     #[serde(default)]
     keeps: Option<String>,
+    /// The key of the switch it comes under.
+    #[serde(default)]
+    under: Option<String>,
 }
 
 /// Whether `text`, at most `most` characters, is fit to show: nothing that hides, reorders or
@@ -610,6 +707,7 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     if compat.min_app.as_deref().is_some_and(|v| version_parts(v).is_none()) || compat.interface == Some(0) {
         return Err(Refusal::Described);
     }
+    let shape = shape_of(&raw.id, &raw.controls, &raw.actions, &raw.filters, &raw.replaces)?;
     let mut files = Vec::with_capacity(raw.files.len().min(MOST_ENTRIES));
     let mut seen = HashSet::new();
     for file in raw.files {
@@ -621,7 +719,9 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     }
     // files besides the rest, and only for code to use (a filter has no way to)
     let picked = raw.controls.iter().filter(|c| c.kind == "file").count();
-    if raw.controls.len() - picked > MOST_CONTROLS || picked > MOST_FILES {
+    let more = compat.interface.is_some_and(|interface| interface >= 6) && !holds.contains(&PluginPart::Filter);
+    let most = if more { MOST_CONTROLS_6 } else { MOST_CONTROLS };
+    if raw.controls.len() - picked > most || picked > MOST_FILES {
         return Err(Refusal::Described);
     }
     if picked > 0 && (!holds.contains(&PluginPart::Hooks) || holds.contains(&PluginPart::Filter)) {
@@ -644,8 +744,14 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
     let has = |part| holds.contains(&part);
     let fits = |path: &str, most: usize| files.iter().find(|f| f.path == path).map(|f| f.size <= most);
     let module = fits(MODULE, MOST_MODULE) == has(PluginPart::Hooks).then_some(true);
-    let filter = fits(FILTER_CODE, MOST_SHADER) == has(PluginPart::Filter).then_some(true);
-    if !module || !filter {
+    // one filter in `filter.wgsl`, or several listed (interface 5), each with its code
+    let listed = !shape.filters.is_empty();
+    if listed && (!has(PluginPart::Filter) || compat.interface.is_none_or(|interface| interface < 5)) {
+        return Err(Refusal::Described);
+    }
+    let filter = fits(FILTER_CODE, MOST_SHADER) == (has(PluginPart::Filter) && !listed).then_some(true);
+    let filters = shape.filters.iter().all(|f| fits(&f.code, MOST_SHADER) == Some(true));
+    if !module || !filter || !filters {
         return Err(Refusal::Described);
     }
     let mut hooks = Vec::new();
@@ -803,6 +909,7 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
         publisher,
         description: raw.description,
         experimental: raw.experimental.unwrap_or(true),
+        interface: compat.interface.unwrap_or(1),
         hooks,
         controls,
         brush_controls,
@@ -811,8 +918,76 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
         layer_kinds,
         brush_engines,
         permissions,
+        shape,
         files,
     })
+}
+
+/// What the manifest of plugin `id` says beyond its card's list (its controls, actions, filters and
+/// what it replaces, as written), if it holds up: a control or an action comes under a
+/// switch of the list's top level, or under one that comes under such a switch; a listed filter has a plain key and name and reads controls
+/// that aren't files, each once; a plugin it takes the place of has an id beside its own (the same
+/// but for the last part), and what took its values is here.
+fn shape_of(
+    id: &str,
+    controls: &[RawControl],
+    actions: &[RawAction],
+    listed: &[RawFilter],
+    replacing: &[RawReplaced],
+) -> Result<Shape, Refusal> {
+    // a switch of the top level, or one that comes under one
+    let top = |key: &str| controls.iter().any(|c| c.key == key && c.kind == "switch" && c.under.is_none());
+    let switch_at = |key: &str| {
+        let at = controls.iter().position(|c| c.key == key && c.kind == "switch");
+        let fits = at.and_then(|at| controls.get(at)).is_some_and(|c| c.under.as_deref().is_none_or(top));
+        at.filter(|_| fits).ok_or(Refusal::Described)
+    };
+    let control_at =
+        |key: &str| controls.iter().position(|c| c.key == key && c.kind != "file").ok_or(Refusal::Described);
+    let under = controls.iter().map(|c| c.under.as_deref().map(switch_at).transpose());
+    let under = under.collect::<Result<Vec<_>, _>>()?;
+    let action_under = actions.iter().map(|a| a.under.as_deref().map(switch_at).transpose());
+    let action_under = action_under.collect::<Result<Vec<_>, _>>()?;
+    if listed.len() > MOST_FILTERS || replacing.len() > MOST_REPLACES {
+        return Err(Refusal::Described);
+    }
+    let mut keys = HashSet::new();
+    let mut filters = Vec::new();
+    for f in listed {
+        let plain = !f.label.trim().is_empty() && shows_plainly(&f.label, 40);
+        if !valid_key(&f.key) || !plain || !keys.insert(f.key.as_str()) {
+            return Err(Refusal::Described);
+        }
+        let controls = f.controls.iter().map(|key| control_at(key)).collect::<Result<Vec<_>, _>>()?;
+        if controls.iter().collect::<HashSet<_>>().len() != controls.len() {
+            return Err(Refusal::Described);
+        }
+        filters.push(ListedFilter {
+            id: format!("{}.{}", id, f.key),
+            label: f.label.clone(),
+            code: format!("{FILTERS_FOLDER}/{}.wgsl", f.key),
+            controls,
+            under: f.under.as_deref().map(switch_at).transpose()?,
+        });
+    }
+    let space = |id: &str| id.rsplit_once('.').map(|(space, _)| space.to_owned());
+    let mut ids = HashSet::new();
+    let mut replaces = Vec::new();
+    for r in replacing {
+        let beside = space(&r.id).is_some() && space(&r.id) == space(id);
+        if !valid_id(&r.id) || r.id == id || !beside || !ids.insert(r.id.as_str()) {
+            return Err(Refusal::Described);
+        }
+        let mut controls = Vec::new();
+        for (old, new) in &r.controls {
+            if !valid_key(old) {
+                return Err(Refusal::Described);
+            }
+            controls.push((format!("{}.{old}", r.id), control_at(new)?));
+        }
+        replaces.push(Replaced { id: r.id.clone(), switch: r.switch.as_deref().map(switch_at).transpose()?, controls });
+    }
+    Ok(Shape { under, action_under, filters, replaces })
 }
 
 /// What a filter's code calls `controls`, in their order: their keys, without the plugin's id.
@@ -829,9 +1004,21 @@ fn code_refused(manifest: &Manifest, path: &str, data: &[u8]) -> Option<Refusal>
         let refused = read.map_err(|why| log::warn!("a filter's code was refused: {why}")).is_err();
         return refused.then_some(Refusal::FilterCode);
     }
+    // one of several, given its own controls
+    if let Some(listed) = manifest.shape.filters.iter().find(|f| f.code == path) {
+        let controls: Vec<PluginControl> =
+            listed.controls.iter().filter_map(|&at| manifest.controls.get(at).cloned()).collect();
+        let text = std::str::from_utf8(data).map_err(|e| e.to_string());
+        let read = text.and_then(|text| procraft_gpu::read_filter(text, &value_names(&controls)));
+        let refused = read.map_err(|why| log::warn!("a filter's code was refused: {why}")).is_err();
+        return refused.then_some(Refusal::FilterCode);
+    }
     if manifest.hooks.contains(&Hook::Picker) && path == PICTURE_CODE {
         let text = std::str::from_utf8(data).map_err(|e| e.to_string());
-        let read = text.and_then(|text| procraft_gpu::read_picture(text).map(|_| ()));
+        let read = text.and_then(|text| match picture_keys(manifest) {
+            Some(keys) => procraft_gpu::read_picture_given(text, &keys).map(|_| ()),
+            None => procraft_gpu::read_picture(text).map(|_| ()),
+        });
         let refused = read.map_err(|why| log::warn!("a picture's code was refused: {why}")).is_err();
         return refused.then_some(Refusal::Code);
     }
@@ -1142,19 +1329,27 @@ pub(crate) fn read_brush_engines(dir: &Path, id: &str, version: &str) -> Vec<cra
 }
 
 /// The picture's code of the picker `id` at `version` in `dir`, if it holds up as it did.
-pub(crate) fn read_picture_code(dir: &Path, id: &str, version: &str) -> Option<String> {
-    let folder = dir.join(id).join(version);
-    read_folder(&folder, id, version)?;
-    String::from_utf8(read_capped(&folder.join(PICTURE_CODE), MOST_SHADER)?).ok()
-}
-
-/// The manifest and the code of the filter `id` at `version` in `dir`, if all of it holds up as it
-/// did.
-pub(crate) fn read_filter_code(dir: &Path, id: &str, version: &str) -> Option<(Manifest, String)> {
+pub(crate) fn read_picture_code(dir: &Path, id: &str, version: &str) -> Option<(String, Option<Vec<String>>)> {
     let folder = dir.join(id).join(version);
     let manifest = read_folder(&folder, id, version)?;
-    let text = String::from_utf8(read_capped(&folder.join(FILTER_CODE), MOST_SHADER)?).ok()?;
-    Some((manifest, text))
+    let text = String::from_utf8(read_capped(&folder.join(PICTURE_CODE), MOST_SHADER)?).ok()?;
+    Some((text, picture_keys(&manifest)))
+}
+
+/// The keys a picker's picture reads its plugin's controls by, in their order, if it is written to
+/// interface 6 or later (one written before is given none).
+pub(crate) fn picture_keys(manifest: &Manifest) -> Option<Vec<String>> {
+    (manifest.interface >= 6).then(|| value_names(&manifest.controls))
+}
+
+/// The manifest of plugin `id` at `version` in `dir` and the code of its filter at `path` in its
+/// folder ([`FILTER_CODE`], or a listed filter's), if all of it holds up as it did.
+pub(crate) fn read_filter_code(dir: &Path, id: &str, version: &str, path: &str) -> Option<(Manifest, String)> {
+    let folder = dir.join(id).join(version);
+    let manifest = read_folder(&folder, id, version)?;
+    let listed = path == FILTER_CODE || manifest.shape.filters.iter().any(|f| f.code == path);
+    let text = String::from_utf8(read_capped(&folder.join(path), MOST_SHADER)?).ok()?;
+    listed.then_some((manifest, text))
 }
 
 /// Where it is written down which filter is on trial: compiling, or not yet drawn. It is there on
@@ -1828,9 +2023,28 @@ pub(crate) mod tests {
 
     #[test]
     fn more_controls_than_a_page_shows_are_refused() {
-        let controls: Vec<Value> =
-            (0..=MOST_CONTROLS).map(|i| json!({ "key": format!("k{i}"), "type": "switch", "label": "A" })).collect();
-        assert_eq!(refusal(&a_filter_file(&with(a_filter(), "/controls", json!(controls)))), Refusal::Described);
+        let switches = |n: usize| -> Vec<Value> {
+            (0..n).map(|i| json!({ "key": format!("k{i}"), "type": "switch", "label": "A" })).collect()
+        };
+        let nine = json!(switches(MOST_CONTROLS + 1));
+        assert_eq!(refusal(&a_filter_file(&with(a_filter(), "/controls", nine.clone()))), Refusal::Described);
+        // code written to interface 6 has room for sixteen, a filter still for eight
+        let module = crate::plugin_run::tests::position_module(
+            r#"(func (export "procraft_control") (param i32 f32))"#,
+            "(i64.const 0)",
+        );
+        let of = |interface: u32, controls: &Value| {
+            let mut manifest = coded("org.example.plugin", &module);
+            manifest["controls"] = controls.clone();
+            let manifest = with(manifest, "/compat/procraft/interface", json!(interface));
+            read_package(&a_coded_file(&manifest, &module)).map(|p| p.manifest.controls.len())
+        };
+        assert_eq!(of(5, &nine).err(), Some(Refusal::Described));
+        assert_eq!(of(6, &nine).ok(), Some(MOST_CONTROLS + 1));
+        assert_eq!(of(6, &json!(switches(MOST_CONTROLS_6))).ok(), Some(MOST_CONTROLS_6));
+        assert_eq!(of(6, &json!(switches(MOST_CONTROLS_6 + 1))).err(), Some(Refusal::Described));
+        let filter = with(with(a_filter(), "/controls", nine), "/compat/procraft/interface", json!(6));
+        assert_eq!(refusal(&a_filter_file(&filter)), Refusal::Described);
     }
 
     #[test]
@@ -1909,7 +2123,7 @@ pub(crate) mod tests {
         };
         // a hook or an interface this app doesn't have is for a newer one
         assert_eq!(of("/hooks", json!(["position", "layers"])), Refusal::Newer);
-        assert_eq!(of("/compat/procraft/interface", json!(5)), Refusal::Newer);
+        assert_eq!(of("/compat/procraft/interface", json!(7)), Refusal::Newer);
         assert_eq!(of("/hooks", json!([])), Refusal::Described);
         assert_eq!(of("/hooks", json!(["position", "position"])), Refusal::Described);
         assert_eq!(of("/compat/procraft", json!({ "min_app": "0.0.1" })), Refusal::Described);
@@ -2313,6 +2527,147 @@ pub(crate) mod tests {
     fn a_filter_needs_its_shader() {
         let wrong = with(a_filter(), "/files/0/path", json!("filter.txt"));
         assert_eq!(refusal(&pack(&wrong, &[("filter.txt", SHADER)])), Refusal::Described);
+    }
+
+    /// Two filters, each under a switch of its own and reading a slider of its own.
+    pub(crate) const TINT: &str = "fn pixel(colour: vec4<f32>, at: vec2<f32>) -> vec4<f32> { return vec4<f32>(colour.rgb * v.amount, colour.a); }";
+    pub(crate) const FADE: &str =
+        "fn pixel(colour: vec4<f32>, at: vec2<f32>) -> vec4<f32> { return vec4<f32>(colour.rgb, colour.a * v.fade); }";
+
+    /// A manifest listing [`TINT`] and [`FADE`] as filters, each under its switch, and its file.
+    pub(crate) fn two_filters(id: &str) -> (Value, Vec<u8>) {
+        let listed =
+            |path: &str, code: &str| json!({ "path": path, "sha256": sha256(code.as_bytes()), "size": code.len() });
+        let mut manifest = filter(id);
+        manifest["compat"]["procraft"]["interface"] = json!(5);
+        manifest["files"] = json!([listed("filters/tint.wgsl", TINT), listed("filters/fade.wgsl", FADE)]);
+        manifest["controls"] = json!([
+            { "key": "tint", "type": "switch", "label": "Tint" },
+            { "key": "amount", "type": "slider", "label": "Amount", "least": 0, "most": 1, "step": 0.1, "starts": 0.5, "under": "tint" },
+            { "key": "fade_on", "type": "switch", "label": "Fade" },
+            { "key": "fade", "type": "slider", "label": "Fade", "least": 0, "most": 1, "step": 0.1, "starts": 1, "under": "fade_on" },
+        ]);
+        manifest["filters"] = json!([
+            { "key": "tint", "label": "Tint", "controls": ["amount"], "under": "tint" },
+            { "key": "fade", "label": "Fade", "controls": ["fade"], "under": "fade_on" },
+        ]);
+        let file = pack(&manifest, &[("filters/tint.wgsl", TINT.as_bytes()), ("filters/fade.wgsl", FADE.as_bytes())]);
+        (manifest, file)
+    }
+
+    #[test]
+    fn a_plugin_can_list_several_filters_each_with_its_code_and_controls() {
+        let (manifest, file) = two_filters("org.example.filters");
+        let package = read_package(&file).unwrap();
+        let shape = &package.manifest.shape;
+        assert_eq!(shape.under, [None, Some(0), None, Some(2)]);
+        let ids: Vec<&str> = shape.filters.iter().map(|f| f.id.as_str()).collect();
+        assert_eq!(ids, ["org.example.filters.tint", "org.example.filters.fade"]);
+        assert_eq!(
+            (shape.filters[1].code.as_str(), &shape.filters[1].controls, shape.filters[1].under),
+            ("filters/fade.wgsl", &vec![3], Some(2))
+        );
+        let of = |path: &str, value: Value| {
+            let files = [("filters/tint.wgsl", TINT.as_bytes()), ("filters/fade.wgsl", FADE.as_bytes())];
+            refusal(&pack(&with(manifest.clone(), path, value), &files))
+        };
+        // they came with interface 5
+        assert_eq!(of("/compat/procraft/interface", json!(4)), Refusal::Described);
+        // each needs its code, which reads only its own controls
+        assert_eq!(of("/filters/1/key", json!("other")), Refusal::Described);
+        assert_eq!(of("/filters/0/controls", json!(["fade"])), Refusal::FilterCode);
+        // a control or a switch that isn't there, or one twice, isn't written right
+        assert_eq!(of("/filters/0/controls", json!(["amount", "amount"])), Refusal::Described);
+        assert_eq!(of("/filters/0/controls", json!(["gone"])), Refusal::Described);
+        assert_eq!(of("/filters/0/under", json!("amount")), Refusal::Described);
+        assert_eq!(of("/filters/1/label", json!(" ")), Refusal::Described);
+        assert_eq!(of("/filters/1/key", json!("tint")), Refusal::Described);
+        // nor is a list beside the one filter.wgsl, or with no filter held
+        let mut beside = manifest.clone();
+        let one = json!({ "path": "filter.wgsl", "sha256": sha256(SHADER), "size": SHADER.len() });
+        beside["files"].as_array_mut().unwrap().push(one);
+        let files =
+            [("filters/tint.wgsl", TINT.as_bytes()), ("filters/fade.wgsl", FADE.as_bytes()), ("filter.wgsl", SHADER)];
+        assert_eq!(refusal(&pack(&beside, &files)), Refusal::Described);
+        let module = a_module();
+        let mut coded_too = coded("org.example.plugin", &module);
+        coded_too["compat"]["procraft"]["interface"] = json!(5);
+        coded_too["filters"] = json!([{ "key": "tint", "label": "Tint" }]);
+        assert_eq!(refusal(&a_coded_file(&coded_too, &module)), Refusal::Described);
+    }
+
+    #[test]
+    fn what_comes_under_a_switch_and_what_a_plugin_replaces_are_written_plainly() {
+        // the acting module, told its controls
+        let told = r#"(func (export "procraft_control") (param i32 f32)) (memory"#;
+        let module = wat::parse_str(crate::plugin_run::tests::ACTS.replacen("(memory", told, 1)).unwrap();
+        let acting = || {
+            let mut manifest = coded("org.example.new", &module);
+            manifest["compat"]["procraft"]["interface"] = json!(2);
+            manifest["hooks"] = json!([]);
+            manifest["permissions"] = json!(["artwork.write"]);
+            manifest["actions"] = json!([{ "key": "grid", "label": "Add a grid layer", "under": "grid" }]);
+            manifest["controls"] = json!([
+                { "key": "grid", "type": "switch", "label": "Grid" },
+                { "key": "size", "type": "slider", "label": "Size", "least": 1, "most": 9, "under": "grid" },
+            ]);
+            manifest["replaces"] = json!([
+                { "id": "org.example.old", "switch": "grid", "controls": { "spacing": "size" } },
+                { "id": "org.example.other" },
+            ]);
+            manifest
+        };
+        let package = read_package(&a_coded_file(&acting(), &module)).unwrap();
+        let shape = package.manifest.shape;
+        assert_eq!((shape.under, shape.action_under), (vec![None, Some(0)], vec![Some(0)]));
+        let old = Replaced {
+            id: "org.example.old".to_owned(),
+            switch: Some(0),
+            controls: vec![("org.example.old.spacing".to_owned(), 1)],
+        };
+        let other = Replaced { id: "org.example.other".to_owned(), switch: None, controls: Vec::new() };
+        assert_eq!(shape.replaces, [old, other]);
+        let of = |path: &str, value: Value| {
+            let mut manifest = acting();
+            let (parent, field) = path.rsplit_once('/').unwrap();
+            manifest.pointer_mut(parent).unwrap()[field] = value;
+            refusal(&a_coded_file(&manifest, &module))
+        };
+        // under a switch at the top of the list or under one there, never a slider, or itself
+        assert_eq!(of("/controls/1/under", json!("size")), Refusal::Described);
+        assert_eq!(of("/controls/0/under", json!("grid")), Refusal::Described);
+        let mut deeper = acting();
+        deeper["controls"] = json!([
+            { "key": "grid", "type": "switch", "label": "Grid" },
+            { "key": "fine", "type": "switch", "label": "Fine", "under": "grid" },
+            { "key": "size", "type": "slider", "label": "Size", "least": 1, "most": 9, "under": "fine" },
+            { "key": "finer", "type": "switch", "label": "Finer", "under": "fine" },
+            { "key": "step", "type": "slider", "label": "Step", "least": 1, "most": 9, "under": "finer" },
+        ]);
+        assert_eq!(refusal(&a_coded_file(&deeper, &module)), Refusal::Described, "three deep");
+        deeper["controls"].as_array_mut().unwrap().truncate(3);
+        let shape = read_package(&a_coded_file(&deeper, &module)).unwrap().manifest.shape;
+        assert_eq!(shape.under, [None, Some(0), Some(1)]);
+        // and it shows while both its switches are on
+        let switch = |on: bool| PluginControl::Switch {
+            control: PluginSwitch { key: "k".to_owned(), label: "K".to_owned(), on, starts: on },
+        };
+        let slider = PluginControl::Switch {
+            control: PluginSwitch { key: "s".to_owned(), label: "S".to_owned(), on: false, starts: false },
+        };
+        for (grid, fine, shows) in [(true, true, true), (true, false, false), (false, true, false)] {
+            let controls = [switch(grid), switch(fine), slider.clone()];
+            assert_eq!(shape.shows(Some(1), &controls), shows, "{grid} {fine}");
+        }
+        assert_eq!(of("/actions/0/under", json!("size")), Refusal::Described);
+        assert_eq!(of("/actions/0/under", json!("nothing")), Refusal::Described);
+        // a plugin beside its own id, once, not itself; what took its values is here
+        for id in ["org.example.new", "com.example.old", "nodots", "org.example.other"] {
+            assert_eq!(of("/replaces/0/id", json!(id)), Refusal::Described, "{id}");
+        }
+        assert_eq!(of("/replaces/0/switch", json!("size")), Refusal::Described);
+        assert_eq!(of("/replaces/0/controls", json!({ "spacing": "gone" })), Refusal::Described);
+        assert_eq!(of("/replaces/0/controls", json!({ "Not a key": "size" })), Refusal::Described);
     }
 
     /// Bytes from a seed, so a failure can be run again.

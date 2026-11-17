@@ -11,6 +11,21 @@ fn pressed_in(grain: f32, press: f32) -> f32 {
     return smoothstep(level - PRESS_SOFT, level + PRESS_SOFT, grain);
 }
 
+// Wet edges: paint showing `c` (0..1) pools to 1 - |sin(x) / x| at x = 4.5c, which rises to full
+// where it shows about 0.7 (a rim where it thins out) and settles back to about 0.78 where it is
+// full; faint paint fades. This is that over `c`, the scale the paint's coverage takes. For thin
+// paint it is the series of 1 - sin(x) / x: worked out directly, the subtraction leaves only the
+// rounding of sin (all a GPU's sin keeps of so small a turn), which the division by `c` blows up
+// into paint far past full.
+fn pooled_over(c: f32) -> f32 {
+    let x = 4.5 * max(c, 0.0);
+    if (x < 0.5) {
+        let x2 = x * x;
+        return 4.5 * x * (1.0 / 6.0 - x2 / 120.0 + x2 * x2 / 5040.0);
+    }
+    return (1.0 - abs(sin(x) / x)) / max(c, 1e-6);
+}
+
 // a grain read unfiltered: the grain's own images are a quarter of the size of what they stand
 // for, so the finer texels a pixel would land on (four to each of ours, tied to the grain so they
 // move with it) are made up around the value read
@@ -287,6 +302,15 @@ fn dual_height(amount: f32, b: f32) -> f32 {
 fn sixth(x: f32) -> f32 {
     let x2 = x * x;
     return x2 * x2 * x2;
+}
+
+// set in a dual mode (over its number + 1): the classic Normal combine, where the first's colour
+// is kept whole beside the second's share of it
+const DUAL_CLASSIC: u32 = 65536u;
+
+// a dual mode as set (its number + 1, perhaps with DUAL_CLASSIC): its number
+fn dual_mode(dual: u32) -> u32 {
+    return (dual & 0xffffu) - 1u;
 }
 
 // a dual brush's first stroke's coverage `a` and its second's `b` combined by the brush's dual

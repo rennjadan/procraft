@@ -234,7 +234,7 @@ mod tests {
         let shapes = HashMap::from([(pixels_name(1), Held::Pixels(Arc::clone(&pixels)))]);
         let text = format!("{MARK}{}", pixels_name(1));
         let (a, b) = (source_of(&text, &shapes).unwrap(), source_of(&text, &shapes).unwrap());
-        assert!(Arc::ptr_eq(&a.pixels, &b.pixels) && Arc::ptr_eq(&a.pixels, &pixels));
+        assert!(Arc::ptr_eq(&a.pixels.shared(), &b.pixels.shared()) && Arc::ptr_eq(&a.pixels.shared(), &pixels));
         let _ = fs::remove_dir_all(&dir);
     }
 

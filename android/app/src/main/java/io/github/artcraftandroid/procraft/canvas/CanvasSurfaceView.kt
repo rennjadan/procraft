@@ -93,6 +93,12 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
 
     private fun remember(width: Int, height: Int, rotation: Int) {
         vm.session?.let { placeGrid(it, width, height, rotation) }
+        // frames no more often than the screen can show them: its fastest refresh at this size
+        display?.let { d ->
+            val size = d.mode
+            val fastest = d.supportedModes.filter { it.physicalWidth == size.physicalWidth && it.physicalHeight == size.physicalHeight }.maxOfOrNull { it.refreshRate }
+            vm.session?.setRefreshRate(fastest ?: d.refreshRate)
+        }
         vm.screenCentre = Offset(width / 2f, height / 2f)
         windowWidth = width
         windowHeight = height
@@ -146,7 +152,8 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
         fun map(x: Float, y: Float) = toPanel(from, x, y).let { (px, py) -> fromPanel(to, px, py) }
         val (ox, oy) = map(0f, 0f)
         val (ux, uy) = map(1f, 0f)
-        s.viewGesture(0f, 0f, ox, oy, 1f, atan2(uy - oy, ux - ox))
+        // (told apart from a turn of the fingers: the artwork's gallery turn counts only those)
+        s.followScreenTurn(ox, oy, atan2(uy - oy, ux - ox))
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
@@ -181,7 +188,10 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
                     palms += e.getPointerId(i)
                     emptyList()
                 } else {
-                    s.touchDown(e.getPointerId(i).toULong(), kindOf(e, i), samples(e, i))
+                    val kind = kindOf(e, i)
+                    // a pen's stroke goes by its lean only if its device says how it leans
+                    if (kind == PointerKind.STYLUS || kind == PointerKind.STYLUS_ERASER) s.setPenTiltKnown(tiltKnown(e))
+                    s.touchDown(e.getPointerId(i).toULong(), kind, samples(e, i))
                 }
             }
             MotionEvent.ACTION_MOVE -> {
@@ -382,14 +392,16 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
         // let go, whatever is open: one held to erase gives the eraser back (before this event's
         // touch, so a stroke that begins as it is let go paints)
         session?.let { s ->
-            if (letGo and MotionEvent.BUTTON_STYLUS_PRIMARY != 0) penLetGo(s, second = false)
-            if (letGo and MotionEvent.BUTTON_STYLUS_SECONDARY != 0) penLetGo(s, second = true)
+            if (letGo and FIRST_BUTTON != 0) penLetGo(s, second = false)
+            if (letGo and SECOND_BUTTON != 0) penLetGo(s, second = true)
         }
-        if (pressed == 0) return own && (e.actionButton and PEN_BUTTONS) != 0
+        if (pressed == 0) return own && penIn && (e.actionButton and PEN_BUTTONS) != 0
         // under the brush studio the tool would change unseen
         if (vm.studioOpen) return own
         val s = session ?: return own
-        penPressed(s, pressed and MotionEvent.BUTTON_STYLUS_PRIMARY == 0, e.x, e.y)
+        // both at once (one event for the two): each does what it is set to
+        if (pressed and FIRST_BUTTON != 0) penPressed(s, second = false, e.x, e.y)
+        if (pressed and SECOND_BUTTON != 0) penPressed(s, second = true, e.x, e.y)
         return own
     }
 

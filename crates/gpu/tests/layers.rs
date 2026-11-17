@@ -783,6 +783,75 @@ fn composites_made_around_cached_pictures_match_full_ones() {
 }
 
 #[test]
+fn with_little_memory_the_caches_borrow_their_second_textures_and_composite_the_same() {
+    let Some((gpu, _, _)) = setup() else { return };
+    let docs = [Document::new(W, W), Document::new(W, W), Document::new(W, W)];
+    let mut canvases = docs.each_ref().map(|d| Canvas::new(&gpu, d).unwrap());
+    // a device of 4 GB (a quarter for the layers' textures: room for every layer here), one of
+    // plenty, and the full composite
+    canvases[0].set_resident_budget(1 << 30);
+    canvases[1].set_cache_composites(true);
+    let [d0, d1, d2] = docs;
+    let [c0, c1, c2] = canvases;
+    let mut t = Twins { docs: [d0, d2], canvases: [c0, c2] };
+    let mut plenty = (d1, c1);
+    // bottom up: red; multiplied blue; screened yellow; the layer worked on with an overlay
+    // clipped to it; a layer of difference and a plain one above
+    let base = t.docs[0].current();
+    let scene = |doc: &mut Document, canvas: &mut Canvas| {
+        fill(canvas, doc, base, [200, 40, 40]);
+        let multiply = doc.add_layer();
+        doc.set_blend(multiply, BlendMode::Multiply);
+        paint(canvas, doc, multiply, [60, 60, 230], Vec2::new(5.0, 5.0), 4.0, StrokeTool::Paint);
+        let yellow = doc.add_layer();
+        doc.set_blend(yellow, BlendMode::Screen);
+        paint(canvas, doc, yellow, [230, 230, 30], Vec2::new(8.0, 10.0), 5.0, StrokeTool::Paint);
+        let worked = doc.add_layer();
+        paint(canvas, doc, worked, [250, 250, 250], Vec2::new(8.0, 8.0), 6.0, StrokeTool::Paint);
+        let overlay = doc.add_layer();
+        doc.set_blend(overlay, BlendMode::Overlay);
+        doc.set_clipped(overlay, true);
+        fill(canvas, doc, overlay, [30, 120, 220]);
+        let difference = doc.add_layer();
+        doc.set_blend(difference, BlendMode::Difference);
+        paint(canvas, doc, difference, [90, 200, 120], Vec2::new(11.0, 5.0), 4.0, StrokeTool::Paint);
+        let top = doc.add_layer();
+        paint(canvas, doc, top, [20, 20, 20], Vec2::new(13.0, 13.0), 2.0, StrokeTool::Paint);
+        doc.set_current(worked);
+        canvas.invalidate();
+    };
+    t.each(scene);
+    scene(&mut plenty.0, &mut plenty.1);
+    t.same(&gpu, 2, "as made");
+    assert!(t.canvases[0].composites_cached(), "made around caches");
+    plenty.1.render_finished(&gpu, &mut plenty.0);
+    assert!(plenty.1.composites_cached());
+    // the same pictures, with fewer textures the canvas's size (two fewer, one borrowed back)
+    let side = u64::from(W * W * 4);
+    assert!(t.canvases[0].texture_bytes() + side <= plenty.1.texture_bytes());
+    // painted on, undone, a layer below changed and one above hidden: each remakes from there
+    let worked = t.docs[0].current();
+    t.each(|doc, canvas| paint(canvas, doc, worked, [0, 200, 200], Vec2::new(9.0, 4.0), 3.0, StrokeTool::Paint));
+    t.same(&gpu, 2, "painted");
+    t.each(|_, canvas| canvas.undo());
+    t.same(&gpu, 2, "undone");
+    let ids: Vec<LayerId> = t.docs[0].layers().iter().map(|l| l.id).collect();
+    t.each(|doc, canvas| {
+        let before = doc.clone();
+        doc.set_opacity(ids[1], 0.4);
+        canvas.record_document(before);
+    });
+    t.same(&gpu, 2, "a layer below changed");
+    t.each(|doc, canvas| {
+        let before = doc.clone();
+        doc.set_visible(ids[6], false);
+        canvas.record_document(before);
+    });
+    t.same(&gpu, 2, "a layer above hidden");
+    assert!(t.canvases[0].composites_cached());
+}
+
+#[test]
 fn parked_layers_come_back_as_they_were() {
     let Some((gpu, _, _)) = setup() else { return };
     let docs = [Document::new(W, W), Document::new(W, W)];
@@ -1287,6 +1356,10 @@ fn allocated(gpu: &Gpu) -> Option<u64> {
 #[test]
 fn a_canvas_makes_its_scratch_and_second_composite_only_once_wanted() {
     let Some(gpu) = Gpu::headless().ok() else { return eprintln!("skipped: no GPU") };
+    // (counted for strokes in half floats: on a GPU that can't draw into them a stroke keeps more)
+    if !gpu.draws_half_floats() {
+        return eprintln!("skipped: strokes aren't in half floats here");
+    }
     let side = 1024u32;
     let mut doc = Document::new(side, side);
     // the first canvas makes the device's pipelines; the second is measured

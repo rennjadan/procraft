@@ -280,6 +280,12 @@ pub struct Colours {
     pub floating: Option<Pos2>,
     floating_grab: Option<egui::Vec2>,
     floating_rgb: bool,
+    /// How big the floating window shows next to the rest of the interface, and whether it shows
+    /// Classic's picker alone, as plugins say; and how it is drawn onto the window (for what opens
+    /// from it).
+    floating_scale: f32,
+    floating_picker_only: bool,
+    floating_transform: egui::emath::TSTransform,
     /// The colour model's button left of the swatches, its menu, and a model chosen there (for
     /// the preferences to keep).
     model_button: Rect,
@@ -324,6 +330,9 @@ impl Default for Colours {
             floating: None,
             floating_grab: None,
             floating_rgb: false,
+            floating_scale: 1.0,
+            floating_picker_only: false,
+            floating_transform: egui::emath::TSTransform::IDENTITY,
             model_button: Rect::NOTHING,
             model_menu: crate::menu::Menu::default(),
             model_chosen: None,
@@ -369,6 +378,12 @@ impl Colours {
         changed
     }
 
+    /// Whether Classic's picker (a picker plugin's) has the hue on a ring of its own, in place of
+    /// the hue slider.
+    pub(crate) fn hue_ringed(&self) -> bool {
+        self.pickers.ringed(self.hsv[0])
+    }
+
     /// Whether Classic shows a plugin's triangle in place of its square.
     pub fn set_triangle(&mut self, on: bool) {
         self.pickers.triangle = on;
@@ -378,6 +393,13 @@ impl Colours {
     /// its.
     pub fn set_picker(&mut self, picker: Option<(Arc<Plugins>, Arc<CanvasSession>)>) {
         self.pickers.picker = picker;
+    }
+
+    /// How big the floating window shows next to the rest of the interface (1: as the rest), and
+    /// whether it shows Classic's picker alone, as the plugins on say.
+    pub fn set_floating_look(&mut self, plugins: &Plugins) {
+        self.floating_scale = plugins.interface_part_scale(procraft_core::InterfacePart::Floating);
+        self.floating_picker_only = plugins.floating_picker_only();
     }
 
     /// Classic's square in `rect`, in the colour model; whether it changed the colour.
@@ -692,7 +714,7 @@ impl Colours {
                     && let (Some(p), Some(from)) = (held.interact_pointer_pos(), ui.input(|i| i.pointer.press_origin()))
                     && p.distance(from) > UNDOCK_DRAG
                 {
-                    self.float_at(p - floating::GRAB);
+                    self.float_at(p - floating::GRAB * self.floating_scale);
                 }
 
                 let top = body.top() + header;
@@ -962,7 +984,8 @@ pub struct Pickers {
     /// it shows).
     disc: Option<(u32, usize, ColourModel, TextureHandle)>,
     ring: Option<(usize, ColourModel, TextureHandle)>,
-    /// What a drag that started on the disc picker moves: the ring (true) or the disc.
+    /// What a drag that started on the disc picker, or on a picker plugin's Classic, moves: the hue
+    /// on a ring (true), or the rest.
     on_ring: Option<bool>,
     /// Classic's square for its hue (with the model it shows), and Harmony's wheel for its
     /// brightness.
@@ -973,7 +996,7 @@ pub struct Pickers {
     /// picker plugin's.
     pub triangle: bool,
     pub picker: Option<(Arc<Plugins>, Arc<CanvasSession>)>,
-    triangle_picture: Option<(u32, usize, bool, TextureHandle)>,
+    triangle_picture: Option<(u32, usize, Option<u64>, TextureHandle)>,
     /// Harmony's hue, saturation and brightness (Display P3) as dragged to, with the colour they
     /// made: kept while that is the colour, not worked out again from it (a dark or greyish
     /// colour's would wander, and black's be lost).
@@ -1082,9 +1105,17 @@ impl Pickers {
         *hsv != before
     }
 
+    /// Whether a picker plugin's Classic has the hue at `hue` on a ring of its own (HSB).
+    fn ringed(&self, hue: f32) -> bool {
+        self.model == ColourModel::Hsb
+            && self.picker.as_ref().is_some_and(|(plugins, _)| plugins.picker_hue_point(hue).is_some())
+    }
+
     /// A plugin's picker in Classic's square `area`, as big as fits: a picker plugin's picture,
     /// touches and knob, or else a triangle (saturation and brightness between the pure hue at the
     /// right, white at the top left and black at the bottom left); returns whether it changed `hsv`.
+    /// A picker plugin's may pick the hue too, on a ring of its own: a drag that starts where it says
+    /// a hue moves the hue, and the hue's knob sits where it says.
     fn triangle(&mut self, ui: &Ui, hsv: &mut [f32; 3], area: Rect) -> bool {
         let side = area.width().min(area.height());
         let rect = Rect::from_center_size(area.center(), vec2(side, side));
@@ -1095,17 +1126,29 @@ impl Pickers {
             Some((plugins, _)) => plugins.picker_pick(x, y),
             None => Some(procraft_core::triangle_sv(x, y)),
         };
+        let hue_at = |x: f32, y: f32| picker.as_ref().and_then(|(plugins, _)| plugins.picker_hue(x, y));
         let response = ui.interact(rect, ui.scope_id().with("classic triangle"), Sense::click_and_drag());
-        if let Some(p) = response.interact_pointer_pos()
-            && let Some([s, v]) = pick((p.x - rect.left()) / side, (p.y - rect.top()) / side).as_deref()
-        {
-            hsv[1] = *s;
-            hsv[2] = *v;
+        if let Some(p) = response.interact_pointer_pos() {
+            let (x, y) = ((p.x - rect.left()) / side, (p.y - rect.top()) / side);
+            // on the picker's ring, the hue for the whole drag; else saturation and brightness
+            if *self.on_ring.get_or_insert_with(|| hue_at(x, y).is_some()) {
+                if let Some(h) = hue_at(x, y) {
+                    hsv[0] = h;
+                }
+            } else if let Some([s, v]) = pick(x.clamp(0.0, 1.0), y.clamp(0.0, 1.0)).as_deref() {
+                hsv[1] = *s;
+                hsv[2] = *v;
+            }
+        }
+        if !response.is_pointer_button_down_on() {
+            self.on_ring = None;
         }
         let hue_key = (hsv[0] * 10_000.0).round() as u32;
         let px = (side * ctx.pixels_per_point()).round() as usize;
-        let plugin = picker.is_some();
-        let stale = |(h, at, by, _): &(u32, usize, bool, TextureHandle)| *h != hue_key || *at != px || *by != plugin;
+        // a picker plugin's drawn again whenever the plugins changed (its controls among them)
+        let plugin = picker.as_ref().map(|(plugins, _)| plugins.generation());
+        let stale =
+            |(h, at, by, _): &(u32, usize, Option<u64>, TextureHandle)| *h != hue_key || *at != px || *by != plugin;
         if self.triangle_picture.as_ref().is_none_or(stale) {
             let rgba = match &picker {
                 Some((_, session)) => session.picker_picture(hsv[0], px as u32),
@@ -1119,6 +1162,10 @@ impl Pickers {
         }
         if let Some((_, _, _, t)) = &self.triangle_picture {
             ui.painter().image(t.id(), rect, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+        }
+        if let Some([x, y]) = picker.as_ref().and_then(|(plugins, _)| plugins.picker_hue_point(hsv[0])).as_deref() {
+            let pure = ColourModel::Hsb.to_rgb([hsv[0], 1.0, 1.0]);
+            knob(ui, pos2(rect.left() + x * side, rect.top() + y * side), 10.75, srgb(pure));
         }
         let at = match &picker {
             Some((plugins, _)) => plugins.picker_point(hsv[1], hsv[2]),
@@ -1211,9 +1258,12 @@ impl Colours {
                 vec2(body.width() - 40.0, SLIDER_ROW),
             )
         };
-        changed |= self.model_slider(ui, row(0.0), "classic hue", 0);
-        changed |= self.model_slider(ui, row(1.0), "classic saturation", 1);
-        changed |= self.model_slider(ui, row(2.0), "classic brightness", 2);
+        // a picker plugin's with the hue on a ring of its own takes the hue slider's place
+        let from = usize::from(self.hue_ringed());
+        let sliders = [(0, "classic hue"), (1, "classic saturation"), (2, "classic brightness")];
+        for (i, (channel, id)) in sliders.into_iter().skip(from).enumerate() {
+            changed |= self.model_slider(ui, row(i as f32), id, channel);
+        }
         if changed {
             self.send(session);
         }

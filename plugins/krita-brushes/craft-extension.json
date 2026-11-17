@@ -11,6 +11,6 @@
   "hooks": [],
   "actions": [{ "key": "studio", "label": "Krita brush studio" }],
   "brush_engines": [
-    { "key": "krita", "label": "Krita brushes", "accepts": ["kpp", "bundle"], "studio": "studio" }
+    { "key": "krita", "label": "Krita brushes", "accepts": ["kpp", "bundle", "myb"], "studio": "studio" }
   ]
 }

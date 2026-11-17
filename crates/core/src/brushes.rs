@@ -96,7 +96,7 @@ impl CanvasSession {
             let shape = &st.brush(st.tool).shape;
             let key =
                 (shape.image, shape.source.as_ref().map(|s| s.id), shape.roundness.to_bits(), shape.rotation.to_bits());
-            let pixels = shape.source.as_ref().map(|s| std::sync::Arc::clone(&s.pixels));
+            let pixels = shape.source.as_ref().map(|s| s.pixels.clone());
             (key, pixels)
         };
         let (image, source, roundness, rotation) = key;
@@ -153,7 +153,7 @@ impl CanvasSession {
                 [brush.hardness, shape.roundness, shape.rotation].map(f32::to_bits),
                 side,
             );
-            (key, shape.source.as_ref().map(|s| std::sync::Arc::clone(&s.pixels)))
+            (key, shape.source.as_ref().map(|s| s.pixels.clone()))
         };
         let mut kept = STAMPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((k, stamp)) = kept.as_ref()
@@ -427,9 +427,10 @@ impl CanvasSession {
             self.use_full_sources(&gpu, &mut canvas, &mut second_style, &second);
             let ratio = second.diameter(0.5) / brush.diameter(0.5).max(1e-3);
             let mode = brush.setting("dual_blend").round().max(0.0) as u32;
+            let classic = brush.setting("classic_combine") >= 0.5;
             (!second_style.in_place()).then(|| {
-                let dual =
-                    procraft_gpu::SecondStroke { style: second_style, mode, threshold: second_style.alpha_threshold };
+                let threshold = second_style.alpha_threshold;
+                let dual = procraft_gpu::SecondStroke { style: second_style, mode, threshold, classic };
                 (second, dual, preview::diameter(&brush) * ratio)
             })
         });
@@ -438,19 +439,28 @@ impl CanvasSession {
             None => canvas.begin_stroke(layer, style),
         }
         if stamp_only {
-            // the brush's stamp on its own in the middle, as wide as its preview size of its most
-            // size (a big one reaching past the preview, as there)
-            let side = (brush.setting("preview_size").clamp(0.0, 1.0) * brush.biggest()).max(1.0);
+            // the brush's stamp on its own in the middle, its preview size of the way from its
+            // least size to its most (a big one reaching past the preview, as there)
+            let (most, share) = (brush.biggest(), brush.setting("preview_size").clamp(0.0, 1.0));
+            let least = brush.min_size.clamp(0.0, most);
+            let side = (least + (most - least) * share).max(1.0);
             canvas.add_stamps(&[Stamp::round(Vec2::new(cw as f32 / 2.0, ch as f32 / 2.0), side / 2.0, 1.0)]);
         } else {
             let samples = preview::samples(&brush);
             if let Some((second, _, diameter)) = second {
-                let mut stroke = StrokeBuilder::new(second, diameter, Pointer::Stylus).steady();
+                let tilts = brush.setting("preview_tilt") >= 0.5;
+                let mut stroke = StrokeBuilder::new(second, diameter, Pointer::Stylus).steady().on_pad(tilts);
                 canvas.add_second_stamps(&stroke.add(&samples));
                 canvas.replace_second_stamps(&stroke.finish());
             }
-            let mut stroke = StrokeBuilder::new(brush.clone(), preview::diameter(&brush), Pointer::Stylus).steady();
-            canvas.add_stamps(&stroke.add(&samples));
+            // drawn as the pad draws: the tilt acting only if the brush previews it, the lean moving
+            // no stamps
+            let tilts = brush.setting("preview_tilt") >= 0.5;
+            let mut stroke =
+                StrokeBuilder::new(brush.clone(), preview::diameter(&brush), Pointer::Stylus).steady().on_pad(tilts);
+            // (its first stamps as they turned to the way it goes, so its end lays only the rest)
+            let added = stroke.add(&samples);
+            canvas.add_stamps(&if stroke.take_turned() { stroke.placed_stamps() } else { added });
             canvas.replace_stamps(&stroke.finish());
         }
         canvas.end_stroke();
@@ -485,6 +495,7 @@ impl CanvasSession {
             tool: 0,
             pointer: 1,
             seed: PREVIEW_SEED,
+            under_at: None,
             turn: 0.0,
         };
         let o = crate::plugin_brushes::engine_stroke(

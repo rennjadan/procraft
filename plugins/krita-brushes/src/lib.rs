@@ -1,7 +1,8 @@
 //! Krita brushes, a plugin for ProCraft: a brush engine (the app's `brush_engines`) that reads
 //! Krita's presets (`.kpp`) and bundles (`.bundle`) and draws their brushes as Krita's pixel
-//! brush and colour smudge brush do, and its quick, tangent normal, sketch and spray brushes as far
-//! as dabs draw them. The app hands it each stroke's input and lays the dabs it answers on the GPU.
+//! brush and colour smudge brush do, and its quick, tangent normal, sketch, spray, bristle, hatching,
+//! curve, particle and grid brushes as far as dabs draw them. The app hands it each stroke's input
+//! and lays the dabs it answers on the GPU.
 //!
 //! - Importing: each preset of an engine it draws becomes a brush whose data is the preset's
 //!   settings and the pictures it names (its tip, its masking brush's, its texture's), found in it
@@ -9,7 +10,8 @@
 //! - Loading: the data read again into a brush ready to draw, and how it looks to the app (its tips
 //!   drawn as grey pictures, its texture's mask, whether it washes, its blend), unless the app holds
 //!   that already (it keeps it on the disk). See `brush.rs`.
-//! - Drawing: dab by dab, as Krita spaces and shapes them. See `engine.rs`.
+//! - Drawing: dab by dab, as Krita spaces and shapes them. See `engine.rs`; Krita's MyPaint
+//!   brushes through MyPaint's engine, see `mypaint.rs`.
 //!
 //! What it knows of Krita's brushes comes from Krita's manual and from reading how Krita works; the
 //! code here is its own (see README.md).
@@ -20,11 +22,14 @@ mod engine;
 mod files;
 mod gimp;
 mod import;
+mod json;
+mod mypaint;
 mod options;
 mod others;
 mod preset;
 mod rec;
 mod studio;
+mod svg;
 mod tips;
 mod utilities;
 mod xml;
@@ -131,6 +136,8 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
     with(|s| {
         let input = s.input.get(..usize::try_from(len).unwrap_or(0)).unwrap_or_default();
         let mut id = None;
+        let mut under = None;
+        let mut canvas = None;
         let mut begin =
             Begin { colour: [0.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 1, turn: 0.0 };
         for (field, value) in fields(input) {
@@ -146,6 +153,11 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
                 8 => begin.seed = u32_of(value).unwrap_or(1),
                 9 => begin.turn = f32_of(value).filter(|t| t.is_finite()).unwrap_or(0.0),
                 10 => begin.start_diameter = f32_of(value).unwrap_or(1.0),
+                11 => under = engine::Under::read(value),
+                12 => {
+                    let f = f32s(value);
+                    canvas = (f.len() >= 2).then(|| (f[0], f[1]));
+                }
                 _ => {}
             }
         }
@@ -158,7 +170,10 @@ pub extern "C" fn procraft_brush_begin(len: i32) -> i32 {
         if s.strokes.len() >= MOST_STROKES {
             s.strokes.remove(0);
         }
-        s.strokes.push((number, Stroke::new(brush, begin)));
+        let mut stroke = Stroke::new(brush, begin);
+        stroke.under = under;
+        stroke.canvas = canvas;
+        s.strokes.push((number, stroke));
         number
     })
 }
@@ -190,13 +205,45 @@ pub extern "C" fn procraft_brush_add(stroke: i32, len: i32) -> i32 {
     })
 }
 
-/// Stroke `stroke` ends: its last dabs (none: each is laid as its samples come).
+/// The colours under the dabs stroke `stroke` asked about (four f32 each, premultiplied, in
+/// order), told before its next samples.
+#[unsafe(no_mangle)]
+pub extern "C" fn procraft_brush_under(stroke: i32, len: i32) -> i32 {
+    with(|s| {
+        let input = s.input.get(..usize::try_from(len).unwrap_or(0)).unwrap_or_default();
+        let told: Vec<[f32; 4]> = input
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|b| {
+                let f = f32s(b);
+                [f[0], f[1], f[2], f[3]].map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 })
+            })
+            .collect();
+        if let Some((_, open)) = s.strokes.iter_mut().find(|(n, _)| *n == stroke) {
+            open.told(&told);
+        }
+        0
+    })
+}
+
+/// Stroke `stroke` ends: its last dabs (most are laid as their samples come).
 #[unsafe(no_mangle)]
 pub extern "C" fn procraft_brush_end(stroke: i32) -> i32 {
     with(|s| {
-        s.output.clear();
-        s.strokes.retain(|(n, _)| *n != stroke);
-        0
+        let State { strokes, output, .. } = s;
+        output.clear();
+        let mut laid = 0;
+        if let Some((_, open)) = strokes.iter_mut().find(|(n, _)| *n == stroke) {
+            open.finish();
+            let dabs = std::mem::take(&mut open.out);
+            for d in &dabs {
+                d.write(output);
+            }
+            laid = dabs.len() as i32;
+        }
+        strokes.retain(|(n, _)| *n != stroke);
+        laid
     })
 }
 

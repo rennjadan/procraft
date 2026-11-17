@@ -47,12 +47,16 @@ mod keys;
 #[cfg(target_os = "ios")]
 mod layer;
 mod layer_ops;
+mod layer_store;
 mod layers;
 mod liquify;
+mod liquify_steps;
 mod modes;
 mod palettes;
 mod pick;
 mod pickers;
+/// A picker plugin's picture compiled: whose it is, its code, the keys it reads its controls by.
+pub(crate) type PickerProgram = (String, Arc<str>, Option<Arc<[String]>>, Arc<procraft_gpu::PictureProgram>);
 mod plugin_artwork;
 mod plugin_brushes;
 mod plugin_canvas;
@@ -80,6 +84,8 @@ mod selection;
 mod sharp;
 mod side_slider;
 mod sound_file;
+mod stock_brushes;
+mod stock_library;
 mod stroke_sound;
 mod studio;
 #[cfg(test)]
@@ -106,7 +112,7 @@ use procraft_engine::brush::Brush;
 use procraft_engine::document::Document;
 use procraft_engine::geom::Vec2;
 use procraft_engine::input::{Pointer, Sample};
-use procraft_engine::library::{BrushSet, library};
+use procraft_engine::library::BrushSet;
 use procraft_engine::stroke::StrokeBuilder;
 use procraft_engine::view::View;
 use procraft_gpu::{Canvas, Gpu, SecondStroke, StrokeStyle, StrokeTool};
@@ -141,7 +147,7 @@ pub use colour_models::{
     colour_model_square_side, colour_model_tracks, colour_models, oklab_of, oklab_of_hsv, oklab_slid, oklab_to_rgb,
     oklab_tracks, oklab_value_slid, oklab_value_tracks,
 };
-pub use crop_edit::CropShown;
+pub use crop_edit::{CropReadout, CropShown};
 pub use device::keep_device;
 pub use frame::{configure, screen_profile};
 pub use gallery::{ArtworkStore, GalleryArtwork, GalleryEntry, ZipKind, zip_file_kind};
@@ -153,7 +159,7 @@ pub use gradients::{GradientInfo, GradientStop, Gradients};
 pub use guide::{GuideInfo, GuideType, GuideUnit, SymmetryType};
 pub use history::ColourHistory;
 pub use hues::{HueControl, RING_HUES, SLIDER_HUES, hue_at, hue_position, hue_stops};
-pub use keys::{KeyCombo, KeyDrag, KeyShortcut, ShortcutGroup, ShortcutRow, key_shortcut, key_shortcut_list};
+pub use keys::{KEY_ZOOM, KeyCombo, KeyDrag, KeyShortcut, ShortcutGroup, ShortcutRow, key_shortcut, key_shortcut_list};
 pub use layers::{
     BlendModeInfo, Blocked, HiddenBy, LayerInfo, LayerOption, LayerOptionRow, LayerType, ThumbnailImage, blend_modes,
     brush_blend_modes, combine_blend_modes, grain_blend_modes, layers_for, set_layer_budget, set_resident_budget,
@@ -171,9 +177,9 @@ pub use plugin_file::read_plugin_file;
 pub use plugin_filter::PluginFilterShown;
 pub use plugin_panel::{PanelRow, PluginPanel};
 pub use plugins::{
-    PluginAction, PluginControl, PluginInfo, PluginOffer, PluginPart, PluginPlace, PluginSlider, PluginSource,
-    PluginSwitch, Plugins, plugin_file_most_bytes, plugin_slider_along, plugin_slider_at, plugin_slider_choice,
-    plugin_slider_choices, plugin_slider_chosen, plugin_slider_shown, plugin_slider_whole,
+    InterfacePart, PluginAction, PluginControl, PluginInfo, PluginOffer, PluginPart, PluginPlace, PluginSlider,
+    PluginSource, PluginSwitch, Plugins, plugin_file_most_bytes, plugin_slider_along, plugin_slider_at,
+    plugin_slider_choice, plugin_slider_choices, plugin_slider_chosen, plugin_slider_shown, plugin_slider_whole,
 };
 pub use presets::{
     CanvasPreset, P3, SRGB, per_inch, preset_height, preset_label, preset_number, preset_width, presets_from_json,
@@ -486,8 +492,9 @@ pub(crate) struct State {
     /// Opened from a folder holding a plugin's artwork: its kind and its data, until the app opens
     /// it with its plugin.
     pub(crate) plugin_opened: Option<plugin_artwork::PluginOpened>,
-    /// The picker plugin's picture, compiled for this session's GPU: whose it is, and its code.
-    pub(crate) picker_program: Option<(String, Arc<str>, Arc<procraft_gpu::PictureProgram>)>,
+    /// The picker plugin's picture, compiled for this session's GPU: whose it is, its code and the
+    /// keys it reads its controls by.
+    pub(crate) picker_program: Option<PickerProgram>,
     /// When the stroke's input was last heard, for a sound plugin.
     pub(crate) sound_heard: Option<std::time::Instant>,
     /// Where the pen last hovered (window pixels) and when, for the spray can's rattle.
@@ -574,6 +581,10 @@ pub(crate) struct State {
     /// A frame wanted at this time, not before: the selection's bands drift slowly, so a frame
     /// shows them moved only every so often (a pixel at a time).
     pub(crate) frame_due: Option<std::time::Instant>,
+    /// The least time between the beginnings of two frames: a little under the screen's refresh
+    /// period, once the app has said what that is (see [`CanvasSession::set_refresh_rate`]).
+    #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+    pub(crate) frame_spacing: Option<std::time::Duration>,
     /// Frames wait (the canvas is being redrawn a stroke at a time, as the brush studio's pad is
     /// when its brush changes), and one was asked for meanwhile.
     pub(crate) holding_frames: bool,
@@ -590,6 +601,8 @@ pub(crate) struct State {
     /// The open stroke's brush engine wanting the pen again while it holds still (an airbrush):
     /// every how many ms, the pen as it last was, and when next.
     pub(crate) airbrush: Option<(f64, PenSample, f64)>,
+    /// The open stroke's brush engine, as it is told the colours under the dabs it asks about.
+    pub(crate) engine_asking: plugin_brushes::Asking,
     /// Brush files' grains at their own size.
     pub(crate) grain_store: grain_store::GrainStore,
     /// Where the library was last kept or read whole, and what it held then (see
@@ -633,6 +646,9 @@ pub(crate) struct State {
     pub(crate) tracking_since: Option<std::time::Instant>,
     /// Saved layer pixels waiting for the canvas (an opened artwork before it is shown).
     pub(crate) pending_pixels: Vec<(procraft_engine::document::LayerId, project::Opened)>,
+    /// The layers' stores as their files were opened, put on the canvas as it is made (see
+    /// `layer_store.rs`).
+    pub(crate) pending_stores: Vec<(procraft_engine::document::LayerId, Vec<u8>)>,
     /// The canvas couldn't be made from these pixels (a failure elsewhere doesn't stop the next try).
     pub(crate) canvas_failed: bool,
     /// Layers whose saved files couldn't be read (shown empty): a save leaves each file as it is
@@ -655,8 +671,14 @@ pub(crate) struct State {
     pub(crate) backdrops: Vec<[f32; 6]>,
     /// Where the glass over the canvas is thin (the side bar's slider tracks), the same way.
     pub(crate) backdrop_windows: Vec<[f32; 6]>,
-    /// The view kept with the artwork, shown when the window first comes.
-    pub(crate) saved_view: Option<project::SavedView>,
+    /// How the gallery shows the artwork: turned this many quarter turns clockwise, as its canvas
+    /// was left (kept with it).
+    pub(crate) turns: u8,
+    /// How far the view has turned with the window as the device turned (radians), the canvas
+    /// staying put on the glass: not a turn of the canvas, so the gallery's turn leaves it out.
+    pub(crate) screen_follow: f32,
+    /// The gallery's turn follows the canvas's (Canvas Orientation Memory); else it stays.
+    pub(crate) turns_follow_view: bool,
     /// The Reference window as the artwork keeps it, and its imported picture (a PNG, upright):
     /// apart from the document, so that undoing never moves it.
     pub(crate) reference_window: procraft_engine::reference_window::ReferenceWindow,
@@ -682,7 +704,7 @@ pub(crate) struct State {
     pub(crate) display_lut: Option<((usize, procraft_engine::profile::Profile), procraft_gpu::DisplayLut)>,
     /// While a colour selection's threshold is dragged: the selection before it, and the layer read once.
     selection_before: Option<Option<procraft_engine::selection::Mask>>,
-    colour_source: Option<(Vec<u8>, procraft_engine::selection::ColourFlood)>,
+    colour_source: Option<selection::ColourSource>,
     /// An adjustment is open on the current layer, and what it last drew.
     adjusting: bool,
     /// The open adjustment's values, as the apps show them (adjusting.rs).
@@ -693,6 +715,11 @@ pub(crate) struct State {
     last_filter: Option<procraft_gpu::Filter>,
     /// The liquify brush as it goes.
     liquify: liquify::LiquifyRun,
+    /// Liquify's undo steps while it is open, and the last closed, set aside to come back; and
+    /// whether the end under way sets it aside without keeping its work (undone past its first step).
+    liquify_steps: liquify_steps::Steps,
+    liquify_kept: Option<liquify_steps::Kept>,
+    liquify_set_aside: bool,
     /// The brush studio is open on this (set, brush), and the brush as it opened.
     studio: Option<((usize, usize), Brush)>,
     /// It shows a dual brush's second, not its first.
@@ -765,24 +792,45 @@ impl State {
         if self.light { SURROUND_LIGHT } else { SURROUND }
     }
 
-    /// Places the canvas in the window the first time: the view kept with the artwork, unless it
-    /// would leave the canvas off the page, else fitted.
+    /// Places the canvas in the window the first time: fitted, turned as the gallery shows it (its
+    /// zoom and place from before are not kept).
     pub(crate) fn place_view(&mut self) {
         if self.view.is_none() {
-            let canvas = (self.doc.width(), self.doc.height());
-            let kept = self
-                .saved_view
-                .take()
-                .and_then(|v| v.view(self.window_size))
-                .filter(|v| project::shows_canvas(v, self.window_size, canvas));
-            self.view = Some(kept.unwrap_or_else(|| self.fitted_view()));
+            self.screen_follow = 0.0;
+            self.view = Some(self.fitted_view());
+        }
+    }
+
+    /// The quarter turns clockwise the gallery shows the artwork turned by, as it would be kept
+    /// now: with Canvas Orientation Memory, the nearest to how its canvas is turned (less what the
+    /// view turned with the screen as the device turned); else, or a model, as it was.
+    pub(crate) fn shown_turns(&self) -> u8 {
+        if self.scene.is_some() {
+            return 0;
+        }
+        // while the guide editor is open, as it was before it
+        let view = self.guide_before.as_ref().map_or(self.view, |(_, before)| *before);
+        match view {
+            Some(v) if self.turns_follow_view => {
+                let m = v.to_screen();
+                // its down axis gives its turn whether or not it is mirrored
+                let angle = (-m.c).atan2(m.d) - self.screen_follow;
+                if angle.is_finite() {
+                    // halfway (45 degrees off) goes to upright or upside down
+                    ((angle / std::f32::consts::FRAC_PI_2).round_ties_even() as i32).rem_euclid(4) as u8
+                } else {
+                    self.turns
+                }
+            }
+            _ => self.turns,
         }
     }
 
     /// The whole canvas fitted in the window, clear of the insets, turned by the right angle the
-    /// view is nearest (fitting straightens a turned canvas, but keeps it on its side if it is).
+    /// view is nearest (fitting straightens a turned canvas, but keeps it on its side if it is);
+    /// before it is shown, as the gallery shows it.
     pub(crate) fn fitted_view(&self) -> View {
-        let turns = self.view.map_or(0, |v| v.quarter_turns());
+        let turns = self.view.map_or(i32::from(self.turns), |v| v.quarter_turns());
         // in the guide editor, the whole window (behind its bars)
         let insets = if self.guide_before.is_some() { [0.0; 4] } else { self.fit_insets };
         View::fit_turned((self.doc.width(), self.doc.height()), self.window_size, insets, turns)
@@ -979,7 +1027,8 @@ impl State {
         }
         self.use_full_shape(&mut style, &second);
         let mode = first.setting("dual_blend").round().max(0.0) as u32;
-        Some((second, SecondStroke { style, mode, threshold: style.alpha_threshold }, diameter))
+        let classic = first.setting("classic_combine") >= 0.5;
+        Some((second, SecondStroke { style, mode, threshold: style.alpha_threshold, classic }, diameter))
     }
 
     /// More input for the pad's last kept stroke, if it keeps them.
@@ -1065,6 +1114,12 @@ impl State {
                 self.unreadable_untold.push(id);
             }
         }
+        // the pixels of the layers with stores, to tell their stores were saved with them
+        let hashes: std::collections::HashMap<_, _> = pixels
+            .iter()
+            .filter(|(id, _)| self.pending_stores.iter().any(|(s, _)| s == id))
+            .map(|(id, px)| (*id, project::pixels_hash(px)))
+            .collect();
         let doc = &self.doc;
         // every layer up as it was read, or no canvas: one the GPU had no memory for would show
         // empty, and be saved so once painted on
@@ -1081,7 +1136,10 @@ impl State {
             Ok(c)
         });
         match made.and_then(|made| made) {
-            Ok(c) => self.canvas = Some(c),
+            Ok(c) => {
+                self.canvas = Some(c);
+                self.put_opened_stores(&hashes);
+            }
             Err(e) => {
                 log::error!("canvas: {e}");
                 self.error = Some(e.to_string());
@@ -1089,6 +1147,35 @@ impl State {
                 self.pending_pixels = pixels.into_iter().map(|(id, px)| (id, project::Opened::Pixels(px))).collect();
             }
         }
+    }
+
+    /// The layers' stores as they were opened put on the canvas just made, each that was saved
+    /// with the pixels its layer has (`hashes`, by layer) and holds up; the rest dry (see
+    /// `layer_store.rs`).
+    pub(crate) fn put_opened_stores(
+        &mut self,
+        hashes: &std::collections::HashMap<procraft_engine::document::LayerId, u64>,
+    ) {
+        let stores = std::mem::take(&mut self.pending_stores);
+        let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return };
+        let size = canvas.size();
+        for (id, bytes) in stores {
+            let opened = layer_store::decode(&bytes, size).filter(|o| hashes.get(&id) == Some(&o.layer_hash));
+            match opened {
+                Some(o) if canvas.put_store(gpu, id, o.kind, &o.planes) => {}
+                _ => log::info!("layer {id:?}'s store left out: it doesn't hold up, or the layer changed since"),
+            }
+        }
+    }
+
+    /// The canvas's zoom (screen pixels a canvas pixel) if a stroke's input comes in whole
+    /// screen pixels, as the first of its `samples` says (a mouse, or a tablet's pen read no finer
+    /// than the pointer it moves): its points are then evened out over the steps of a pixel a slow
+    /// line goes in (see [`StrokeBuilder::read_in_whole_pixels`]).
+    pub(crate) fn whole_pixels(&self, samples: &[PenSample]) -> Option<f32> {
+        let first = samples.first()?;
+        let whole = first.x.fract() == 0.0 && first.y.fract() == 0.0;
+        self.view.map(|v| v.zoom()).filter(|_| whole)
     }
 
     /// Samples in canvas pixels.
@@ -1132,7 +1219,12 @@ fn draw_samples(
         return !kept.is_empty() || !tip.is_empty();
     }
     let stamps = guide::mirrored(guide, &builder.add(samples));
-    canvas.add_stamps(&stamps);
+    if builder.take_turned() {
+        // its first stamps turned to the way it goes: the few laid so far laid again as they are
+        canvas.replace_stamps(&guide::mirrored(guide, &builder.placed_stamps()));
+    } else {
+        canvas.add_stamps(&stamps);
+    }
     // the stretch to the newest point waits for the point after it to curve by: shown meanwhile
     // (as predicted input is, until the next)
     show_ahead(canvas, builder, &[], guide);
@@ -1205,8 +1297,13 @@ fn lay_stroke(
     }
     let drawn = builder.stamp_count();
     let for_good = if canvas.shows_tip() { builder.drawn_for_good() } else { None };
+    // a smudge, or an adjustment painted on, has laid its stamps for good as they came
+    let laid = canvas.stroke_tool() == Some(StrokeTool::Smudge) || canvas.is_pencil();
+    if laid {
+        builder.hold_laid();
+    }
     let all = builder.finish();
-    if canvas.stroke_tool() == Some(StrokeTool::Smudge) || canvas.is_pencil() {
+    if laid {
         canvas.add_stamps(&guide::mirrored(guide, all.get(drawn..).unwrap_or(&[])));
     } else if let Some(rest) = for_good.and_then(|stamps| all.strip_prefix(stamps.as_slice())) {
         // nothing laid changes: a long stroke's end needn't lay it all again
@@ -1351,7 +1448,8 @@ impl Shared {
         }
         // every layer up as it was read, or no canvas (what was opened kept): one the GPU had no
         // memory for would show empty, and be saved so once painted on
-        let made = gpu.checked(|| -> Result<Canvas, procraft_gpu::GpuError> {
+        type Made = (Canvas, std::collections::HashMap<procraft_engine::document::LayerId, u64>);
+        let made = gpu.checked(|| -> Result<Made, procraft_gpu::GpuError> {
             let budget = crate::layers::resident_budget();
             let (w, h) = (doc.width(), doc.height());
             // read on a few threads (each file decoded and its compressed copy made: those below
@@ -1402,6 +1500,7 @@ impl Shared {
                 // it can't be, the readers stop at their next layer, nothing taking what they read
                 let mut c = Canvas::unfilled(&gpu, &doc)?;
                 c.set_resident_budget(budget);
+                let mut hashes = std::collections::HashMap::new();
                 let mut waiting = std::collections::BTreeMap::new();
                 let mut at = 0;
                 let mut unread = Vec::new();
@@ -1416,6 +1515,7 @@ impl Shared {
                                 if let Ok(mut saved) = self.saving.lock() {
                                     saved.read(*id, hash);
                                 }
+                                hashes.insert(*id, hash);
                                 match layer {
                                     Read::Upload(px, painted, Some(copy))
                                         if copy.bytes() * 4 <= px.len()
@@ -1449,7 +1549,7 @@ impl Shared {
                     c.parked_layers(),
                     copies / 1024
                 );
-                Ok(c)
+                Ok((c, hashes))
             })
         });
         let mut st = self.lock();
@@ -1458,9 +1558,10 @@ impl Shared {
         }
         let same = st.doc == doc && st.pending_pixels.iter().map(|(id, _)| *id).eq(ids.iter().copied());
         match made.and_then(|made| made) {
-            Ok(c) if same => {
+            Ok((c, hashes)) if same => {
                 st.pending_pixels.clear();
                 st.canvas = Some(c);
+                st.put_opened_stores(&hashes);
             }
             Ok(_) => st.ensure_canvas(),
             Err(e) => {
@@ -1525,7 +1626,7 @@ impl CanvasSession {
         pixels: Vec<(procraft_engine::document::LayerId, Vec<u8>)>,
     ) -> Arc<CanvasSession> {
         device::start_log();
-        let shipped = library();
+        let shipped = stock_library::shipped();
         let shelf = brush_library::LibrarySet::shipped(&shipped);
         // the round pen to paint, the soft airbrush to erase, the round brush to smudge
         let [paint_brush, erase_brush, smudge_brush] =
@@ -1553,6 +1654,7 @@ impl CanvasSession {
             sharp: sharp::Sharp::default(),
             lay_to: None,
             layer_data_unread: std::collections::HashSet::new(),
+            pending_stores: Vec::new(),
             pour: None,
             reveal: None,
             reduce_motion: false,
@@ -1570,7 +1672,7 @@ impl CanvasSession {
             crop_redo: None,
             library: shelf,
             libraries: brush_libraries::Libraries::default(),
-            shipped: Arc::new(shipped),
+            shipped,
             fallback: Brush::round_pen(),
             paint_brush,
             erase_brush,
@@ -1593,6 +1695,7 @@ impl CanvasSession {
             x_ray: false,
             needs_frame: false,
             frame_due: None,
+            frame_spacing: None,
             holding_frames: false,
             frame_held: false,
             stop: false,
@@ -1601,6 +1704,7 @@ impl CanvasSession {
             frames: 0,
             pad_strokes: None,
             airbrush: None,
+            engine_asking: plugin_brushes::Asking::default(),
             grain_store: grain_store::GrainStore::default(),
             library_kept: None,
             plugin_stepping: 0,
@@ -1644,6 +1748,9 @@ impl CanvasSession {
             crop_edit: crop_edit::CropEdit::default(),
             last_filter: None,
             liquify: liquify::LiquifyRun::default(),
+            liquify_steps: liquify_steps::Steps::default(),
+            liquify_kept: None,
+            liquify_set_aside: false,
             studio: None,
             studio_second: false,
             pencil: false,
@@ -1675,7 +1782,9 @@ impl CanvasSession {
             fit_insets: [0.0; 4],
             backdrops: Vec::new(),
             backdrop_windows: Vec::new(),
-            saved_view: None,
+            turns: 0,
+            screen_follow: 0.0,
+            turns_follow_view: true,
             reference_window: Default::default(),
             reference_picture: None,
         };
@@ -1833,6 +1942,7 @@ impl CanvasSession {
         st.note_recent(st.brush_ref(tool));
         st.info.strokes = st.info.strokes.saturating_add(1);
         let seed = st.strokes.wrapping_mul(0x9e37_79b9);
+        let whole_pixels = st.whole_pixels(&samples);
         let make = |st: &State, brush: Brush, diameter: f32, seed: u32| {
             let preview_tilt = brush.setting("preview_tilt") >= 0.5;
             let mut builder = StrokeBuilder::with_seed(brush, diameter, pointer.into(), seed)
@@ -1840,6 +1950,9 @@ impl CanvasSession {
                 .with_input(st.input.clone())
                 .on_view_turned(st.view.map_or(0.0, |v| v.rotation()))
                 .seen_at(st.view.map_or(1.0, |v| v.zoom()) / st.display_scale);
+            if let Some(zoom) = whole_pixels {
+                builder = builder.read_in_whole_pixels(zoom);
+            }
             if st.pad_strokes.is_some() {
                 // on the studio's pad the lean moves no stamps, and the tilt switches act only
                 // when the brush previews tilt
@@ -1857,7 +1970,8 @@ impl CanvasSession {
             second.as_ref().map(|(b, _, d)| make(st, b.clone(), d * st.brush_scale(), seed ^ 0x5eed_0002));
         // a brush a plugin's brush engine made is drawn by it while it is on: its stamps, how they
         // are laid and its second stroke are the engine's
-        let outside = st.outside_stroke(&brush, tool, current, pointer, diameter, seed);
+        let first = st.to_canvas(samples.get(..1).unwrap_or_default()).first().map(|s| (s.pos.x, s.pos.y));
+        let outside = st.outside_stroke(&brush, tool, current, pointer, diameter, seed, first);
         st.airbrush = outside.as_ref().and_then(|o| o.airbrush).zip(samples.last()).map(|(ms, last)| {
             let every = f64::from(ms) * 0.5;
             (every, *last, last.time_ms + every)
@@ -1879,7 +1993,7 @@ impl CanvasSession {
         // on a plugin's layer it is recorded as it goes (not on the brush studio's pad)
         st.recording = None;
         if st.pad_strokes.is_none() {
-            st.begin_recording(current, tool, pointer, seed, &canvas_samples);
+            st.begin_recording(current, tool, pointer, seed, whole_pixels, &canvas_samples);
         }
         st.drawn.clear();
         st.drawn_moving = 0.0;
@@ -1954,6 +2068,8 @@ impl CanvasSession {
         if let Some(recording) = st.recording.as_mut().filter(|_| st.stroke.is_some()) {
             recording.add(&canvas_samples);
         }
+        // a brush engine told the colours under the dabs it asked about before its next samples
+        st.tell_under();
         let (Some(builder), Some(canvas)) = (st.stroke.as_mut(), st.canvas.as_mut()) else { return };
         if draw_samples(canvas, builder, st.second.as_mut(), &canvas_samples, &st.doc.stroke_guide()) {
             st.redraw_painted_on();
@@ -2022,6 +2138,8 @@ impl CanvasSession {
         }
         // (painted into an open adjustment, it tells no plugin: what one did would end it)
         let tells = !st.adjusting;
+        st.tell_under();
+        st.engine_asking = plugin_brushes::Asking::default();
         let (Some(mut builder), Some(canvas)) = (st.stroke.take(), st.canvas.as_mut()) else { return };
         let mut second = st.second.take();
         lift_samples(canvas, &mut builder, second.as_mut(), &canvas_samples, &st.doc.stroke_guide());
@@ -2113,6 +2231,12 @@ impl CanvasSession {
     /// fill then shows at once instead of spreading in.
     pub fn set_reduce_motion(&self, reduce: bool) {
         self.shared.lock().reduce_motion = reduce;
+    }
+
+    /// How many frames a second the screen shows at most (its fastest refresh): frames are drawn
+    /// no more often than that (a little more, so none is missed), however fast input comes.
+    pub fn set_refresh_rate(&self, hertz: f32) {
+        self.shared.lock().frame_spacing = crate::frame::frame_spacing(hertz);
     }
 
     /// How many window pixels make one interface point (the screen's density).
@@ -2342,9 +2466,29 @@ impl CanvasSession {
         st.scene = None;
     }
 
-    /// The artwork opens fitted, not as it was left (Canvas Orientation Memory off).
-    pub fn forget_saved_view(&self) {
-        self.shared.lock().saved_view = None;
+    /// Canvas Orientation Memory: on, the quarter turn the artwork is kept at (which it opens
+    /// at, and the gallery shows it at) follows its canvas's; off, it stays as it is. On at first.
+    pub fn set_orientation_memory(&self, on: bool) {
+        self.shared.lock().turns_follow_view = on;
+    }
+
+    /// How many quarter turns clockwise the gallery shows the artwork turned by, as it would be
+    /// kept now (see [`CanvasSession::save`]): as its canvas is turned, to the nearest.
+    pub fn shown_turns(&self) -> u32 {
+        u32::from(self.shared.lock().shown_turns())
+    }
+
+    /// The window turned with the device: the view turns by `rotation` (radians) about the
+    /// window's top-left corner and moves by `pan`, so the canvas stays where it was on the glass.
+    /// As [`CanvasSession::view_gesture`], but not counted as a turn of the canvas.
+    pub fn follow_screen_turn(&self, pan_x: f32, pan_y: f32, rotation: f32) {
+        {
+            let mut st = self.shared.lock();
+            if rotation.is_finite() && st.view.is_some() && !st.scene_shown() {
+                st.screen_follow = (st.screen_follow + rotation).rem_euclid(std::f32::consts::TAU);
+            }
+        }
+        self.view_gesture(0.0, 0.0, pan_x, pan_y, 1.0, rotation);
     }
 
     /// The tool chosen; the one it replaces is kept as the last used (a pen's "switch to the
@@ -2381,7 +2525,15 @@ impl CanvasSession {
     /// again ([`CanvasSession::layer_text`]) and draws it.
     pub fn set_color(&self, r: f32, g: f32, b: f32) {
         let c = [r, g, b].map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
-        let changed = std::mem::replace(&mut self.shared.lock().color, c) != c;
+        let changed = {
+            let mut st = self.shared.lock();
+            let changed = std::mem::replace(&mut st.color, c) != c;
+            // what Color Fill will fill shows in the colour
+            if changed && st.selection_display == selection::SelectionDisplay::ColourFill && st.selection.is_some() {
+                self.shared.frame(&mut st);
+            }
+            changed
+        };
         if changed {
             self.text_colour_chosen(c);
         }
@@ -2433,12 +2585,20 @@ impl CanvasSession {
         if self.recolor_step_aside() {
             return Some(recolor::STEP.to_owned());
         }
+        // Liquify open: its last step taken back (past its first, it closes)
+        if let Some(name) = self.step_liquify(true) {
+            return name;
+        }
         // an adjustment open on the layer: its changes taken back, or the step before it
         if let Some(name) = self.step_adjusting(Self::undo_step, true) {
             return name;
         }
         if self.quickshape_undo() {
             return None;
+        }
+        // the step that kept Liquify's work: taken back, Liquify opens again with its steps
+        if let Some(name) = self.liquify_again(true) {
+            return name;
         }
         self.undo_step()
     }
@@ -2471,12 +2631,19 @@ impl CanvasSession {
         if self.swap_crop(false) {
             return Some("Crop canvas".to_owned());
         }
+        if let Some(name) = self.step_liquify(false) {
+            return name;
+        }
         // an adjustment open on the layer, with nothing changed yet: the step after it
         if let Some(name) = self.step_adjusting(Self::redo_step, false) {
             return name;
         }
         if self.quickshape_redo() {
             return None;
+        }
+        // Liquify undone past its first step, and nothing since: it opens again
+        if let Some(name) = self.liquify_again(false) {
+            return name;
         }
         // recoloring, the open fill steps aside and is made again over what comes back
         let recoloring = self.recolor_step_aside();
@@ -2552,18 +2719,31 @@ impl CanvasSession {
             opacity: sliders.opacity,
             brush_diameter: st.brush(st.tool).diameter(sliders.size) * st.brush_scale(),
             // an open shape is kept, then undone; a plugin's artwork goes by its own steps
+            // Liquify open: its first step undone closes it
             can_undo: st.plugin_steps().is_some_and(|(undo, _)| undo)
+                || st.liquify_open()
                 || st.canvas.as_ref().is_some_and(Canvas::can_undo)
                 || st.crop_undo.is_some()
                 || st.shape.is_some()
                 || st.adjust.touched()
                 || st.text_edit.as_ref().is_some_and(|e| e.has_step(true)),
             // an open shape has only its own drags to redo
-            can_redo: st.shape.as_ref().map_or_else(
-                || st.canvas.as_ref().is_some_and(Canvas::can_redo) || st.crop_redo_ready() || st.shape_to_redo(),
-                quickshape::ShapeEdit::can_redo,
-            ) || st.text_edit.as_ref().is_some_and(|e| e.has_step(false))
-                || st.plugin_steps().is_some_and(|(_, redo)| redo),
+            // Liquify open: only its own steps (and the step that kept it, once it came back by an
+            // undo) to redo
+            can_redo: if st.liquify_open() {
+                st.liquify_can_redo()
+            } else {
+                st.shape.as_ref().map_or_else(
+                    || {
+                        st.canvas.as_ref().is_some_and(Canvas::can_redo)
+                            || st.crop_redo_ready()
+                            || st.shape_to_redo()
+                            || st.liquify_redo_ready()
+                    },
+                    quickshape::ShapeEdit::can_redo,
+                ) || st.text_edit.as_ref().is_some_and(|e| e.has_step(false))
+                    || st.plugin_steps().is_some_and(|(_, redo)| redo)
+            },
             zoom: st.view.map_or(1.0, |v| v.zoom()),
             frames: st.frames,
             frame_interval_ms: st.frame_interval_ms,

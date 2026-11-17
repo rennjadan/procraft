@@ -262,6 +262,8 @@ pub struct Gallery {
     /// Where each artwork's picture (by folder) was last drawn: what the gallery zooms into and
     /// out of as an artwork opens and closes.
     pictures: HashMap<String, Rect>,
+    /// The box each artwork's picture was last fitted in.
+    boxes: HashMap<String, Rect>,
     /// Pictures shrinking under a press, growing as they lift, or going back (by folder).
     lifts: HashMap<String, Lift>,
     /// A stack opening, its artworks flying out of its cell (where it was, since when); or left,
@@ -386,6 +388,7 @@ impl Gallery {
             about: false,
             mark: None,
             pictures: HashMap::new(),
+            boxes: HashMap::new(),
             lifts: HashMap::new(),
             opening_stack: None,
             leaving_stack: None,
@@ -439,6 +442,20 @@ impl Gallery {
     /// Where the artwork in folder `dir` was last drawn, if it was.
     pub fn picture_of(&self, dir: &str) -> Option<Rect> {
         self.pictures.get(dir).copied()
+    }
+
+    /// Where the artwork in folder `dir` (its canvas `size` pixels) will be drawn once it shows
+    /// turned `turns` quarter turns clockwise (as its canvas was left), if its cell was drawn.
+    pub fn picture_as(&self, dir: &str, size: (u32, u32), turns: u32) -> Option<Rect> {
+        let shown = GalleryArtwork {
+            dir: dir.to_owned(),
+            name: String::new(),
+            width: size.0,
+            height: size.1,
+            modified_ms: 0,
+            turns,
+        };
+        self.boxes.get(dir).map(|frame| Self::fitted(*frame, &shown)).or_else(|| self.picture_of(dir))
     }
 
     /// The gallery's own page (its header and grid), as the window's background.
@@ -805,7 +822,7 @@ impl Gallery {
     /// the field under it.
     fn rename_places(a: &GalleryArtwork, screen: Rect) -> (Rect, Rect) {
         let (fw, fh) = (RENAME_FRAME.0 - RENAME_MARGIN * 2.0, RENAME_FRAME.1 - RENAME_MARGIN * 2.0);
-        let ratio = if a.width > 0 && a.height > 0 { a.width as f32 / a.height as f32 } else { 0.75 };
+        let ratio = shown_ratio(a);
         let (aw, ah) = if ratio > fw / fh { (fw, fw / ratio) } else { (fh * ratio, fh) };
         let top = screen.top() + RENAME_TOP + (RENAME_FRAME.1 - ah) / 2.0;
         let picture = Rect::from_min_size(pos2(screen.center().x - aw / 2.0, top), vec2(aw, ah));
@@ -1662,7 +1679,7 @@ impl Gallery {
 
     /// The artwork's picture as large as fits in `frame`, at its bottom middle.
     fn fitted(frame: Rect, a: &GalleryArtwork) -> Rect {
-        let ratio = if a.width > 0 && a.height > 0 { a.width as f32 / a.height as f32 } else { 0.75 };
+        let ratio = shown_ratio(a);
         let size = if ratio <= frame.width() / frame.height() {
             vec2(frame.height() * ratio, frame.height())
         } else {
@@ -1793,6 +1810,7 @@ impl Gallery {
         let frame = Self::thumb_box(cell);
         let picture = Self::fitted(frame, a);
         self.pictures.insert(a.dir.clone(), picture);
+        self.boxes.insert(a.dir.clone(), frame);
         // shrunk or grown about its middle as it is pressed or lifted; spread open, it is drawn
         // where the fingers have it instead
         let picture = Rect::from_center_size(picture.center(), picture.size() * scale);
@@ -2409,6 +2427,12 @@ impl Glide {
             self.y = y;
         }
     }
+}
+
+/// An artwork's width over its height as the gallery shows it (on its side, the other way).
+fn shown_ratio(a: &GalleryArtwork) -> f32 {
+    let upright = if a.width > 0 && a.height > 0 { a.width as f32 / a.height as f32 } else { 0.75 };
+    if a.turns % 2 == 1 { 1.0 / upright } else { upright }
 }
 
 #[cfg(test)]

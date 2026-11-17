@@ -49,6 +49,16 @@
 //!   its picture the plugin's `picture.wgsl`): `procraft_picker_pick(x: f32, y: f32) -> i64` gives
 //!   the saturation and brightness at a point of the square (0..1, y down) and
 //!   `procraft_picker_point(s: f32, v: f32) -> i64` where they sit, each pair packed as `position`'s.
+//!   If it has them (interface 6): `procraft_picker_on() -> i32` whether it draws Classic now (not
+//!   0; without it, always); `procraft_picker_hue(x: f32, y: f32) -> f32` the hue (0..1) a touch
+//!   starting at a point picks, below 0 where it picks saturation and brightness instead; and
+//!   `procraft_picker_hue_point(h: f32) -> i64` where hue `h`'s knob sits, packed as `position`'s,
+//!   below 0 while the picker leaves the hue to the app's slider.
+//! - `procraft_interface_part_scale(part: i32) -> f32`: for the hook `interface_part_scale`, how big
+//!   a part of the interface shows next to the rest of it, .5 to 2 (`part` by
+//!   [`crate::plugins::InterfacePart`]).
+//! - `procraft_floating_picker_only() -> i32`: for the hook `floating_picker_only`, whether the
+//!   floating colour window shows Classic's picker alone (not 0).
 //! - For the hook `quickshape_curve` (a curve QuickShape may snap to, the plugin's):
 //!   `procraft_curve_begin(count: i32, best: i32) -> i32` gives where the stroke's `count` points go
 //!   (x and y each, 32-bit floats, window pixels), `best` the kind QuickShape found first (its place
@@ -117,7 +127,9 @@
 //!   `procraft_brush_load(engine: i32, len: i32) -> i32` takes a brush's data and answers how it
 //!   looks (below 0: refused), `procraft_brush_begin(len: i32) -> i32` starts a stroke (its number,
 //!   -1: load its brush first), `procraft_brush_add(stroke: i32, len: i32) -> i32` takes its samples
-//!   and `procraft_brush_end(stroke: i32) -> i32` ends it, each answering how many dabs are at out.
+//!   and `procraft_brush_end(stroke: i32) -> i32` ends it, each answering how many dabs are at out;
+//!   if it has it, `procraft_brush_under(stroke: i32, len: i32) -> i32` takes the colours under the
+//!   dabs it asked about.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::{Duration, Instant};
@@ -198,6 +210,11 @@ const RANDOMISE: &str = "procraft_randomise";
 const COLOUR_TRIANGLE: &str = "procraft_colour_triangle";
 const PICKER_PICK: &str = "procraft_picker_pick";
 const PICKER_POINT: &str = "procraft_picker_point";
+const PICKER_ON: &str = "procraft_picker_on";
+const PICKER_HUE: &str = "procraft_picker_hue";
+const PICKER_HUE_POINT: &str = "procraft_picker_hue_point";
+const INTERFACE_PART_SCALE: &str = "procraft_interface_part_scale";
+const FLOATING_PICKER_ONLY: &str = "procraft_floating_picker_only";
 const CURVE_BEGIN: &str = "procraft_curve_begin";
 const CURVE_RUN: &str = "procraft_curve_run";
 const CURVE_NODES: &str = "procraft_curve_nodes";
@@ -251,6 +268,7 @@ const BRUSH_LOAD: &str = "procraft_brush_load";
 const BRUSH_BEGIN: &str = "procraft_brush_begin";
 const BRUSH_ADD: &str = "procraft_brush_add";
 const BRUSH_END: &str = "procraft_brush_end";
+const BRUSH_UNDER: &str = "procraft_brush_under";
 /// What making brushes of a file may spend and take, and reading one brush (its tips decoded).
 const IMPORT_FUEL: u64 = 8_000_000_000;
 const MOST_IMPORT_TIME: Duration = Duration::from_secs(60);
@@ -331,6 +349,10 @@ pub(crate) enum Hook {
     /// Brush engines of its own (interface 4): not named in `hooks`, but on it whenever its
     /// manifest lists `brush_engines`.
     Brushes,
+    /// How big a part of the interface shows next to the rest of it.
+    InterfacePartScale,
+    /// The floating colour window with Classic's picker alone.
+    FloatingPickerOnly,
 }
 
 impl Hook {
@@ -357,6 +379,8 @@ impl Hook {
             "layer_added" => Some(Hook::LayerAdded),
             "key_shortcut" => Some(Hook::KeyShortcut),
             "keep_clear" => Some(Hook::KeepClear),
+            "interface_part_scale" => Some(Hook::InterfacePartScale),
+            "floating_picker_only" => Some(Hook::FloatingPickerOnly),
             _ => None,
         }
     }
@@ -387,6 +411,8 @@ impl Hook {
             Hook::KeepClear => "This plugin can keep the interface clear of the status bar and the camera.",
             Hook::Layers => "This plugin can add kinds of layer whose strokes it keeps, and draw them again.",
             Hook::Brushes => "This plugin can read brush files and draw their brushes its own way.",
+            Hook::InterfacePartScale => "This plugin can make parts of the interface bigger or smaller.",
+            Hook::FloatingPickerOnly => "This plugin can show the floating colour window with its picker alone.",
         }
     }
 
@@ -406,6 +432,8 @@ impl Hook {
             Hook::InterfaceColour => exports(module, INTERFACE_COLOUR, &[ValType::I32], &[ValType::I32]),
             Hook::PinPanels => exports(module, PIN_PANELS, &[], &[ValType::I32]),
             Hook::KeepClear => exports(module, KEEP_CLEAR, &[], &[ValType::I32]),
+            Hook::InterfacePartScale => exports(module, INTERFACE_PART_SCALE, &[ValType::I32], &[ValType::F32]),
+            Hook::FloatingPickerOnly => exports(module, FLOATING_PICKER_ONLY, &[], &[ValType::I32]),
             Hook::OpacityTogether => exports(module, OPACITY_TOGETHER, &[], &[ValType::I32]),
             Hook::RandomiseBrush => exports(module, RANDOMISE, &[ValType::I32, ValType::I32], &[ValType::F32]),
             Hook::ColourTriangle => exports(module, COLOUR_TRIANGLE, &[], &[ValType::I32]),
@@ -671,6 +699,8 @@ struct BrushCalls {
     begin: TypedFunc<i32, i32>,
     add: TypedFunc<(i32, i32), i32>,
     end: TypedFunc<i32, i32>,
+    /// The colours under the dabs a stroke asked about, if it takes them.
+    under: Option<TypedFunc<(i32, i32), i32>>,
 }
 
 /// What a plugin says of an item recorded on its layer.
@@ -759,6 +789,11 @@ pub(crate) struct Running {
     colour_triangle: Option<TypedFunc<(), i32>>,
     picker_pick: Option<TypedFunc<(f32, f32), i64>>,
     picker_point: Option<TypedFunc<(f32, f32), i64>>,
+    picker_on: Option<TypedFunc<(), i32>>,
+    picker_hue: Option<TypedFunc<(f32, f32), f32>>,
+    picker_hue_point: Option<TypedFunc<f32, i64>>,
+    interface_part_scale: Option<TypedFunc<i32, f32>>,
+    floating_picker_only: Option<TypedFunc<(), i32>>,
     curve: Option<CurveCalls>,
     stroke_sound: Option<SoundCall>,
     sound_prepare: Option<TypedFunc<i32, i32>>,
@@ -900,6 +935,11 @@ impl Running {
             let colour_triangle = instance.get_typed_func(&store, COLOUR_TRIANGLE).ok();
             let picker_pick = instance.get_typed_func(&store, PICKER_PICK).ok();
             let picker_point = instance.get_typed_func(&store, PICKER_POINT).ok();
+            let picker_on = instance.get_typed_func(&store, PICKER_ON).ok();
+            let picker_hue = instance.get_typed_func(&store, PICKER_HUE).ok();
+            let picker_hue_point = instance.get_typed_func(&store, PICKER_HUE_POINT).ok();
+            let interface_part_scale = instance.get_typed_func(&store, INTERFACE_PART_SCALE).ok();
+            let floating_picker_only = instance.get_typed_func(&store, FLOATING_PICKER_ONLY).ok();
             let curve = (|| {
                 Some(CurveCalls {
                     begin: instance.get_typed_func(&store, CURVE_BEGIN).ok()?,
@@ -963,6 +1003,7 @@ impl Running {
                     begin: instance.get_typed_func(&store, BRUSH_BEGIN).ok()?,
                     add: instance.get_typed_func(&store, BRUSH_ADD).ok()?,
                     end: instance.get_typed_func(&store, BRUSH_END).ok()?,
+                    under: instance.get_typed_func(&store, BRUSH_UNDER).ok(),
                 })
             })();
             let key_buffer = instance.get_typed_func(&store, KEY_BUFFER).ok();
@@ -993,6 +1034,11 @@ impl Running {
                 colour_triangle,
                 picker_pick,
                 picker_point,
+                picker_on,
+                picker_hue,
+                picker_hue_point,
+                interface_part_scale,
+                floating_picker_only,
                 curve,
                 stroke_sound,
                 sound_prepare,
@@ -1368,6 +1414,19 @@ impl Running {
             guarded(|| long_call(store, &calls.add, (stroke, len), &mut left, until))?
         };
         self.dabs(count, &mut left, until)
+    }
+
+    /// Stroke `stroke` is handed the colours under the dabs it asked about (`colours`, four f32
+    /// each), if it takes them.
+    pub(crate) fn brush_under(&mut self, stroke: i32, colours: &[u8]) -> Result<(), Stop> {
+        if self.brushes.as_ref().is_none_or(|calls| calls.under.is_none()) {
+            return Ok(());
+        }
+        let (mut left, until) = (DAB_FUEL, Instant::now() + MOST_DAB_TIME);
+        let len = self.brush_in(colours, &mut left, until)?;
+        let Running { store, brushes, .. } = self;
+        let Some(under) = brushes.as_ref().and_then(|calls| calls.under.as_ref()) else { return Ok(()) };
+        guarded(|| long_call(store, under, (stroke, len), &mut left, until)).map(|_| ())
     }
 
     /// The dabs stroke `stroke` lays as it ends, [`DAB_BYTES`] each.
@@ -1814,6 +1873,77 @@ impl Running {
         let Running { store, picker_point, .. } = self;
         let Some(point) = picker_point else { return Ok(None) };
         picker_pair(store, point, (s, v)).map(Some)
+    }
+
+    /// Whether it says it draws its picker now: always, if it has no say.
+    pub(crate) fn picker_on(&mut self) -> Result<bool, Stop> {
+        let Running { store, picker_on, .. } = self;
+        let Some(picker_on) = picker_on else { return Ok(true) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            picker_on.call(&mut *store, ()).map_err(|e| stop_of(&e))
+        })?;
+        Ok(said != 0)
+    }
+
+    /// The hue (0..1, taken round) it says a touch starting at (`x`, `y`) of its picker picks; none
+    /// where it picks saturation and brightness, or if it picks no hue.
+    pub(crate) fn picker_hue(&mut self, x: f32, y: f32) -> Result<Option<f32>, Stop> {
+        let Running { store, picker_hue, .. } = self;
+        let Some(picker_hue) = picker_hue else { return Ok(None) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            picker_hue.call(&mut *store, (x, y)).map_err(|e| stop_of(&e))
+        })?;
+        if !said.is_finite() {
+            Err(Stop::Nonsense)
+        } else if said < 0.0 {
+            Ok(None)
+        } else {
+            Ok(Some(said.rem_euclid(1.0)))
+        }
+    }
+
+    /// Where it says hue `h`'s knob sits on its picker (0..1 each way, y down); none while it
+    /// leaves the hue to the app's slider.
+    pub(crate) fn picker_hue_point(&mut self, h: f32) -> Result<Option<(f32, f32)>, Stop> {
+        let Running { store, picker_hue_point, .. } = self;
+        let Some(point) = picker_hue_point else { return Ok(None) };
+        let packed = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            point.call(&mut *store, h).map_err(|e| stop_of(&e))
+        })?;
+        let bits = packed as u64;
+        let (x, y) = (f32::from_bits(bits as u32), f32::from_bits((bits >> 32) as u32));
+        if !x.is_finite() || !y.is_finite() {
+            Err(Stop::Nonsense)
+        } else if x < 0.0 || y < 0.0 {
+            Ok(None)
+        } else {
+            Ok(Some((x.min(1.0), y.min(1.0))))
+        }
+    }
+
+    /// How big it says part `part` of the interface shows next to the rest of it.
+    pub(crate) fn interface_part_scale(&mut self, part: i32) -> Result<f32, Stop> {
+        let Running { store, interface_part_scale, .. } = self;
+        let Some(scale) = interface_part_scale else { return Ok(1.0) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            scale.call(&mut *store, part).map_err(|e| stop_of(&e))
+        })?;
+        if SCALES.contains(&said) { Ok(said) } else { Err(Stop::Nonsense) }
+    }
+
+    /// Whether it says the floating colour window shows Classic's picker alone.
+    pub(crate) fn floating_picker_only(&mut self) -> Result<bool, Stop> {
+        let Running { store, floating_picker_only, .. } = self;
+        let Some(floating_picker_only) = floating_picker_only else { return Ok(false) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            floating_picker_only.call(&mut *store, ()).map_err(|e| stop_of(&e))
+        })?;
+        Ok(said != 0)
     }
 
     /// Where it says brush setting `setting` goes, as a share of its range (none: left as it is).
@@ -2397,6 +2527,66 @@ pub(crate) mod tests {
         }
     }
 
+    #[test]
+    fn a_part_s_scale_is_one_anybody_could_use() {
+        // part 0 as `value` says, any other as the rest
+        let says = |value: &str| {
+            let text = format!(
+                r#"(module (func (export "procraft_interface_part_scale") (param i32) (result f32)
+                    (if (result f32) (local.get 0) (then (f32.const 1)) (else (f32.const {value})))))"#
+            );
+            let bytes = wat::parse_str(text).unwrap();
+            assert!(can_run(&bytes, &[Hook::InterfacePartScale], false));
+            let mut running = started(&bytes);
+            (running.interface_part_scale(0), running.interface_part_scale(1))
+        };
+        assert_eq!(says("0.5"), (Ok(0.5), Ok(1.0)));
+        assert_eq!(says("0.75"), (Ok(0.75), Ok(1.0)));
+        for bad in ["0", "0.49", "2.01", "nan"] {
+            assert_eq!(says(bad).0, Err(Stop::Nonsense), "{bad}");
+        }
+        let only = r#"(module (func (export "procraft_floating_picker_only") (result i32) (i32.const 1)))"#;
+        let bytes = wat::parse_str(only).unwrap();
+        assert!(can_run(&bytes, &[Hook::FloatingPickerOnly], false));
+        assert_eq!(started(&bytes).floating_picker_only(), Ok(true));
+        assert!(!can_run(&bytes, &[Hook::InterfacePartScale], false), "not what that hook calls");
+    }
+
+    #[test]
+    fn a_picker_may_pick_the_hue_on_a_ring_of_its_own_and_go_quiet() {
+        // a ring outside the middle half: a touch there picks the hue a quarter round, and hue h
+        // sits at (h, 0); it draws while its control says
+        let text = format!(
+            r#"(module
+                (global $on (mut i32) (i32.const 1))
+                (func (export "procraft_control") (param i32 f32) (global.set $on (i32.trunc_f32_s (local.get 1))))
+                (func (export "procraft_picker_on") (result i32) (global.get $on))
+                (func (export "procraft_picker_hue") (param f32 f32) (result f32)
+                    (select (f32.const 0.25) (f32.const -1) (f32.gt (local.get 0) (f32.const 0.75))))
+                (func (export "procraft_picker_hue_point") (param f32) (result i64)
+                    (i64.extend_i32_u (i32.reinterpret_f32 (local.get 0))))
+                {})"#,
+            &PICKS["(module".len()..PICKS.len() - 1]
+        );
+        let bytes = wat::parse_str(text).unwrap();
+        assert!(can_run(&bytes, &[Hook::Picker], true));
+        let mut running = Running::start(&bytes, &[1.0]).unwrap();
+        assert_eq!(running.picker_on(), Ok(true));
+        assert_eq!(running.picker_hue(0.9, 0.5), Ok(Some(0.25)));
+        assert_eq!(running.picker_hue(0.5, 0.5), Ok(None));
+        assert_eq!(running.picker_hue_point(0.5), Ok(Some((0.5, 0.0))));
+        // below 0: the app's slider has the hue
+        assert_eq!(running.picker_hue_point(-0.5), Ok(None));
+        assert_eq!(running.picker_hue_point(f32::NAN), Err(Stop::Nonsense));
+        running.control(0, 0.0).unwrap();
+        assert_eq!(running.picker_on(), Ok(false));
+        // a picker without them always draws, and leaves the hue to the app
+        let mut plain = started(&wat::parse_str(PICKS).unwrap());
+        assert_eq!(plain.picker_on(), Ok(true));
+        assert_eq!(plain.picker_hue(0.9, 0.5), Ok(None));
+        assert_eq!(plain.picker_hue_point(0.5), Ok(None));
+    }
+
     /// A paste module whose `procraft_paste_row` does `body`, its buffer where `buffer` says.
     pub(crate) fn paste_module(buffer: &str, body: &str) -> Vec<u8> {
         let text = format!(
@@ -2677,5 +2867,33 @@ pub(crate) mod tests {
         }
         eprintln!("the most a press spent, by keys bound: {spent:?}");
         assert!(spent.iter().all(|&(_, most)| most < SAMPLE_FUEL), "{spent:?}");
+    }
+
+    #[test]
+    fn the_keyboard_plugin_gives_a_tablet_s_view_moves_keys() {
+        // told a tablet's shortcuts (Android's, an iPad's), with keys it kept for the view's own
+        // moves and a turn of 10°: each key is taken as its move's press, which the canvas does
+        use crate::KeyShortcut::{PanView, TurnView, ZoomView};
+        let (code, hooks, permissions) = keyboard_plugin();
+        let mut running = Running::start_on(&code, &[], &hooks, &permissions).unwrap();
+        let kept = "view:zoom-in\tcommand+=\nview:pan-left\tleft\nview:turn:-15\tshift+r\nTurn step\t10";
+        running.give_kept(kept.as_bytes()).unwrap();
+        running.tell_shortcuts(&crate::keys::shortcuts_told(false, false)).unwrap();
+        let combo = |text: &str| crate::KeyCombo::read(text).unwrap();
+        let mut does = |press: &str| {
+            let taken = running.key_shortcut(&combo(press)).unwrap();
+            let taken = taken.map_or_else(|| combo(press), |p| p.into_iter().next().unwrap());
+            crate::key_shortcut(taken.key, taken.command, taken.shift, taken.alt, false)
+        };
+        assert_eq!(does("command+="), Some(ZoomView { by: crate::KEY_ZOOM }));
+        assert_eq!(does("left"), Some(PanView { dx: -1.0, dy: 0.0 }));
+        assert_eq!(does("shift+r"), Some(TurnView { by: (-10f32).to_radians() }));
+        // the rest as they came: Ctrl+Z undoes, R alone does nothing on a tablet
+        assert_eq!(does("command+z"), Some(crate::KeyShortcut::Undo));
+        assert_eq!(does("r"), None);
+        // the list's rows say which keys do them now
+        let keys = running.key_shortcut_keys(&combo("view:zoom-in")).unwrap();
+        assert_eq!(keys, Some(vec![combo("command+=")]));
+        assert_eq!(running.key_shortcut_keys(&combo("view:fit")).unwrap(), None);
     }
 }

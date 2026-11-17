@@ -10,11 +10,92 @@ use crate::curve::Curve;
 use crate::textures::TEXTURE_SIZE;
 
 /// An image of the user's own for a brush's shape or grain: square greyscale, `TEXTURE_SIZE` on a
-/// side, rows top to bottom, white = paint; known by a hash of its pixels.
+/// side, rows top to bottom, white = paint; known by a hash of its pixels. One of our stand-ins for
+/// a stock image is known by what it is drawn from instead, is drawn the first time its pixels are
+/// read, and knows which stock image it stands in for, by the key its measurements are kept under
+/// (see [`crate::textures::stock_key`]).
 #[derive(Clone, Debug)]
 pub struct Source {
     pub id: u64,
-    pub pixels: Arc<Vec<u8>>,
+    pub pixels: Pixels,
+    pub stand_in_for: Option<u64>,
+}
+
+/// A source's pixels: drawn, or drawn the first time they are read (a stand-in, which most brushes
+/// holding it never draw with), once for every brush sharing them. They read as the pixels.
+#[derive(Clone)]
+pub struct Pixels(Arc<PixelCell>);
+
+struct PixelCell {
+    drawn: std::sync::OnceLock<Arc<Vec<u8>>>,
+    draw: Option<Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>>,
+}
+
+impl Pixels {
+    /// Pixels drawn already.
+    pub fn drawn(pixels: Arc<Vec<u8>>) -> Pixels {
+        let drawn = std::sync::OnceLock::new();
+        let _ = drawn.set(pixels);
+        Pixels(Arc::new(PixelCell { drawn, draw: None }))
+    }
+
+    /// Pixels `draw` draws the first time they are read (`TEXTURE_SIZE` square; blank if it can't).
+    pub fn later(draw: impl Fn() -> Option<Vec<u8>> + Send + Sync + 'static) -> Pixels {
+        Pixels(Arc::new(PixelCell { drawn: std::sync::OnceLock::new(), draw: Some(Box::new(draw)) }))
+    }
+
+    /// The pixels, to share (drawn now if they weren't).
+    pub fn shared(&self) -> Arc<Vec<u8>> {
+        Arc::clone(self.now())
+    }
+
+    /// Whether they are drawn yet.
+    pub fn is_drawn(&self) -> bool {
+        self.0.drawn.get().is_some()
+    }
+
+    /// Whether `a` and `b` are the same pixels, not a copy.
+    pub fn same(a: &Pixels, b: &Pixels) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+
+    /// A hold on them that doesn't keep them.
+    pub fn downgrade(&self) -> WeakPixels {
+        WeakPixels(Arc::downgrade(&self.0))
+    }
+
+    fn now(&self) -> &Arc<Vec<u8>> {
+        self.0.drawn.get_or_init(|| {
+            let side = TEXTURE_SIZE * TEXTURE_SIZE;
+            let drawn = self.0.draw.as_ref().and_then(|draw| draw()).filter(|p| p.len() == side);
+            Arc::new(drawn.unwrap_or_else(|| vec![0; side]))
+        })
+    }
+}
+
+impl std::ops::Deref for Pixels {
+    type Target = Vec<u8>;
+
+    fn deref(&self) -> &Vec<u8> {
+        self.now()
+    }
+}
+
+impl std::fmt::Debug for Pixels {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Pixels({})", if self.is_drawn() { "drawn" } else { "to draw" })
+    }
+}
+
+/// A hold on a source's pixels that doesn't keep them (see [`Pixels::downgrade`]).
+#[derive(Clone)]
+pub struct WeakPixels(std::sync::Weak<PixelCell>);
+
+impl WeakPixels {
+    /// The pixels, if anything still holds them.
+    pub fn upgrade(&self) -> Option<Pixels> {
+        self.0.upgrade().map(Pixels)
+    }
 }
 
 impl PartialEq for Source {
@@ -29,7 +110,7 @@ impl Source {
         if pixels.len() != TEXTURE_SIZE * TEXTURE_SIZE {
             return None;
         }
-        Some(Source { id: image_id(&pixels), pixels: Arc::new(pixels) })
+        Some(Source { id: image_id(&pixels), pixels: Pixels::drawn(Arc::new(pixels)), stand_in_for: None })
     }
 
     /// The image from pixels already shared (not copied), or none if it isn't `TEXTURE_SIZE`
@@ -38,7 +119,17 @@ impl Source {
         if pixels.len() != TEXTURE_SIZE * TEXTURE_SIZE {
             return None;
         }
-        Some(Source { id: image_id(&pixels), pixels })
+        Some(Source { id: image_id(&pixels), pixels: Pixels::drawn(pixels), stand_in_for: None })
+    }
+
+    /// The image `pixels` draws, known as `id` (what it is drawn from, told apart from any other).
+    pub fn drawn_later(id: u64, pixels: Pixels) -> Source {
+        Source { id, pixels, stand_in_for: None }
+    }
+
+    /// The image as our stand-in for the stock image whose measurements are kept under `key`.
+    pub fn standing_in_for(self, key: u64) -> Source {
+        Source { stand_in_for: Some(key), ..self }
     }
 
     /// The pixels as text (base64), to keep with a brush.
@@ -852,12 +943,16 @@ impl Brush {
     /// measured, held to an eighth to four times. 1 for any other grain, or where either isn't
     /// known.
     fn stand_in_tile(&self) -> f32 {
-        let (Some(stock), Some(index)) = (&self.stock.grain, self.grain.image) else { return 1.0 };
+        // the stock image its file names, or (a stock brush of ours, which names none) the one its
+        // grain's image stands in for
+        let stock = self.stock.grain.as_ref().map(|s| crate::textures::stock_key(&s.name));
+        let stock = stock.or_else(|| self.grain.source.as_ref().and_then(|s| s.stand_in_for));
+        let (Some(stock), Some(index)) = (stock, self.grain.image) else { return 1.0 };
         // a paper or a wash drawn by the stock image's own octaves of noise: a share of that image,
         // fixed to the canvas as wide as it times the file's scale over root two (as a brush
         // file's own image is), moving read as the image is stamp by stamp
         if crate::textures::drawn_by_octaves(index)
-            && let Some((width, _)) = crate::textures::stock_grain_octaves(&stock.name)
+            && let Some((width, _)) = crate::textures::stock_grain_octaves_of(stock)
         {
             let share = crate::textures::OCTAVE_SHARE;
             if self.grain.mode == GrainMode::Moving {
@@ -875,7 +970,7 @@ impl Brush {
             }
             return width * self.grain.file_scale() / std::f32::consts::SQRT_2 / self.grain.scale.max(1e-3);
         }
-        let theirs = crate::textures::stock_grain_features(&stock.name)
+        let theirs = crate::textures::stock_grain_features_of(stock)
             .map(|levels| crate::textures::feature_at_tile(&levels, self.grain.scale));
         stand_in_tile(theirs, crate::textures::grain_feature(index))
     }

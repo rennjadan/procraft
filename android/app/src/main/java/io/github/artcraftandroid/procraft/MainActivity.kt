@@ -17,6 +17,7 @@ import androidx.core.view.WindowInsetsControllerCompat
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.ProjectionPresentation
 import io.github.artcraftandroid.procraft.canvas.PEN_DOUBLE_TAP_KEY
+import io.github.artcraftandroid.procraft.canvas.systemShortcutKeys
 import io.github.artcraftandroid.procraft.canvas.PenKeyAction
 import io.github.artcraftandroid.procraft.canvas.PenDoubleTaps
 import io.github.artcraftandroid.procraft.canvas.keyPress
@@ -209,7 +210,8 @@ class MainActivity : ComponentActivity() {
         if (typing()) return super.onKeyDown(keyCode, event)
         if (isAltKey(keyCode) && event.repeatCount == 0 && !event.isCtrlPressed && vm.modifyKey(true)) return true
         val press = keyPress(keyCode, event.metaState)
-        if (event.repeatCount == 0 && press != null && vm.keyShortcut(press)) return true
+        // held, a key goes on moving the view, if that is what it does
+        if (press != null && vm.keyShortcut(press, repeat = event.repeatCount > 0)) return true
         return super.onKeyDown(keyCode, event)
     }
 
@@ -236,10 +238,7 @@ class MainActivity : ComponentActivity() {
         for (group in vm.plugins.keyShortcutList(false, false)) {
             val items = group.rows.flatMap { row ->
                 row.combos.mapNotNull { c ->
-                    val code = io.github.artcraftandroid.procraft.canvas.keyCodeNamed(c.key) ?: return@mapNotNull null
-                    val modifiers = (if (c.command) android.view.KeyEvent.META_CTRL_ON else 0) or
-                        (if (c.shift) android.view.KeyEvent.META_SHIFT_ON else 0) or
-                        (if (c.alt) android.view.KeyEvent.META_ALT_ON else 0)
+                    val (code, modifiers) = systemShortcutKeys(c.key, c.command, c.shift, c.alt) ?: return@mapNotNull null
                     android.view.KeyboardShortcutInfo(row.does, code, modifiers)
                 }
             }

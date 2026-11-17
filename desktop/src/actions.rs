@@ -1355,7 +1355,7 @@ pub fn plugin_panel(
     let mut asked = None;
     egui::Area::new(Id::unique("plugin panel")).fixed_pos(rect.min).order(Order::Foreground).show(ctx, |ui| {
         ui.allocate_rect(rect, Sense::click());
-        crate::panel::floating_frame(ui, look, "plugin panel frame", rect, backdrops);
+        crate::panel::floating_frame(ui, look, "plugin panel frame", rect, 1.0, backdrops);
         let painter = ui.painter().clone();
         let title_at = pos2(rect.left() + 24.0, rect.top() + 22.5);
         text(&painter, title_at, Align2::LEFT_TOP, &panel.title, 22.0, Weight::Bold, argb(crate::panel::PANEL_TITLE));
