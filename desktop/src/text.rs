@@ -213,6 +213,8 @@ pub struct TextEditor {
     ring: Option<(Chosen, Option<Picture>)>,
     /// A drag moving the text: where (points) it was last.
     dragging: Option<Pos2>,
+    /// The layer's box and typeface are pinned (Lock Position): only its words change.
+    pinned: bool,
     /// A press on a side's dot, dragged: the box's width.
     side: Option<SidePress>,
     /// Names drawn in their faces (by name, family, style and pixel size): the picture and its
@@ -312,6 +314,7 @@ impl TextEditor {
             return false;
         }
         self.start(session, info);
+        self.pinned = session.text_pinned(id);
         true
     }
 
@@ -323,6 +326,7 @@ impl TextEditor {
         self.style_open = false;
         self.before_style = None;
         self.dragging = None;
+        self.pinned = false;
         self.side = None;
         self.drawer.forget();
         self.info = Some(info);
@@ -341,6 +345,14 @@ impl TextEditor {
     /// The look of the letters chosen changed by `change` (with none chosen, of what is typed
     /// next): theirs alone.
     fn restyle(&mut self, session: &CanvasSession, change: TextStyleChange) {
+        // pinned, its typeface, style and size stay as they are
+        let typeface = matches!(
+            change,
+            TextStyleChange::Font { .. } | TextStyleChange::Style { .. } | TextStyleChange::Size { .. }
+        );
+        if self.pinned && typeface {
+            return;
+        }
         let (start, end) = self.chosen;
         if let Some(now) = session.text_restyle(start as u32, end as u32, change) {
             self.info = Some(now);
@@ -547,7 +559,10 @@ impl TextEditor {
                     if let Some(side) = session.text_side_at(p.x * ppp, p.y * ppp, SIDE_REACH * ppp) {
                         self.side = Some(SidePress { side, from: p, dragging: false });
                     } else if upright.contains(p) {
-                        self.dragging = Some(p);
+                        // pinned, the box stays where it is
+                        if !self.pinned {
+                            self.dragging = Some(p);
+                        }
                     } else {
                         ended = true;
                     }

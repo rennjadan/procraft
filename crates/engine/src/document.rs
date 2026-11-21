@@ -209,6 +209,11 @@ pub struct LayerText {
     /// throughout; then the look above is the first stretch's. One look throughout keeps none
     /// (as text was kept before it could have more), the look above being all of it's.
     pub runs: Vec<TextRun>,
+    /// Its box's place and width, and its typeface, style and size, kept as they are: only its
+    /// words (and colour and the like) change (Lock Position, for templates). Changed only by
+    /// [`Document::set_text_pinned`].
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
 }
 
 /// A stretch of a text layer's characters in a look of its own: its typeface and style, size,
@@ -277,6 +282,7 @@ impl Default for LayerText {
             origin: [0.0; 2],
             width: 0.0,
             runs: Vec::new(),
+            pinned: false,
         }
     }
 }
@@ -382,6 +388,32 @@ impl LayerText {
             vertical: self.vertical,
             ..LayerText::default()
         }
+    }
+
+    /// Its box's place and width, and its typeface, style and size (each stretch's from the one
+    /// of `before` where it starts), put back as `before` had them.
+    fn keep_place_and_type(&mut self, before: &LayerText) {
+        self.origin = before.origin;
+        self.width = before.width;
+        (self.font, self.style, self.size) = (before.font.clone(), before.style.clone(), before.size);
+        let mut at = 0u32;
+        for run in &mut self.runs {
+            let old = before.run_at(at);
+            (run.font, run.style, run.size) = (old.font, old.style, old.size);
+            at = at.saturating_add(run.len);
+        }
+    }
+
+    /// The look of the stretch that character `at` is in (the last one's past the end).
+    fn run_at(&self, at: u32) -> TextRun {
+        let mut start = 0u32;
+        for run in &self.runs {
+            start = start.saturating_add(run.len);
+            if at < start {
+                return run.clone();
+            }
+        }
+        self.runs.last().cloned().unwrap_or_else(|| self.run(0))
     }
 
     /// A layer name from the text: its first line, shortened.
@@ -1200,12 +1232,31 @@ impl Document {
     /// Changes a text layer's text (renaming it after the text); false if it isn't one.
     pub fn set_text(&mut self, id: LayerId, text: LayerText) -> bool {
         let Some(l) = self.layer_mut(id).filter(|l| l.text.is_some()) else { return false };
-        let text = text.sanitized();
+        let mut text = text.sanitized();
+        // pinned: the box stays where it is, as wide, in its typeface, style and size
+        if let Some(before) = l.text.as_ref() {
+            text.pinned = before.pinned;
+            if before.pinned {
+                text.keep_place_and_type(before);
+            }
+        }
         if let Some(name) = text.name() {
             l.name = name;
         }
         l.text = Some(text);
         true
+    }
+
+    /// Pins text layer `id`'s box and typeface (Lock Position), or lets them change again; false
+    /// if it isn't a text layer or is already so.
+    pub fn set_text_pinned(&mut self, id: LayerId, pinned: bool) -> bool {
+        match self.layer_mut(id).and_then(|l| l.text.as_mut()) {
+            Some(t) if t.pinned != pinned => {
+                t.pinned = pinned;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Makes a text layer, or a layer of a plugin's kind, an ordinary one, its pixels kept; false
@@ -2611,4 +2662,40 @@ mod tests {
         assert_eq!(ids(&d), vec![one, two]);
         assert!(d.layer(one_mask).is_none() && d.layer(three_mask).is_none());
     }
+
+    #[test]
+    fn pinned_text_keeps_its_place_and_typeface() {
+        let mut d = Document::new(100, 100);
+        let t = d.add_text_layer(LayerText {
+            text: "Name".to_owned(),
+            font: "Serif".to_owned(),
+            size: 30.0,
+            origin: [10.0, 20.0],
+            width: 50.0,
+            ..LayerText::default()
+        });
+        assert!(d.set_text_pinned(t, true));
+        let kept = d.layer(t).unwrap().text.clone().unwrap();
+        let moved = LayerText {
+            text: "Fire Drake".to_owned(),
+            font: "Sans".to_owned(),
+            size: 90.0,
+            origin: [70.0, 80.0],
+            width: 5.0,
+            color: [1.0, 0.0, 0.0],
+            pinned: false,
+            ..kept
+        };
+        assert!(d.set_text(t, moved));
+        let now = d.layer(t).unwrap().text.clone().unwrap();
+        assert_eq!(now.text, "Fire Drake");
+        assert_eq!(now.color, [1.0, 0.0, 0.0]);
+        assert_eq!((now.origin, now.width, now.size), ([10.0, 20.0], 50.0, 30.0));
+        assert_eq!(now.font, "Serif");
+        assert!(now.pinned);
+        assert!(d.set_text_pinned(t, false));
+        assert!(d.set_text(t, LayerText { origin: [1.0, 2.0], ..now }));
+        assert_eq!(d.layer(t).unwrap().text.as_ref().unwrap().origin, [1.0, 2.0]);
+    }
+
 }

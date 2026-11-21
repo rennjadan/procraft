@@ -1349,7 +1349,9 @@ impl Layers {
         let rows: Vec<LayerOptionRow> = session.layer_options(l.id);
         // a plugin's actions for the layer, after the app's own
         let actions = std::mem::take(&mut self.plugin_actions);
-        let count = rows.len() + actions.len();
+        // a text layer's own: its box and typeface kept while its words change (for templates)
+        let pinned = (l.text && !l.locked).then(|| session.text_pinned(l.id));
+        let count = rows.len() + usize::from(pinned.is_some()) + actions.len();
         // as measured, an empty one (a locked group's or mask's) is a pill 64 tall
         let height = (7.0 * 2.0 + menu::OPTION_HEIGHT * count as f32).max(64.0);
         let screen = ctx.content_rect();
@@ -1358,6 +1360,7 @@ impl Layers {
         let rect = Rect::from_min_size(pos2(panel.left() + OPTIONS_LEFT, top), vec2(OPTIONS_WIDTH, height));
         let mut chosen = None;
         let mut action = None;
+        let mut pin = None;
         self.options_menu.show(
             ctx,
             "layer options",
@@ -1377,7 +1380,14 @@ impl Layers {
                         chosen = Some(r.option);
                     }
                 }
-                for (&row, a) in places.iter().skip(rows.len()).zip(&actions) {
+                let mut after = rows.len();
+                if let (Some(on), Some(&row)) = (pinned, places.get(after)) {
+                    after += 1;
+                    if menu::option(ui, look, row, "Lock Position", on, true, false) {
+                        pin = Some(!on);
+                    }
+                }
+                for (&row, a) in places.iter().skip(after).zip(&actions) {
                     if menu::option(ui, look, row, &a.label, false, true, false) {
                         action = Some(a.key.clone());
                     }
@@ -1387,6 +1397,14 @@ impl Layers {
         if let Some(key) = action {
             self.options_menu.close();
             self.run_action = Some(key);
+            return;
+        }
+        if let Some(on) = pin {
+            self.options_menu.close();
+            if session.set_text_pinned(l.id, on) {
+                let said = if on { "Position locked: only the words change" } else { "Position unlocked" };
+                self.notice = Some((said.into(), true));
+            }
             return;
         }
         // every row closes the menu, a switch's too (it shows ticked next time)

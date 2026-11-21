@@ -174,6 +174,8 @@ impl From<TextInfo> for LayerText {
             origin: [t.x, t.y],
             width: t.width,
             runs: t.runs.into_iter().map(TextRun::from).collect(),
+            // (kept from the layer as it was: see `Document::set_text`)
+            pinned: false,
         }
     }
 }
@@ -504,7 +506,11 @@ impl CanvasSession {
     /// pixel (`x`, `y`), the nearer if both are; none when no text is being edited.
     pub fn text_side_at(&self, x: f32, y: f32, reach: f32) -> Option<TextSide> {
         let st = self.shared.lock();
-        let (_, info) = edited(&st)?;
+        // a pinned box's sides stay put
+        let (layer, info) = edited(&st)?;
+        if st.doc.layer(layer).and_then(|l| l.text.as_ref()).is_some_and(|t| t.pinned) {
+            return None;
+        }
         let m = st.view.map_or(Affine::IDENTITY, |v| v.to_screen());
         let [left, top, width, height] = <[f32; 4]>::try_from(crate::text_draw::text_box(info)).ok()?;
         let at = Vec2::new(x, y);
@@ -574,6 +580,20 @@ impl CanvasSession {
     }
 
     /// A text layer's text, or none for another layer.
+    /// Whether text layer `id`'s box and typeface are pinned (Lock Position): its words change,
+    /// not where it is or its typeface, style and size.
+    pub fn text_pinned(&self, id: u64) -> bool {
+        let st = self.shared.lock();
+        st.doc.layer(LayerId(id)).and_then(|l| l.text.as_ref()).is_some_and(|t| t.pinned)
+    }
+
+    /// Pins text layer `id`'s box and typeface, or lets them change again, as one undo step; false
+    /// if it isn't a text layer (or is already so).
+    pub fn set_text_pinned(&self, id: u64, pinned: bool) -> bool {
+        let name = if pinned { "Lock Position" } else { "Unlock Position" };
+        self.change(name, |d| d.set_text_pinned(LayerId(id), pinned).then_some(())).is_some()
+    }
+
     pub fn layer_text(&self, id: u64) -> Option<TextInfo> {
         let st = self.shared.lock();
         st.doc.layer(LayerId(id))?.text.as_ref().map(TextInfo::from)
