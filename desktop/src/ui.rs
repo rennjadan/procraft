@@ -143,6 +143,8 @@ pub struct Interface {
     erase_drop: ColourDrop,
     /// The shape tool.
     shapes: crate::shapes::Shapes,
+    /// The five colours in the top bar.
+    strip: crate::palette_strip::Strip,
     library: Library,
     overlays: Overlays,
     /// The interface is hidden (full screen).
@@ -278,6 +280,7 @@ impl Interface {
             drop: ColourDrop::default(),
             erase_drop: ColourDrop::eraser(),
             shapes: crate::shapes::Shapes::default(),
+            strip: crate::palette_strip::Strip::kept(&prefs.strip_colors, prefs.strip_shown),
             library: Library::default(),
             overlays: Overlays::default(),
             bars_hidden: false,
@@ -776,6 +779,28 @@ impl Interface {
                 None => {}
             }
         }
+        // the five colours in the top bar: tapped painted with, held set to the colour, dragged out
+        // poured (ColorDrop); their button opens the palettes
+        if let Some(gap) = crate::palette_strip::bar_gap(&bar) {
+            let (button, swatches) = crate::palette_strip::layout(gap, self.strip.shown);
+            self.strip.paint(ui, button, &swatches);
+            for (i, rect) in swatches.iter().enumerate() {
+                let rgb = self.strip.colors.get(i).copied().unwrap_or(0);
+                let id = ui.scope_id().with(("strip swatch", i));
+                match self.drop.source(ui, session, id, *rect, rgb, true, true, None) {
+                    Some(Touch::Tap) => self.colours.set_rgb(session, rgb),
+                    Some(Touch::Hold) => {
+                        if let Some(c) = self.strip.colors.get_mut(i) {
+                            *c = to_hex(self.colours.rgb());
+                        }
+                        self.keep_strip();
+                        self.overlays.notice("Swatch set to your colour", false);
+                    }
+                    Some(Touch::Dragged) => self.open = None,
+                    None => {}
+                }
+            }
+        }
         // the button beside the eraser: dragged out, what it lands in is cleared (EraseDrop);
         // tapped, it says how
         if let Some(rect) = bar.rect(BarButton::EraseDrop) {
@@ -887,6 +912,15 @@ impl Interface {
         self.colours.set_model(self.prefs.colour_model);
         if self.open != Some(Popover::Actions) {
             self.actions_panel.closed();
+        }
+        match self.strip.picker(&ctx, session, to_hex(self.colours.rgb())) {
+            Some(crate::palette_strip::Said::Changed) => self.keep_strip(),
+            Some(crate::palette_strip::Said::Notice(said)) => self.overlays.notice(said, false),
+            Some(crate::palette_strip::Said::Save(five)) => {
+                self.colours.palettes.add_named("Color theme".into(), five.to_vec());
+                self.overlays.notice("Saved to your palettes", false);
+            }
+            None => {}
         }
         let mut card = crate::shapes::Card {
             corner_mm: self.prefs.card_corner_mm,
@@ -1407,6 +1441,13 @@ impl Interface {
     fn follow_shape(&mut self, session: &CanvasSession) {
         self.overlays.shape = session.quickshape_info();
         self.overlays.shape_editing &= self.overlays.shape.is_some();
+    }
+
+    /// The palette strip kept as it now is.
+    fn keep_strip(&mut self) {
+        self.prefs.strip_colors = self.strip.colors_text();
+        self.prefs.strip_shown = self.strip.shown;
+        self.prefs.keep();
     }
 
     /// Undo (recoloring, the core takes back the open fill first).

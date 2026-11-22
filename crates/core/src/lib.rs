@@ -38,6 +38,7 @@ mod gestures;
 mod gradients;
 mod grain_store;
 mod guide;
+mod harmony_palettes;
 mod held;
 mod history;
 mod hooks;
@@ -160,6 +161,7 @@ pub use gestures::{
 };
 pub use gradients::{GradientInfo, GradientStop, Gradients};
 pub use guide::{GuideInfo, GuideType, GuideUnit, SymmetryType};
+pub use harmony_palettes::{HarmonyPalette, harmony_palettes};
 pub use history::ColourHistory;
 pub use hues::{HueControl, RING_HUES, SLIDER_HUES, hue_at, hue_position, hue_stops};
 pub use keys::{KEY_ZOOM, KeyCombo, KeyDrag, KeyShortcut, ShortcutGroup, ShortcutRow, key_shortcut, key_shortcut_list};

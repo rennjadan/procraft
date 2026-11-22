@@ -147,6 +147,11 @@ impl Palettes {
         Some(palette::write_swatches(p, &crate::layers::srgb_profile()))
     }
 
+    /// A palette named `name` of `colors` (0xRRGGBB), added at the end.
+    pub fn add_named(&self, name: String, colors: Vec<u32>) {
+        self.change(|p, _| p.push(Palette::new(name.clone(), colors.into_iter().map(|c| Some(c & 0xFF_FFFF)))));
+    }
+
     /// A palette of the main colours of a picture (`pixels` 0xAARRGGBB), light to dark, added at
     /// the end; false if it has none (all see-through).
     pub fn add_from_pixels(&self, pixels: Vec<u32>) -> bool {

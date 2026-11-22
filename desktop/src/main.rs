@@ -41,6 +41,7 @@ mod look;
 mod menu;
 mod model_picture;
 mod overlays;
+mod palette_strip;
 mod panel;
 mod pdf;
 mod pen;
