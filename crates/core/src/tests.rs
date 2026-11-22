@@ -15523,3 +15523,38 @@ fn a_painted_layer_traced_becomes_a_vector_layer_that_looks_as_it_did_and_goes_b
     assert_eq!(layer_rgba(&s, pixel), after);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn an_erase_drop_clears_the_area_it_lands_in_and_undoes_as_one_step() {
+    let Some(s) = session(100, 100) else { return };
+    let layer = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+    s.set_color(1.0, 0.0, 0.0);
+    assert!(s.fill_layer(layer));
+    s.set_brush_size(0.05);
+    s.set_color(0.0, 0.0, 0.0);
+    let ring: Vec<PenSample> = (0..=64)
+        .map(|i| {
+            let t = i as f32 / 64.0 * std::f32::consts::TAU;
+            sample(50.0 + 30.0 * t.cos(), 50.0 + 30.0 * t.sin(), f64::from(i) * 8.0)
+        })
+        .collect();
+    s.stroke_begin(PointerKind::Finger, ring[..1].to_vec());
+    s.stroke_add(ring[1..].to_vec());
+    s.stroke_end(vec![]);
+    let red = |[r, g, b, a]: [u8; 4]| r > 200 && g < 60 && b < 60 && a > 200;
+    assert!(red(pixel(&s, 50, 50)) && red(pixel(&s, 5, 5)));
+    assert!(s.erase_drop(50.0, 50.0, 0.2));
+    s.pour_end(true, Some("EraseDrop".to_owned()));
+    let alpha = |x: usize, y: usize| {
+        let pixels = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+        pixels.get((y * 100 + x) * 4 + 3).copied().unwrap()
+    };
+    assert_eq!(alpha(50, 50), 0, "inside the ring, the layer is see-through");
+    assert_eq!(alpha(5, 5), 255);
+    assert!(red(pixel(&s, 5, 5)), "outside it stays");
+    s.undo();
+    assert!(red(pixel(&s, 50, 50)), "one undo brings it back");
+    // Alpha Lock keeps coverage: nothing to clear
+    assert!(s.set_layer_alpha_lock(layer, true));
+    assert!(!s.erase_drop(50.0, 50.0, 0.2));
+}

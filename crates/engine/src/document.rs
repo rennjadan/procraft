@@ -2697,5 +2697,4 @@ mod tests {
         assert!(d.set_text(t, LayerText { origin: [1.0, 2.0], ..now }));
         assert_eq!(d.layer(t).unwrap().text.as_ref().unwrap().origin, [1.0, 2.0]);
     }
-
 }

@@ -20,6 +20,8 @@ pub enum BarButton {
     Paint,
     Smudge,
     Erase,
+    /// EraseDrop, beside the eraser: dragged out, what it lands in is cleared.
+    EraseDrop,
     Layers,
     Colour,
 }
@@ -135,21 +137,58 @@ pub fn top_bar(ui: &mut Ui, look: &mut Look, tool: ToolKind, colour: Color32, br
         }
         let tools = [
             (BarButton::Layers, &icons::LAYERS, lit.layers),
+            (BarButton::EraseDrop, &icons::ERASE, false),
             (BarButton::Erase, &icons::ERASE, !lit.panel_open && tool == ToolKind::Erase),
             (BarButton::Smudge, &icons::SMUDGE, !lit.panel_open && tool == ToolKind::Smudge),
             (BarButton::Paint, &icons::BRUSH, !lit.panel_open && tool == ToolKind::Paint),
         ];
+        let mut erase_drop = None;
         for (which, icon, on) in tools {
             x -= pc::BAR_BUTTON_WIDTH + tool_gap;
             let rect = button(x, pc::BAR_BUTTON_WIDTH);
+            // EraseDrop's touches are its own (as the colour's are ColorDrop's): a see-through
+            // drop, checked as see-through is shown
+            if which == BarButton::EraseDrop {
+                checked_disc(ui.painter(), rect.center(), pc::COLOR_DOT / 2.0);
+                erase_drop = Some(rect);
+                continue;
+            }
             tap(ui, which, rect);
             let l = highlight(&ctx, ui.scope_id().with(("lit", which)), on);
             // a 44 frame shown as it is, over the 38 tall button
             look.icon(ui, icon, rect.center(), 44.0, mix(argb(pc::BAR_GLYPH), argb(pc::BAR_GLYPH_SELECTED), l));
         }
         bar.rects.push((BarButton::Colour, colour_rect));
+        if let Some(rect) = erase_drop {
+            bar.rects.push((BarButton::EraseDrop, rect));
+        }
     });
     bar
+}
+
+/// A disc of radius `r` at `c` checked grey and white, as see-through is shown, ringed.
+fn checked_disc(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let (light, dark) = (Color32::from_gray(235), Color32::from_gray(150));
+    painter.circle_filled(c, r, light);
+    let cell = r / 2.0;
+    let clip = painter.with_clip_rect(Rect::from_center_size(c, vec2(r * 2.0, r * 2.0)));
+    // the dark squares, cut round by the light disc's ring drawn over
+    for i in -2..2 {
+        for j in -2..2 {
+            if (i + j) % 2 != 0 {
+                let min = pos2(c.x + i as f32 * cell, c.y + j as f32 * cell);
+                let sq = Rect::from_min_size(min, vec2(cell, cell));
+                // only the parts inside the disc: corners nearer than the radius
+                let near = [sq.left_top(), sq.right_top(), sq.left_bottom(), sq.right_bottom()]
+                    .iter()
+                    .all(|p| p.distance(c) <= r + 0.5);
+                if near {
+                    clip.rect_filled(sq, 0, dark);
+                }
+            }
+        }
+    }
+    painter.circle_stroke(c, r - 0.5, Stroke::new(1.5, Color32::from_gray(90)));
 }
 
 /// Where the side bar is in `window`, against its right edge or its left.

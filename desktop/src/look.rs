@@ -158,7 +158,7 @@ pub mod pc {
             (26.0, 14.0)
         };
         let needs = |(tool, action): (f32, f32)| {
-            BAR_MARGIN * 2.0 + GALLERY_WIDTH + (BAR_BUTTON_WIDTH + action) * 4.0 + BAR_BUTTON_WIDTH * 5.0 + tool * 4.0
+            BAR_MARGIN * 2.0 + GALLERY_WIDTH + (BAR_BUTTON_WIDTH + action) * 4.0 + BAR_BUTTON_WIDTH * 6.0 + tool * 5.0
         };
         [measured, (8.0, 14.0)].into_iter().find(|&gaps| needs(gaps) <= width).unwrap_or((2.0, 4.0))
     }
@@ -740,17 +740,19 @@ mod tests {
     fn the_top_bars_ends_never_meet_and_a_wide_enough_window_keeps_its_measured_step() {
         assert_eq!(pc::bar_gaps(720.0), (8.0, 14.0));
         assert_eq!(pc::bar_gaps(1200.0), (26.0, 14.0));
-        // the step for this width has gaps of 26 and 14, which would take 694
-        assert_eq!(pc::bar_gaps(650.0), (8.0, 14.0));
+        // (with EraseDrop's button) the step for this width has gaps of 26 and 14, which would take
+        // 764, and 8 and 14 would take 674
+        assert_eq!(pc::bar_gaps(650.0), (2.0, 4.0));
+        assert_eq!(pc::bar_gaps(680.0), (8.0, 14.0));
         assert_eq!(pc::bar_gaps(610.0), (2.0, 4.0));
-        for width in 558..2000 {
+        for width in 604..2000 {
             let width = width as f32;
             let (tool, action) = pc::bar_gaps(width);
             let needs = pc::BAR_MARGIN * 2.0
                 + pc::GALLERY_WIDTH
                 + (pc::BAR_BUTTON_WIDTH + action) * 4.0
-                + pc::BAR_BUTTON_WIDTH * 5.0
-                + tool * 4.0;
+                + pc::BAR_BUTTON_WIDTH * 6.0
+                + tool * 5.0;
             assert!(needs <= width, "{width}");
         }
     }

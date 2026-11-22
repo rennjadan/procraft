@@ -90,6 +90,8 @@ pub struct ColourDrop {
     /// The colour button's centre, as last drawn: over the bars a dragged colour shrinks the
     /// further it is from it.
     button: Option<Pos2>,
+    /// EraseDrop: what it lands in is cleared to see-through, as the eraser would.
+    erase: bool,
 }
 
 impl Default for ColourDrop {
@@ -105,7 +107,37 @@ impl Default for ColourDrop {
             poured: false,
             refused: false,
             button: None,
+            erase: false,
         }
+    }
+}
+
+impl ColourDrop {
+    /// EraseDrop: dragged out of the button beside the eraser, what it lands in is cleared to
+    /// see-through (no Continue filling).
+    pub fn eraser() -> ColourDrop {
+        ColourDrop { erase: true, ..ColourDrop::default() }
+    }
+
+    /// What it's called, on the band and as the undo step.
+    fn name(&self) -> &'static str {
+        if self.erase { "EraseDrop" } else { "ColorDrop" }
+    }
+
+    /// Fills (or clears) at window pixel (`x`, `y`) with `threshold`.
+    fn drop_at(&self, session: &CanvasSession, x: f32, y: f32, rgb: u32, threshold: f32) -> bool {
+        if self.erase {
+            session.erase_drop(x, y, threshold)
+        } else {
+            let [r, g, b] = of_hex(rgb);
+            session.pour_drop(x, y, r, g, b, threshold)
+        }
+    }
+
+    /// The fill let go: one undo step, and the band offers to go on filling (ColorDrop's only).
+    fn ended(&mut self, session: &CanvasSession) {
+        session.pour_end(true, Some(self.name().to_owned()));
+        self.band = if self.erase { Band::None } else { Band::Dropped(Instant::now()) };
     }
 }
 
@@ -242,9 +274,8 @@ impl ColourDrop {
         let rested = press.and_then(|p| p.drag).map(|d| d.now()).filter(|s| s.resting).map(|s| pos2(s.dot_x, s.dot_y));
         let dot = self.dot.take();
         if std::mem::take(&mut self.poured) {
-            session.pour_end(true, None);
             self.sliding = false;
-            self.band = Band::Dropped(Instant::now());
+            self.ended(session);
             return;
         }
         let at =
@@ -252,14 +283,12 @@ impl ColourDrop {
         let poured = match (at, dot) {
             (Some(at), Some((_, rgb))) => {
                 let ppp = ctx.pixels_per_point();
-                let [r, g, b] = of_hex(rgb);
-                session.pour_drop(at.x * ppp, at.y * ppp, r, g, b, self.threshold)
+                self.drop_at(session, at.x * ppp, at.y * ppp, rgb, self.threshold)
             }
             _ => false,
         };
         if poured {
-            session.pour_end(true, None);
-            self.band = Band::Dropped(Instant::now());
+            self.ended(session);
         } else {
             self.band = Band::None;
         }
@@ -283,8 +312,7 @@ impl ColourDrop {
             return;
         }
         let ppp = ctx.pixels_per_point();
-        let [r, g, b] = of_hex(rgb);
-        self.poured = session.pour_drop(at.x * ppp, at.y * ppp, r, g, b, threshold);
+        self.poured = self.drop_at(session, at.x * ppp, at.y * ppp, rgb, threshold);
         self.refused = !self.poured;
     }
 
@@ -328,11 +356,14 @@ impl ColourDrop {
                 _ => self.band = Band::None,
             }
         }
-        let fill = (self.band == Band::Filling).then(|| {
-            let [r, g, b] = of_hex(self.swatch.unwrap_or(current));
-            Fill { r, g, b, threshold: self.threshold }
-        });
-        session.set_touch_filling(fill);
+        // (Continue filling is ColorDrop's: EraseDrop leaves the touches to it)
+        if !self.erase {
+            let fill = (self.band == Band::Filling).then(|| {
+                let [r, g, b] = of_hex(self.swatch.unwrap_or(current));
+                Fill { r, g, b, threshold: self.threshold }
+            });
+            session.set_touch_filling(fill);
+        }
         if self.band != Band::None {
             self.shown = self.band;
         }
@@ -340,12 +371,17 @@ impl ColourDrop {
         let blob = self.press.as_ref().filter(|p| p.dragging).and_then(|p| p.blob.clone());
         if let (Some((_, rgb)), Some(blob)) = (self.dot, blob) {
             let shape = blob.shape(ctx.input(|i| i.time) * 1000.0);
-            let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique("colour drop dot")));
+            let painter = ctx
+                .layer_painter(egui::LayerId::new(egui::Order::Tooltip, Id::unique(("colour drop dot", self.erase))));
             paint_blob(&painter, &shape, srgb(of_hex(rgb)), ctx.pixels_per_point());
             // it springs and wobbles on its own
             ctx.request_repaint();
         }
-        let out = ease(ctx.animate_bool_with_time(Id::unique("colour drop band"), self.band != Band::None, SLIDE));
+        let out = ease(ctx.animate_bool_with_time(
+            Id::unique(("colour drop band", self.erase)),
+            self.band != Band::None,
+            SLIDE,
+        ));
         if out <= 0.0 {
             return;
         }
@@ -354,7 +390,7 @@ impl ColourDrop {
         let lined = matches!(what, Band::Dragging | Band::Filling);
         let height = BAND_HEIGHT + if self.sliding { ROW_HEIGHT } else { 0.0 } + if lined { LINE_HEIGHT } else { 0.0 };
         let y = top - (1.0 - out) * height;
-        egui::Area::new(Id::unique("colour drop band"))
+        egui::Area::new(Id::unique(("colour drop band", self.erase)))
             .fixed_pos(pos2(window.left(), y))
             .order(egui::Order::Middle)
             .show(ctx, |ui| {
@@ -366,12 +402,19 @@ impl ColourDrop {
                 let ink = argb(INK);
                 let blue = argb(pc::ACCENT);
                 // "ColorDrop", then the tick that ends filling or the offer to continue
-                let name = painter.layout_no_wrap("ColorDrop".into(), Weight::Bold.font(16.5), ink).size().x;
+                let title = self.name();
+                let name = painter.layout_no_wrap(title.into(), Weight::Bold.font(16.5), ink).size().x;
                 let button = vec2(if what == Band::Filling { 20.0 } else { 101.0 }, 20.0);
-                let left = band.center().x - (name + 13.0 + button.x) / 2.0;
-                text(painter, pos2(left, band.center().y), Align2::LEFT_CENTER, "ColorDrop", 16.5, Weight::Bold, ink);
+                // EraseDrop's band is its name alone
+                let left = if self.erase {
+                    band.center().x - name / 2.0
+                } else {
+                    band.center().x - (name + 13.0 + button.x) / 2.0
+                };
+                text(painter, pos2(left, band.center().y), Align2::LEFT_CENTER, title, 16.5, Weight::Bold, ink);
                 let button = Rect::from_min_size(pos2(left + name + 13.0, band.center().y - button.y / 2.0), button);
-                if what == Band::Filling {
+                if self.erase {
+                } else if what == Band::Filling {
                     painter.circle_filled(button.center(), 10.0, blue);
                     let c = button.center();
                     // the tick's ends rounded
@@ -392,7 +435,9 @@ impl ColourDrop {
                         Color32::WHITE,
                     );
                 }
-                if ui.interact(button, ui.scope_id().with("colour drop button"), Sense::click()).clicked() {
+                if !self.erase
+                    && ui.interact(button, ui.scope_id().with("colour drop button"), Sense::click()).clicked()
+                {
                     if what == Band::Filling {
                         self.end_filling();
                     } else if matches!(self.band, Band::Dropped(_)) {

@@ -553,6 +553,12 @@ pub fn pour_over(pixels: &mut [u8], mask: &Mask, colour: [f32; 3], alpha_lock: b
     pour_with(pixels, mask, alpha_lock, |_| [r, g, b, 1.0]);
 }
 
+/// Clears `pixels` (premultiplied RGBA8) to see-through as much as `mask` takes it, as the eraser
+/// would (EraseDrop).
+pub fn erase(pixels: &mut [u8], mask: &Mask) {
+    pour_with(pixels, mask, false, |_| [0.0; 4]);
+}
+
 /// Each pixel `mask` takes moved toward what `full` (from the pixel, premultiplied 0..1) makes of
 /// it, as far as the mask goes.
 fn pour_with(pixels: &mut [u8], mask: &Mask, alpha_lock: bool, full: impl Fn([f32; 4]) -> [f32; 4]) {

@@ -51,6 +51,8 @@ pub(crate) struct Pour {
     /// The reference layer's pixels when measured on it, so poured over this one.
     elsewhere: Option<Vec<u8>>,
     colour: [f32; 3],
+    /// It clears what it reaches to see-through, as the eraser would (EraseDrop).
+    erase: bool,
     selection: Option<Mask>,
     alpha_lock: bool,
     /// The threshold last poured, in thousandths, and where the layer was last poured into (x, y,
@@ -75,7 +77,7 @@ impl Pour {
         let mask = self.flood.as_ref().map(|flood| {
             let mut mask = self.closed.clone().unwrap_or_else(|| flood.mask(threshold));
             // poured into what is see-through, it goes on under the line it stopped at
-            if flood.colour[3] == 0 {
+            if flood.colour[3] == 0 && !self.erase {
                 fill::under_edges(&mut mask, self.elsewhere.as_deref().unwrap_or(&self.before));
             }
             if let Some(sel) = &self.selection {
@@ -117,7 +119,9 @@ impl Pour {
         if let (Some(mask), Some(flood)) = (&mask, &self.flood) {
             let data = cut(&mask.data, 1);
             let part = Mask { width: region[2], height: region[3], data };
-            if self.elsewhere.is_some() {
+            if self.erase {
+                fill::erase(&mut pixels, &part);
+            } else if self.elsewhere.is_some() {
                 fill::pour_over(&mut pixels, &part, self.colour, self.alpha_lock);
             } else {
                 fill::pour(&mut pixels, &part, flood.colour, self.colour, self.alpha_lock);
@@ -319,14 +323,24 @@ impl CanvasSession {
     /// the canvas, or the layer locked or text). The pour stays open for
     /// [`CanvasSession::pour_threshold`] until [`CanvasSession::pour_end`].
     pub fn pour_begin(&self, x: f32, y: f32, r: f32, g: f32, b: f32, threshold: f32) -> bool {
-        self.begin_pour(x, y, [r, g, b], threshold, false)
+        self.begin_drop(x, y, [r, g, b], threshold, false, false)
     }
 
     /// Pours as [`CanvasSession::pour_begin`] does a colour dragged out and let go, or come to
     /// rest, at window point (`x`, `y`): the fill is made at once, and shows spreading in from the
     /// point over a moment (at once with Reduce Motion).
     pub fn pour_drop(&self, x: f32, y: f32, r: f32, g: f32, b: f32, threshold: f32) -> bool {
-        self.begin_pour(x, y, [r, g, b], threshold, true)
+        self.begin_drop(x, y, [r, g, b], threshold, true, false)
+    }
+
+    /// Clears the area joined to window point (`x`, `y`) with `threshold` (0..1) on the current
+    /// layer to see-through, as the eraser would, as [`CanvasSession::pour_drop`] fills it
+    /// (EraseDrop): within the selection if there is one, spreading in from the point, open for
+    /// [`CanvasSession::pour_threshold`] until [`CanvasSession::pour_end`] (name it "EraseDrop").
+    /// False if nothing was cleared (off the canvas, or the layer locked, text, Alpha Locked or a
+    /// plugin's).
+    pub fn erase_drop(&self, x: f32, y: f32, threshold: f32) -> bool {
+        self.begin_drop(x, y, [0.0; 3], threshold, true, true)
     }
 
     /// The open pour redone from window point (`x`, `y`) instead, from the layer as it was: off
@@ -406,7 +420,8 @@ impl CanvasSession {
 impl CanvasSession {
     /// Pours `colour` at window point (`x`, `y`) with `threshold` (see
     /// [`CanvasSession::pour_begin`]); `spread`: shown spreading in from the point.
-    fn begin_pour(&self, x: f32, y: f32, colour: [f32; 3], threshold: f32, spread: bool) -> bool {
+    /// `erase`: cleared to see-through instead (EraseDrop).
+    fn begin_drop(&self, x: f32, y: f32, colour: [f32; 3], threshold: f32, spread: bool, erase: bool) -> bool {
         self.pour_end(true, None);
         self.await_pour();
         let mut guard = self.shared.lock();
@@ -418,6 +433,10 @@ impl CanvasSession {
         let (w, h) = (st.doc.width(), st.doc.height());
         let current = st.doc.current();
         let Some(layer) = st.doc.layer(current).cloned() else { return false };
+        // nothing to clear on a layer whose coverage is kept, nor one a plugin draws
+        if erase && (layer.alpha_lock || layer.plugin.is_some()) {
+            return false;
+        }
         // a plugin's layer that takes a dropped colour makes of it what it will, as one step
         if layer.plugin.is_some() && !st.doc.is_locked(current) && st.plugin_layer_fills(current) {
             let at = Vec2::new(seed.0 as f32 + 0.5, seed.1 as f32 + 0.5);
@@ -446,6 +465,7 @@ impl CanvasSession {
             flood: None,
             elsewhere,
             colour: [r, g, b].map(unit),
+            erase,
             selection: within,
             alpha_lock: layer.alpha_lock,
             shown: thousandths(threshold),

@@ -139,6 +139,8 @@ pub struct Interface {
     background_pick: Option<BackgroundPick>,
     pub(crate) colours: Colours,
     drop: ColourDrop,
+    /// EraseDrop, dragged out of the button beside the eraser.
+    erase_drop: ColourDrop,
     library: Library,
     overlays: Overlays,
     /// The interface is hidden (full screen).
@@ -272,6 +274,7 @@ impl Interface {
             background_pick: None,
             colours: Colours::default(),
             drop: ColourDrop::default(),
+            erase_drop: ColourDrop::eraser(),
             library: Library::default(),
             overlays: Overlays::default(),
             bars_hidden: false,
@@ -697,6 +700,7 @@ impl Interface {
             self.hover_cursor(&ctx, session, &info, input);
             self.overlays.show(ui, &mut self.look, colour, false);
             self.drop.show(&ctx, session, to_hex(self.colours.rgb()), 0.0);
+            self.erase_drop.show(&ctx, session, 0, 0.0);
             self.copy_paste_panel(&ctx, session);
             self.layer_choice(&ctx, session);
             self.quick_menu(&ctx, session);
@@ -738,7 +742,7 @@ impl Interface {
             Some(BarButton::Transform) => self.toggle_transform(session),
             Some(BarButton::Selection) => self.toggle_selection(session),
             Some(BarButton::Adjustments) => self.adjustments_pressed(session),
-            Some(BarButton::Colour) | None => {}
+            Some(BarButton::Colour | BarButton::EraseDrop) | None => {}
         }
         // the colour button: tapped it opens the colours, held it goes back to the previous
         // colour, and dragged out its colour fills where it is let go (ColorDrop)
@@ -754,6 +758,16 @@ impl Interface {
                 }
                 Some(Touch::Dragged) => self.open = None,
                 None => {}
+            }
+        }
+        // the button beside the eraser: dragged out, what it lands in is cleared (EraseDrop);
+        // tapped, it says how
+        if let Some(rect) = bar.rect(BarButton::EraseDrop) {
+            let id = ui.scope_id().with("erase drop button");
+            match self.erase_drop.source(ui, session, id, rect, 0xF2F2F2, false, false, None) {
+                Some(Touch::Tap) => self.overlays.notice("Drag onto an area to erase it", false),
+                Some(Touch::Dragged) => self.open = None,
+                _ => {}
             }
         }
         self.canvas_rect = ui.available_rect_before_wrap();
@@ -906,6 +920,7 @@ impl Interface {
             self.animation.reset(session);
         }
         self.drop.show(&ctx, session, to_hex(self.colours.rgb()), pc::BAR_HEIGHT);
+        self.erase_drop.show(&ctx, session, 0, pc::BAR_HEIGHT);
         self.copy_paste_panel(&ctx, session);
         self.layer_choice(&ctx, session);
         self.quick_menu(&ctx, session);
