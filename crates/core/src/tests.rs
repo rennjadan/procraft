@@ -15491,40 +15491,6 @@ fn a_long_session_keeps_the_app_s_thread_quick() {
 }
 
 #[test]
-fn a_painted_layer_traced_becomes_a_vector_layer_that_looks_as_it_did_and_goes_back_to_pixels() {
-    let Some((s, _plugins, dir)) = vector_session(120, "trace") else { return };
-    let pixel = s.add_layer();
-    s.select_layer(pixel);
-    for y in [30.0, 60.0, 90.0] {
-        stroke_across(&s, y, 10.0, 110.0);
-    }
-    let before = layer_rgba(&s, pixel);
-    assert_eq!(s.plain_layer_ids().first(), Some(&pixel));
-    assert_eq!(s.vectorize_layer(pixel, VECTOR_KIND), Some(true));
-    assert_eq!(s.plugin_layer_kind(pixel).as_deref(), Some(VECTOR_KIND));
-    let items = vector_items(&s, pixel);
-    assert!(!items.is_empty() && items.iter().all(|i| i.region.is_some()), "{} items", items.len());
-    // laid again from the fills, it looks as it did: nearly every pixel's coverage close
-    let after = layer_rgba(&s, pixel);
-    let off = before
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .zip(after.as_chunks::<4>().0)
-        .filter(|(a, b)| a[3].abs_diff(b[3]) > 96)
-        .count();
-    assert!(off * 100 < 120 * 120 * 3, "{off} pixels differ");
-    // a layer already vector isn't traced again; switched off, it is pixels as it shows
-    assert_eq!(s.vectorize_layer(pixel, VECTOR_KIND), Some(false));
-    // (the canvas's first layer, empty, is still plain)
-    assert_eq!(s.layers_of_kind(VECTOR_KIND.to_owned()), (1, 1));
-    assert_eq!(s.rasterize_layers_of(VECTOR_KIND.to_owned()), 1);
-    assert_eq!(s.plugin_layer_kind(pixel), None);
-    assert_eq!(layer_rgba(&s, pixel), after);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[test]
 fn an_erase_drop_clears_the_area_it_lands_in_and_undoes_as_one_step() {
     let Some(s) = session(100, 100) else { return };
     let layer = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();

@@ -41,9 +41,6 @@ pub struct Prefs {
     /// Brush sizes relative to the screen (else to the canvas).
     pub brush_on_screen: bool,
     pub brush_cursor: bool,
-    /// Vector (plugin) layers drawn again at the screen's resolution once the view settles zoomed
-    /// in. Off, as it starts here, a stroke changes only the pixels it lands on.
-    pub sharp_layers: bool,
     /// In full screen, the taskbar is swiped in from the top edge (as it starts), else the bottom.
     pub taskbar_from_top: bool,
     /// In full screen, a swipe in from the edge shows the taskbar (as it starts).
@@ -117,7 +114,6 @@ impl Default for Prefs {
             brush_on_screen: false,
             brush_cursor: true,
             pen_cross: true,
-            sharp_layers: false,
             taskbar_from_top: true,
             taskbar_swipe: true,
             card_corner_mm: 3.175,
@@ -169,7 +165,7 @@ impl Prefs {
     /// As kept (anything missing or unreadable as it starts).
     pub fn kept() -> Prefs {
         let store = crate::files::app_dir().join("plugins").to_string_lossy().into_owned();
-        let mut p = Prefs { plugins: Plugins::with_bundled(store), ..Prefs::default() };
+        let mut p = Prefs { plugins: no_vector(Plugins::with_bundled(store)), ..Prefs::default() };
         let text = std::fs::read_to_string(crate::files::app_dir().join("interface")).unwrap_or_default();
         for line in text.lines() {
             let Some((name, value)) = line.split_once(' ') else { continue };
@@ -183,7 +179,6 @@ impl Prefs {
                 "brush_on_screen" => p.brush_on_screen = on,
                 "brush_cursor" => p.brush_cursor = on,
                 "pen_cross" => p.pen_cross = on,
-                "sharp_layers" => p.sharp_layers = on,
                 "taskbar_from_top" => p.taskbar_from_top = on,
                 "taskbar_swipe" => p.taskbar_swipe = on,
                 "card_corner_mm" => p.card_corner_mm = number.map_or(p.card_corner_mm, |v| v.clamp(0.0, 20.0)),
@@ -249,7 +244,6 @@ impl Prefs {
             format!("brush_on_screen {}", self.brush_on_screen),
             format!("brush_cursor {}", self.brush_cursor),
             format!("pen_cross {}", self.pen_cross),
-            format!("sharp_layers {}", self.sharp_layers),
             format!("taskbar_from_top {}", self.taskbar_from_top),
             format!("taskbar_swipe {}", self.taskbar_swipe),
             format!("card_corner_mm {}", self.card_corner_mm),
@@ -298,7 +292,8 @@ impl Prefs {
         session.set_selection_visibility(self.selection_visibility);
         session.use_plugins(Arc::clone(&self.plugins));
         session.set_simplified_undos(self.simplified_undos);
-        session.set_sharp_layers(self.sharp_layers);
+        // (no vector layers here: nothing drawn again sharp)
+        session.set_sharp_layers(false);
         session.set_speed_distance(self.speed_distance);
         // the turn an artwork is kept at follows its canvas's (Canvas Orientation Memory), or stays
         session.set_orientation_memory(self.orientation_memory);
@@ -342,4 +337,14 @@ fn place<T: PartialEq>(list: &[T], v: T) -> usize {
 
 fn pick<T: Copy>(list: &[T], value: &str) -> Option<T> {
     list.get(value.parse::<usize>().ok()?).copied()
+}
+
+/// The bundled vector layers plugin, switched off: this ProCraft has no vector layers (an
+/// artwork's are made pixels as it opens).
+pub const VECTOR_PLUGIN: &str = "io.github.artcraftandroid.vector-layers";
+
+/// `plugins` with the vector layers plugin switched off.
+pub fn no_vector(plugins: std::sync::Arc<Plugins>) -> std::sync::Arc<Plugins> {
+    plugins.set_on(VECTOR_PLUGIN.to_owned(), false);
+    plugins
 }

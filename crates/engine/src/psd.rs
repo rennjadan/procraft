@@ -756,8 +756,21 @@ fn build(records: &[Record], f: &Format) -> Built {
         let Some(r) = records.get(i).filter(|r| !matches!(r.section, Some(1..=3))) else { return Made::Nothing };
         match picture(r, f) {
             None => Made::Nothing,
+            // only a plain bottom layer filling the whole canvas, solid and shown, becomes the
+            // background colour: one that is hidden, see-through, smaller than the canvas, masked,
+            // clipped or blended stays a layer of its own
             Some(p) => match p.uniform() {
-                Some(colour) if i == 0 => Made::Uniform(colour),
+                Some(colour)
+                    if i == 0
+                        && p.covers(w, h)
+                        && r.opacity == 255
+                        && !r.hidden
+                        && !r.clipped
+                        && r.mask.is_none()
+                        && &r.blend == b"norm" =>
+                {
+                    Made::Uniform(colour)
+                }
                 _ => Made::Pixels(p.on_canvas(w, h)),
             },
         }
@@ -839,11 +852,16 @@ struct Picture {
 }
 
 impl Picture {
-    /// Its colour, if every pixel of it is the same.
+    /// Its colour, if every pixel of it is the same and solid.
     fn uniform(&self) -> Option<[u8; 3]> {
         let mut px = self.rgba.as_chunks::<4>().0.iter();
         let first = *px.next()?;
-        px.all(|p| *p == first).then_some([first[0], first[1], first[2]])
+        (first[3] == 255 && px.all(|p| *p == first)).then_some([first[0], first[1], first[2]])
+    }
+
+    /// Whether it lies over all of a `w` x `h` canvas.
+    fn covers(&self, w: usize, h: usize) -> bool {
+        self.left == 0 && self.top == 0 && self.width >= w && self.rgba.len() >= w * h * 4
     }
 
     /// Premultiplied, on a transparent canvas `w` x `h`.
@@ -1274,9 +1292,16 @@ mod tests {
     #[test]
     fn a_bottom_layer_of_one_colour_becomes_the_background() {
         let (w, h) = (4, 4);
+        // part of the canvas only, all of one colour: a layer of its own (a shape, not the
+        // background); hidden, likewise
+        let part = Raw { rect: [1, 1, 3, 3], name: "Card back", ..Raw::default() }.filled([10, 20, 30, 255]);
+        let dot = Raw { rect: [0, 0, 1, 1], name: "Dot", ..Raw::default() }.filled([255, 0, 0, 255]);
+        let got = read(&raw_psd(w, h, &[part, dot], [0; 4])).unwrap();
+        assert!(!got.document.background_visible);
+        assert_eq!(got.document.layers().len(), 2);
         let records = [
-            // part of the canvas only, but all of one colour
-            Raw { rect: [1, 1, 3, 3], name: "Background", ..Raw::default() }.filled([10, 20, 30, 255]),
+            // all of the canvas, of one colour
+            Raw { rect: [0, 0, 4, 4], name: "Background", ..Raw::default() }.filled([10, 20, 30, 255]),
             Raw { rect: [0, 0, 1, 1], name: "Dot", ..Raw::default() }.filled([255, 0, 0, 255]),
         ];
         let got = read(&raw_psd(w, h, &records, [0; 4])).unwrap();

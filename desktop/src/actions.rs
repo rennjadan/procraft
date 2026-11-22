@@ -121,8 +121,6 @@ pub enum Act {
     BrushCursor,
     /// The pen's + crosshair shown or hidden (Pressure and Smoothing).
     PenCross,
-    /// Vector layers drawn again sharp when zoomed in, or left as their pixels.
-    SharpLayers,
     /// The edge the taskbar is swiped in from in full screen: the top or the bottom.
     TaskbarEdge,
     /// The taskbar swipe in full screen on or off.
@@ -410,7 +408,6 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                     Button("Pressure and Smoothing", None, Some(Act::Page(Page::Pressure))),
                     Button("Gesture controls", None, Some(Act::GestureControls)),
                     Button("Plugins", None, Some(Act::Page(Page::Plugins))),
-                    Switch("Sharp vector layers when zoomed", prefs.sharp_layers, Some(Act::SharpLayers)),
                 ],
                 vec![
                     Slide(
@@ -699,10 +696,6 @@ impl Actions {
             }
             Some(Tapped::Act(Act::PenCross)) => {
                 prefs.pen_cross = !prefs.pen_cross;
-                Some(Act::Prefs)
-            }
-            Some(Tapped::Act(Act::SharpLayers)) => {
-                prefs.sharp_layers = !prefs.sharp_layers;
                 Some(Act::Prefs)
             }
             Some(Tapped::Act(Act::TaskbarSwipe)) => {
@@ -2139,7 +2132,7 @@ mod tests {
     fn what_the_app_comes_with_has_a_card_each_off_as_any_import_and_removed_stays_removed() {
         let (mut page, dir) = with_store("bundled");
         let store = dir.to_string_lossy().into_owned();
-        page.prefs.plugins = Plugins::with_bundled(store.clone());
+        page.prefs.plugins = crate::prefs::no_vector(Plugins::with_bundled(store.clone()));
         page.frame(Vec::new());
         page.frame(Vec::new());
         let list = page.list();
@@ -2160,7 +2153,7 @@ mod tests {
         assert!(page.tap(at));
         let gone = |plugins: &Plugins| plugins.plugins().iter().all(|p| p.id != list[0].id);
         assert!(gone(&page.prefs.plugins));
-        let next = Plugins::with_bundled(store);
+        let next = crate::prefs::no_vector(Plugins::with_bundled(store));
         assert!(gone(&next));
         assert_eq!(next.plugins().len(), list.len() - 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2185,7 +2178,7 @@ mod tests {
         // has had a touch, from the frame after)
         let scrolled = |touches: bool, told: bool| {
             let (mut page, dir) = with_store(&format!("scroll-{touches}-{told}"));
-            page.prefs.plugins = Plugins::with_bundled(dir.to_string_lossy().into_owned());
+            page.prefs.plugins = crate::prefs::no_vector(Plugins::with_bundled(dir.to_string_lossy().into_owned()));
             page.frame(Vec::new());
             page.frame(Vec::new());
             assert!(page.cards().last().is_some_and(|c| c.1 > body().bottom()), "the cards fit the page");
