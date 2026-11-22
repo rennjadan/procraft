@@ -84,6 +84,14 @@ const BLEND_SETTLE: f32 = 0.12;
 /// picked.
 const SWIPE_BUTTON: f32 = 82.0;
 const SWIPE_GAP: f32 = 2.0;
+/// A flick of the layer list: how fast it slows (per second, as the gallery's), the slowest
+/// speed it glides at and the fastest (points a second), the moments its speed is read over
+/// (seconds), and the speed it stops below.
+const FLING_SLOWING: f32 = 3.2;
+const FLING_LEAST: f32 = 120.0;
+const FLING_MOST: f32 = 6000.0;
+const FLING_WINDOW: f64 = 0.1;
+const FLING_STOP: f32 = 12.0;
 /// A text layer's Pin Text button (its semi-lock), in the accent's blue.
 const SWIPE_PIN_FILL: u32 = 0xFF0A84FF;
 const SWIPE_FILL: u32 = 0xFF3F3F3F;
@@ -162,6 +170,10 @@ pub struct Layers {
     last_rows: HashMap<u64, Rect>,
     list: Option<Rect>,
     scroll_by: f32,
+    /// A flick of the list let go: it glides on (points a second, as `scroll_by` goes), slowing
+    /// to a stop; and the finger's recent moves (when, how far down) to tell a flick's speed.
+    fling: f32,
+    moves: Vec<(f64, f32)>,
     /// A press on a row's visibility box: whose, since when, and whether holding it has acted.
     box_press: Option<(u64, Instant, bool)>,
     /// The fingers on a touch screen, two put on two rows being pinched, and two put on one row.
@@ -423,6 +435,16 @@ impl Layers {
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                            // a flick let go glides on, slowing as Procreate's list does
+                            if self.press.is_none() && self.fling != 0.0 {
+                                let dt = ui.input(|i| i.stable_dt).clamp(0.001, 0.05);
+                                self.scroll_by += self.fling * dt;
+                                self.fling *= (-FLING_SLOWING * dt).exp();
+                                if self.fling.abs() < FLING_STOP {
+                                    self.fling = 0.0;
+                                }
+                                ui.ctx().request_repaint();
+                            }
                             // at once: a finger's drag or a dragged row's at the edge, each frame
                             ui.scroll_with_delta_animation(
                                 vec2(0.0, -std::mem::take(&mut self.scroll_by)),
@@ -510,6 +532,8 @@ impl Layers {
                                             dy: 0.0,
                                             mouse,
                                         });
+                                        // a press catches the list gliding
+                                        self.fling = 0.0;
                                         // a press on another row closes the one open (as on the
                                         // tablet)
                                         if self.swiped.is_some_and(|open| open != l.id) {
@@ -1238,6 +1262,7 @@ impl Layers {
                         // up or down: the list follows the finger from where it was put down
                         if !sideways {
                             self.scroll_by -= d.y;
+                            self.moves = vec![(ctx.input(|i| i.time), d.y)];
                             ctx.request_repaint();
                         }
                     } else if p.since.elapsed() >= HOLD || d.length() > SLOP {
@@ -1285,7 +1310,11 @@ impl Layers {
                 // a finger's: the row has the drag (not the list's own drag to scroll), the list
                 // follows it
                 Way::Ignored if !p.mouse => {
-                    self.scroll_by -= ctx.input(|i| i.pointer.delta().y);
+                    let (dy, now) = ctx.input(|i| (i.pointer.delta().y, i.time));
+                    self.scroll_by -= dy;
+                    // the last moment's moves, for the flick's speed
+                    self.moves.push((now, dy));
+                    self.moves.retain(|(t, _)| now - t <= FLING_WINDOW);
                     ctx.request_repaint();
                 }
                 Way::Ignored => {}
@@ -1295,6 +1324,17 @@ impl Layers {
         }
         self.press = None;
         self.dragged_rows.clear();
+        // a finger's scroll let go while moving: the list glides on at its speed
+        if p.way == Way::Ignored && !p.mouse {
+            let now = ctx.input(|i| i.time);
+            let recent: Vec<&(f64, f32)> = self.moves.iter().filter(|(t, _)| now - t <= FLING_WINDOW).collect();
+            let moved: f32 = recent.iter().map(|(_, d)| d).sum();
+            let span = recent.first().map_or(0.0, |(t, _)| (now - t) as f32).max(1.0 / 60.0);
+            let speed = -moved / span;
+            self.fling = if speed.abs() >= FLING_LEAST { speed.clamp(-FLING_MOST, FLING_MOST) } else { 0.0 };
+            self.moves.clear();
+            ctx.request_repaint();
+        }
         match p.way {
             Way::Swipe => {
                 let slide = self.slid.get(&p.id).copied().unwrap_or(0.0);
