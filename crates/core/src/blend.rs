@@ -38,12 +38,49 @@ pub struct GradientSpec {
     pub bands: u32,
 }
 
-/// A gradient being placed: its layer as it was, and what of it can change.
+/// A gradient or shape being placed: its layer as it was, what of it can change, where it last
+/// showed (a shape's), and the undo step's name.
 pub(crate) struct Draft {
-    layer: LayerId,
-    before: Vec<u8>,
-    selection: Option<Mask>,
-    alpha_lock: bool,
+    pub(crate) layer: LayerId,
+    pub(crate) before: Vec<u8>,
+    pub(crate) selection: Option<Mask>,
+    pub(crate) alpha_lock: bool,
+    pub(crate) shown: Option<procraft_engine::geom::IRect>,
+    pub(crate) name: &'static str,
+}
+
+/// Begins a draft on the current layer (its pixels kept, the layer held), unless one is open;
+/// false if it can't be (the layer locked, text or a plugin's).
+pub(crate) fn begin_draft(st: &mut crate::State, name: &'static str) -> bool {
+    if st.gradient.is_some() {
+        return true;
+    }
+    let current = st.doc.current();
+    let Some(layer) = st.doc.layer(current).cloned() else { return false };
+    if st.doc.is_locked(current) || layer.drawn_from_data() {
+        return false;
+    }
+    let Some(before) = st.current_pixels() else { return false };
+    let selection = st.reach_selection();
+    if let Some(canvas) = st.canvas.as_mut() {
+        canvas.hold_layer(current);
+    }
+    st.gradient = Some(Draft { layer: current, before, selection, alpha_lock: layer.alpha_lock, shown: None, name });
+    true
+}
+
+/// Ends the open draft: `keep` makes it one undo step (its name), else the layer goes back.
+pub(crate) fn end_draft(shared: &crate::Shared, st: &mut crate::State, keep: bool) -> bool {
+    let Some(draft) = st.gradient.take() else { return false };
+    if let Some(canvas) = st.canvas.as_mut() {
+        if keep {
+            canvas.name_next_step(draft.name);
+        }
+        canvas.release_layer(keep, None);
+    }
+    st.revision += 1;
+    shared.frame(st);
+    true
 }
 
 /// How far along the gradient (0..1) the pixel centred at (`x`, `y`) is.
@@ -116,18 +153,8 @@ impl CanvasSession {
     pub fn gradient_show(&self, spec: GradientSpec) -> bool {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        if st.gradient.is_none() {
-            let current = st.doc.current();
-            let Some(layer) = st.doc.layer(current).cloned() else { return false };
-            if st.doc.is_locked(current) || layer.drawn_from_data() {
-                return false;
-            }
-            let Some(before) = st.current_pixels() else { return false };
-            let selection = st.reach_selection();
-            if let Some(canvas) = st.canvas.as_mut() {
-                canvas.hold_layer(current);
-            }
-            st.gradient = Some(Draft { layer: current, before, selection, alpha_lock: layer.alpha_lock });
+        if !begin_draft(st, "Gradient") {
+            return false;
         }
         let (w, h) = (st.doc.width(), st.doc.height());
         let Some(draft) = st.gradient.as_ref() else { return false };
@@ -145,17 +172,7 @@ impl CanvasSession {
     pub fn gradient_end(&self, keep: bool) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
-        if st.gradient.take().is_none() {
-            return;
-        }
-        if let Some(canvas) = st.canvas.as_mut() {
-            if keep {
-                canvas.name_next_step("Gradient");
-            }
-            canvas.release_layer(keep, None);
-        }
-        st.revision += 1;
-        self.shared.frame(st);
+        end_draft(&self.shared, st, keep);
     }
 
     /// Whether a gradient is being placed.

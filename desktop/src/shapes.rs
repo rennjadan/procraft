@@ -17,22 +17,17 @@ use crate::look::{Weight, argb, pc, text};
 /// Within this many points a dragged edge or middle snaps.
 const SNAP: f32 = 10.0;
 /// A handle's reach (points) and its dot.
-const HANDLE_REACH: f32 = 22.0;
-const HANDLE_DOT: f32 = 6.0;
+const HANDLE_REACH: f32 = 30.0;
+const HANDLE_DOT: f32 = 9.0;
+/// How far in from a rounded rectangle's top-left corner its rounding dot sits, past its radius
+/// (points).
+const ROUND_INSET: f32 = 36.0;
+/// The tiles' size (points).
+const TILE: f32 = 44.0;
 const GUIDE: Color32 = Color32::from_rgb(255, 64, 200);
 const PANEL_HEIGHT: f32 = 168.0;
 /// A tap this near a lasso's first point (points) closes it.
 const CLOSE_REACH: f32 = 16.0;
-
-const KINDS: [(ShapeKind, &str); 7] = [
-    (ShapeKind::Rectangle, "Rectangle"),
-    (ShapeKind::Ellipse, "Ellipse"),
-    (ShapeKind::Line, "Line"),
-    (ShapeKind::Triangle, "Triangle"),
-    (ShapeKind::Diamond, "Diamond"),
-    (ShapeKind::Hexagon, "Hexagon"),
-    (ShapeKind::Star, "Star"),
-];
 
 /// Card corner presets: name and radius (mm).
 const CORNERS: [(&str, f32); 3] = [("1/8\" (poker, MTG, Pokémon)", 3.175), ("3 mm", 3.0), ("5.5 mm (US game)", 5.5)];
@@ -56,6 +51,8 @@ enum Grip {
     /// A corner (0 top left, clockwise), or an edge's middle (4 top, 5 right, 6 bottom, 7 left);
     /// a line's ends are corners 0 and 2.
     Handle(u8),
+    /// The rounding dot: dragged in, the corners round more.
+    Round,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +107,12 @@ pub struct Shapes {
     shown_with: Option<[f32; 3]>,
     /// A lasso closed this frame, to fill or erase once the touches are read.
     pending_lasso: Option<(Vec<Pos2>, [f32; 3])>,
+    /// The rectangle's corners are rounded (else square, whatever the radius).
+    rounded: bool,
+    /// The shape as last shown on the layer (none while nothing shows), and the colour painted
+    /// with.
+    shown: Option<ShapeSpec>,
+    rgb: [f32; 3],
 }
 
 impl Default for Shapes {
@@ -139,6 +142,9 @@ impl Default for Shapes {
             bands: 1,
             shown_with: None,
             pending_lasso: None,
+            rounded: false,
+            shown: None,
+            rgb: [0.0; 3],
         }
     }
 }
@@ -181,6 +187,7 @@ impl Shapes {
     /// Put away: a gradient being placed is kept (as a tool changed in Procreate keeps it).
     pub fn close(&mut self, session: &CanvasSession) {
         self.on = false;
+        self.commit(session);
         self.rect = None;
         self.drag = None;
         self.card_open = false;
@@ -191,9 +198,61 @@ impl Shapes {
 
     /// A gradient being placed taken back (undo while it shows); false if none was.
     pub fn cancel_gradient(&mut self, session: &CanvasSession) -> bool {
+        // a shape showing goes too
+        if self.shown.is_some() || (self.rect.is_some() && session.gradient_open()) {
+            self.discard(session);
+            return true;
+        }
         let open = self.grad.is_some() || session.gradient_open();
         self.end_gradient(session, false);
         open
+    }
+
+    /// The shape shown on the layer as it now is (a selection shape shows as its outline alone).
+    fn refresh(&mut self, session: &CanvasSession) {
+        let spec = self.spec(self.rgb);
+        if spec == self.shown {
+            return;
+        }
+        match spec {
+            Some(spec) if spec.make != ShapeMake::Select => {
+                if session.shape_show(spec) {
+                    self.shown = Some(spec);
+                }
+            }
+            _ => {
+                if self.shown.take().is_some() {
+                    session.shape_end(false, None);
+                }
+            }
+        }
+    }
+
+    /// The shape made for good (one undo step), the tool ready for the next; none if there was
+    /// none, or what went wrong.
+    fn commit(&mut self, session: &CanvasSession) -> Option<Said> {
+        let spec = self.spec(self.rgb)?;
+        self.rect = None;
+        self.drag = None;
+        if spec.make == ShapeMake::Select {
+            return (!session.make_shape(spec)).then_some(Said::Notice("Can't select that", true));
+        }
+        if self.shown != Some(spec) && !session.shape_show(spec) {
+            self.shown = None;
+            return Some(Said::Notice("Can't draw a shape on this layer", true));
+        }
+        self.shown = None;
+        session.shape_end(true, Some(spec));
+        None
+    }
+
+    /// The shape taken back, the layer as it was.
+    fn discard(&mut self, session: &CanvasSession) {
+        self.rect = None;
+        self.drag = None;
+        if self.shown.take().is_some() {
+            session.shape_end(false, None);
+        }
     }
 
     fn end_gradient(&mut self, session: &CanvasSession, keep: bool) {
@@ -286,7 +345,7 @@ impl Shapes {
             y0,
             x1,
             y1,
-            corner: self.corner,
+            corner: if self.rounded && self.kind == ShapeKind::Rectangle { self.corner } else { 0.0 },
             width: self.width,
             r,
             g,
@@ -307,6 +366,7 @@ impl Shapes {
         if !self.on {
             return None;
         }
+        self.rgb = rgb;
         let ppp = ctx.pixels_per_point();
         let m = matrix(session);
         let [a, b, ..] = m;
@@ -348,6 +408,10 @@ impl Shapes {
                     && let Some(p) = response.interact_pointer_pos().and_then(to_canvas)
                 {
                     let grip = self.grip_at(m, ppp, response.interact_pointer_pos().unwrap_or_default());
+                    // a new shape: the last one made for good first
+                    if grip == Grip::New && self.rect.is_some() {
+                        said = self.commit(session);
+                    }
                     let was = match grip {
                         Grip::New => [p.x, p.y, p.x, p.y],
                         _ => self.rect.unwrap_or([p.x, p.y, p.x, p.y]),
@@ -355,6 +419,16 @@ impl Shapes {
                     self.drag = Some(Drag { grip, from: p, was });
                 }
                 if let (Some(drag), Some(now)) = (self.drag, at.and_then(to_canvas))
+                    && response.dragged()
+                    && drag.grip == Grip::Round
+                {
+                    // the rounding dot: as far in as it is dragged, less its inset
+                    let [x0, y0, x1, y1] = normal(drag.was);
+                    let inset = ROUND_INSET * per_point;
+                    let most = ((x1 - x0).min(y1 - y0) / 2.0).max(0.0);
+                    self.corner = ((now.x - x0).min(now.y - y0) - inset).clamp(0.0, most);
+                    self.matched = false;
+                } else if let (Some(drag), Some(now)) = (self.drag, at.and_then(to_canvas))
                     && response.dragged()
                 {
                     let r = self.dragged(drag, now, shift || self.square);
@@ -370,7 +444,7 @@ impl Shapes {
                         let [x0, y0, x1, y1] = normal(r);
                         self.kind != ShapeKind::Line && (x1 - x0 < 1.0 || y1 - y0 < 1.0)
                     }) {
-                        self.rect = None;
+                        self.discard(session);
                     }
                 }
                 // what it will make, the card's cut and what was placed, faintly
@@ -416,7 +490,11 @@ impl Shapes {
                     }
                     for h in self.handles(m, ppp) {
                         painter.circle_filled(h, HANDLE_DOT, Color32::WHITE);
-                        painter.circle_stroke(h, HANDLE_DOT, Stroke::new(1.5, argb(pc::ACCENT)));
+                        painter.circle_stroke(h, HANDLE_DOT, Stroke::new(2.0, argb(pc::ACCENT)));
+                    }
+                    if let Some(dot) = self.round_dot(m, ppp, per_point) {
+                        painter.circle_filled(dot, HANDLE_DOT - 2.0, argb(pc::ACCENT));
+                        painter.circle_stroke(dot, HANDLE_DOT + 2.0, Stroke::new(1.5, Color32::WHITE));
                     }
                 }
             },
@@ -438,6 +516,9 @@ impl Shapes {
                         if self.tab == Tab::Gradient {
                             self.end_gradient(session, true);
                         }
+                        if self.tab == Tab::Shapes {
+                            said = self.commit(session);
+                        }
                         self.tab = tab;
                         self.lasso.clear();
                         self.taps.clear();
@@ -457,39 +538,71 @@ impl Shapes {
                 self.gradient_panel(&mut ui, session, rgb, &mut said);
                 return;
             }
+            // the shapes, what they make, and square, as pictures
             ui.horizontal(|ui| {
-                for (kind, name) in KINDS {
-                    if ui.add(egui::Button::selectable(self.kind == kind, name)).clicked() {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let tiles: [(&str, ShapeKind, bool); 8] = [
+                    ("Rectangle", ShapeKind::Rectangle, false),
+                    ("Rounded rectangle", ShapeKind::Rectangle, true),
+                    ("Ellipse", ShapeKind::Ellipse, false),
+                    ("Line", ShapeKind::Line, false),
+                    ("Triangle", ShapeKind::Triangle, false),
+                    ("Diamond", ShapeKind::Diamond, false),
+                    ("Hexagon", ShapeKind::Hexagon, false),
+                    ("Star", ShapeKind::Star, false),
+                ];
+                for (name, kind, rounded) in tiles {
+                    let on = self.kind == kind && (kind != ShapeKind::Rectangle || self.rounded == rounded);
+                    if tile(ui, on, name, |p, r, ink| kind_icon(p, r, kind, rounded, ink)) {
                         self.kind = kind;
-                        self.match_corner(&cut, &kept);
+                        if kind == ShapeKind::Rectangle {
+                            self.rounded = rounded;
+                            if rounded {
+                                self.matched = true;
+                                let before = self.corner;
+                                self.match_corner(&cut, &kept);
+                                // nothing to match: a gentle rounding to start from
+                                if self.corner <= 0.0 || self.corner == before && before <= 0.0 {
+                                    self.corner = self.rect.map_or(40.0, |r| {
+                                        let [x0, y0, x1, y1] = normal(r);
+                                        ((x1 - x0).min(y1 - y0) * 0.12).max(4.0)
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
-                ui.separator();
+                ui.add_space(10.0);
                 for (make, name) in
                     [(ShapeMake::Fill, "Fill"), (ShapeMake::Outline, "Outline"), (ShapeMake::Select, "Selection")]
                 {
-                    if ui.add(egui::Button::selectable(self.make == make, name)).clicked() {
+                    if tile(ui, self.make == make, name, |p, r, ink| make_icon(p, r, make, ink)) {
                         self.make = make;
                     }
                 }
-                ui.separator();
-                ui.checkbox(&mut self.square, "Square");
+                ui.add_space(10.0);
+                if tile(ui, self.square, "Keep square (or hold Shift)", |p, r, ink| {
+                    p.rect_stroke(r.shrink(2.0), 1.0, Stroke::new(2.0, ink), egui::StrokeKind::Middle);
+                    p.text(r.center(), Align2::CENTER_CENTER, "1:1", egui::FontId::proportional(10.0), ink);
+                }) {
+                    self.square = !self.square;
+                }
             });
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 let per_inch = cw / (card.width_in + 2.0 * card.bleed_in).max(0.1);
-                if self.kind == ShapeKind::Rectangle {
+                if self.kind == ShapeKind::Rectangle && self.rounded {
                     let most = self.rect.map_or(cw.min(ch) / 2.0, |r| {
                         let [x0, y0, x1, y1] = normal(r);
                         ((x1 - x0).min(y1 - y0) / 2.0).max(1.0)
                     });
                     let before = self.corner;
                     ui.label("Corners");
-                    ui.add(egui::Slider::new(&mut self.corner, 0.0..=most.max(1.0)).suffix(" px"));
+                    ui.add(egui::Slider::new(&mut self.corner, 0.0..=most.max(1.0)).show_value(false));
                     if self.corner != before {
                         self.matched = false;
                     }
-                    ui.label(format!("{:.3}\"", self.corner / per_inch));
+                    ui.label(format!("{:.0} px · {:.3}\"", self.corner, self.corner / per_inch));
                     if ui.checkbox(&mut self.matched, "Match corners").changed() {
                         self.match_corner(&cut, &kept);
                     }
@@ -500,29 +613,37 @@ impl Shapes {
                     ui.add(egui::Slider::new(&mut self.width, 1.0..=400.0).logarithmic(true).suffix(" px"));
                     ui.separator();
                 }
-                if ui.button("Card edge").on_hover_text("A rectangle on the card's cut, its corners matching").clicked()
-                {
+                if ui.button("⬚ Card edge").on_hover_text("A rounded rectangle on the card's cut").clicked() {
+                    said = self.commit(session).or(said.take());
                     self.rect = Some([cut.x0, cut.y0, cut.x1, cut.y1]);
                     self.kind = ShapeKind::Rectangle;
+                    self.rounded = true;
                     self.corner = cut.corner;
                     self.matched = true;
                 }
-                if ui.button("Rotate 90°").clicked() {
+                if ui.add_enabled(self.rect.is_some(), egui::Button::new("⟳ Rotate 90°")).clicked() {
                     self.rotate();
                     self.match_corner(&cut, &kept);
                 }
-                if ui.button("Card…").clicked() {
+                if ui.add(egui::Button::selectable(self.card_open, "Card size…")).clicked() {
                     self.card_open = !self.card_open;
                 }
                 ui.separator();
-                if ui.button("Cancel").clicked() {
-                    self.rect = None;
+                if ui.add_enabled(self.rect.is_some(), egui::Button::new("Cancel")).clicked() {
+                    self.discard(session);
                 }
                 let apply = egui::Button::new(egui::RichText::new("Apply").strong()).fill(argb(pc::ACCENT));
                 if ui.add_enabled(self.rect.is_some(), apply).clicked() {
-                    said = Some(self.apply(session, rgb));
+                    said = self.commit(session).or(said.take());
                 }
             });
+            ui.label(
+                egui::RichText::new(
+                    "Drag to draw · drag the dots to resize · drag inside to move · start a new shape to keep this one",
+                )
+                .size(11.5)
+                .color(Color32::from_gray(150)),
+            );
             if self.card_open {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -551,6 +672,9 @@ impl Shapes {
                 });
             }
         });
+        if self.tab == Tab::Shapes {
+            self.refresh(session);
+        }
         if let Some((path, rgb)) = self.pending_lasso.take() {
             said = self.apply_lasso(session, &path, rgb).or(said);
         }
@@ -778,6 +902,17 @@ impl Shapes {
         }
     }
 
+    /// Where a rounded rectangle's rounding dot is (points): in from its top-left corner by its
+    /// radius and a little more; none for other shapes or one too small to hold it.
+    fn round_dot(&self, m: [f32; 6], ppp: f32, per_point: f32) -> Option<Pos2> {
+        if self.kind != ShapeKind::Rectangle || !self.rounded {
+            return None;
+        }
+        let [x0, y0, x1, y1] = normal(self.rect?);
+        let d = self.corner + ROUND_INSET * per_point;
+        (d * 2.0 < (x1 - x0).min(y1 - y0)).then(|| to_window(m, ppp, x0 + d, y0 + d))
+    }
+
     /// Where the handles are (points): the box's corners and edge middles; a line's ends.
     fn handles(&self, m: [f32; 6], ppp: f32) -> Vec<Pos2> {
         let Some(r) = self.rect else { return Vec::new() };
@@ -795,6 +930,11 @@ impl Shapes {
 
     /// What a press at window point `p` (points) takes hold of.
     fn grip_at(&self, m: [f32; 6], ppp: f32, p: Pos2) -> Grip {
+        let [a, b, ..] = m;
+        let per_point = ppp / a.hypot(b).max(1e-6);
+        if self.round_dot(m, ppp, per_point).is_some_and(|d| d.distance(p) <= HANDLE_REACH * 0.8) {
+            return Grip::Round;
+        }
         let handles = self.handles(m, ppp);
         let nearest = handles
             .iter()
@@ -841,6 +981,7 @@ impl Shapes {
             Grip::Handle(5) => [x0, y0, x1 + dx, y1],
             Grip::Handle(6) => [x0, y0, x1, y1 + dy],
             Grip::Handle(_) => [x0 + dx, y0, x1, y1],
+            Grip::Round => drag.was,
         };
         // square: the side dragged most sets both
         if square && !line && matches!(drag.grip, Grip::New | Grip::Handle(0..=3)) {
@@ -944,7 +1085,7 @@ impl Shapes {
     /// A rounded rectangle inside another (or the card's cut) takes corners parallel to its,
     /// while Match corners is on.
     fn match_corner(&mut self, cut: &PlacedShape, kept: &[PlacedShape]) {
-        if !self.matched || self.kind != ShapeKind::Rectangle {
+        if !self.matched || !self.rounded || self.kind != ShapeKind::Rectangle {
             return;
         }
         let Some(r) = self.rect else { return };
@@ -970,15 +1111,61 @@ impl Shapes {
         self.rect =
             Some(if self.kind == ShapeKind::Line { [a.0, a.1, b.0, b.1] } else { normal([a.0, a.1, b.0, b.1]) });
     }
+}
 
-    /// Makes the live shape; the tool stays open for the next.
-    fn apply(&mut self, session: &CanvasSession, rgb: [f32; 3]) -> Said {
-        let Some(spec) = self.spec(rgb) else { return Said::Notice("Drag on the canvas to draw a shape", false) };
-        if session.make_shape(spec) {
-            self.rect = None;
-            Said::Notice(if spec.make == ShapeMake::Select { "Shape selected" } else { "Shape made" }, false)
-        } else {
-            Said::Notice("Can't draw a shape on this layer", true)
+/// A picture button: lit when `on`, the picture drawn by `draw` in its middle; true if tapped.
+fn tile(ui: &mut egui::Ui, on: bool, name: &str, draw: impl FnOnce(&egui::Painter, Rect, Color32)) -> bool {
+    let (rect, response) = ui.allocate_exact_size(vec2(TILE, TILE), Sense::click());
+    let fill = if on {
+        argb(pc::ACCENT)
+    } else if response.hovered() {
+        Color32::from_white_alpha(28)
+    } else {
+        Color32::from_white_alpha(10)
+    };
+    ui.painter().rect_filled(rect, 10.0, fill);
+    let ink = if on { Color32::WHITE } else { Color32::from_gray(215) };
+    draw(ui.painter(), rect.shrink(11.0), ink);
+    response.on_hover_text(name).clicked()
+}
+
+/// A shape's picture in `r`.
+fn kind_icon(p: &egui::Painter, r: Rect, kind: ShapeKind, rounded: bool, ink: Color32) {
+    let stroke = Stroke::new(2.0, ink);
+    let spec = ShapeSpec {
+        kind,
+        make: ShapeMake::Fill,
+        x0: r.left(),
+        y0: r.top() + if matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse) { 3.0 } else { 0.0 },
+        x1: r.right(),
+        y1: r.bottom() - if matches!(kind, ShapeKind::Rectangle | ShapeKind::Ellipse) { 3.0 } else { 0.0 },
+        corner: if rounded { 6.0 } else { 0.0 },
+        width: 2.0,
+        r: 0.0,
+        g: 0.0,
+        b: 0.0,
+    };
+    if kind == ShapeKind::Line {
+        p.line_segment([r.left_bottom(), r.right_top()], Stroke::new(2.5, ink));
+        return;
+    }
+    let points: Vec<Pos2> = shape_points(spec).as_chunks::<2>().0.iter().map(|[x, y]| pos2(*x, *y)).collect();
+    p.add(Shape::closed_line(points, stroke));
+}
+
+/// What a shape makes, as a picture in `r`: filled, outlined, or a selection's dashes.
+fn make_icon(p: &egui::Painter, r: Rect, make: ShapeMake, ink: Color32) {
+    let r = r.shrink(1.0);
+    match make {
+        ShapeMake::Fill => {
+            p.rect_filled(r, 4.0, ink);
+        }
+        ShapeMake::Outline => {
+            p.rect_stroke(r, 4.0, Stroke::new(3.0, ink), egui::StrokeKind::Inside);
+        }
+        ShapeMake::Select => {
+            let corners = vec![r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()];
+            p.extend(Shape::dashed_line(&corners, Stroke::new(1.8, ink), 3.5, 2.5));
         }
     }
 }

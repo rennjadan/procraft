@@ -15590,6 +15590,18 @@ fn a_rounded_rectangle_shape_is_drawn_kept_to_snap_to_and_undone_as_one_step() {
     assert_eq!(kept.first().map(|p| p.corner), Some(20.0));
     s.undo();
     assert_eq!(alpha(50, 70), 0, "one undo takes it away");
+    // shown live while placed: taken back leaves nothing, kept is one step and is kept to snap to
+    assert!(s.shape_show(card));
+    assert!(s.shape_show(ShapeSpec { x1: 50.0, ..card }));
+    s.shape_end(false, None);
+    assert_eq!(alpha(30, 70), 0, "taken back");
+    assert!(s.shape_show(ShapeSpec { x1: 50.0, ..card }));
+    s.shape_end(true, Some(ShapeSpec { x1: 50.0, ..card }));
+    assert_eq!(alpha(30, 70), 255);
+    assert_eq!(alpha(80, 70), 0, "only where it was last shown");
+    assert!(s.placed_shapes().iter().any(|p| p.x1 == 50.0), "kept to snap to");
+    s.undo();
+    assert_eq!(alpha(30, 70), 0);
     // outlined: its edge only
     assert!(s.make_shape(ShapeSpec { make: ShapeMake::Outline, width: 6.0, ..card }));
     assert_eq!(alpha(50, 2), 255);

@@ -282,16 +282,7 @@ impl CanvasSession {
             }
             st.rewrite_layer(current, rect, pixels);
         }
-        if spec.kind == ShapeKind::Rectangle {
-            let (x0, y0, x1, y1) = boxed(&spec);
-            let kept = [x0, y0, x1, y1, spec.corner.clamp(0.0, (x1 - x0).min(y1 - y0) / 2.0)];
-            let shapes = &mut st.doc.shapes;
-            shapes.retain(|s| s.iter().zip(&kept).any(|(a, b)| (a - b).abs() > 0.5));
-            shapes.push(kept);
-            if shapes.len() > MOST_KEPT {
-                shapes.remove(0);
-            }
-        }
+        keep_rectangle(st, &spec);
         st.revision += 1;
         self.shared.frame(st);
         true
@@ -339,6 +330,68 @@ impl CanvasSession {
         true
     }
 
+    /// Shows `spec` (filled or outlined) on the current layer as it is placed, the layer as it was
+    /// kept underneath: begun the first time, then shown again where it was and is now. False if
+    /// it can't be (a selection shape, or the layer locked, text or a plugin's).
+    pub fn shape_show(&self, spec: ShapeSpec) -> bool {
+        if spec.make == ShapeMake::Select {
+            return false;
+        }
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if !crate::blend::begin_draft(st, "Shape") {
+            return false;
+        }
+        let (w, h) = (st.doc.width(), st.doc.height());
+        let now = reach(&spec, w, h);
+        let Some(draft) = st.gradient.as_mut() else { return false };
+        let region = match (now, draft.shown) {
+            (Some(a), Some(b)) => a.union(b),
+            (a, b) => match a.or(b) {
+                Some(r) => r,
+                None => return true,
+            },
+        };
+        draft.shown = now;
+        // the layer as it was there, the shape over it
+        let stride = w as usize;
+        let (x0, x1) = (region.x0.max(0) as usize, region.x1.max(0) as usize);
+        let mut pixels = Vec::with_capacity((x1 - x0) * region.height() as usize * 4);
+        for y in region.y0.max(0) as usize..region.y1.max(0) as usize {
+            pixels.extend_from_slice(draft.before.get((y * stride + x0) * 4..(y * stride + x1) * 4).unwrap_or(&[]));
+        }
+        let mut data = shape_mask(&spec, region);
+        if now.is_none() {
+            data.fill(0);
+        }
+        if let Some(sel) = &draft.selection {
+            for (m, s) in data.iter_mut().zip(mask_part(sel, region)) {
+                *m = ((u16::from(*m) * u16::from(s) + 127) / 255) as u8;
+            }
+        }
+        let mask = Mask { width: region.width(), height: region.height(), data };
+        fill::pour_over(&mut pixels, &mask, [spec.r, spec.g, spec.b], draft.alpha_lock);
+        let layer = draft.layer;
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.put_layer_region(layer, region.x0 as u32, region.y0 as u32, region.width(), region.height(), pixels);
+        }
+        self.shared.frame(st);
+        true
+    }
+
+    /// Ends the shape being shown: `keep` makes it one undo step ("Shape"), a rectangle kept with
+    /// the artwork to snap to (`spec`, as it was last shown); otherwise the layer goes back.
+    pub fn shape_end(&self, keep: bool, spec: Option<ShapeSpec>) {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        if crate::blend::end_draft(&self.shared, st, keep)
+            && keep
+            && let Some(spec) = spec
+        {
+            keep_rectangle(st, &spec);
+        }
+    }
+
     /// The rectangles placed in this artwork, oldest first.
     pub fn placed_shapes(&self) -> Vec<PlacedShape> {
         let st = self.shared.lock();
@@ -361,6 +414,21 @@ impl CanvasSession {
         let view = st.view?;
         let p = view.screen_to_canvas(procraft_engine::geom::Vec2::new(x, y))?;
         Some(vec![p.x, p.y])
+    }
+}
+
+/// A rectangle made kept with the artwork, to snap to (the oldest go past [`MOST_KEPT`]).
+fn keep_rectangle(st: &mut crate::State, spec: &ShapeSpec) {
+    if spec.kind != ShapeKind::Rectangle {
+        return;
+    }
+    let (x0, y0, x1, y1) = boxed(spec);
+    let kept = [x0, y0, x1, y1, spec.corner.clamp(0.0, (x1 - x0).min(y1 - y0) / 2.0)];
+    let shapes = &mut st.doc.shapes;
+    shapes.retain(|s| s.iter().zip(&kept).any(|(a, b)| (a - b).abs() > 0.5));
+    shapes.push(kept);
+    if shapes.len() > MOST_KEPT {
+        shapes.remove(0);
     }
 }
 
