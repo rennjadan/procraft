@@ -1404,7 +1404,10 @@ impl Interface {
                 // closes the panel
                 TouchCommand::PanelFades | TouchCommand::PanelTapped => self.open = None,
                 // a stroke or a fill on a text layer: it takes them once rasterized
-                TouchCommand::TextLayer => self.text.ask_rasterize(),
+                // no question: rasterizing is the text layer's own option (in its options menu)
+                TouchCommand::TextLayer => {
+                    self.overlays.notice("Text layer: pick another layer to paint (Rasterize is in its options)", false)
+                }
                 // (the pen's hover, which sets the brush with a finger, isn't the desktop's)
                 // (the view moving on its own is drawn as it goes)
                 TouchCommand::ViewMoved | TouchCommand::ViewSettles | TouchCommand::BrushChanged => {}

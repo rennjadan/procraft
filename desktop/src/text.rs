@@ -16,7 +16,7 @@ use procraft_core::{
     CanvasSession, TextAlignment, TextDraw, TextDrawn, TextInfo, TextRunInfo, TextSide, TextStyleChange,
 };
 
-use crate::alert::{Alert, Answer, Asking};
+use crate::alert::{Alert, Answer};
 use crate::icons::{self, Icon};
 use crate::look::{Look, Themed, Weight, argb, pc, text};
 
@@ -427,20 +427,6 @@ impl TextEditor {
         if self.side.take().is_some_and(|s| s.dragging) {
             session.text_side_end();
         }
-    }
-
-    /// A stroke landed on a text layer: asks to rasterize it.
-    pub fn ask_rasterize(&mut self) {
-        self.rasterize.ask(Asking {
-            title: "Rasterize this text layer?".into(),
-            message: "Its text can't be edited afterwards; you can paint on it.".into(),
-            action: "Rasterize".into(),
-            icon: None,
-            destructive: false,
-            extra: None,
-            first: None,
-            alone: false,
-        });
     }
 
     /// The editor, while text is edited, and the question about rasterizing.
