@@ -621,6 +621,10 @@ pub struct Document {
     /// The look of the text last edited (see [`LayerText::look`]), which new text starts with.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text_style: Option<LayerText>,
+    /// The rectangles the shape tool placed (left, top, right, bottom, corner radius; canvas
+    /// pixels): a shape drawn later snaps to them and matches its corners to theirs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shapes: Vec<[f32; 5]>,
 }
 
 /// The layers a file lists, as many as can be read: in a damaged file a layer with fields that
@@ -704,6 +708,7 @@ impl Document {
             icc: None,
             solo: None,
             text_style: None,
+            shapes: Vec::new(),
         };
         doc.add_layer();
         doc

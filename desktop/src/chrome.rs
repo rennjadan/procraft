@@ -17,6 +17,8 @@ pub enum BarButton {
     Adjustments,
     Selection,
     Transform,
+    /// The shape tool (rectangles, rounded ones, ellipses, lines and more).
+    Shapes,
     Paint,
     Smudge,
     Erase,
@@ -33,6 +35,7 @@ pub struct Lit {
     pub adjustments: bool,
     pub selection: bool,
     pub transform: bool,
+    pub shapes: bool,
     pub layers: bool,
     /// A panel takes the highlight from the current tool while open.
     pub panel_open: bool,
@@ -120,6 +123,19 @@ pub fn top_bar(ui: &mut Ui, look: &mut Look, tool: ToolKind, colour: Color32, br
             ui.painter().circle_filled(rect.center(), pc::ACTION_DISC_SIZE / 2.0, disc);
             look.icon(ui, icon, rect.center(), glyph, mix(argb(pc::ACTION_GLYPH), Color32::WHITE, l));
             x += pc::BAR_BUTTON_WIDTH + action_gap;
+        }
+        // Shapes: a rounded square over a circle, drawn
+        {
+            let rect = button(x, pc::BAR_BUTTON_WIDTH);
+            tap(ui, BarButton::Shapes, rect);
+            let l = highlight(&ctx, ui.scope_id().with(("lit", BarButton::Shapes)), lit.shapes);
+            let disc = mix(argb(pc::ACTION_DISC), argb(pc::BAR_GLYPH_SELECTED), l);
+            let ink = mix(argb(pc::ACTION_GLYPH), Color32::WHITE, l);
+            let c = rect.center();
+            ui.painter().circle_filled(c, pc::ACTION_DISC_SIZE / 2.0, disc);
+            let square = Rect::from_min_size(c + vec2(-9.0, -9.0), vec2(12.0, 12.0));
+            ui.painter().rect_stroke(square, 3.0, Stroke::new(1.8, ink), egui::StrokeKind::Middle);
+            ui.painter().circle_stroke(c + vec2(4.0, 4.0), 6.0, Stroke::new(1.8, ink));
         }
 
         // from the colour leftwards

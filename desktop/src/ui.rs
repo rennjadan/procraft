@@ -141,6 +141,8 @@ pub struct Interface {
     drop: ColourDrop,
     /// EraseDrop, dragged out of the button beside the eraser.
     erase_drop: ColourDrop,
+    /// The shape tool.
+    shapes: crate::shapes::Shapes,
     library: Library,
     overlays: Overlays,
     /// The interface is hidden (full screen).
@@ -275,6 +277,7 @@ impl Interface {
             colours: Colours::default(),
             drop: ColourDrop::default(),
             erase_drop: ColourDrop::eraser(),
+            shapes: crate::shapes::Shapes::default(),
             library: Library::default(),
             overlays: Overlays::default(),
             bars_hidden: false,
@@ -596,6 +599,7 @@ impl Interface {
         let lit = Lit {
             actions: self.open == Some(Popover::Actions),
             transform: self.transform.on,
+            shapes: self.shapes.on,
             // while the selection tool is open, or while something is selected
             selection: self.selection.on || session.has_selection(),
             adjustments: self.open == Some(Popover::Adjustments)
@@ -719,7 +723,19 @@ impl Interface {
         }
         let bar = crate::chrome::top_bar(ui, &mut self.look, info.tool, colour, self.colours.hsv[2], &lit);
         let held = self.tool_hold(&ctx, session, &bar);
+        // another button tapped while placing shapes puts the shape tool away first
+        if self.shapes.on && bar.pressed.is_some_and(|b| b != BarButton::Shapes) {
+            self.shapes.close();
+        }
         match bar.pressed.filter(|_| !held) {
+            Some(BarButton::Shapes) => {
+                if self.shapes.on {
+                    self.shapes.close();
+                } else if self.switch_modes(session, ModeButton::Tool) {
+                    self.open = None;
+                    self.shapes.open();
+                }
+            }
             Some(BarButton::Gallery) => self.actions.push(Action::Gallery),
             Some(BarButton::Actions) => self.toggle(session, Popover::Actions),
             Some(BarButton::Layers) => self.toggle(session, Popover::Layers),
@@ -872,6 +888,20 @@ impl Interface {
         if self.open != Some(Popover::Actions) {
             self.actions_panel.closed();
         }
+        let mut card = crate::shapes::Card {
+            corner_mm: self.prefs.card_corner_mm,
+            bleed_in: self.prefs.card_bleed_in,
+            width_in: self.prefs.card_width_in,
+        };
+        match self.shapes.show(&ctx, session, pc::BAR_HEIGHT, self.colours.rgb(), &mut card) {
+            Some(crate::shapes::Said::Notice(said, warning)) => self.overlays.notice(said, warning),
+            Some(crate::shapes::Said::Card(card)) => {
+                (self.prefs.card_corner_mm, self.prefs.card_bleed_in, self.prefs.card_width_in) =
+                    (card.corner_mm, card.bleed_in, card.width_in);
+                self.prefs.keep();
+            }
+            None => {}
+        }
         self.transform.show(&ctx, &mut self.look, session, &mut backdrops);
         self.plugin_panel(&ctx, session, &mut backdrops);
         crate::model_picture::show(&ctx, &mut self.look, session);
@@ -971,8 +1001,9 @@ impl Interface {
             let icon = if input.zooming_view() { egui::CursorIcon::ZoomIn } else { egui::CursorIcon::Grab };
             ctx.set_cursor_icon(icon);
         }
-        self.popover_open = self.open.is_some() || self.settings || self.text.editing();
-        self.panel_lets_through = self.open.is_some_and(|p| !self.modal(p)) && !self.settings && !self.text.editing();
+        self.popover_open = self.open.is_some() || self.settings || self.text.editing() || self.shapes.on;
+        self.panel_lets_through =
+            self.open.is_some_and(|p| !self.modal(p)) && !self.settings && !self.text.editing() && !self.shapes.on;
     }
 
     /// The touch companion, with its switch on in Advanced settings.

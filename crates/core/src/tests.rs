@@ -15558,3 +15558,40 @@ fn an_erase_drop_clears_the_area_it_lands_in_and_undoes_as_one_step() {
     assert!(s.set_layer_alpha_lock(layer, true));
     assert!(!s.erase_drop(50.0, 50.0, 0.2));
 }
+
+#[test]
+fn a_rounded_rectangle_shape_is_drawn_kept_to_snap_to_and_undone_as_one_step() {
+    use crate::shapes::{ShapeKind, ShapeMake, ShapeSpec};
+    let Some(s) = session(100, 140) else { return };
+    let layer = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+    let alpha = |x: usize, y: usize| {
+        let pixels = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+        pixels.get((y * 100 + x) * 4 + 3).copied().unwrap()
+    };
+    let card = ShapeSpec {
+        kind: ShapeKind::Rectangle,
+        make: ShapeMake::Fill,
+        x0: 0.0,
+        y0: 0.0,
+        x1: 100.0,
+        y1: 140.0,
+        corner: 20.0,
+        width: 0.0,
+        r: 0.0,
+        g: 0.0,
+        b: 1.0,
+    };
+    assert!(s.make_shape(card));
+    assert_eq!(alpha(50, 70), 255, "filled inside");
+    assert_eq!(alpha(0, 0), 0, "its rounded corner left clear");
+    assert_eq!(alpha(50, 0), 255, "straight edges reach the canvas edge");
+    let kept = s.placed_shapes();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept.first().map(|p| p.corner), Some(20.0));
+    s.undo();
+    assert_eq!(alpha(50, 70), 0, "one undo takes it away");
+    // outlined: its edge only
+    assert!(s.make_shape(ShapeSpec { make: ShapeMake::Outline, width: 6.0, ..card }));
+    assert_eq!(alpha(50, 2), 255);
+    assert_eq!(alpha(50, 70), 0);
+}

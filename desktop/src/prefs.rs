@@ -51,6 +51,11 @@ pub struct Prefs {
     /// The fine + where the pen hovers or last touched, when no brush outline shows there. Off,
     /// nothing marks the pen's place: an accurate pen needs no mark.
     pub pen_cross: bool,
+    /// The card the shape tool snaps to and matches corners with: its corner radius (mm), bleed
+    /// and trimmed width (inches).
+    pub card_corner_mm: f32,
+    pub card_bleed_in: f32,
+    pub card_width_in: f32,
     pub cursor_shows: CursorShows,
     pub cursor_style: CursorStyle,
     /// The colour model the Colors panel's disc and Value sliders work in.
@@ -112,6 +117,9 @@ impl Default for Prefs {
             sharp_layers: false,
             taskbar_from_top: true,
             taskbar_swipe: true,
+            card_corner_mm: 3.175,
+            card_bleed_in: 0.0,
+            card_width_in: 2.5,
             cursor_shows: CursorShows::Hovering,
             cursor_style: CursorStyle::Brush,
             colour_model: procraft_core::ColourModel::Hsb,
@@ -173,6 +181,9 @@ impl Prefs {
                 "sharp_layers" => p.sharp_layers = on,
                 "taskbar_from_top" => p.taskbar_from_top = on,
                 "taskbar_swipe" => p.taskbar_swipe = on,
+                "card_corner_mm" => p.card_corner_mm = number.map_or(p.card_corner_mm, |v| v.clamp(0.0, 20.0)),
+                "card_bleed_in" => p.card_bleed_in = number.map_or(p.card_bleed_in, |v| v.clamp(0.0, 1.0)),
+                "card_width_in" => p.card_width_in = number.map_or(p.card_width_in, |v| v.clamp(0.5, 20.0)),
                 "cursor_shows" => p.cursor_shows = pick(&SHOWS, value).unwrap_or(p.cursor_shows),
                 "cursor_style" => p.cursor_style = pick(&STYLES, value).unwrap_or(p.cursor_style),
                 "colour_model" => {
@@ -234,6 +245,9 @@ impl Prefs {
             format!("sharp_layers {}", self.sharp_layers),
             format!("taskbar_from_top {}", self.taskbar_from_top),
             format!("taskbar_swipe {}", self.taskbar_swipe),
+            format!("card_corner_mm {}", self.card_corner_mm),
+            format!("card_bleed_in {}", self.card_bleed_in),
+            format!("card_width_in {}", self.card_width_in),
             format!("cursor_shows {}", place(&SHOWS, self.cursor_shows)),
             format!("cursor_style {}", place(&STYLES, self.cursor_style)),
             format!("colour_model {}", self.colour_model.key()),

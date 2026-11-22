@@ -81,6 +81,7 @@ mod render;
 mod reveal;
 mod scene3d;
 mod selection;
+mod shapes;
 mod sharp;
 mod side_slider;
 mod sound_file;
@@ -205,6 +206,7 @@ pub use scene3d::{
     unpack_model_artwork, zip_model_name,
 };
 pub use selection::{SelectionDisplay, SelectionJoin};
+pub use shapes::{PlacedShape, ShapeKind, ShapeMake, ShapeSpec, shape_holding, shape_parallel_corner, shape_points};
 pub use side_slider::{SideSliderTap, side_slider_drag_share, side_slider_tap};
 pub use studio::{
     SliderExtrasInfo, SourceImage, SourceKind, StudioAbout, curve_samples, repeatable_source, slider_extras,
