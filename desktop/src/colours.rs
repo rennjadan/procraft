@@ -1027,6 +1027,25 @@ impl Pickers {
                 *hsv = self.model.disc_pick(*hsv, [d.x / disc_radius, d.y / disc_radius]);
             }
         }
+        // double-tapped inside the disc, the colour snaps to the nearest of its nine points (white,
+        // black, the pure hue, the greys and tints between), as Procreate's does
+        if response.double_clicked()
+            && let Some(p) = response.interact_pointer_pos()
+            && (p - centre).length() <= disc_radius * 1.08
+        {
+            let at = (p - centre) / disc_radius;
+            let model = self.model;
+            let nearest = snap_points(hsv[0])
+                .into_iter()
+                .map(|c| {
+                    let [x, y] = model.disc_point(c);
+                    (c, (vec2(x, y) - at).length())
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            if let Some((c, _)) = nearest {
+                *hsv = c;
+            }
+        }
         if !response.is_pointer_button_down_on() {
             self.on_ring = None;
         }
@@ -1082,6 +1101,12 @@ impl Pickers {
         if let Some(p) = response.interact_pointer_pos() {
             hsv[1] = ((p.x - square.left()) / square.width()).clamp(0.0, 1.0);
             hsv[2] = 1.0 - ((p.y - square.top()) / square.height()).clamp(0.0, 1.0);
+        }
+        // double-tapped, the nearest of its corners, edges' middles and middle (pure white, black,
+        // the pure hue...)
+        if response.double_clicked() {
+            hsv[1] = (hsv[1] * 2.0).round() / 2.0;
+            hsv[2] = (hsv[2] * 2.0).round() / 2.0;
         }
         let hue_key = (hsv[0] * 10_000.0).round() as u32;
         let side = (square.width() * ppp).round() as usize;
@@ -2158,6 +2183,18 @@ pub fn rgb_to_hsv([r, g, b]: [f32; 3]) -> [f32; 3] {
         (r - g) / d + 4.0
     };
     [h / 6.0, if max > 0.0 { d / max } else { 0.0 }, max]
+}
+
+/// The nine points a double-tap on the disc snaps to, for hue `h`: every saturation and
+/// brightness of none, half and all (all of them black at no brightness).
+fn snap_points(h: f32) -> Vec<[f32; 3]> {
+    let mut points = Vec::with_capacity(9);
+    for s in [0.0, 0.5, 1.0] {
+        for v in [0.0, 0.5, 1.0] {
+            points.push([h, s, v]);
+        }
+    }
+    points
 }
 
 #[cfg(test)]

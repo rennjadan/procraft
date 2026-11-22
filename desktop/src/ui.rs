@@ -2781,8 +2781,10 @@ impl Interface {
     /// N, O, S (and Shift) for its files, with +, - and 0 for its view. A plugin rebinding keys takes
     /// each press as it says first; a plugin's panel asking for a key press takes the next.
     fn shortcuts(&mut self, ctx: &egui::Context, session: &Arc<CanvasSession>, info: &CanvasInfo) {
-        // a text field, or the hex keypad, takes the keys; text being edited takes them all
-        if ctx.egui_wants_keyboard_input() || self.keys_taken() {
+        // a text field, or the hex keypad, takes the keys; text being edited takes them all; with
+        // the Windows key held they are Windows' own (Win+Shift+S takes a screenshot, the menus
+        // left open for it)
+        if ctx.egui_wants_keyboard_input() || self.keys_taken() || crate::input::windows_key_held() {
             return;
         }
         let keys: Vec<(Key, Modifiers, bool)> = ctx.input(|i| {

@@ -420,6 +420,10 @@ impl Input {
         match event {
             WindowEvent::ModifiersChanged(m) => {
                 let state = m.state();
+                // the Windows key held: its combinations (Win+Shift+S) are Windows', not shortcuts
+                if !cfg!(target_os = "macos") {
+                    WINDOWS_KEY.store(state.super_key(), std::sync::atomic::Ordering::Relaxed);
+                }
                 self.command_key = if cfg!(target_os = "macos") { state.super_key() } else { state.control_key() };
                 self.control = state.control_key();
                 self.alt = state.alt_key();
@@ -472,6 +476,7 @@ impl Input {
             }
             WindowEvent::Focused(false) => {
                 // keys let go elsewhere never come back up here (nor, perhaps, a press's lift)
+                WINDOWS_KEY.store(false, std::sync::atomic::Ordering::Relaxed);
                 self.space = false;
                 self.r_key = None;
                 self.command_key = false;
@@ -723,6 +728,14 @@ fn is_r(event: &KeyEvent) -> bool {
         }
         _ => false,
     }
+}
+
+/// The Windows key is held (its combinations belong to Windows: Win+Shift+S's S is no shortcut).
+static WINDOWS_KEY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the Windows key is held down.
+pub fn windows_key_held() -> bool {
+    WINDOWS_KEY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
