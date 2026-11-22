@@ -284,6 +284,7 @@ fn main() {
         interface_touches: input::InterfaceTouches::default(),
         closed: false,
         full: full_screen::FullScreen::kept(),
+        update_alert: alert::Alert::default(),
         vectorizing: None,
     };
     // a panic on the window's thread ends the app: said, rather than the window just vanishing
@@ -357,6 +358,8 @@ struct App {
     /// Full screen as F11 makes it, the taskbar covered, and a swipe up from the bottom edge to
     /// show the taskbar for a while (see [`FullScreen`]).
     full: full_screen::FullScreen,
+    /// The question asking to restart for an update.
+    update_alert: alert::Alert,
     /// The artwork being traced into vector layers, a layer a frame (see [`App::vectorize_step`]).
     vectorizing: Option<Vectorizing>,
 }
@@ -917,6 +920,7 @@ impl App {
         let full = &mut self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
+            update::prompt(ui.ctx(), &mut self.ui.look, &mut self.update_alert);
             full.paint(ui.ctx());
             // opening: the gallery over it, growing from the artwork's picture
             if let Some(zoom) = self.zoom.as_ref().filter(|z| z.opening) {
@@ -998,6 +1002,7 @@ impl App {
         // (on OpenGL from the first frame, which stays while they are made)
         let getting_ready = waited.is_some_and(|w| w >= CANVASES_SLOW) || screen.canvases_later();
         let full = &mut self.full;
+        let update_alert = &mut self.update_alert;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             interface.style_once(ui.ctx());
             full.paint(ui.ctx());
@@ -1014,6 +1019,7 @@ impl App {
             crate::pen::take_button_presses();
             // a share from the gallery shows its card there
             interface.export_card.show(ui.ctx(), &mut interface.look);
+            update::prompt(ui.ctx(), &mut interface.look, update_alert);
             interface.plugin_alert(ui.ctx());
             if reading == Some(true) {
                 opening_veil(ui.ctx());

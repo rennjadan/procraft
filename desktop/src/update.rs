@@ -3,9 +3,9 @@
 //! whose builds are Renn's version with the original developer's newest work merged in).
 //!
 //! The Updates setting (the gallery's + list) says what happens when a newer build is out:
-//! - Automatic (as it starts): it is downloaded quietly, and installed when ProCraft closes.
-//! - Ask first: the gallery's Check for updates row says one is ready; a tap saves, closes,
-//!   installs and opens it again.
+//! - Automatic (as it starts): it is downloaded quietly, then a question asks to restart:
+//!   Restart saves, closes, installs and opens ProCraft again; Later leaves it ready in the row.
+//! - Ask first: the same question as soon as one is found; Restart downloads it first.
 //! - Off: nothing, unless Check for updates is tapped.
 //!
 //! What it finds shows in that row itself (no window of its own over the app): checking, up to
@@ -40,8 +40,10 @@ static MODE: AtomicU8 = AtomicU8::new(AUTOMATIC);
 static READY: AtomicBool = AtomicBool::new(false);
 /// A look under way.
 static LOOKING: AtomicBool = AtomicBool::new(false);
-/// The release whose installer is downloaded and waits for the app to close.
-static WAITING: Mutex<Option<String>> = Mutex::new(None);
+/// The release whose installer is downloaded (its tag and file), ready to install on a restart.
+static WAITING: Mutex<Option<(String, std::path::PathBuf)>> = Mutex::new(None);
+/// A restart is to be asked for (a build found or downloaded), once.
+static ASK: AtomicBool = AtomicBool::new(false);
 /// The window the questions show over, and how to wake the app to close.
 static APP: OnceLock<(Arc<Window>, EventLoopProxy<()>)> = OnceLock::new();
 
@@ -57,7 +59,7 @@ enum Status {
         url: String,
     },
     Downloading,
-    /// Downloaded: it installs when ProCraft closes.
+    /// Downloaded: it installs when ProCraft restarts.
     Waiting,
     NotInstalled,
     Failed(String),
@@ -90,7 +92,7 @@ pub fn row_text() -> (String, bool) {
         Status::UpToDate => (format!("Up to date{developer}"), false),
         Status::Ready { .. } => ("Ready \u{2014} tap to install".to_owned(), false),
         Status::Downloading => ("Downloading\u{2026}".to_owned(), true),
-        Status::Waiting => ("Installs when you close".to_owned(), false),
+        Status::Waiting => ("Ready \u{2014} tap to restart and update".to_owned(), false),
         Status::NotInstalled => ("Only the installed copy".to_owned(), false),
         Status::Failed(e) => (format!("Couldn't check: {}", e.chars().take(40).collect::<String>()), false),
     }
@@ -169,7 +171,7 @@ pub fn tap() {
         set(Status::Idle);
         return;
     }
-    let ready = matches!(status(), Status::Ready { .. });
+    let ready = matches!(status(), Status::Ready { .. } | Status::Waiting);
     let spawned = std::thread::Builder::new()
         .name("procraft-update-now".to_owned())
         .spawn(move || if ready { install_now() } else { look(true) });
@@ -242,28 +244,50 @@ fn look_once(asked: bool) -> Result<(), String> {
         set(Status::UpToDate);
         return Ok(());
     }
+    let _ = exe;
+    // already downloaded (Later was answered): ready in the row, not asked again
     let waiting = WAITING.lock().ok().and_then(|w| w.clone());
-    if waiting.as_deref() == Some(tag.as_str()) {
+    if waiting.is_some_and(|(t, _)| t == tag) {
         set(Status::Waiting);
+        if asked {
+            ASK.store(true, Ordering::Relaxed);
+            wake();
+        }
         return Ok(());
     }
-    // Automatic: downloaded now, installed when the app closes; else it waits for a tap
+    // Automatic: downloaded now, then a restart asked for; else asked for at once (Restart then
+    // downloads it)
     if !asked && mode() == crate::update::AUTOMATIC {
         set(Status::Downloading);
-        download_and_wait(&tag, &url, &exe, false)?;
+        let msi = download(&tag, &url)?;
+        if let Ok(mut w) = WAITING.lock() {
+            *w = Some((tag, msi));
+        }
         set(Status::Waiting);
     } else {
         set(Status::Ready { tag, url });
     }
+    ASK.store(true, Ordering::Relaxed);
+    wake();
     Ok(())
 }
 
 /// The build ready installed now: downloaded, then the app saves, closes, installs and opens again.
 fn install_now() {
-    let Status::Ready { tag, url } = status() else { return };
-    set(Status::Downloading);
-    let outcome =
-        std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| download_and_wait(&tag, &url, &exe, true));
+    let msi = match status() {
+        Status::Ready { tag, url } => {
+            set(Status::Downloading);
+            download(&tag, &url)
+        }
+        Status::Waiting => {
+            WAITING.lock().ok().and_then(|w| w.clone()).map(|(_, m)| m).ok_or_else(|| "nothing downloaded".to_owned())
+        }
+        _ => return,
+    };
+    let outcome = msi.and_then(|msi| {
+        let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+        install_after_exit(&msi, &exe)
+    });
     match outcome {
         Ok(()) => {
             READY.store(true, Ordering::Relaxed);
@@ -275,9 +299,8 @@ fn install_now() {
     }
 }
 
-/// Downloads release `tag`'s installer (`url`), and leaves a helper waiting for the app to close
-/// to install it (then, `reopen`, to open `exe` again).
-fn download_and_wait(tag: &str, url: &str, exe: &std::path::Path, reopen: bool) -> Result<(), String> {
+/// Downloads release `tag`'s installer (`url`) to the temporary folder: where it is.
+fn download(tag: &str, url: &str) -> Result<std::path::PathBuf, String> {
     let msi = std::env::temp_dir().join(format!("procraft-{tag}.msi"));
     let target = quoted(&msi.to_string_lossy());
     powershell(&format!(
@@ -285,19 +308,53 @@ fn download_and_wait(tag: &str, url: &str, exe: &std::path::Path, reopen: bool) 
          Invoke-WebRequest -Uri '{}' -OutFile '{target}' -UseBasicParsing -TimeoutSec 900",
         quoted(url)
     ))?;
-    let reopen =
-        if reopen { format!("Start-Process -FilePath '{}'", quoted(&exe.to_string_lossy())) } else { String::new() };
+    Ok(msi)
+}
+
+/// Leaves a helper waiting for the app to close to install `msi`, then open `exe` again.
+fn install_after_exit(msi: &std::path::Path, exe: &std::path::Path) -> Result<(), String> {
+    let target = quoted(&msi.to_string_lossy());
     let helper = format!(
         "Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 500; \
          Start-Process -FilePath 'msiexec.exe' -ArgumentList @('/i', '\"{target}\"', '/qn', '/norestart') -Verb RunAs -Wait; \
-         Remove-Item -LiteralPath '{target}' -ErrorAction SilentlyContinue; {reopen}",
+         Remove-Item -LiteralPath '{target}' -ErrorAction SilentlyContinue; Start-Process -FilePath '{}'",
+        quoted(&exe.to_string_lossy()),
         pid = std::process::id(),
     );
-    spawn_hidden(&helper)?;
-    if let Ok(mut w) = WAITING.lock() {
-        *w = Some(tag.to_owned());
+    spawn_hidden(&helper)
+}
+
+/// Wakes the app to show what changed.
+fn wake() {
+    if let Some((window, wake)) = APP.get() {
+        window.request_redraw();
+        let _ = wake.send_event(());
     }
-    Ok(())
+}
+
+/// Asks to restart for an update when one is ready (found, or downloaded): Restart saves,
+/// closes, installs and opens ProCraft again; Later leaves it in the gallery's row.
+pub fn prompt(ctx: &egui::Context, look: &mut crate::look::Look, alert: &mut crate::alert::Alert) {
+    if ASK.swap(false, Ordering::Relaxed) && !alert.is_open() {
+        let downloaded = matches!(status(), Status::Waiting);
+        alert.ask(crate::alert::Asking {
+            title: "Update ready".into(),
+            message: if downloaded {
+                "Restart ProCraft to install it? Your artwork is saved first.".into()
+            } else {
+                "A new version is out. Restart ProCraft to download and install it? Your artwork is saved first.".into()
+            },
+            action: "Restart".into(),
+            icon: None,
+            destructive: false,
+            extra: None,
+            first: Some("Later".into()),
+            alone: false,
+        });
+    }
+    if let Some(crate::alert::Answer::Action) = alert.show(ctx, look) {
+        tap();
+    }
 }
 
 /// The latest release of `repo`: its build, tag, installer and whether the developer's newest
