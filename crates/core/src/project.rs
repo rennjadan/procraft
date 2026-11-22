@@ -1654,17 +1654,31 @@ pub(crate) fn opened_pixels(
     height: u32,
 ) -> (Vec<(LayerId, Vec<u8>)>, Vec<LayerId>) {
     let mut unread = Vec::new();
-    let pixels = layers
-        .into_iter()
-        .filter_map(|(id, layer)| match layer.pixels(width, height) {
-            Ok(rgba) => Some((id, rgba)),
-            Err(e) => {
+    // decoded side by side (as many at once as memory allows): an artwork of many layers opens
+    // in a fraction of the time
+    let held: Vec<(LayerId, std::sync::Mutex<Option<Opened>>)> =
+        layers.into_iter().map(|(id, l)| (id, std::sync::Mutex::new(Some(l)))).collect();
+    let each = width as usize * height as usize * 4;
+    let decoded = procraft_engine::par::side_by_side_within(&held, each, |(_, l)| {
+        let layer = l.lock().unwrap_or_else(|e| e.into_inner()).take();
+        layer.map(|layer| layer.pixels(width, height))
+    });
+    let mut pixels = Vec::with_capacity(held.len());
+    for ((id, l), done) in held.iter().zip(decoded) {
+        // one a worker couldn't take, done here
+        let outcome = done.flatten().or_else(|| {
+            let layer = l.lock().unwrap_or_else(|e| e.into_inner()).take();
+            layer.map(|layer| layer.pixels(width, height))
+        });
+        match outcome {
+            Some(Ok(rgba)) => pixels.push((*id, rgba)),
+            Some(Err(e)) => {
                 log::error!("layer {id:?}: {e}");
-                unread.push(id);
-                None
+                unread.push(*id);
             }
-        })
-        .collect();
+            None => unread.push(*id),
+        }
+    }
     (pixels, unread)
 }
 
@@ -2163,5 +2177,50 @@ mod signature_tests {
         left.sort();
         assert_eq!(left, ["photo.jpg", "signature.json"]);
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod psd_timing {
+    /// Times each part of importing the PSD at PSD_IN (to find what is slow):
+    /// `PSD_IN=a.psd cargo test --release -p procraft-core psd_import_timing -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn psd_import_timing() {
+        let Some(input) = std::env::var_os("PSD_IN") else { return };
+        let t = std::time::Instant::now();
+        let bytes = std::fs::read(input).unwrap();
+        eprintln!("read file {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let imported = procraft_engine::psd::read(&bytes).unwrap();
+        eprintln!("psd::read {:?} ({} layers)", t.elapsed(), imported.pixels.len());
+        let t = std::time::Instant::now();
+        let session = crate::CanvasSession::with_document(imported.document, "t".into(), imported.pixels);
+        eprintln!("with_document {:?}", t.elapsed());
+        let dir = std::env::temp_dir().join("psd-timing");
+        let _ = std::fs::remove_dir_all(&dir);
+        let t = std::time::Instant::now();
+        session.save(dir.to_string_lossy().into_owned()).unwrap();
+        eprintln!("save {:?}", t.elapsed());
+        drop(session);
+        let t = std::time::Instant::now();
+        let opened = crate::CanvasSession::open(dir.to_string_lossy().into_owned()).unwrap();
+        eprintln!("open {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        let pending = std::mem::take(&mut opened.shared.lock().pending_pixels);
+        let (w, h) = {
+            let st = opened.shared.lock();
+            (st.doc.width(), st.doc.height())
+        };
+        let (px, _) = super::opened_pixels(pending, w, h);
+        eprintln!("decode {} layers {:?}", px.len(), t.elapsed());
+        let t = std::time::Instant::now();
+        let flat = procraft_engine::psd::flattened(&bytes);
+        eprintln!("flattened {:?}", t.elapsed());
+        let t = std::time::Instant::now();
+        if let Some((w, h, f)) = flat {
+            let _ = super::thumbnail(&f, w, h, super::THUMBNAIL_SIDE);
+        }
+        eprintln!("thumbnail {:?}", t.elapsed());
     }
 }

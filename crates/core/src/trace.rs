@@ -55,12 +55,21 @@ pub(crate) fn trace(rgba: &[u8], width: u32, height: u32, detail: Detail) -> Vec
         return Vec::new();
     }
     let colours = straight(rgba, w * h);
+    // grain and dither smoothed away first (a painted texture's speckle would be traced shape by
+    // shape), the groups found and each pixel put in one on the smoothed colours; the averages
+    // below are still the paint's own
+    let smooth = softened(&colours, w, h, SOFTEN);
+    // the groups are the paint's own colours (no blend of two neighbours becomes one of its own)
     let centres = find_colours(&colours, detail.colours.clamp(1, 250));
     if centres.is_empty() {
         return Vec::new();
     }
-    let mut labels = label(&colours, &centres);
-    merge_specks(&mut labels, w, h, detail.least_speck);
+    let mut labels = label(&smooth, &centres);
+    for _ in 0..TIDY_ROUNDS {
+        labels = tidied(&labels, w, h);
+    }
+    // the smallest speck kept grows with the picture (a few hundredths of a percent of it)
+    merge_specks(&mut labels, w, h, detail.least_speck.max(w * h / 40_000));
     // each colour group: how much it covers, its colour and opacity as the pixels in it average
     let mut stats = vec![(0usize, [0f64; 4]); centres.len()];
     for (l, c) in labels.iter().zip(&colours) {
@@ -112,6 +121,100 @@ pub(crate) fn trace(rgba: &[u8], width: u32, height: u32, detail: Detail) -> Vec
         }
         stray *= 2.0;
     }
+}
+
+/// How far (pixels) colours are averaged with their neighbours' before grouping.
+const SOFTEN: usize = 2;
+/// Rounds of tidying the groups' edges.
+const TIDY_ROUNDS: usize = 2;
+
+/// `colours` (`w` × `h`) each averaged with its neighbours `r` around (a box, twice: near a
+/// gaussian), so grain and dither even out.
+fn softened(colours: &[[u8; 4]], w: usize, h: usize, r: usize) -> Vec<[u8; 4]> {
+    // colour weighed by opacity (clear pixels lend none), opacity alongside
+    let mut a: Vec<[u32; 4]> = colours
+        .iter()
+        .map(|c| {
+            let k = u32::from(c[3]);
+            [u32::from(c[0]) * k, u32::from(c[1]) * k, u32::from(c[2]) * k, k]
+        })
+        .collect();
+    let mut b = a.clone();
+    let window = (2 * r + 1) as u32;
+    for _ in 0..2 {
+        for y in 0..h {
+            let row = y * w;
+            for x in 0..w {
+                let mut sum = [0u32; 4];
+                for dx in 0..=2 * r {
+                    let xx = (x + dx).saturating_sub(r).min(w - 1);
+                    if let Some(p) = a.get(row + xx) {
+                        for (s, v) in sum.iter_mut().zip(p) {
+                            *s += v;
+                        }
+                    }
+                }
+                if let Some(o) = b.get_mut(row + x) {
+                    *o = sum.map(|s| s / window);
+                }
+            }
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let mut sum = [0u32; 4];
+                for dy in 0..=2 * r {
+                    let yy = (y + dy).saturating_sub(r).min(h - 1);
+                    if let Some(p) = b.get(yy * w + x) {
+                        for (s, v) in sum.iter_mut().zip(p) {
+                            *s += v;
+                        }
+                    }
+                }
+                if let Some(o) = a.get_mut(y * w + x) {
+                    *o = sum.map(|s| s / window);
+                }
+            }
+        }
+    }
+    a.into_iter()
+        .zip(colours)
+        .map(|(c, orig)| {
+            // what was clear stays clear (and solid stays solid): only colour is smoothed
+            let k = c[3].max(1);
+            let un = |v: u32| (v / k).min(255) as u8;
+            if orig[3] == 0 { *orig } else { [un(c[0]), un(c[1]), un(c[2]), orig[3]] }
+        })
+        .collect()
+}
+
+/// Each pixel's group as most of the pixels round it (two each way) have it: ragged edges between
+/// groups made smooth, lone pixels taken in.
+fn tidied(labels: &[u16], w: usize, h: usize) -> Vec<u16> {
+    let mut out = labels.to_vec();
+    let mut counts: Vec<(u16, u8)> = Vec::with_capacity(25);
+    for y in 0..h {
+        for x in 0..w {
+            counts.clear();
+            for yy in y.saturating_sub(2)..(y + 3).min(h) {
+                for xx in x.saturating_sub(2)..(x + 3).min(w) {
+                    let l = labels.get(yy * w + xx).copied().unwrap_or(NONE);
+                    match counts.iter_mut().find(|(k, _)| *k == l) {
+                        Some((_, n)) => *n += 1,
+                        None => counts.push((l, 1)),
+                    }
+                }
+            }
+            let own = labels.get(y * w + x).copied().unwrap_or(NONE);
+            // a clear pixel stays clear, and paint stays paint (edges kept where they are)
+            if let Some((best, _)) =
+                counts.iter().filter(|(k, _)| (*k == NONE) == (own == NONE)).max_by_key(|(_, n)| *n)
+                && let Some(o) = out.get_mut(y * w + x)
+            {
+                *o = *best;
+            }
+        }
+    }
+    out
 }
 
 /// Each pixel's colour, no longer premultiplied, and its opacity (0 to 255).
@@ -605,5 +708,55 @@ mod quality {
             std::fs::write(dir.join("source.ppm"), ppm).unwrap();
         }
         assert!(!shapes.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod look_test {
+    /// Traces the picture at TRACE_IN and writes how the shapes look to TRACE_OUT (to see a trace
+    /// by eye): `TRACE_IN=a.png TRACE_OUT=b.png cargo test -p procraft-core trace_picture -- --ignored`.
+    #[test]
+    #[ignore]
+    fn trace_picture() {
+        let (Some(input), Some(output)) = (std::env::var_os("TRACE_IN"), std::env::var_os("TRACE_OUT")) else { return };
+        let img = image::open(input).unwrap().to_rgba8();
+        let (w, h) = img.dimensions();
+        // premultiplied, as layers are
+        let mut px = img.into_raw();
+        for p in px.chunks_exact_mut(4) {
+            let a = u32::from(p[3]);
+            for c in p.iter_mut().take(3) {
+                *c = ((u32::from(*c) * a + 127) / 255) as u8;
+            }
+        }
+        let started = std::time::Instant::now();
+        let shapes = super::trace(&px, w, h, super::Detail::default());
+        eprintln!("{} shapes in {:?}", shapes.len(), started.elapsed());
+        let mut out = vec![255u8; (w * h * 4) as usize];
+        for s in &shapes {
+            // even-odd: each outline flips what it covers
+            let mut cover = vec![false; (w * h) as usize];
+            for o in &s.outlines {
+                let pts: Vec<procraft_engine::geom::Vec2> =
+                    o.iter().map(|&[x, y]| procraft_engine::geom::Vec2::new(x, y)).collect();
+                let m = procraft_engine::selection::Mask::polygon(w, h, &pts);
+                for (c, &v) in cover.iter_mut().zip(&m.data) {
+                    if v > 127 {
+                        *c = !*c;
+                    }
+                }
+            }
+            let col = s.colour.map(|c| (c * 255.0).round() as u8);
+            for (i, &c) in cover.iter().enumerate() {
+                if c {
+                    let a = s.opacity;
+                    for k in 0..3 {
+                        let d = &mut out[i * 4 + k];
+                        *d = (f32::from(*d) * (1.0 - a) + f32::from(col[k]) * a).round() as u8;
+                    }
+                }
+            }
+        }
+        image::save_buffer(output, &out, w, h, image::ColorType::Rgba8).unwrap();
     }
 }

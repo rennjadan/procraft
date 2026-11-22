@@ -483,11 +483,14 @@ impl Layers {
                                         ui.ctx().animate_value_with_time(ui.scope_id().with(("aside", l.id)), way, 0.3);
                                     let row = row.translate(vec2(0.0, aside));
                                     let at = row.translate(vec2(slide, 0.0));
+                                    // open, the whole row takes a swipe back (the buttons under the
+                                    // finger too: they, added after, keep their taps)
+                                    let id = ui.scope_id().with(("row", l.id));
+                                    let area = if slide < 0.0 { row } else { at.intersect(row) };
+                                    let response = ui.interact(area, id, Sense::click_and_drag());
                                     if slide < 0.0 {
                                         self.swipe_buttons(ui, session, l, row, alone);
                                     }
-                                    let id = ui.scope_id().with(("row", l.id));
-                                    let response = ui.interact(at.intersect(row), id, Sense::click_and_drag());
                                     if response.is_pointer_button_down_on()
                                         && self.press.is_none()
                                         && let Some(origin) = ui.input(|i| i.pointer.interact_pos())
