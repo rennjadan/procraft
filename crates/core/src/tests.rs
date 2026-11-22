@@ -15595,3 +15595,53 @@ fn a_rounded_rectangle_shape_is_drawn_kept_to_snap_to_and_undone_as_one_step() {
     assert_eq!(alpha(50, 2), 255);
     assert_eq!(alpha(50, 70), 0);
 }
+
+#[test]
+fn a_lasso_fills_and_erases_its_shape_and_a_gradient_shows_until_applied() {
+    use crate::blend::{GradientKind, GradientSpec};
+    let Some(s) = session(100, 100) else { return };
+    let layer = s.layers().iter().find(|l| l.current).map(|l| l.id).unwrap();
+    let px = |x: usize, y: usize| {
+        let pixels = s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap();
+        <[u8; 4]>::try_from(pixels.get((y * 100 + x) * 4..(y * 100 + x) * 4 + 4).unwrap()).unwrap()
+    };
+    let square = vec![10.0, 10.0, 60.0, 10.0, 60.0, 60.0, 10.0, 60.0];
+    assert!(s.lasso_fill(square, false, 0.0, 1.0, 0.0));
+    assert_eq!(px(30, 30)[3], 255, "inside filled");
+    assert_eq!(px(80, 80)[3], 0, "outside not");
+    // a smaller lasso erases a hole
+    assert!(s.lasso_fill(vec![20.0, 20.0, 40.0, 20.0, 40.0, 40.0, 20.0, 40.0], true, 0.0, 0.0, 0.0));
+    assert_eq!(px(30, 30)[3], 0);
+    assert_eq!(px(15, 15)[3], 255);
+    s.undo();
+    assert_eq!(px(30, 30)[3], 255, "the erase undone alone");
+    // a gradient from solid blue at the left to see-through at the right
+    let g = GradientSpec {
+        kind: GradientKind::Linear,
+        x0: 0.0,
+        y0: 0.0,
+        x1: 100.0,
+        y1: 0.0,
+        r0: 0.0,
+        g0: 0.0,
+        b0: 1.0,
+        a0: 1.0,
+        r1: 0.0,
+        g1: 0.0,
+        b1: 0.0,
+        a1: 0.0,
+        bands: 0,
+    };
+    assert!(s.gradient_show(g));
+    assert!(s.gradient_open());
+    s.gradient_end(true);
+    let (left, right) = (px(2, 90), px(97, 90));
+    assert!(left[2] > 200 && left[3] > 200, "{left:?}");
+    assert!(right[3] < 20, "{right:?}");
+    s.undo();
+    assert_eq!(px(2, 90)[3], 0, "one undo takes the gradient away");
+    // cancelled, nothing changes
+    assert!(s.gradient_show(g));
+    s.gradient_end(false);
+    assert_eq!(px(2, 90)[3], 0);
+}

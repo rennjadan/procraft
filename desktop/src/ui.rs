@@ -725,12 +725,12 @@ impl Interface {
         let held = self.tool_hold(&ctx, session, &bar);
         // another button tapped while placing shapes puts the shape tool away first
         if self.shapes.on && bar.pressed.is_some_and(|b| b != BarButton::Shapes) {
-            self.shapes.close();
+            self.shapes.close(session);
         }
         match bar.pressed.filter(|_| !held) {
             Some(BarButton::Shapes) => {
                 if self.shapes.on {
-                    self.shapes.close();
+                    self.shapes.close(session);
                 } else if self.switch_modes(session, ModeButton::Tool) {
                     self.open = None;
                     self.shapes.open();
@@ -1412,6 +1412,10 @@ impl Interface {
     /// Undo (recoloring, the core takes back the open fill first).
     fn undo(&mut self, session: &CanvasSession) {
         self.feedback();
+        // a gradient still being placed is what goes
+        if self.shapes.cancel_gradient(session) {
+            return;
+        }
         // transforming, the transform's last change goes back, the box with it
         if self.transform.on {
             self.transform.moved(session.transform_apply(procraft_core::TransformAction::Undo));
@@ -1454,6 +1458,9 @@ impl Interface {
 
     fn redo(&mut self, session: &CanvasSession) {
         self.feedback();
+        if session.gradient_open() {
+            return;
+        }
         // transforming, nothing is redone until it ends
         if self.transform.on {
             return;

@@ -17,6 +17,7 @@ mod adjust_menu;
 mod adjusting;
 mod animation;
 mod app_log;
+mod blend;
 mod brush_files;
 mod brush_libraries;
 mod brush_library;
@@ -130,6 +131,7 @@ pub use animation::{
     AnimationPlayback, AnimationSettings, FrameRate, PlayStep, animation_next_step, export_fps_at, export_fps_fraction,
     export_fps_label, frame_rate,
 };
+pub use blend::{GradientKind, GradientSpec};
 pub use brush_files::BrushEngines;
 pub use brush_files::{BrushesRead, OTHER_BRUSH_EXTENSIONS, ReadBrushes, is_brush_zip, read_any_brushes, read_brushes};
 pub use brush_libraries::BrushLibraryInfo;
@@ -538,6 +540,8 @@ pub(crate) struct State {
     pub(crate) layer_data_unread: std::collections::HashSet<procraft_engine::document::LayerId>,
     /// A colour dropped on the canvas whose threshold can still change.
     pub(crate) pour: Option<pour::Pour>,
+    /// A gradient being placed.
+    pub(crate) gradient: Option<blend::Draft>,
     /// A dropped colour's fill spreading in, while it does.
     pub(crate) reveal: Option<reveal::Reveal>,
     /// The system asks for less motion: a dropped colour's fill shows at once.
@@ -1658,6 +1662,7 @@ impl CanvasSession {
             layer_data_unread: std::collections::HashSet::new(),
             pending_stores: Vec::new(),
             pour: None,
+            gradient: None,
             reveal: None,
             reduce_motion: false,
             recolor: None,

@@ -8,7 +8,8 @@
 
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 use procraft_core::{
-    CanvasSession, PlacedShape, ShapeKind, ShapeMake, ShapeSpec, shape_holding, shape_parallel_corner, shape_points,
+    CanvasSession, GradientKind, GradientSpec, PlacedShape, ShapeKind, ShapeMake, ShapeSpec, shape_holding,
+    shape_parallel_corner, shape_points,
 };
 
 use crate::look::{Weight, argb, pc, text};
@@ -19,7 +20,9 @@ const SNAP: f32 = 10.0;
 const HANDLE_REACH: f32 = 22.0;
 const HANDLE_DOT: f32 = 6.0;
 const GUIDE: Color32 = Color32::from_rgb(255, 64, 200);
-const PANEL_HEIGHT: f32 = 132.0;
+const PANEL_HEIGHT: f32 = 168.0;
+/// A tap this near a lasso's first point (points) closes it.
+const CLOSE_REACH: f32 = 16.0;
 
 const KINDS: [(ShapeKind, &str); 7] = [
     (ShapeKind::Rectangle, "Rectangle"),
@@ -33,6 +36,16 @@ const KINDS: [(ShapeKind, &str); 7] = [
 
 /// Card corner presets: name and radius (mm).
 const CORNERS: [(&str, f32); 3] = [("1/8\" (poker, MTG, Pokémon)", 3.175), ("3 mm", 3.0), ("5.5 mm (US game)", 5.5)];
+
+/// The panel's tools.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tab {
+    Shapes,
+    /// A shape drawn freehand (or tapped point by point) fills or erases at once.
+    Lasso,
+    /// A colour blended along a drag (the blender).
+    Gradient,
+}
 
 /// What a drag on the canvas is doing.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -78,6 +91,25 @@ pub struct Shapes {
     /// The guides it snapped to this frame (canvas x, canvas y).
     guides: (Option<f32>, Option<f32>),
     card_open: bool,
+    tab: Tab,
+    /// The lasso being drawn freehand, and the points tapped (canvas pixels); erasing, not filling;
+    /// its path smoothed.
+    lasso: Vec<Pos2>,
+    taps: Vec<Pos2>,
+    lasso_erase: bool,
+    smooth: bool,
+    /// The gradient's start and end (canvas pixels), which end a drag holds (0 a new one, 1 the
+    /// start, 2 the end), its kind, whether it fades to see-through (else to `second`), its bands,
+    /// and the colour it was last shown with.
+    grad: Option<(Pos2, Pos2)>,
+    grad_grip: Option<u8>,
+    grad_kind: GradientKind,
+    to_clear: bool,
+    second: [f32; 3],
+    bands: u32,
+    shown_with: Option<[f32; 3]>,
+    /// A lasso closed this frame, to fill or erase once the touches are read.
+    pending_lasso: Option<(Vec<Pos2>, [f32; 3])>,
 }
 
 impl Default for Shapes {
@@ -94,6 +126,19 @@ impl Default for Shapes {
             drag: None,
             guides: (None, None),
             card_open: false,
+            tab: Tab::Shapes,
+            lasso: Vec::new(),
+            taps: Vec::new(),
+            lasso_erase: false,
+            smooth: true,
+            grad: None,
+            grad_grip: None,
+            grad_kind: GradientKind::Linear,
+            to_clear: true,
+            second: [1.0, 1.0, 1.0],
+            bands: 1,
+            shown_with: None,
+            pending_lasso: None,
         }
     }
 }
@@ -133,11 +178,95 @@ impl Shapes {
         self.drag = None;
     }
 
-    pub fn close(&mut self) {
+    /// Put away: a gradient being placed is kept (as a tool changed in Procreate keeps it).
+    pub fn close(&mut self, session: &CanvasSession) {
         self.on = false;
         self.rect = None;
         self.drag = None;
         self.card_open = false;
+        self.lasso.clear();
+        self.taps.clear();
+        self.end_gradient(session, true);
+    }
+
+    /// A gradient being placed taken back (undo while it shows); false if none was.
+    pub fn cancel_gradient(&mut self, session: &CanvasSession) -> bool {
+        let open = self.grad.is_some() || session.gradient_open();
+        self.end_gradient(session, false);
+        open
+    }
+
+    fn end_gradient(&mut self, session: &CanvasSession, keep: bool) {
+        if self.grad.take().is_some() || session.gradient_open() {
+            session.gradient_end(keep);
+        }
+        self.grad_grip = None;
+        self.shown_with = None;
+    }
+
+    fn gradient_spec(&self, rgb: [f32; 3]) -> Option<GradientSpec> {
+        let (a, b) = self.grad?;
+        let [r0, g0, b0] = rgb;
+        let [r1, g1, b1] = if self.to_clear { rgb } else { self.second };
+        Some(GradientSpec {
+            kind: self.grad_kind,
+            x0: a.x,
+            y0: a.y,
+            x1: b.x,
+            y1: b.y,
+            r0,
+            g0,
+            b0,
+            a0: 1.0,
+            r1,
+            g1,
+            b1,
+            a1: if self.to_clear { 0.0 } else { 1.0 },
+            bands: if self.bands >= 2 { self.bands } else { 0 },
+        })
+    }
+
+    /// The gradient shown again as it now is.
+    fn show_gradient(&mut self, session: &CanvasSession, rgb: [f32; 3]) -> Option<Said> {
+        let spec = self.gradient_spec(rgb)?;
+        self.shown_with = Some(rgb);
+        if session.gradient_show(spec) {
+            None
+        } else {
+            self.grad = None;
+            Some(Said::Notice("Can't put a gradient on this layer", true))
+        }
+    }
+
+    /// The lasso's path, smoothed if asked (corner cutting, twice), as canvas x, y pairs.
+    fn lasso_points(&self, path: &[Pos2]) -> Vec<f32> {
+        let mut pts: Vec<Pos2> = path.to_vec();
+        if self.smooth && pts.len() >= 4 {
+            for _ in 0..2 {
+                let n = pts.len();
+                let mut next = Vec::with_capacity(n * 2);
+                for i in 0..n {
+                    let a = pts.get(i).copied().unwrap_or_default();
+                    let b = pts.get((i + 1) % n).copied().unwrap_or_default();
+                    next.push(a.lerp(b, 0.25));
+                    next.push(a.lerp(b, 0.75));
+                }
+                pts = next;
+            }
+        }
+        pts.iter().flat_map(|p| [p.x, p.y]).collect()
+    }
+
+    fn apply_lasso(&mut self, session: &CanvasSession, path: &[Pos2], rgb: [f32; 3]) -> Option<Said> {
+        if path.len() < 3 {
+            return None;
+        }
+        let [r, g, b] = rgb;
+        if session.lasso_fill(self.lasso_points(path), self.lasso_erase, r, g, b) {
+            None
+        } else {
+            Some(Said::Notice("Can't change this layer", true))
+        }
     }
 
     /// The card's cut on a `w` × `h` canvas (canvas pixels), its corner radius in pixels.
@@ -195,6 +324,11 @@ impl Shapes {
             Some(pos2(*v.first()?, *v.get(1)?))
         };
         let mut said = None;
+        let mut close = false;
+        // a colour changed while a gradient shows: shown in it
+        if self.tab == Tab::Gradient && self.grad.is_some() && self.shown_with != Some(rgb) {
+            said = self.show_gradient(session, rgb);
+        }
         // touches over the canvas: a new shape, a handle, or the shape moved
         egui::Area::new(Id::unique("shapes over canvas")).fixed_pos(canvas_area.min).order(Order::Middle).show(
             ctx,
@@ -202,6 +336,14 @@ impl Shapes {
                 let response = ui.allocate_rect(canvas_area, Sense::click_and_drag());
                 let at = ui.input(|i| i.pointer.interact_pos());
                 let shift = ui.input(|i| i.modifiers.shift);
+                if self.tab == Tab::Lasso {
+                    said = self.lasso_touch(ui, &response, at, m, ppp, per_point, &to_canvas, rgb);
+                    return;
+                }
+                if self.tab == Tab::Gradient {
+                    said = self.gradient_touch(ui, session, &response, at, m, ppp, &to_canvas, rgb, shift);
+                    return;
+                }
                 if response.drag_started()
                     && let Some(p) = response.interact_pointer_pos().and_then(to_canvas)
                 {
@@ -289,6 +431,33 @@ impl Shapes {
             ui.visuals_mut().override_text_color = Some(Color32::from_gray(225));
             ui.spacing_mut().button_padding = vec2(10.0, 6.0);
             ui.horizontal(|ui| {
+                for (tab, name) in [(Tab::Shapes, "Shapes"), (Tab::Lasso, "Lasso"), (Tab::Gradient, "Gradient")] {
+                    let label = egui::RichText::new(name).strong().size(15.0);
+                    if ui.add(egui::Button::selectable(self.tab == tab, label)).clicked() && self.tab != tab {
+                        // leaving the gradient keeps it
+                        if self.tab == Tab::Gradient {
+                            self.end_gradient(session, true);
+                        }
+                        self.tab = tab;
+                        self.lasso.clear();
+                        self.taps.clear();
+                    }
+                }
+                ui.separator();
+                if ui.button("Done").clicked() {
+                    close = true;
+                }
+            });
+            ui.add_space(4.0);
+            if self.tab == Tab::Lasso {
+                self.lasso_panel(&mut ui, session, rgb, &mut said);
+                return;
+            }
+            if self.tab == Tab::Gradient {
+                self.gradient_panel(&mut ui, session, rgb, &mut said);
+                return;
+            }
+            ui.horizontal(|ui| {
                 for (kind, name) in KINDS {
                     if ui.add(egui::Button::selectable(self.kind == kind, name)).clicked() {
                         self.kind = kind;
@@ -353,9 +522,6 @@ impl Shapes {
                 if ui.add_enabled(self.rect.is_some(), apply).clicked() {
                     said = Some(self.apply(session, rgb));
                 }
-                if ui.button("Done").clicked() {
-                    self.close();
-                }
             });
             if self.card_open {
                 ui.add_space(4.0);
@@ -385,7 +551,14 @@ impl Shapes {
                 });
             }
         });
-        if self.drag.is_some() {
+        if let Some((path, rgb)) = self.pending_lasso.take() {
+            said = self.apply_lasso(session, &path, rgb).or(said);
+        }
+        if close {
+            self.close(session);
+            return said;
+        }
+        if self.drag.is_some() || !self.lasso.is_empty() {
             ctx.request_repaint();
         }
         // the shape's size, by its box
@@ -397,6 +570,212 @@ impl Shapes {
             text(&painter, p, Align2::LEFT_TOP, &label, 14.0, Weight::Medium, Color32::WHITE);
         }
         said
+    }
+
+    /// The lasso's touches: a drag draws it freehand and fills (or erases) as it lets go; taps put
+    /// down its points one by one, a tap on the first closing it.
+    #[allow(clippy::too_many_arguments)]
+    fn lasso_touch(
+        &mut self,
+        ui: &egui::Ui,
+        response: &egui::Response,
+        at: Option<Pos2>,
+        m: [f32; 6],
+        ppp: f32,
+        per_point: f32,
+        to_canvas: &dyn Fn(Pos2) -> Option<Pos2>,
+        rgb: [f32; 3],
+    ) -> Option<Said> {
+        if response.drag_started()
+            && self.taps.is_empty()
+            && let Some(p) = response.interact_pointer_pos().and_then(to_canvas)
+        {
+            self.lasso = vec![p];
+        }
+        if response.dragged()
+            && !self.lasso.is_empty()
+            && let Some(p) = at.and_then(to_canvas)
+            && self.lasso.last().is_none_or(|l| l.distance(p) >= 1.5 * per_point)
+        {
+            self.lasso.push(p);
+        }
+        if response.drag_stopped() && !self.lasso.is_empty() {
+            self.pending_lasso = Some((std::mem::take(&mut self.lasso), rgb));
+        }
+        if response.clicked()
+            && let Some(w) = response.interact_pointer_pos()
+            && let Some(p) = to_canvas(w)
+        {
+            let near_first = self.taps.first().is_some_and(|f| to_window(m, ppp, f.x, f.y).distance(w) <= CLOSE_REACH);
+            if near_first && self.taps.len() >= 3 {
+                self.pending_lasso = Some((std::mem::take(&mut self.taps), rgb));
+            } else {
+                self.taps.push(p);
+            }
+        }
+        // the path as it goes, and the line on to the pointer from the last point tapped
+        let painter = ui.painter();
+        let colour = if self.lasso_erase { Color32::from_gray(235) } else { crate::colours::srgb(rgb) };
+        let window = |p: &Pos2| to_window(m, ppp, p.x, p.y);
+        let hover = at.or(ui.input(|i| i.pointer.hover_pos()));
+        for (path, tapped) in [(&self.lasso, false), (&self.taps, true)] {
+            let mut pts: Vec<Pos2> = path.iter().map(window).collect();
+            if tapped
+                && !pts.is_empty()
+                && let Some(h) = hover
+            {
+                pts.push(h);
+            }
+            if pts.len() >= 2 {
+                painter.add(Shape::line(pts.clone(), Stroke::new(3.0, Color32::from_black_alpha(140))));
+                painter.add(Shape::line(pts, Stroke::new(1.5, colour)));
+            }
+        }
+        if let Some(first) = self.taps.first() {
+            painter.circle_stroke(window(first), CLOSE_REACH / 2.0, Stroke::new(2.0, argb(pc::ACCENT)));
+        }
+        None
+    }
+
+    fn lasso_panel(&mut self, ui: &mut egui::Ui, session: &CanvasSession, rgb: [f32; 3], said: &mut Option<Said>) {
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::selectable(!self.lasso_erase, "Fill")).clicked() {
+                self.lasso_erase = false;
+            }
+            if ui.add(egui::Button::selectable(self.lasso_erase, "Erase")).clicked() {
+                self.lasso_erase = true;
+            }
+            ui.separator();
+            ui.checkbox(&mut self.smooth, "Smooth curves");
+            ui.separator();
+            if ui.add_enabled(self.taps.len() >= 3, egui::Button::new("Close shape")).clicked() {
+                let path = std::mem::take(&mut self.taps);
+                *said = self.apply_lasso(session, &path, rgb);
+            }
+            if ui.add_enabled(!self.taps.is_empty(), egui::Button::new("Clear points")).clicked() {
+                self.taps.clear();
+            }
+        });
+        ui.add_space(4.0);
+        ui.label("Drag to draw a shape freehand, or tap point by point (tap the first point to close). It fills or erases at once.");
+    }
+
+    /// The gradient's touches: a drag lays one from where it starts to where it ends; its end
+    /// dots move its ends. Shift keeps it to 45° steps.
+    #[allow(clippy::too_many_arguments)]
+    fn gradient_touch(
+        &mut self,
+        ui: &egui::Ui,
+        session: &CanvasSession,
+        response: &egui::Response,
+        at: Option<Pos2>,
+        m: [f32; 6],
+        ppp: f32,
+        to_canvas: &dyn Fn(Pos2) -> Option<Pos2>,
+        rgb: [f32; 3],
+        shift: bool,
+    ) -> Option<Said> {
+        let mut said = None;
+        let window = |p: Pos2| to_window(m, ppp, p.x, p.y);
+        if response.drag_started()
+            && let Some(w) = response.interact_pointer_pos()
+            && let Some(p) = to_canvas(w)
+        {
+            let near = |q: Pos2| window(q).distance(w) <= HANDLE_REACH;
+            self.grad_grip = match self.grad {
+                Some((a, _)) if near(a) => Some(1),
+                Some((_, b)) if near(b) => Some(2),
+                _ => {
+                    self.grad = Some((p, p));
+                    Some(0)
+                }
+            };
+        }
+        if response.dragged()
+            && let (Some(grip), Some((a, b)), Some(mut p)) = (self.grad_grip, self.grad, at.and_then(to_canvas))
+        {
+            // Shift: the angle in 45° steps from the other end
+            let other = if grip == 1 { b } else { a };
+            if shift {
+                let d = p - other;
+                let step = std::f32::consts::FRAC_PI_4;
+                let angle = (d.y.atan2(d.x) / step).round() * step;
+                p = other + vec2(angle.cos(), angle.sin()) * d.length();
+            }
+            self.grad = Some(if grip == 1 { (p, b) } else { (a, p) });
+            if self.grad.is_some_and(|(a, b)| a.distance(b) >= 1.0) {
+                said = self.show_gradient(session, rgb);
+            }
+        }
+        if response.drag_stopped() {
+            self.grad_grip = None;
+            // a tap, not a drag: nothing laid
+            if self.grad.is_some_and(|(a, b)| a.distance(b) < 1.0) && !session.gradient_open() {
+                self.grad = None;
+            }
+        }
+        if let Some((a, b)) = self.grad {
+            let painter = ui.painter();
+            let (wa, wb) = (window(a), window(b));
+            painter.line_segment([wa, wb], Stroke::new(3.0, Color32::from_black_alpha(140)));
+            painter.line_segment([wa, wb], Stroke::new(1.5, Color32::WHITE));
+            painter.circle_filled(wa, HANDLE_DOT + 2.0, crate::colours::srgb(rgb));
+            painter.circle_stroke(wa, HANDLE_DOT + 2.0, Stroke::new(2.0, Color32::WHITE));
+            let end = if self.to_clear { Color32::from_gray(60) } else { crate::colours::srgb(self.second) };
+            painter.circle_filled(wb, HANDLE_DOT + 2.0, end);
+            painter.circle_stroke(wb, HANDLE_DOT + 2.0, Stroke::new(2.0, Color32::WHITE));
+        }
+        said
+    }
+
+    fn gradient_panel(&mut self, ui: &mut egui::Ui, session: &CanvasSession, rgb: [f32; 3], said: &mut Option<Said>) {
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            for (kind, name) in [
+                (GradientKind::Linear, "Linear"),
+                (GradientKind::Radial, "Radial"),
+                (GradientKind::Reflected, "Reflected"),
+            ] {
+                if ui.add(egui::Button::selectable(self.grad_kind == kind, name)).clicked() {
+                    self.grad_kind = kind;
+                    changed = true;
+                }
+            }
+            ui.separator();
+            if ui.add(egui::Button::selectable(self.to_clear, "To see-through")).clicked() {
+                self.to_clear = true;
+                changed = true;
+            }
+            if ui.add(egui::Button::selectable(!self.to_clear, "To colour")).clicked() {
+                self.to_clear = false;
+                changed = true;
+            }
+            if !self.to_clear && egui::color_picker::color_edit_button_rgb(ui, &mut self.second).changed() {
+                changed = true;
+            }
+            ui.separator();
+            ui.label("Bands");
+            if ui.add(egui::Slider::new(&mut self.bands, 1..=8).show_value(false)).changed() {
+                changed = true;
+            }
+            ui.label(if self.bands < 2 { "smooth".to_owned() } else { format!("{}", self.bands) });
+        });
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            let open = self.grad.is_some();
+            if ui.add_enabled(open, egui::Button::new("Cancel")).clicked() {
+                self.end_gradient(session, false);
+            }
+            let apply = egui::Button::new(egui::RichText::new("Apply").strong()).fill(argb(pc::ACCENT));
+            if ui.add_enabled(open, apply).clicked() {
+                self.end_gradient(session, true);
+                *said = Some(Said::Notice("Gradient applied", false));
+            }
+            ui.label("Drag across the canvas: your colour at the start, blending to the end. Drag the dots to adjust.");
+        });
+        if changed && self.grad.is_some() {
+            *said = self.show_gradient(session, rgb).or(said.take());
+        }
     }
 
     /// Where the handles are (points): the box's corners and edge middles; a line's ends.

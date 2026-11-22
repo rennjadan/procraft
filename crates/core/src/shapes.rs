@@ -297,6 +297,48 @@ impl CanvasSession {
         true
     }
 
+    /// Fills (or with `erase`, clears to see-through) the shape inside the closed path through
+    /// canvas points `points` (x, y pairs) on the current layer, as one undo step ("Lasso Fill",
+    /// "Lasso Erase"): within the selection if there is one, only where there is paint when
+    /// alpha-locked. False if nothing was made (fewer than three points, off the canvas, or the
+    /// layer locked, text or a plugin's; erasing, alpha-locked).
+    pub fn lasso_fill(&self, points: Vec<f32>, erase: bool, r: f32, g: f32, b: f32) -> bool {
+        let pts: Vec<procraft_engine::geom::Vec2> =
+            points.as_chunks::<2>().0.iter().map(|&[x, y]| procraft_engine::geom::Vec2::new(x, y)).collect();
+        if pts.len() < 3 || pts.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return false;
+        }
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let (w, h) = (st.doc.width(), st.doc.height());
+        let current = st.doc.current();
+        let Some(layer) = st.doc.layer(current).cloned() else { return false };
+        if st.doc.is_locked(current) || layer.drawn_from_data() || (erase && layer.alpha_lock) {
+            return false;
+        }
+        let mut shape = Mask::polygon(w, h, &pts);
+        if let Some(sel) = st.reach_selection() {
+            for (m, &s) in shape.data.iter_mut().zip(&sel.data) {
+                *m = ((u16::from(*m) * u16::from(s) + 127) / 255) as u8;
+            }
+        }
+        let Some(rect) = crate::layer_ops::mask_rect(&shape) else { return false };
+        let Some(mut pixels) = st.layer_part(current, rect) else { return false };
+        let part = Mask { width: rect.width(), height: rect.height(), data: mask_part(&shape, rect) };
+        if erase {
+            fill::erase(&mut pixels, &part);
+        } else {
+            fill::pour_over(&mut pixels, &part, [r, g, b], layer.alpha_lock);
+        }
+        if let Some(canvas) = st.canvas.as_mut() {
+            canvas.name_next_step(if erase { "Lasso Erase" } else { "Lasso Fill" });
+        }
+        st.rewrite_layer(current, rect, pixels);
+        st.revision += 1;
+        self.shared.frame(st);
+        true
+    }
+
     /// The rectangles placed in this artwork, oldest first.
     pub fn placed_shapes(&self) -> Vec<PlacedShape> {
         let st = self.shared.lock();
