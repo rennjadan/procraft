@@ -84,6 +84,8 @@ const BLEND_SETTLE: f32 = 0.12;
 /// picked.
 const SWIPE_BUTTON: f32 = 82.0;
 const SWIPE_GAP: f32 = 2.0;
+/// A text layer's Pin Text button (its semi-lock), in the accent's blue.
+const SWIPE_PIN_FILL: u32 = 0xFF0A84FF;
 const SWIPE_FILL: u32 = 0xFF3F3F3F;
 const SWIPE_INK: u32 = 0xFFC1C1C1;
 const SWIPE_DELETE: u32 = 0xFFFF473D;
@@ -997,6 +999,11 @@ impl Layers {
     /// and Delete (Clear for the only layer).
     fn swipe_buttons(&mut self, ui: &Ui, session: &CanvasSession, l: &LayerInfo, row: Rect, alone: bool) {
         let mut buttons = vec![(if l.locked { "Unlock" } else { "Lock" }, SWIPE_FILL, SWIPE_INK)];
+        // a text layer's semi-lock: its box and typeface kept, its words still editable
+        if l.text && !l.locked {
+            let pinned = session.text_pinned(l.id);
+            buttons.push((if pinned { "Unpin Text" } else { "Pin Text" }, SWIPE_PIN_FILL, 0xFFFFFFFF));
+        }
         if l.kind != LayerType::Mask {
             buttons.push(("Duplicate", SWIPE_FILL, SWIPE_INK));
         }
@@ -1020,6 +1027,13 @@ impl Layers {
                         }
                     }
                     "Duplicate" => _ = session.duplicate_layer(l.id),
+                    "Pin Text" | "Unpin Text" => {
+                        let on = label == "Pin Text";
+                        if session.set_text_pinned(l.id, on) {
+                            let said = if on { "Position locked: only the words change" } else { "Position unlocked" };
+                            self.notice = Some((said.into(), true));
+                        }
+                    }
                     "Clear" => {
                         session.select_layer(l.id);
                         session.clear_layer();
@@ -1679,7 +1693,8 @@ impl Layers {
         ink: Color32,
     ) {
         let Some((id, typed, focused)) = self.renaming.as_mut().filter(|(id, _, _)| *id == l.id) else {
-            locked_name(ui, look, l, at, right, ink);
+            let pinned = l.text && session.text_pinned(l.id);
+            locked_name(ui, look, l, at, right, ink, pinned);
             return;
         };
         if l.locked {
@@ -1874,9 +1889,12 @@ fn fit_picture(ui: &Ui, texture: &TextureHandle, rect: Rect) {
 
 /// A row's name, where it always is: 29 in from `at`, ending by `right`; a small padlock in the gap
 /// before it when locked.
-fn locked_name(ui: &Ui, look: &mut Look, l: &LayerInfo, at: Pos2, right: f32, ink: Color32) {
+fn locked_name(ui: &Ui, look: &mut Look, l: &LayerInfo, at: Pos2, right: f32, ink: Color32, pinned: bool) {
     if l.locked {
         look.icon(ui, &icons::LOCK_ROW, pos2(at.x + 3.0 + 8.5, at.y), 17.0, ink);
+    } else if pinned {
+        // a text layer's Lock Position (its words still change): the padlock in blue
+        look.icon(ui, &icons::LOCK_ROW, pos2(at.x + 3.0 + 8.5, at.y), 17.0, argb(pc::ACCENT));
     }
     let g = galley(ui, &l.name, 17.0, Weight::Regular, ink, (right - at.x - 29.0 - 6.0).max(10.0));
     ui.painter().galley(pos2(at.x + 29.0, at.y - g.size().y / 2.0), g, ink);
@@ -1900,7 +1918,13 @@ struct RowLook {
 
 /// How far a row slides left to show its buttons: 6 past them.
 fn swipe_reach(l: &LayerInfo) -> f32 {
-    let buttons = if l.kind == LayerType::Mask { 2.0 } else { 3.0 };
+    let buttons = if l.kind == LayerType::Mask {
+        2.0
+    } else if l.text && !l.locked {
+        4.0
+    } else {
+        3.0
+    };
     SWIPE_BUTTON * buttons + SWIPE_GAP * (buttons - 1.0) + 6.0
 }
 

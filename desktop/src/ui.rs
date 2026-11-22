@@ -1403,10 +1403,15 @@ impl Interface {
                 // a press on the canvas with a panel open: dragged or held, it goes on; a tap only
                 // closes the panel
                 TouchCommand::PanelFades | TouchCommand::PanelTapped => self.open = None,
-                // a stroke or a fill on a text layer: it takes them once rasterized
-                // no question: rasterizing is the text layer's own option (in its options menu)
+                // a touch on the canvas with a text layer chosen edits its text (as on the tablet);
+                // rasterizing stays the layer's own option
                 TouchCommand::TextLayer => {
-                    self.overlays.notice("Text layer: pick another layer to paint (Rasterize is in its options)", false)
+                    let current = session.layers().into_iter().find(|l| l.current);
+                    match current {
+                        Some(l) if l.locked => self.overlays.notice("This text layer is locked", false),
+                        Some(l) if !self.text.editing() && self.text.edit(session, l.id) => {}
+                        _ => {}
+                    }
                 }
                 // (the pen's hover, which sets the brush with a finger, isn't the desktop's)
                 // (the view moving on its own is drawn as it goes)
