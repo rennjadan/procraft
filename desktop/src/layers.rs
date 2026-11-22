@@ -508,6 +508,11 @@ impl Layers {
                                             dy: 0.0,
                                             mouse,
                                         });
+                                        // a press on another row closes the one open (as on the
+                                        // tablet)
+                                        if self.swiped.is_some_and(|open| open != l.id) {
+                                            self.swiped = None;
+                                        }
                                     }
                                     let mut row_ui = ui.new_child(UiBuilder::new().max_rect(row));
                                     row_ui.set_clip_rect(row.intersect(ui.clip_rect()));
@@ -1002,7 +1007,11 @@ impl Layers {
             right -= SWIPE_BUTTON + SWIPE_GAP;
             ui.painter().rect_filled(rect, 8, argb(fill));
             text(ui.painter(), rect.center(), Align2::CENTER_CENTER, label, 15.0, Weight::Medium, argb(ink));
-            if ui.interact(rect, ui.scope_id().with(("swipe", l.id, label)), Sense::click()).clicked() {
+            // a tap alone, on a row that is open and still: the end of a swipe never presses one
+            let still = self.press.is_none_or(|p| p.way == Way::Undecided)
+                && self.swiped == Some(l.id)
+                && self.slid.get(&l.id).is_some_and(|s| (s + swipe_reach(l)).abs() < 2.0);
+            if ui.interact(rect, ui.scope_id().with(("swipe", l.id, label)), Sense::click()).clicked() && still {
                 match label {
                     "Lock" | "Unlock" => {
                         let said = session.lock_said(l.id, !l.locked);
@@ -1207,8 +1216,10 @@ impl Layers {
         if down {
             match p.way {
                 Way::Undecided => {
-                    let sideways = d.x.abs() > d.y.abs();
-                    if d.length() > SLOP && (sideways || !p.mouse) {
+                    // an open row takes a nudge right as closing it (a slanting one too)
+                    let closing = open && d.x > SLOP * 0.5 && d.x > d.y.abs() * 0.6;
+                    let sideways = closing || d.x.abs() > d.y.abs();
+                    if (d.length() > SLOP || closing) && (sideways || !p.mouse) {
                         p.way = if sideways { Way::Swipe } else { Way::Ignored };
                         // up or down: the list follows the finger from where it was put down
                         if !sideways {
@@ -1276,7 +1287,8 @@ impl Layers {
                 if slide > PICK_REACH / 2.0 {
                     session.pick_layer(p.id);
                 } else {
-                    let opened = slide < -reach / 2.0;
+                    // open, a fifth of the way back closes it; closed, half the way opens it
+                    let opened = if open { slide < -reach * 0.8 } else { slide < -reach / 2.0 };
                     if opened != open {
                         self.swiped = opened.then_some(p.id);
                     }
