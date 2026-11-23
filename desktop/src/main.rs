@@ -1080,6 +1080,10 @@ impl App {
 
     /// While the gallery zooms, another frame soon; once done, everything back in its place.
     fn zoom_on(&mut self) {
+        // moved on a frame at a time (a slow frame holds it, never skips it)
+        if let Some(zoom) = self.zoom.as_mut() {
+            zoom.tick();
+        }
         let Some(zoom) = &self.zoom else { return };
         if zoom.done() {
             self.zoom = None;

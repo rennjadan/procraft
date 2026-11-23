@@ -14,6 +14,8 @@ use crate::look::cubic_bezier;
 
 /// How long opening and closing take.
 const OPEN: Duration = Duration::from_millis(400);
+/// The most a frame moves a zoom on (a 30th of a second): a slower frame doesn't skip it.
+const MOST_STEP: Duration = Duration::from_millis(33);
 const CLOSE: Duration = Duration::from_millis(500);
 /// How much of the opening's end the gallery fades over, and how much of the closing's start the
 /// canvas does.
@@ -29,7 +31,11 @@ pub struct Zoom {
     /// How far the picture in the gallery shows the artwork turned: quarter turns clockwise.
     turns: u32,
     pub opening: bool,
-    started: Instant,
+    /// How far it has played, and when it last moved on: it moves on a frame at a time, never
+    /// more than [`MOST_STEP`] a frame, so a slow frame (an artwork's layers loading as it first
+    /// shows) holds it rather than skipping it.
+    shown: Duration,
+    last: Instant,
     /// The canvas as it closed.
     picture: Option<TextureHandle>,
 }
@@ -44,7 +50,8 @@ impl Zoom {
             canvas: canvas_place(session, &matrix, scale),
             turns,
             opening: true,
-            started: Instant::now(),
+            shown: Duration::ZERO,
+            last: Instant::now(),
             picture: None,
         }
     }
@@ -56,12 +63,20 @@ impl Zoom {
             ctx.load_texture("closing canvas", image, egui::TextureOptions::LINEAR)
         });
         let canvas = canvas_place(session, &session.view_matrix(), ctx.pixels_per_point());
-        Zoom { cell, canvas, turns, opening: false, started: Instant::now(), picture }
+        Zoom { cell, canvas, turns, opening: false, shown: Duration::ZERO, last: Instant::now(), picture }
     }
 
     /// Not under way yet (the canvas is still being made): it starts from the gallery again.
     pub fn hold(&mut self) {
-        self.started = Instant::now();
+        self.shown = Duration::ZERO;
+        self.last = Instant::now();
+    }
+
+    /// Moves it on by the time since the last frame, at most [`MOST_STEP`].
+    pub fn tick(&mut self) {
+        let now = Instant::now();
+        self.shown += now.duration_since(self.last).min(MOST_STEP);
+        self.last = now;
     }
 
     fn length(&self) -> Duration {
@@ -69,12 +84,12 @@ impl Zoom {
     }
 
     pub fn done(&self) -> bool {
-        self.started.elapsed() >= self.length()
+        self.shown >= self.length()
     }
 
     /// How far along it is, eased (0 to 1).
     fn progress(&self) -> f32 {
-        let t = self.started.elapsed().as_secs_f32() / self.length().as_secs_f32();
+        let t = (self.shown.as_secs_f32() / self.length().as_secs_f32()).min(1.0);
         cubic_bezier(0.42, 0.0, 0.58, 1.0, t)
     }
 
