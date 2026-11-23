@@ -42,6 +42,10 @@ const RETURN_GRACE_S: f32 = 0.5;
 /// The curtain: frames drawn under it before it lifts, how long it takes to lift, and to fall
 /// before the app closes for an update (seconds).
 const CURTAIN_FRAMES: u32 = 3;
+/// The curtain stays down until the app says it is ready (its pictures read, its drawing made
+/// ready) and has drawn this many frames since, or at most this long (seconds) as it starts.
+const READY_FRAMES: u32 = 4;
+const READY_MOST_S: f32 = 4.0;
 const CURTAIN_UP_S: f32 = 0.55;
 const CURTAIN_DOWN_S: f32 = 0.4;
 
@@ -112,6 +116,10 @@ pub(crate) struct FullScreen {
     /// closes for an update (with what it says meanwhile).
     curtain: Ease,
     frames: u32,
+    /// The app is ready to be seen (frames since it was), and when the curtain first showed.
+    ready_frames: u32,
+    began: Instant,
+    lifting: bool,
     closing: Option<&'static str>,
     closed: bool,
 }
@@ -132,6 +140,9 @@ impl FullScreen {
             mouse_swallowed: false,
             curtain: Ease::at(1.0),
             frames: 0,
+            ready_frames: 0,
+            began: Instant::now(),
+            lifting: false,
             closing: None,
             closed: false,
         }
@@ -153,11 +164,7 @@ impl FullScreen {
 
     /// Whether frames are wanted: the veil or the curtain moving, or a finger held back.
     pub(crate) fn moving(&self) -> bool {
-        self.pull.is_some()
-            || self.held.is_some()
-            || self.veil.moving()
-            || self.curtain.moving()
-            || self.frames < CURTAIN_FRAMES + 1
+        self.pull.is_some() || self.held.is_some() || self.veil.moving() || self.curtain.moving() || !self.lifting
     }
 
     /// The taskbar up, the veil easing the rest of the way in.
@@ -174,6 +181,12 @@ impl FullScreen {
         self.revealed = false;
         self.returned = Some(Instant::now());
         self.veil = self.veil.to(0.0, EASE_OUT_S);
+    }
+
+    /// Whether the app is ready to be seen this frame (its first screen settled): the curtain
+    /// lifts after a few such frames in a row.
+    pub(crate) fn ready(&mut self, ready: bool) {
+        self.ready_frames = if ready { self.ready_frames.saturating_add(1) } else { 0 };
     }
 
     /// The curtain falls, saying `words`, before the app closes (for an update).
@@ -204,7 +217,12 @@ impl FullScreen {
     /// Draws the veil and the curtain over everything, while they show.
     pub(crate) fn paint(&mut self, ctx: &egui::Context) {
         self.frames = self.frames.saturating_add(1);
-        if self.frames == CURTAIN_FRAMES && self.closing.is_none() {
+        // lifted once the app is ready and has drawn a few frames since (steady), or at the most
+        // after a while
+        let ready = self.ready_frames >= READY_FRAMES && self.frames >= CURTAIN_FRAMES;
+        let waited = self.began.elapsed().as_secs_f32() >= READY_MOST_S;
+        if !self.lifting && self.closing.is_none() && (ready || waited) {
+            self.lifting = true;
             self.curtain = self.curtain.to(0.0, CURTAIN_UP_S);
         }
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Debug, egui::Id::unique("full screen veil")));
@@ -216,6 +234,19 @@ impl FullScreen {
         let curtain = self.curtain.level().clamp(0.0, 1.0);
         if curtain > 0.002 {
             painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha((curtain * 255.0).round() as u8));
+            if self.closing.is_none() && !self.lifting {
+                // waiting: the app's name, breathing softly
+                let t = self.began.elapsed().as_secs_f32();
+                let shown = (t / 0.4).min(1.0) * (0.75 + 0.25 * (t * 2.2).sin());
+                let ink = egui::Color32::from_white_alpha((shown * curtain * 200.0).round() as u8);
+                painter.text(
+                    screen.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "ProCraft",
+                    egui::FontId::proportional(34.0),
+                    ink,
+                );
+            }
             if let Some(words) = self.closing {
                 let ink = egui::Color32::from_white_alpha((curtain * 220.0).round() as u8);
                 painter.text(

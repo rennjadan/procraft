@@ -201,6 +201,8 @@ pub struct Gallery {
     stack: Option<(String, String)>,
     /// Each artwork's thumbnail (by folder), and when the artwork was changed when it was read.
     thumbs: HashMap<String, (i64, Option<TextureHandle>)>,
+    /// Frames shown so far (its first screen's pictures are asked for in the first).
+    shown_frames: u32,
     /// Thumbnails being read on a thread of their own (a gallery of many would hold up the
     /// window), and that thread.
     reading: std::collections::HashSet<(String, i64)>,
@@ -353,6 +355,7 @@ impl Gallery {
             entries: Vec::new(),
             stack: None,
             thumbs: HashMap::new(),
+            shown_frames: 0,
             reading: Default::default(),
             reader: None,
             duplicating: Vec::new(),
@@ -526,7 +529,13 @@ impl Gallery {
     }
 
     /// Shows the gallery over the whole window; returns what a tap asked for.
+    /// Whether it has settled: shown, and the pictures it asked for read.
+    pub fn settled(&self) -> bool {
+        self.shown_frames >= 2 && self.reading.is_empty()
+    }
+
     pub fn show(&mut self, ctx: &egui::Context, look: &mut Look, colours: &crate::colours::Colours) -> Option<Asked> {
+        self.shown_frames = self.shown_frames.saturating_add(1);
         self.thumbnails_read(ctx);
         self.duplicated(ctx);
         let screen = ctx.content_rect();

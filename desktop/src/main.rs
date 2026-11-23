@@ -827,6 +827,8 @@ impl App {
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
         let raw = screen.take_input();
+        // an artwork showing: ready to be seen
+        self.full.ready(true);
         let full = &mut self.full;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
@@ -909,6 +911,8 @@ impl App {
         let waited = screen.canvases_waited();
         // (on OpenGL from the first frame, which stays while they are made)
         let getting_ready = waited.is_some_and(|w| w >= CANVASES_SLOW) || screen.canvases_later();
+        // the curtain lifts once the gallery's pictures are in and the drawing is made ready
+        self.full.ready(gallery.settled() && waited.is_none() && !screen.canvases_later());
         let full = &mut self.full;
         let update_alert = &mut self.update_alert;
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
