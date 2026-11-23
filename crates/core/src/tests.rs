@@ -15623,3 +15623,23 @@ fn a_lasso_fills_and_erases_its_shape_and_a_gradient_shows_until_applied() {
     s.gradient_end(false);
     assert_eq!(px(2, 90)[3], 0);
 }
+
+#[test]
+fn an_artwork_read_ahead_has_its_layers_as_pixels_unless_too_big() {
+    let Some(s) = session(64, 64) else { return };
+    s.add_layer();
+    let dir = std::env::temp_dir().join(format!("procraft-read-ahead-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    s.save(dir.to_string_lossy().into_owned()).unwrap();
+    let opened = CanvasSession::open(dir.to_string_lossy().into_owned()).unwrap();
+    let pngs = |o: &CanvasSession| {
+        o.shared.lock().pending_pixels.iter().filter(|(_, l)| matches!(l, crate::project::Opened::Png(_))).count()
+    };
+    assert!(pngs(&opened) > 0);
+    // too big for what it may take: left to be read as it shows
+    assert!(!opened.prepare_layers(1));
+    assert!(pngs(&opened) > 0);
+    assert!(opened.prepare_layers(u64::MAX));
+    assert_eq!(pngs(&opened), 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}

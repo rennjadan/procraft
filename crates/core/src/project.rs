@@ -2180,6 +2180,36 @@ mod signature_tests {
     }
 }
 
+/// Readying an opened artwork before it shows (not for the mobile apps' bindings).
+impl CanvasSession {
+    /// Its layers' files read into pixels now (side by side), so its first frame only puts them
+    /// on the screen: done unless they would take more than `most_bytes` of memory (false then;
+    /// they are read as it first shows, as ever). A layer whose file can't be read is left for
+    /// that too.
+    pub fn prepare_layers(&self, most_bytes: u64) -> bool {
+        let mut st = self.shared.lock();
+        let (w, h) = (st.doc.width(), st.doc.height());
+        let each = u64::from(w) * u64::from(h) * 4;
+        let pngs = st.pending_pixels.iter().filter(|(_, l)| matches!(l, Opened::Png(_))).count() as u64;
+        if pngs == 0 {
+            return true;
+        }
+        if pngs.saturating_mul(each) > most_bytes {
+            return false;
+        }
+        let decoded = procraft_engine::par::side_by_side_within(&st.pending_pixels, each as usize, |(_, l)| match l {
+            Opened::Png(bytes) => Opened::Png(bytes.clone()).pixels(w, h).ok(),
+            Opened::Pixels(_) => None,
+        });
+        for ((_, layer), done) in st.pending_pixels.iter_mut().zip(decoded) {
+            if let Some(Some(rgba)) = done {
+                *layer = Opened::Pixels(rgba);
+            }
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod psd_timing {
     /// Times each part of importing the PSD at PSD_IN (to find what is slow):

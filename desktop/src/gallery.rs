@@ -529,6 +529,14 @@ impl Gallery {
     }
 
     /// Shows the gallery over the whole window; returns what a tap asked for.
+    /// The artwork first in the gallery (the latest worked on), to ready ahead of a tap.
+    pub fn first_artwork(&self) -> Option<String> {
+        self.entries.iter().find_map(|e| match e {
+            GalleryEntry::Artwork { artwork } => Some(artwork.dir.clone()),
+            GalleryEntry::Stack { .. } => None,
+        })
+    }
+
     /// Whether it has settled: shown, and the pictures it asked for read.
     pub fn settled(&self) -> bool {
         self.shown_frames >= 2 && self.reading.is_empty()

@@ -265,6 +265,7 @@ fn main() {
         opening: None,
         importing: None,
         reading_artwork: None,
+        prefetch: None,
         share_once_made: None,
         reading_photo: None,
         screen: None,
@@ -325,6 +326,9 @@ struct App {
     /// An artwork in the gallery being opened, read on a thread of its own (an artwork of many
     /// layers holds hundreds of MB): since when, its folder, and the reading.
     reading_artwork: Option<ReadingArtwork>,
+    /// The gallery's first artwork read ahead while the gallery waits: opened at once if tapped
+    /// (unless it changed since).
+    prefetch: Option<Prefetch>,
     /// The gallery's animated Share of the artwork just opened, started once its canvas is made
     /// (the preview's frames and the file are read from it).
     share_once_made: Option<animated_export::Animated>,
@@ -359,6 +363,39 @@ struct App {
     full: full_screen::FullScreen,
     /// The question asking to restart for an update.
     update_alert: alert::Alert,
+}
+
+/// An artwork read ahead (its files read, its layers made pixels if they fit in memory) on a
+/// thread of its own, while the gallery waits.
+struct Prefetch {
+    dir: String,
+    stamp: Option<std::time::SystemTime>,
+    reading: std::thread::JoinHandle<Option<Arc<CanvasSession>>>,
+}
+
+/// The most memory an artwork read ahead may take as pixels (bytes): a bigger one's layers are
+/// read as it opens.
+const PREFETCH_MOST: u64 = 1_200_000_000;
+
+impl Prefetch {
+    fn start(dir: String) -> Prefetch {
+        let stamp = artwork_stamp(&dir);
+        let folder = dir.clone();
+        let reading = std::thread::Builder::new()
+            .name("procraft-read-ahead".to_owned())
+            .spawn(move || {
+                let session = CanvasSession::open(folder).ok()?;
+                session.prepare_layers(PREFETCH_MOST);
+                Some(session)
+            })
+            .unwrap_or_else(|_| std::thread::spawn(|| None));
+        Prefetch { dir, stamp, reading }
+    }
+}
+
+/// When the artwork in `dir` last changed (its file saved), to tell one read ahead is still it.
+fn artwork_stamp(dir: &str) -> Option<std::time::SystemTime> {
+    std::fs::metadata(std::path::Path::new(dir).join("artwork.json")).and_then(|m| m.modified()).ok()
 }
 
 /// The app's icon, for the window's title bar and the task bar.
@@ -456,6 +493,10 @@ impl ApplicationHandler for App {
         self.frame();
         if let Some(screen) = &self.screen {
             screen.window.set_visible(true);
+            // brought to the front and made the active window: opened again by an update's helper
+            // (in the background) it would otherwise show without taking touches until one
+            // activated it
+            screen.window.focus_window();
             screen.window.request_redraw();
         }
     }
@@ -911,6 +952,19 @@ impl App {
         let waited = screen.canvases_waited();
         // (on OpenGL from the first frame, which stays while they are made)
         let getting_ready = waited.is_some_and(|w| w >= CANVASES_SLOW) || screen.canvases_later();
+        // the gallery's first artwork read ahead once it has settled (and nothing else is read)
+        let idle = self.reading_artwork.is_none() && self.importing.is_none() && self.reading_photo.is_none();
+        if idle && gallery.settled() && waited.is_none() {
+            let first = gallery.first_artwork();
+            let stale = self.prefetch.as_ref().is_some_and(|p| Some(&p.dir) != first.as_ref());
+            if stale {
+                self.prefetch = None;
+            }
+            if let Some(dir) = first.filter(|_| self.prefetch.as_ref().is_none_or(|p| p.stamp != artwork_stamp(&p.dir)))
+            {
+                self.prefetch = Some(Prefetch::start(dir));
+            }
+        }
         // the curtain lifts once the gallery's pictures are in and the drawing is made ready
         self.full.ready(gallery.settled() && waited.is_none() && !screen.canvases_later());
         let full = &mut self.full;
@@ -1215,10 +1269,14 @@ impl App {
     }
 
     /// Starts reading the artwork in gallery folder `dir` on a thread of its own, to open it (to
-    /// share it as `shared_as`, if given).
+    /// share it as `shared_as`, if given): the one read ahead, if it is that one, unchanged.
     fn read_artwork(&mut self, dir: String, shared_as: Option<animated_export::Animated>) {
         let folder = dir.clone();
-        let reading = std::thread::spawn(move || CanvasSession::open(folder).map_err(|e| e.to_string()));
+        let ahead = self.prefetch.take().filter(|p| p.dir == dir && p.stamp == artwork_stamp(&dir));
+        let reading = std::thread::spawn(move || match ahead.and_then(|p| p.reading.join().ok().flatten()) {
+            Some(session) => Ok(session),
+            None => CanvasSession::open(folder).map_err(|e| e.to_string()),
+        });
         self.reading_artwork = Some((Instant::now(), dir, shared_as, reading));
     }
 
