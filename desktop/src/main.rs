@@ -233,6 +233,8 @@ fn getting_ready_note(ctx: &egui::Context) {
 fn main() {
     // the log, to the app folder's file too, and a crash's message into it
     startup::init();
+    // one identity with its shortcuts: pinned to the taskbar, the pin is the running app's icon
+    set_app_identity();
     // the layers may take half the computer's memory, as on the tablet (so how many a canvas holds
     // grows with it), their textures up to 2 GiB of it; the composite is made around the layers
     // not being worked on, so a frame composites only those
@@ -397,6 +399,20 @@ impl Prefetch {
 fn artwork_stamp(dir: &str) -> Option<std::time::SystemTime> {
     std::fs::metadata(std::path::Path::new(dir).join("artwork.json")).and_then(|m| m.modified()).ok()
 }
+
+/// The identity Windows groups the app's windows, its taskbar pin and its shortcuts by (the
+/// installer's shortcuts carry it too).
+#[cfg(windows)]
+fn set_app_identity() {
+    use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+    // SAFETY: a static string, read by the call only
+    if let Err(e) = unsafe { SetCurrentProcessExplicitAppUserModelID(windows::core::w!("Rennjadan.ProCraft")) } {
+        log::warn!("setting the app's identity for the taskbar: {e}");
+    }
+}
+
+#[cfg(not(windows))]
+fn set_app_identity() {}
 
 /// The app's icon, for the window's title bar and the task bar.
 fn window_icon() -> Option<winit::window::Icon> {
