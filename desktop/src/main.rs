@@ -403,6 +403,7 @@ fn artwork_stamp(dir: &str) -> Option<std::time::SystemTime> {
 /// The identity Windows groups the app's windows, its taskbar pin and its shortcuts by (the
 /// installer's shortcuts carry it too).
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn set_app_identity() {
     use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
     // SAFETY: a static string, read by the call only
