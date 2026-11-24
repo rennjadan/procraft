@@ -42,6 +42,8 @@ const GPU_START: &str = "gpu-start.txt";
 /// There while Direct3D 12 is being asked which GPUs there are: a driver that crashes as it is
 /// asked mustn't do so at every start.
 const GPU_ASKING: &str = "gpu-asking.txt";
+/// A note that the next start chooses the graphics backend again (see [`retry_best_graphics`]).
+const GPU_RETRY: &str = "gpu-retry.txt";
 
 /// This run's part in the record.
 static RUN: Mutex<Run> = Mutex::new(Run::NEW);
@@ -181,6 +183,7 @@ const INTEL: u32 = 0x8086;
 pub fn backend_order() -> &'static [usize] {
     static ORDER: OnceLock<Vec<usize>> = OnceLock::new();
     ORDER.get_or_init(|| {
+        forget_graphics_if_asked();
         let backends = Gpu::backends();
         let listed: Vec<usize> = (0..backends.len()).collect();
         // asked only where it changes anything: not with a backend named by hand, and not where
@@ -327,10 +330,23 @@ pub fn backend_now() -> &'static str {
 /// Forgets which graphics backend to start with: the next start asks again, trying the best for
 /// this GPU first (Direct3D 12 on Intel) and falling back from a failing one as ever.
 pub fn retry_best_graphics() {
-    for name in [GPU_START, GPU_ASKING] {
-        let _ = std::fs::remove_file(files::app_dir().join(name));
+    // a note the next start acts on: the record itself is written again as this run ends
+    if let Err(e) = files::write_whole(&files::app_dir().join(GPU_RETRY), b"retry") {
+        log::warn!("keeping that the graphics are to be chosen again: {e}");
     }
-    log::info!("the graphics backend to start with forgotten: the next start chooses again");
+    log::info!("the graphics backend to start with is to be chosen again at the next start");
+}
+
+/// Acts on [`retry_best_graphics`]'s note, once, as the app starts: the backend record and the
+/// listing note forgotten, so the backends are put in this GPU's order again.
+fn forget_graphics_if_asked() {
+    let dir = files::app_dir();
+    if dir.join(GPU_RETRY).exists() {
+        for name in [GPU_START, GPU_ASKING, GPU_RETRY] {
+            let _ = std::fs::remove_file(dir.join(name));
+        }
+        log::info!("the graphics backend chosen again, as asked: the best for this GPU first");
+    }
 }
 
 /// Backend `index` is about to be tried for the window: kept as trying until the window's first
