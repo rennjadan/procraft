@@ -15,7 +15,7 @@ use crate::icons;
 use crate::look::{Look, Themed, Weight, argb, text};
 use crate::transform::{
     Button, DASH, DASH_GAP, MENU_ARROW, MENU_GROUP, MENU_TEXT, MENU_WIDTH, Tapped, button_tip, floating_toolbar,
-    menu_slider, menu_title, popover_frame,
+    menu_slider_let_go, menu_title, popover_frame,
 };
 
 /// The selection toolbar's buttons with room (narrower where the window is).
@@ -24,6 +24,9 @@ const FEATHER_WIDTH: f32 = 250.0;
 const START_DOT: u32 = 0xFFC7C7C7;
 const MESSAGE_BAR: Themed = Themed(0xFF606060, 0xFFD0D0D0);
 const MESSAGE_TEXT: Themed = Themed(0xFFB5B5B5, 0xFF3B3B3B);
+/// A kept selection's row slid left this far shows Delete (59 x 38, 13 in from the right) beside it.
+const SAVED_REVEAL: f32 = 82.0;
+const SAVED_DELETE: u32 = 0xFFEE4246;
 const KINDS: [SelectKind; 4] =
     [SelectKind::Automatic, SelectKind::Freehand, SelectKind::Rectangle, SelectKind::Ellipse];
 
@@ -57,9 +60,17 @@ pub struct Selection {
     popup: Popup,
     saved: u32,
     pictures: HashMap<u32, TextureHandle>,
+    /// A kept selection's row being slid (which, and how far), and the one slid open.
+    saved_drag: Option<(u32, f32)>,
+    saved_open: Option<u32>,
 }
 
 impl Selection {
+    /// The tool as it starts, Color Fill on or off as it was left.
+    pub fn with_color_fill(on: bool) -> Selection {
+        Selection { color_fill: on, ..Selection::default() }
+    }
+
     /// Color Fill is on: what is selected is filled as the tool closes.
     pub fn color_fill(&self) -> bool {
         self.color_fill
@@ -93,6 +104,8 @@ impl Default for Selection {
             popup: Popup::None,
             saved: 0,
             pictures: HashMap::new(),
+            saved_drag: None,
+            saved_open: None,
         }
     }
 }
@@ -337,9 +350,14 @@ impl Selection {
                 let shown =
                     if amount <= 0.0 { "None".to_owned() } else { format!("{}%", (amount * 100.0).round() as i32) };
                 let row = Rect::from_min_size(group.min + vec2(0.0, 8.0), vec2(group.width(), 59.0));
-                if let Some(v) = menu_slider(ui, row, "Amount", amount, &shown) {
+                let (value, let_go) = menu_slider_let_go(ui, row, "Amount", amount, &shown);
+                if let Some(v) = value {
                     self.feather = v;
                     session.select_feather(v);
+                }
+                // let go, the line where the selection fades out goes
+                if let_go {
+                    session.select_feather_let_go();
                 }
                 return;
             }
@@ -360,18 +378,62 @@ impl Selection {
                 self.saved = session.save_selection();
                 self.open_popup_refresh(ctx, session);
             }
-            for i in 0..self.saved {
-                let row = Rect::from_min_size(
-                    pos2(inner.left(), inner.top() + 48.0 + 52.0 * i as f32),
+            // the newest at the top, each named by its place among them, oldest first
+            let mut deleted = None;
+            for row in 0..self.saved {
+                let i = self.saved - 1 - row;
+                let place = Rect::from_min_size(
+                    pos2(inner.left(), inner.top() + 48.0 + 52.0 * row as f32),
                     vec2(inner.width(), 51.0),
                 );
-                if row.bottom() > inner.bottom() {
+                if place.bottom() > inner.bottom() {
                     break;
                 }
-                ui.painter().rect_filled(row, 13, argb(MENU_GROUP));
+                // slid left under a drag, it shows Delete beside it
+                let response = ui.interact(place, ui.scope_id().with(("saved selection", i)), Sense::click_and_drag());
+                let x = match self.saved_drag {
+                    Some((d, x)) if d == i => x,
+                    _ if self.saved_open == Some(i) => -SAVED_REVEAL,
+                    _ => 0.0,
+                };
+                if response.drag_started() {
+                    self.saved_drag = Some((i, x));
+                }
+                if let Some((d, x)) = self.saved_drag.as_mut()
+                    && *d == i
+                {
+                    *x = (*x + response.drag_delta().x).clamp(-SAVED_REVEAL, 0.0);
+                }
+                if response.drag_stopped() {
+                    self.saved_open = (x < -SAVED_REVEAL / 2.0).then_some(i);
+                    self.saved_drag = None;
+                }
+                let painter = ui.painter().with_clip_rect(place.intersect(ui.clip_rect()));
+                if x < 0.0 {
+                    let delete = Rect::from_min_size(
+                        pos2(place.right() - 13.0 - 59.0, place.center().y - 19.0),
+                        vec2(59.0, 38.0),
+                    );
+                    painter.rect_filled(delete, 11.0, argb(SAVED_DELETE));
+                    text(
+                        &painter,
+                        delete.center(),
+                        Align2::CENTER_CENTER,
+                        "Delete",
+                        15.0,
+                        Weight::Regular,
+                        Color32::WHITE,
+                    );
+                    if ui.interact(delete, ui.scope_id().with(("delete saved selection", i)), Sense::click()).clicked()
+                    {
+                        deleted = Some(i);
+                    }
+                }
+                let row = place.translate(vec2(x, 0.0));
+                painter.rect_filled(row, 13, argb(MENU_GROUP));
                 let thumb = Rect::from_min_size(row.min + vec2(0.0, 2.5), vec2(64.0, 46.0));
                 let corners = egui::CornerRadius { nw: 13, sw: 13, ne: 0, se: 0 };
-                ui.painter().rect_filled(thumb, corners, Color32::BLACK);
+                painter.rect_filled(thumb, corners, Color32::BLACK);
                 if let Some(t) = self.pictures.get(&i) {
                     let size = t.size_vec2();
                     let k = (thumb.width() / size.x.max(1.0)).min(thumb.height() / size.y.max(1.0));
@@ -381,11 +443,11 @@ impl Selection {
                     let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                     let picture =
                         egui::epaint::RectShape::filled(shown, corners, Color32::WHITE).with_texture(t.id(), uv);
-                    ui.painter().add(picture);
+                    painter.add(picture);
                 }
                 let label = format!("Selection {}", i + 1);
                 text(
-                    ui.painter(),
+                    &painter,
                     pos2(thumb.right() + 14.0, row.center().y),
                     Align2::LEFT_CENTER,
                     &label,
@@ -393,11 +455,21 @@ impl Selection {
                     Weight::Regular,
                     ink,
                 );
-                if ui.interact(row, ui.scope_id().with(("saved selection", i)), Sense::click()).clicked() {
-                    session.load_selection(i);
-                    self.has = session.has_selection();
-                    self.look(session);
+                // a tap loads it, or puts away a row slid open
+                if response.clicked() && deleted.is_none() {
+                    if self.saved_open.is_some() {
+                        self.saved_open = None;
+                    } else {
+                        session.load_selection(i);
+                        self.has = session.has_selection();
+                        self.look(session);
+                    }
                 }
+            }
+            if let Some(i) = deleted {
+                self.saved_open = None;
+                session.delete_saved_selection(i);
+                self.open_popup_refresh(ctx, session);
             }
         });
     }
@@ -419,18 +491,21 @@ impl Selection {
     fn overlay(&self, ctx: &egui::Context, session: &CanvasSession, bar_top: f32) {
         let ppp = ctx.pixels_per_point();
         let painter = ctx.layer_painter(LayerId::new(Order::Middle, Id::unique("selection overlay")));
+        let view = session.view_matrix();
+        let [a, b, c, d, e, f] =
+            view.get(..6).and_then(|v| <[f32; 6]>::try_from(v).ok()).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        let to_window = |x: f32, y: f32| pos2(a * x + c * y + e, b * x + d * y + f) / ppp;
+        // the shapes joined to the selection while the tool is open: their paths, dashed
+        for outline in session.selection_outlines() {
+            let mut points: Vec<Pos2> = outline.as_chunks::<2>().0.iter().map(|&[x, y]| to_window(x, y)).collect();
+            if points.len() >= 2 {
+                points.extend(points.first().copied());
+                dashed(&painter, &points);
+            }
+        }
         // the strokes the selection takes on a plugin's layer: their box, as the transform box shows
         if self.taken.len() == 8 {
-            let view = session.view_matrix();
-            let [a, b, c, d, e, f] =
-                view.get(..6).and_then(|v| <[f32; 6]>::try_from(v).ok()).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-            let corners: Vec<Pos2> = self
-                .taken
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|&[x, y]| pos2(a * x + c * y + e, b * x + d * y + f) / ppp)
-                .collect();
+            let corners: Vec<Pos2> = self.taken.as_chunks::<2>().0.iter().map(|&[x, y]| to_window(x, y)).collect();
             let mut edge = corners.clone();
             edge.extend(corners.first());
             painter.extend(Shape::dashed_line_with_offset(

@@ -100,6 +100,8 @@ private val SideDot = 7.5.dp
 private val SideReach = 20.dp
 /** Fingers tapped outside the box this quickly (ms) undo or redo, as on the canvas. */
 private const val EditTapMs = 300L
+/** Taps on the text this near the last one (the platform's double-tap reach) count on from it. */
+private val TapsReach = 100.dp
 /** The sheet's words: white, black on the light interface. */
 // a design row's track and the middle tick of one that runs both ways
 private val DesignTrack get() = if (Pc.light) Color(0xFFE3E3E3) else Color(0xFF5A5A5A)
@@ -117,14 +119,37 @@ fun BoxScope.TextEditor(vm: CanvasViewModel) {
     val focus = remember { FocusRequester() }
     val keyboard = LocalSoftwareKeyboardController.current
     val box by rememberUpdatedState(windowBox(vm, info))
+    // quick taps on the text one after another: one puts the caret there, two choose the word,
+    // three all of it
+    val taps = remember { TextTaps() }
+    // a touch on the text brings the keyboard back if it was put away; not while the style sheet
+    // has its place: the sheet stays (its keyboard button swaps them back), never under the keyboard
+    fun touchedText() {
+        if (!textTouchBringsKeyboard(vm.textStyleOpen)) return
+        vm.textKeyboard = true
+        focus.requestFocus()
+        keyboard?.show()
+    }
     // a tap outside the box ends the edit, keeping it; dragging inside it moves the text, and
     // dragging a side's dot (past the touch slop) moves that side: the box's width
     Box(Modifier.fillMaxSize().pointerInput(Unit) {
         awaitEachGesture {
             val down = awaitFirstDown()
+            // let go at upAt (ms) without moving: a tap on the text, counted on from the last
+            fun tapped(upAt: Long) {
+                if (upAt - down.uptimeMillis > viewConfiguration.longPressTimeoutMillis) return
+                taps.count = tapsCounted(
+                    taps.count, taps.lastUp, taps.lastAt, down.uptimeMillis, down.position,
+                    viewConfiguration.doubleTapTimeoutMillis, TapsReach.toPx(),
+                )
+                taps.lastUp = upAt
+                taps.lastAt = down.position
+                vm.tapText(down.position, taps.count)
+            }
             vm.textSideAt(down.position, SideReach.toPx())?.let { side ->
                 down.consume()
                 var dragging = false
+                var upAt: Long? = null
                 while (true) {
                     val c = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                     if (!dragging && (c.position - down.position).getDistance() > viewConfiguration.touchSlop) {
@@ -133,13 +158,15 @@ fun BoxScope.TextEditor(vm: CanvasViewModel) {
                     if (dragging) vm.dragTextSide(c.position)
                     c.consume()
                     // after the move: a finger's lift can carry its last one
-                    if (!c.pressed) break
+                    if (!c.pressed) {
+                        upAt = c.uptimeMillis
+                        break
+                    }
                 }
+                // a tap on the dot is a tap on the text
                 if (dragging) vm.endTextSide() else {
-                    // a tap on the dot is a tap on the text
-                    vm.textKeyboard = true
-                    focus.requestFocus()
-                    keyboard?.show()
+                    touchedText()
+                    upAt?.let { tapped(it) }
                 }
                 return@awaitEachGesture
             }
@@ -169,16 +196,21 @@ fun BoxScope.TextEditor(vm: CanvasViewModel) {
                 }
                 return@awaitEachGesture
             }
-            // a touch on the text brings the keyboard back if it was put away
-            vm.textKeyboard = true
-            focus.requestFocus()
-            keyboard?.show()
+            touchedText()
+            // dragged past the slop, the text follows; let go before that, a tap chooses letters
             var last = down.position
+            var moving = false
             while (true) {
                 val c = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
-                if (!c.pressed) break
-                vm.moveText(last, c.position)
-                last = c.position
+                if (!c.pressed) {
+                    if (!moving) tapped(c.uptimeMillis)
+                    break
+                }
+                moving = moving || (c.position - down.position).getDistance() > viewConfiguration.touchSlop
+                if (moving) {
+                    vm.moveText(last, c.position)
+                    last = c.position
+                }
                 c.consume()
             }
         }
@@ -209,6 +241,27 @@ fun BoxScope.TextEditor(vm: CanvasViewModel) {
         if (vm.textStyleOpen) TextStyleSheet(vm, info) else if (reach > 0) TextBar(vm)
     }
 }
+
+/**
+ * Whether a touch on the text being edited brings the on-screen keyboard up: not while the style
+ * sheet is open, as the sheet has the keyboard's place (its keyboard button swaps them back).
+ */
+internal fun textTouchBringsKeyboard(styleOpen: Boolean): Boolean = !styleOpen
+
+/** The taps on the text so far: how many in a row, and when (ms) and where the last was let go. */
+private class TextTaps {
+    var count = 0
+    var lastUp = 0L
+    var lastAt = Offset.Zero
+}
+
+/**
+ * How many taps in a row a tap pressed at [downAt] (ms) at [at] makes, after [before] of them
+ * the last of which was let go at [lastUp] at [lastAt]: one more when it comes within [timeout]
+ * ms and [reach] pixels of that, else the first again; after three, the next is the first.
+ */
+internal fun tapsCounted(before: Int, lastUp: Long, lastAt: Offset, downAt: Long, at: Offset, timeout: Long, reach: Float): Int =
+    if (before in 1..2 && downAt - lastUp in 0..timeout && (at - lastAt).getDistance() <= reach) before + 1 else 1
 
 /** Less of the window than this share between its bottom and what shows above is a system bar, not a keyboard. */
 private const val KEYBOARD_LEAST = 0.15f

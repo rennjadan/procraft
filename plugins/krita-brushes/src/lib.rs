@@ -95,6 +95,8 @@ pub extern "C" fn procraft_brush_import(_engine: i32, len: i32) -> i32 {
                 _ => {}
             }
         }
+        // (what the last answer held let go first: a bundle's brushes take hundreds of megabytes)
+        s.output = Vec::new();
         s.output = import::import(&name, bytes);
         s.output.len() as i32
     })

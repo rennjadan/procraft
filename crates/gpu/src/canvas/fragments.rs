@@ -13,12 +13,12 @@
 //! - Liquify: its stamps' sums and its field in integers ([`LiquifyBits`]).
 
 use procraft_engine::geom::IRect;
-use wgpu::util::DeviceExt;
 
 use super::{
-    Canvas, LAYER_FORMAT, LIQUIFY_LEAST_RADIUS, LiquifyStamp, LiquifyUniform, SMUDGE_GRID, SMUDGE_UNIFORM_SIZE,
-    SmudgeUniform, StampInstance, UNIFORM_SIZE, UniformData, WET_PASS_SIZE, WET_PLOT_MOST, WET_PLOTS_TEXELS, by_rule,
-    copy_at, extent, quad_reach, rule_tiles, smudge, texture,
+    Aside, Canvas, Carry, Kept, LAYER_FORMAT, LIQUIFY_LEAST_RADIUS, LiquifyStamp, LiquifyUniform, RULE_LISTS_KEPT,
+    SMUDGE_GRID, SMUDGE_REACH, SMUDGE_UNIFORM_SIZE, SmudgeUniform, StampInstance, UNIFORM_SIZE, UniformData,
+    WET_PASS_SIZE, WET_PLOT_MOST, WET_PLOTS_TEXELS, by_rule, carry_hand_overs, copy_at, extent, quad_reach, rule_lists,
+    smudge, texture,
 };
 use crate::Gpu;
 
@@ -78,8 +78,9 @@ pub(crate) struct FragmentPipelines {
     pub(super) blur_down: wgpu::RenderPipeline,
     pub(super) blur_across: wgpu::RenderPipeline,
     /// A stamp laid, by whether the window keeps how much of the paint each pixel has taken, and
-    /// how much shows (each its own target).
+    /// how much shows (each its own target); and a run of a pass's stamps laid at once, likewise.
     pub(super) deposit: [[wgpu::RenderPipeline; 2]; 2],
+    pub(super) deposit_run: [[wgpu::RenderPipeline; 2]; 2],
     pub(super) synthesize: wgpu::RenderPipeline,
     pub(super) wet_plots: wgpu::RenderPipeline,
     pub(super) wet_carried: wgpu::RenderPipeline,
@@ -239,6 +240,8 @@ impl FragmentPipelines {
                 loaded(8, FLOAT),
                 loaded(9, FLOAT),
                 loaded(10, UINT),
+                // the paper's tile, which wet paint takes (filtered, as a stroke's paper is)
+                loaded(11, wgpu::TextureSampleType::Float { filterable: true }),
             ],
         });
         let smudge_carry_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -259,10 +262,12 @@ impl FragmentPipelines {
             pipeline(label, &smudge_pipeline_layout, &smudge_module, ("vs_full", fs), targets)
         };
         let carried = [target(CARRY_FORMAT)];
-        let deposit = |amount: bool, shown: bool| {
+        let deposit_by = |fs: &'static str, amount: bool, shown: bool| {
             let kept = |on: bool| if on { target(AMOUNT_FORMAT) } else { None };
-            pass("smudge deposit", "fs_deposit", &[target(LAYER_FORMAT), kept(amount), kept(shown)])
+            pass("smudge deposit", fs, &[target(LAYER_FORMAT), kept(amount), kept(shown)])
         };
+        let deposit = |amount, shown| deposit_by("fs_deposit", amount, shown);
+        let deposit_run = |amount, shown| deposit_by("fs_deposit_run", amount, shown);
         let liquify = liquify.map(|(uniform_layout, transform_layout, filter_module)| {
             let liquify_module = module("liquify in integers", include_str!("../shaders/liquify.wgsl"));
             let sums_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -325,6 +330,10 @@ impl FragmentPipelines {
             blur_down: pass("smudge blur down", "fs_blur_down", &carried),
             blur_across: pass("smudge blur across", "fs_blur_across", &carried),
             deposit: [[deposit(false, false), deposit(false, true)], [deposit(true, false), deposit(true, true)]],
+            deposit_run: [
+                [deposit_run(false, false), deposit_run(false, true)],
+                [deposit_run(true, false), deposit_run(true, true)],
+            ],
             synthesize: pass("smudge synthesize", "fs_synthesize", &[target(LAYER_FORMAT)]),
             wet_plots: pass("smudge wet plots", "fs_wet_plots", &carried),
             wet_carried: pass("smudge wet carried", "fs_wet_carried", &carried),
@@ -350,8 +359,29 @@ pub(super) struct BuiltUp {
 pub(super) struct Fragments {
     built: Vec<BuiltUp>,
     rule_out: Option<[(wgpu::Texture, wgpu::TextureView); 2]>,
+    /// The rule's lists, kept from render to render as the compute passes' are (see
+    /// `super::RuleLists`), taken in turn from the next.
+    pub(super) rule_lists: Vec<RuleList>,
+    rule_next: usize,
     tip_backup: Option<wgpu::Texture>,
     spares: Option<Spares>,
+}
+
+/// A list of the rule's tiles kept for the fragment passes: its words in a texture, the stamps it
+/// lists in a uniform buffer beside it, and its bind group with what that binds besides.
+pub(super) struct RuleList {
+    tiles: Tex,
+    stamps: wgpu::Buffer,
+    bind: Option<(RuleBinds, wgpu::BindGroup)>,
+}
+
+/// What a fragment rule pass's bind group binds besides its list: the uniforms, the stroke as it
+/// shows and its build-up.
+#[derive(Clone, PartialEq)]
+pub(super) struct RuleBinds {
+    uniforms: wgpu::Buffer,
+    shown: wgpu::TextureView,
+    built: wgpu::TextureView,
 }
 
 /// The most build-ups a canvas keeps (see [`Fragments`]).
@@ -361,7 +391,14 @@ impl Fragments {
     /// The textures it holds.
     pub(super) fn textures(&self) -> Vec<&wgpu::Texture> {
         let outs = self.rule_out.iter().flat_map(|pair| pair.iter().map(|(t, _)| t));
-        self.built.iter().map(|b| &b.texture).chain(outs).chain(self.tip_backup.as_ref()).collect()
+        let lists = self.rule_lists.iter().map(|l| &l.tiles.texture);
+        self.built.iter().map(|b| &b.texture).chain(outs).chain(lists).chain(self.tip_backup.as_ref()).collect()
+    }
+
+    /// A render begins: the rule's lists free for its work again, as many kept as are to be.
+    pub(super) fn rule_lists_begin(&mut self) {
+        self.rule_lists.truncate(RULE_LISTS_KEPT);
+        self.rule_next = 0;
     }
 }
 
@@ -441,19 +478,20 @@ impl Canvas {
         })
     }
 
-    /// Lays `instances` into the stroke texture `texture` by `rule` (see
+    /// Lays `instances` into the stroke texture `texture` (`shown` its view) by `rule` (see
     /// [`Canvas::fragment_rule`]) in fragment passes: a part of the canvas at most
-    /// [`super::RULE_PART`] pixels a side at a time, each pixel going through the stamps over its
-    /// tile in order as its paint stands after each (its build-up, where nothing else drew there
-    /// since), at most [`RULE_STAMPS_MOST`] stamps a pass; then the part copied into the stroke and
-    /// its build-up.
+    /// [`super::RULE_PART`] pixels a side at a time (smaller where its list would be longer than
+    /// a list may be: see `super::rule_lists`), each pixel going through the stamps over its tile
+    /// in order as its paint stands after each (its build-up, where nothing else drew there since),
+    /// at most [`RULE_STAMPS_MOST`] stamps a pass; then the part copied into the stroke and its
+    /// build-up. A part whose list couldn't be made (past the GPU's memory) is left out, said once.
     pub(super) fn lay_by_rule_in_fragments(
         &mut self,
         gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         (uniform, brush): (u32, &wgpu::BindGroup),
         instances: &[StampInstance],
-        texture: &wgpu::Texture,
+        (texture, shown): (&wgpu::Texture, &wgpu::TextureView),
         rule: u32,
     ) {
         let device = &gpu.device;
@@ -477,100 +515,148 @@ impl Canvas {
             None
         };
         let spare = self.spares(device).word.view.clone();
-        let built_view = built.as_ref().map_or(&spare, |(_, view)| view);
-        let shown = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let binds = RuleBinds {
+            uniforms: self.uniform_buffer.clone(),
+            shown: shown.clone(),
+            built: built.as_ref().map_or(spare, |(_, view)| view.clone()),
+        };
+        // as many rows of words as a texture may have
+        let rows_most = device.limits().max_texture_dimension_2d;
+        let most = self.rule_list_most.min(usize::try_from(RULE_ROW * rows_most).unwrap_or(usize::MAX));
         let full = self.full();
         for chunk in instances.chunks(RULE_STAMPS_MOST) {
             let bounds = chunk.iter().fold(IRect::EMPTY, |b, s| b.union(quad_reach(s))).intersect(full);
-            let mut data = bytemuck::cast_slice::<StampInstance, u8>(chunk).to_vec();
-            data.resize(RULE_STAMPS_BYTES as usize, 0);
-            let stamps = uniform_buffer(gpu, "stamp rule stamps", &data);
+            let mut stamps = bytemuck::cast_slice::<StampInstance, u8>(chunk).to_vec();
+            stamps.resize(RULE_STAMPS_BYTES as usize, 0);
             let step = part as i32;
             let mut y0 = bounds.y0;
             while y0 < bounds.y1 {
                 let mut x0 = bounds.x0;
                 while x0 < bounds.x1 {
-                    let rect = IRect { x0, y0, x1: (x0 + step).min(bounds.x1), y1: (y0 + step).min(bounds.y1) };
+                    let whole = IRect { x0, y0, x1: (x0 + step).min(bounds.x1), y1: (y0 + step).min(bounds.y1) };
                     x0 += step;
-                    let Some(mut words) = rule_tiles(chunk, 0, rect, rule) else { continue };
-                    let rows = (words.len() as u32).div_ceil(RULE_ROW);
-                    words.resize((rows * RULE_ROW) as usize, 0);
-                    let tiles = device.create_texture_with_data(
-                        &gpu.queue,
-                        &wgpu::TextureDescriptor {
-                            label: Some("stamp rule tiles"),
-                            size: extent(RULE_ROW, rows),
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            format: wgpu::TextureFormat::R32Uint,
-                            usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                            view_formats: &[],
-                        },
-                        wgpu::util::TextureDataOrder::LayerMajor,
-                        bytemuck::cast_slice(&words),
-                    );
-                    let tiles_view = tiles.create_view(&wgpu::TextureViewDescriptor::default());
-                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("stamp rule in fragments"),
-                        layout: &fragments.rule_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                    buffer: &self.uniform_buffer,
-                                    offset: 0,
-                                    size: wgpu::BufferSize::new(UNIFORM_SIZE),
-                                }),
-                            },
-                            wgpu::BindGroupEntry { binding: 1, resource: stamps.as_entire_binding() },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: wgpu::BindingResource::TextureView(&tiles_view),
-                            },
-                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&shown) },
-                            wgpu::BindGroupEntry {
-                                binding: 4,
-                                resource: wgpu::BindingResource::TextureView(built_view),
-                            },
-                        ],
-                    });
-                    let attachment = |view| {
-                        Some(wgpu::RenderPassColorAttachment {
-                            view,
-                            depth_slice: None,
-                            resolve_target: None,
-                            ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                        })
-                    };
-                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("stamp rule in fragments"),
-                        color_attachments: &[
-                            attachment(&out8_view),
-                            if eight { attachment(&out16_view) } else { None },
-                        ],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    pass.set_scissor_rect(0, 0, rect.width(), rect.height());
-                    pass.set_pipeline(&fragments.rule);
-                    pass.set_bind_group(0, &bind, &[uniform]);
-                    pass.set_bind_group(1, brush, &[]);
-                    pass.draw(0..3, 0..1);
-                    drop(pass);
-                    let size = extent(rect.width(), rect.height());
-                    encoder.copy_texture_to_texture(copy_at(&out8, 0, 0), copy_at(texture, rect.x0, rect.y0), size);
-                    if let Some((built, _)) = &built {
-                        encoder.copy_texture_to_texture(copy_at(&out16, 0, 0), copy_at(built, rect.x0, rect.y0), size);
+                    for (rect, words) in rule_lists(chunk, 0, whole, rule, most) {
+                        let Some(bind) =
+                            self.fragment_rule_list(gpu, (&words, &stamps), &binds, &fragments.rule_layout)
+                        else {
+                            continue;
+                        };
+                        let attachment = |view| {
+                            Some(wgpu::RenderPassColorAttachment {
+                                view,
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                            })
+                        };
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("stamp rule in fragments"),
+                            color_attachments: &[
+                                attachment(&out8_view),
+                                if eight { attachment(&out16_view) } else { None },
+                            ],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        pass.set_scissor_rect(0, 0, rect.width(), rect.height());
+                        pass.set_pipeline(&fragments.rule);
+                        pass.set_bind_group(0, &bind, &[uniform]);
+                        pass.set_bind_group(1, brush, &[]);
+                        pass.draw(0..3, 0..1);
+                        drop(pass);
+                        let size = extent(rect.width(), rect.height());
+                        encoder.copy_texture_to_texture(copy_at(&out8, 0, 0), copy_at(texture, rect.x0, rect.y0), size);
+                        if let Some((built, _)) = &built {
+                            encoder.copy_texture_to_texture(
+                                copy_at(&out16, 0, 0),
+                                copy_at(built, rect.x0, rect.y0),
+                                size,
+                            );
+                        }
                     }
                 }
                 y0 += step;
             }
         }
     }
+
+    /// The bind group for the next part of this render's fragment rule passes, its list holding
+    /// `words` and the stamps it lists `stamps` (both written through the queue): a kept list,
+    /// grown if it is too small, bound with `binds`. None if it couldn't be made, said once.
+    fn fragment_rule_list(
+        &mut self,
+        gpu: &Gpu,
+        (words, stamps): (&[u32], &[u8]),
+        binds: &RuleBinds,
+        layout: &wgpu::BindGroupLayout,
+    ) -> Option<wgpu::BindGroup> {
+        let device = &gpu.device;
+        let rows = u32::try_from(words.len().div_ceil(RULE_ROW as usize)).unwrap_or(u32::MAX).max(1);
+        let at = self.fragments.rule_next;
+        self.rule_lists.largest = self.rule_lists.largest.max(words.len());
+        let roomy = self.fragments.rule_lists.get(at).is_some_and(|l| l.tiles.texture.height() >= rows);
+        if !roomy {
+            // in steps, so that a list a little longer than the last doesn't make one each frame
+            let tall =
+                rows.next_power_of_two().max(RULE_ROWS_LEAST).min(device.limits().max_texture_dimension_2d).max(rows);
+            let list = self.made_or_told(device, |device| RuleList {
+                tiles: Tex::new(device, "stamp rule tiles", RULE_ROW, tall, wgpu::TextureFormat::R32Uint),
+                stamps: device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("stamp rule stamps"),
+                    size: RULE_STAMPS_BYTES,
+                    usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                }),
+                bind: None,
+            })?;
+            match self.fragments.rule_lists.get_mut(at) {
+                Some(kept) => *kept = list,
+                None => self.fragments.rule_lists.push(list),
+            }
+        }
+        self.fragments.rule_next += 1;
+        let list = self.fragments.rule_lists.get_mut(at)?;
+        let mut padded = words.to_vec();
+        padded.resize((rows * RULE_ROW) as usize, 0);
+        gpu.queue.write_texture(
+            copy_at(&list.tiles.texture, 0, 0),
+            bytemuck::cast_slice(&padded),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(RULE_ROW * 4), rows_per_image: Some(rows) },
+            extent(RULE_ROW, rows),
+        );
+        gpu.queue.write_buffer(&list.stamps, 0, stamps);
+        if let Some((bound, bind)) = &list.bind
+            && bound == binds
+        {
+            return Some(bind.clone());
+        }
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("stamp rule in fragments"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &binds.uniforms,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(UNIFORM_SIZE),
+                    }),
+                },
+                wgpu::BindGroupEntry { binding: 1, resource: list.stamps.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&list.tiles.view) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&binds.shown) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&binds.built) },
+            ],
+        });
+        list.bind = Some((binds.clone(), bind.clone()));
+        Some(bind)
+    }
 }
+
+/// The fewest rows a fragment rule list's texture is made with.
+const RULE_ROWS_LEAST: u32 = 16;
 
 /// A texture and its view.
 #[derive(Clone)]
@@ -624,6 +710,42 @@ impl Held {
             Held::Smudge { carry, scratch, dull } => vec![&carry.texture, &scratch.texture, &dull.texture],
             Held::Wet { carried: [a, b], plots } => vec![&a.texture, &b.texture, &plots.texture],
         }
+    }
+}
+
+/// Hands the stroke's carry textures `held` from copy `out` (what of its carry is kept goes aside) to
+/// copy `into` (what of its carry its piece reads comes back), as `smudge::hand_over` does buffers.
+fn hand_over(
+    encoder: &mut wgpu::CommandEncoder,
+    held: &Held,
+    carries: &[Carry],
+    out: Option<(usize, Kept)>,
+    (into, needs): (usize, Kept),
+) {
+    let aside = |copy: usize| match carries.get(copy).and_then(|c| c.aside.as_ref()) {
+        Some(Aside::Texture(tex)) => Some(tex),
+        _ => None,
+    };
+    // where it lies: the grid's rows within that many cells of its middle, or the rows of the
+    // carried-over plot its texels take (in the copy's put aside, the same)
+    let kept_in = |kept: Kept| match (kept, held) {
+        (Kept::Cells(cells), Held::Smudge { carry, .. }) => {
+            let (cells, middle) = (cells.clamp(0, SMUDGE_REACH), SMUDGE_GRID as i32 / 2);
+            Some((carry, IRect::new(0, middle - cells, SMUDGE_GRID as i32, middle + cells + 1)))
+        }
+        (Kept::Plot { which, texels }, Held::Wet { carried, .. }) => {
+            let rows = texels.div_ceil(CARRIED_ROW).min(CARRIED_ROW);
+            carried.get(which.min(1) as usize).map(|t| (t, IRect::new(0, 0, CARRIED_ROW as i32, rows as i32)))
+        }
+        _ => None,
+    };
+    if let Some((copy, kept)) = out
+        && let (Some(aside), Some((tex, rect))) = (aside(copy), kept_in(kept))
+    {
+        copy_rect(encoder, tex, aside, rect, 0);
+    }
+    if let (Some(aside), Some((tex, rect))) = (aside(into), kept_in(needs)) {
+        copy_rect(encoder, aside, tex, rect, 0);
     }
 }
 
@@ -760,6 +882,8 @@ impl Canvas {
         (brush, second): (&wgpu::BindGroup, Option<&wgpu::TextureView>),
     ) -> bool {
         let device = &gpu.device;
+        // the paper as it is now, which each wet stamp takes as it lays
+        let paper = self.paper_look();
         let reach = if reach.is_empty() { IRect::new(0, 0, 1, 1) } else { reach }.intersect(self.full());
         if reach.is_empty() || !self.fits_window(reach) {
             log::error!("smudging: {} by {} pixels is past what a window holds", reach.width(), reach.height());
@@ -770,9 +894,10 @@ impl Canvas {
         let (work, kept) = pieces.iter().fold((false, false), |(w, k), p| (w || p.work, k || p.kept));
         let count: usize = pieces.iter().map(|p| p.uniforms.len()).sum();
         self.smudge_uniform_room(gpu, params, count);
-        // the layer as it was is read by a glaze and paint put together, else not filled in
+        // the layer as it was is read by a glaze, paint laid apart and paint put together, else
+        // not filled in
         let before = pieces.iter().any(|p| {
-            p.uniforms.iter().any(|u| u.source_before == 1)
+            p.uniforms.iter().any(|u| u.source_before == 1 || u.laid_apart == 2)
                 || p.dispatches.iter().any(|d| matches!(d.0, smudge::Pipe::Synthesize))
         });
         if !self.window_in_fragments(gpu, encoder, (reach, before), &each) {
@@ -786,6 +911,9 @@ impl Canvas {
             (spares.eight.view.clone(), spares.word.view.clone(), spares.words.view.clone());
         let Some(smudge) = self.smudge.as_ref() else { return false };
         let (Some(window), Some(held)) = (smudge.frag_window.as_ref(), smudge.held.as_ref()) else { return false };
+        // where the carry goes from one of a symmetry's copies to another's
+        let (overs, resident) = carry_hand_overs(smudge.resident, pieces);
+        let mut overs = overs.into_iter().peekable();
         let uniform = |binding, buffer, size| wgpu::BindGroupEntry {
             binding,
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
@@ -816,6 +944,8 @@ impl Canvas {
                 // the image as last shown, for a stroke that picks up from it (else anything)
                 view(9, if from_image { &self.composite_view } else { before_view }),
                 view(10, &first(&window.shown).unwrap_or_else(|| spare_word.clone())),
+                // the paper's tile, which wet paint takes
+                view(11, &self.paper_view),
             ],
         });
         let carry_bind = |carry: &wgpu::TextureView, plots: &wgpu::TextureView| {
@@ -848,12 +978,15 @@ impl Canvas {
             IRect::new(r.x0 - reach.x0, r.y0 - reach.y0, r.x1 - reach.x0, r.y1 - reach.y0)
         };
         let grid = SMUDGE_GRID as i32;
-        for piece in pieces {
+        for (k, piece) in pieces.iter().enumerate() {
+            if let Some((_, out, into)) = overs.next_if(|o| o.0 == k) {
+                hand_over(encoder, held, &smudge.carries, out, into);
+            }
             let laid: Vec<(u32, SmudgeUniform)> = piece
                 .uniforms
                 .iter()
                 .map(|u| {
-                    let u = SmudgeUniform { origin, stride, rows: reach.height(), ..*u };
+                    let u = SmudgeUniform { origin, stride, rows: reach.height(), paper, ..*u };
                     (params.push(&u), u)
                 })
                 .collect();
@@ -883,13 +1016,15 @@ impl Canvas {
                         draw_in(encoder, "smudge blur", pipeline, &[Some(&scratch.view)], rect, binds(&main));
                         copy_rect(encoder, scratch, carry, rect, down);
                     }
-                    (smudge::Pipe::Deposit, _) => {
+                    (smudge::Pipe::Deposit | smudge::Pipe::DepositRun, _) => {
                         let rect = in_window(bbox);
                         let into = if u.laid_apart == 2 { window.grained.as_ref() } else { Some(&window.work) };
                         let Some([was, next]) = into else { continue };
                         let amount = window.amount.as_ref();
                         let shown = window.shown.as_ref();
-                        let [[alone, with_shown], [with_amount, with_both]] = &f.deposit;
+                        let variants =
+                            if matches!(pipe, smudge::Pipe::DepositRun) { &f.deposit_run } else { &f.deposit };
+                        let [[alone, with_shown], [with_amount, with_both]] = variants;
                         let pipeline = match (amount.is_some(), shown.is_some()) {
                             (false, false) => alone,
                             (false, true) => with_shown,
@@ -938,6 +1073,9 @@ impl Canvas {
                 }
             }
         }
+        if let Some(smudge) = self.smudge.as_mut() {
+            smudge.resident = resident;
+        }
         self.window_out_fragments(encoder, reach, writes, (work, kept));
         true
     }
@@ -964,11 +1102,14 @@ impl Canvas {
         if smudge.stalled {
             return false;
         }
-        let keeps = smudge.keeps;
+        let (keeps, tile_side) = (smudge.keeps, smudge.tile);
         let (width, height) = (reach.width(), reach.height());
         let small = smudge.frag_window.as_ref().is_none_or(|w| !w.fits(width, height));
-        let mut missing: Vec<(u32, u32)> =
-            writes.iter().flat_map(|w| smudge::tiles_of(*w)).filter(|t| !smudge.tiles.contains_key(t)).collect();
+        let mut missing: Vec<(u32, u32)> = writes
+            .iter()
+            .flat_map(|w| smudge::tiles_of(*w, tile_side))
+            .filter(|t| !smudge.tiles.contains_key(t))
+            .collect();
         missing.sort_unstable();
         missing.dedup();
         if small || !missing.is_empty() {
@@ -977,7 +1118,7 @@ impl Canvas {
             // grown in steps, so a stroke that reaches further doesn't make them every frame
             let side = |n: u32, of: u32| n.next_multiple_of(256).min(of).max(n);
             let window = small.then(|| FragWindow::new(device, (side(width, canvas_w), side(height, canvas_h)), keeps));
-            let tile = |label, format| texture(device, label, smudge::TILE, smudge::TILE, format);
+            let tile = |label, format| texture(device, label, tile_side, tile_side, format);
             let made: Vec<((u32, u32), smudge::Tile)> = missing
                 .iter()
                 .map(|&at| {
@@ -1008,7 +1149,7 @@ impl Canvas {
             }
             for (at, tile) in made {
                 // the layer there as it was: the stroke hasn't written to it yet
-                let r = smudge::tile_rect(at).intersect(full);
+                let r = smudge::tile_rect(at, tile_side).intersect(full);
                 let kept = std::iter::once((&layer.texture, &tile.before))
                     .chain(tile.grained.iter().map(|g| (&layer.texture, g)))
                     .chain(also.iter().copied().zip(&tile.more));
@@ -1045,13 +1186,13 @@ impl Canvas {
             ));
         }
         // what the stroke keeps where it has been
-        for at in smudge::tiles_of(reach) {
+        for at in smudge::tiles_of(reach, tile_side) {
             let Some(tile) = smudge.tiles.get(&at) else { continue };
-            let r = smudge::tile_rect(at).intersect(reach);
+            let r = smudge::tile_rect(at, tile_side).intersect(reach);
             if r.is_empty() {
                 continue;
             }
-            let t = smudge::tile_rect(at);
+            let t = smudge::tile_rect(at, tile_side);
             let (x, y, size) = (r.x0 - t.x0, r.y0 - t.y0, extent(r.width(), r.height()));
             let (wx, wy) = (r.x0 - reach.x0, r.y0 - reach.y0);
             if before {
@@ -1100,9 +1241,9 @@ impl Canvas {
         if !kept {
             return;
         }
-        for at in smudge::tiles_of(changed) {
+        for at in smudge::tiles_of(changed, smudge.tile) {
             let Some(tile) = smudge.tiles.get(&at) else { continue };
-            let t = smudge::tile_rect(at);
+            let t = smudge::tile_rect(at, smudge.tile);
             let r = t.intersect(changed);
             if r.is_empty() {
                 continue;

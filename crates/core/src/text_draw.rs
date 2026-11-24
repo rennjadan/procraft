@@ -208,7 +208,7 @@ pub fn import_text_font(bytes: Vec<u8>, file_name: String) -> Option<TextTypefac
             Err(_) => break,
         }
     }
-    std::fs::write(&path, bytes).ok()?;
+    crate::storage::write(&path, bytes).ok()?;
     // a file that isn't a font is dropped (only this new one)
     let offered = offer_file(&path);
     if offered.is_none() {
@@ -890,6 +890,44 @@ pub fn text_caret(info: TextInfo, index: u32) -> Vec<f32> {
     let Some(line) = laid.lines.get(line) else { return Vec::new() };
     let top = info.y - info.baseline * info.size;
     vec![info.x + x, top + line.top, top + line.bottom]
+}
+
+/// The place between characters of the text (as the core counts them) nearest canvas point
+/// (`x`, `y`): on the line laid out nearest it, before or after the letter nearest it. None for
+/// vertical text, whose letters are spread apart.
+pub(crate) fn index_at(info: &TextInfo, x: f32, y: f32) -> Option<usize> {
+    if info.vertical || !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+    let laid = lay_out(&mut fonts(), info);
+    let (bx, by) = (x - info.x, y - (info.y - info.baseline * info.size));
+    let off = |l: &Line| if by < l.top { l.top - by } else { (by - l.bottom).max(0.0) };
+    let line = laid.lines.iter().min_by(|a, b| off(a).total_cmp(&off(b)))?;
+    // each letter's two sides: before it and after it (the other way round right to left)
+    let sides = line.glyphs.iter().flat_map(|g| {
+        let (left, right) = (g.x, g.x + g.w);
+        if g.level.is_rtl() { [(g.start, right), (g.end, left)] } else { [(g.start, left), (g.end, right)] }
+    });
+    let offset = sides.min_by(|a, b| (a.1 - bx).abs().total_cmp(&(b.1 - bx).abs())).map_or(0, |s| s.0);
+    // back from the line's bytes to a character of the text shown, then of the text as typed
+    let (text, typed) = shown_mapped(info);
+    let line_start = match line.paragraph {
+        0 => 0,
+        n => text.match_indices('\n').nth(n - 1).map_or(text.len(), |(i, _)| i + 1),
+    };
+    let shown = text.get(..(line_start + offset).min(text.len())).map_or(0, |s| s.chars().count());
+    Some(typed.get(shown).copied().unwrap_or_else(|| info.text.chars().count()))
+}
+
+/// The word around place `index` of `text` (as the core counts): from just after the last space
+/// or line break before it to just before the first at or after it.
+pub(crate) fn word_at(text: &str, index: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let at = index.min(chars.len());
+    let (before, after) = chars.split_at(at);
+    let start = before.iter().rposition(|c| c.is_whitespace()).map_or(0, |i| i + 1);
+    let end = after.iter().position(|c| c.is_whitespace()).map_or(chars.len(), |i| at + i);
+    (start, end)
 }
 
 /// How wide the ring round chosen letters is, as a fraction of the text's size.

@@ -356,11 +356,13 @@ fn brush_of<'p>(
     let turned = value("RotationValue").unwrap_or(1.0).clamp(0.0, 1.0);
     let amount = |option: &str| value(&format!("{option}Value")).unwrap_or(1.0).clamp(0.0, 1.0);
     // the hue turned, the saturation, the value (lighter or darker) and Darken (darker), each
-    // as far as its amount where `id` drives it
+    // as far as its amount where `id` drives it: the first three either way from the middle of
+    // their curves, only as far as the curve goes from it
     let colours = |id: &str| {
         let by = |option: &str| if driven(option, id) { amount(option) } else { 0.0 };
-        let value = by("v");
-        [by("h"), by("s"), value, value.max(by("Darken"))]
+        let turned = |option: &str| by(option) * swing(&sensor_curve(param, option, id));
+        let value = turned("v");
+        [turned("h"), turned("s"), value, value.max(by("Darken"))]
     };
     // the texture's picture: in the preset as the base64 of its base64 (older ones); else one it
     // names, by its file's name, its own and its sum
@@ -486,17 +488,39 @@ fn pressure_curve<'p>(param: &dyn Fn(&str) -> Option<&'p str>, option: &str, che
         Some(r) => vec![r],
         None => Vec::new(),
     };
-    let pressure = sensors.iter().find(|s| s.attribute("id") == Some("pressure"));
-    if pressure.is_none() && !sensors.is_empty() {
+    if !sensors.is_empty() && !sensors.iter().any(|s| s.attribute("id") == Some("pressure")) {
         return None;
     }
+    Some(sensor_curve(param, option, "pressure"))
+}
+
+/// The curve the setting `option` of those `param` gives follows for its sensor `id`: the one its
+/// sensors share, as they do unless told not to (its own key, else the sensor read last, else the
+/// older keys), or, not shared, that sensor's own; else a straight line.
+fn sensor_curve<'p>(param: &dyn Fn(&str) -> Option<&'p str>, option: &str, id: &str) -> Vec<Vec2> {
+    let key = |what: &str| param(&format!("{option}{what}"));
+    let definition = key("Sensor").unwrap_or_default();
+    let root = xml::parse(definition);
+    let sensors: Vec<&Element> = match &root {
+        Some(r) if r.attribute("id") == Some("sensorslist") => r.all("ChildSensor").into_iter().collect(),
+        Some(r) => vec![r],
+        None => Vec::new(),
+    };
     let older = (param(&format!("Custom{option}")) == Some("true")).then(|| param(&format!("Curve{option}"))).flatten();
     let last = sensors.last().and_then(|s| s.child("curve")).map(|c| c.text.as_str());
     let read = if definition.contains("curve") { last } else { older };
-    let own = pressure.and_then(|s| s.child("curve")).map(|c| c.text.as_str());
+    let own =
+        sensors.iter().find(|s| s.attribute("id") == Some(id)).and_then(|s| s.child("curve")).map(|c| c.text.as_str());
     let text = if key("UseSameCurve") != Some("false") { key("commonCurve").or(read) } else { own };
     let points = text.map(curve_points).unwrap_or_default();
-    Some(if points.len() >= 2 { points } else { vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)] })
+    if points.len() >= 2 { points } else { vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)] }
+}
+
+/// How far a setting Krita turns either way from the middle of its curve (hue, saturation, value)
+/// goes along `curve`, as a share of all the way: the furthest the curve goes from a half, twice
+/// over. A straight line goes all the way; one kept near the middle hardly turns it.
+fn swing(curve: &[Vec2]) -> f32 {
+    curve.iter().map(|p| (2.0 * p.y.clamp(0.0, 1.0) - 1.0).abs()).fold(0.0, f32::max)
 }
 
 /// The sensors that drive `option` of those `param` gives, by their names (pressure, where it
@@ -931,7 +955,7 @@ fn faded_half(fade: f32) -> f32 {
 }
 
 /// The error function, to within about 1e-7 (Abramowitz and Stegun's 7.1.26).
-fn erf(x: f32) -> f32 {
+pub(crate) fn erf(x: f32) -> f32 {
     let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
     let poly = t * (0.254_829_6 + t * (-0.284_496_7 + t * (1.421_413_8 + t * (-1.453_152 + t * 1.061_405_4))));
     let e = 1.0 - poly * (-x * x).exp();
@@ -1268,6 +1292,37 @@ mod tests {
             (pressed.ratio_random, pressed.ratio_pressure),
             (0.0, Some(vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)]))
         );
+    }
+
+    #[test]
+    fn a_colour_turned_at_random_goes_only_as_far_as_its_curve_goes_from_the_middle() {
+        let round = r#"<Brush type="auto_brush"><MaskGenerator type="circle"/></Brush>"#;
+        let read = |params: &[(&str, &str)]| {
+            let extra: String = params.iter().map(|(k, v)| param(k, v)).collect();
+            let xml = preset("Spray", round, false).replace("</Preset>", &format!("{extra}</Preset>"));
+            read_preset(&kpp(&xml), &|_| None).unwrap()
+        };
+        let fuzzy = r#"<!DOCTYPE params> <params id="fuzzy"/> "#;
+        let hue = |curve: &str| {
+            read(&[
+                ("Pressureh", "true"),
+                ("hSensor", fuzzy),
+                ("hValue", "1"),
+                ("hUseSameCurve", "true"),
+                ("hcommonCurve", curve),
+            ])
+            .color_random[0]
+        };
+        // a straight line turns it all the way, either way; one kept within 0.486 and 0.514, as an
+        // impasto set keeps its hue, about 5 degrees of the half turn's 180
+        assert_eq!(hue("0,0;1,1;"), 1.0);
+        let near = hue("0,0.486111;1,0.513889;");
+        assert!((near - 0.0278).abs() < 1e-3, "{near}");
+        // and the value alike, each stroke, its own curve where its sensors keep their own
+        let own = r#"<!DOCTYPE params> <params id="fuzzystroke"> <curve>0,0.25;1,0.75;</curve> </params> "#;
+        let value = read(&[("Pressurev", "true"), ("vSensor", own), ("vValue", "0.8"), ("vUseSameCurve", "false")])
+            .color_per_stroke;
+        assert!((value[2] - 0.4).abs() < 1e-6, "{value:?}");
     }
 
     #[test]

@@ -8,28 +8,51 @@
 //! Drivers don't all make the context they are asked for: its packets are read as the context
 //! opened says they are laid out, its messages taken from the base it gives them, and a pressure
 //! range the device doesn't give (or the pen presses past) is found from the pen's own presses.
+//!
+//! A driver gives packets only to the app in front (Wacom's: the one with the keyboard), and may
+//! not take a context put on top while the pen presses, as it does when its press brings the
+//! window to the front: the context is enabled and put on top as the window comes to the front,
+//! enabled anew and put on top again once the pen is up if no packet has come by then, and
+//! re-opened if a press still finds none.
 
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, POINT, WPARAM};
 use windows::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
-use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow};
 use windows::core::{s, w};
 
-/// The base WinTab's messages are asked to start from (its default), and where two of them are
-/// from it: a packet is waiting, and the pen came near or went.
+/// The base WinTab's messages are asked to start from (its default), and where some of them are
+/// from it: a packet is waiting, a context is closing, a context moved in the overlap order, and
+/// the pen came near or went.
 const WT_DEFBASE: u32 = 0x7FF0;
 const PACKET: u32 = 0;
+const CTXCLOSE: u32 = 2;
+const CTXOVERLAP: u32 = 4;
 const PROXIMITY: u32 = 5;
 /// The first message number left to apps: a base below it isn't one a context can use.
 const WM_USER: u32 = 0x0400;
+/// A context's status: disabled, and on top of the overlap order.
+const CXS_DISABLED: u32 = 0x0001;
+const CXS_ONTOP: u32 = 0x0004;
 
 /// The base of the messages the open context sends (0: none is open).
 static BASE: AtomicU32 = AtomicU32::new(0);
+/// The open context's handle (0: none), for the messages about a context that name it.
+static CONTEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// When the last packet handed the pen on as the mouse's was read (ms since [`started`]; 0, never)
+/// and where it found the mouse pointer then (window pixels), if it could say.
+static PACKET_AT: AtomicU64 = AtomicU64::new(0);
+static PACKET_POINTER: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// How long the mouse pointer may move with no packet before what moves it is taken for the mouse:
+/// a pen moving it is read a hundred times a second or more, its packets ahead of the moves they
+/// make (a window's posted messages come before its mouse's).
+const PEN_QUIET: Duration = Duration::from_millis(100);
 
 /// What [`WTInfoW`] is asked: the default digitizing and system contexts, a device's name,
 /// pressure and orientation axes, and a cursor's name.
@@ -37,6 +60,8 @@ const WTI_DEFCONTEXT: u32 = 3;
 const WTI_DEFSYSCTX: u32 = 4;
 const WTI_DEVICES: u32 = 100;
 const WTI_CURSORS: u32 = 200;
+/// How many categories the devices, and the cursors, have: one each, from their first.
+const CATEGORIES: u32 = 100;
 const DVC_NAME: u32 = 1;
 const DVC_NPRESSURE: u32 = 15;
 const DVC_ORIENTATION: u32 = 17;
@@ -60,8 +85,12 @@ const PK_FIELDS: u32 = 14;
 const PACKET_DATA: u32 = PK_CURSOR | PK_BUTTONS | PK_X | PK_Y | PK_NORMAL_PRESSURE | PK_ORIENTATION;
 /// Room for a packet: every field WinTab defines (80 bytes), and what a driver's own add.
 const PACKET_ROOM: usize = 512;
-/// The most a name read from the driver may take, bytes.
-const NAME_ROOM: usize = 256;
+/// Room for a name read from the driver, wide characters: far more than any gives. Its size isn't
+/// asked first (WinTab's way, with no room given), as some drivers write the name all the same,
+/// where there is no room, and crash.
+const NAME_ROOM: usize = 4096;
+/// Room past a context description for what a driver may write after it.
+const SPARE: usize = 512;
 /// How far (pixels, each way) where a packet puts the pen may be from the mouse pointer the
 /// driver moved for it, and still be taken: further, the tablet is mapped otherwise than its
 /// context says, and the pointer's whole pixels are taken instead.
@@ -125,6 +154,19 @@ const BLANK: LogContext = LogContext {
     sys_ext: [0; 2],
     sys_sens: [0; 2],
 };
+
+/// A context description with room after it, for the driver to fill.
+#[repr(C)]
+struct Roomy {
+    context: LogContext,
+    _spare: [u8; SPARE],
+}
+
+impl Roomy {
+    const fn new(context: LogContext) -> Roomy {
+        Roomy { context, _spare: [0; SPARE] }
+    }
+}
 
 /// One of a device's axes (its `AXIS`).
 #[repr(C)]
@@ -318,20 +360,27 @@ type WtOpen = unsafe extern "system" fn(HWND, *mut LogContext, i32) -> *mut c_vo
 type WtGet = unsafe extern "system" fn(*mut c_void, *mut LogContext) -> i32;
 type WtPacket = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
 type WtOverlap = unsafe extern "system" fn(*mut c_void, i32) -> i32;
+type WtEnable = unsafe extern "system" fn(*mut c_void, i32) -> i32;
+type WtClose = unsafe extern "system" fn(*mut c_void) -> i32;
 type WtQueueSizeSet = unsafe extern "system" fn(*mut c_void, i32) -> i32;
 
-/// The driver's calls and the context opened on the window, with how its packets are read, the
-/// pressure's range, whether the device gives an orientation, where its packets put the pen on the
-/// screen, and what the log has been told of them (the cursors heard from, the pen's first press,
-/// packets without a pressure).
+/// The driver's calls (those a driver may lack, if it does) and the context opened on the window,
+/// with how its packets are read, the pressure's range, whether the device gives an orientation,
+/// where its packets put the pen on the screen, and what the log has been told of them (the
+/// cursors heard from, the pen's first press, packets without a pressure).
 struct Tablet {
     info: WtInfo,
     packet: WtPacket,
     overlap: WtOverlap,
+    enable: Option<WtEnable>,
+    close: Option<WtClose>,
+    get: Option<WtGet>,
     context: usize,
     reader: Reader,
     pressures: Pressures,
     leans: bool,
+    /// Its device gives the pen's barrel turned (twist), as an Art Pen's does.
+    twists: bool,
     area: Option<Area>,
     cursors_told: Vec<u32>,
     press_told: bool,
@@ -368,47 +417,67 @@ fn ink_lately() -> bool {
     at != 0 && started().elapsed().as_millis() as u64 <= at + INK_QUIET.as_millis() as u64
 }
 
-/// A name the driver gives (`category`, `index`), unless it says it takes more than
-/// [`NAME_ROOM`]: its size asked first, as some drivers write more than a fixed room holds.
+/// A name the driver gives (`category`, `index`), read into room far larger than any name (its
+/// size never asked: see [`NAME_ROOM`]), up to its end or the room's.
 fn name(info: WtInfo, category: u32, index: u32) -> String {
-    // SAFETY: no room given: the driver only says how much the name takes
-    if unsafe { info(category, index, std::ptr::null_mut()) } as usize > NAME_ROOM {
-        return String::new();
-    }
-    let mut name = [0u16; NAME_ROOM / 2];
-    // SAFETY: room for the name, in wide characters, as large as the driver said it takes
+    let mut name = vec![0u16; NAME_ROOM];
+    // SAFETY: room for a name, in wide characters, many times longer than a driver's
     unsafe { info(category, index, name.as_mut_ptr().cast()) };
     let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
     String::from_utf16_lossy(name.get(..len).unwrap_or_default())
 }
 
-/// Opens a WinTab context on `hwnd` if a tablet's driver gives WinTab; nothing if none does.
+/// The category [`WTInfoW`] gives device `device`'s axes and name in: the first device's for a
+/// number past the devices' categories (a context the driver left unfilled), which would ask
+/// another category, laid out otherwise.
+fn device_category(device: u32) -> u32 {
+    WTI_DEVICES + if device < CATEGORIES { device } else { 0 }
+}
+
+/// The category [`WTInfoW`] gives cursor `cursor`'s name in; none past the cursors' categories.
+fn cursor_category(cursor: u32) -> Option<u32> {
+    if cursor < CATEGORIES { Some(WTI_CURSORS + cursor) } else { None }
+}
+
+/// Opens a WinTab context on `hwnd` if a tablet's driver gives WinTab; nothing if none does, or if
+/// the driver crashed as the app last started it (see [`crate::startup::wintab_trying`]): the pen
+/// then comes through Windows Ink alone.
 pub fn open(hwnd: HWND) {
+    if !crate::startup::wintab_trying() {
+        return;
+    }
+    start(hwnd);
+    crate::startup::wintab_made();
+}
+
+/// [`open`]'s work.
+fn start(hwnd: HWND) {
     // SAFETY: the driver's library, if there is one, loaded by its fixed name
     let Ok(library) = (unsafe { LoadLibraryW(w!("wintab32.dll")) }) else { return };
     let Some((info, open, packet, overlap)) = calls(library) else {
         log::warn!("WinTab: wintab32.dll lacks its calls");
         return;
     };
-    let mut context = BLANK;
+    let mut roomy = Roomy::new(BLANK);
     // the system's context, which moves the pointer as the pen does; a driver without one, its
     // digitizing context made one
-    // SAFETY: a context description to fill, as large as WinTab's
-    let kind = if unsafe { info(WTI_DEFSYSCTX, 0, (&raw mut context).cast()) } != 0 {
+    // SAFETY: a context description to fill, with room past it
+    let kind = if unsafe { info(WTI_DEFSYSCTX, 0, (&raw mut roomy).cast()) } != 0 {
         "system"
-    } else if unsafe { info(WTI_DEFCONTEXT, 0, (&raw mut context).cast()) } != 0 {
+    } else if unsafe { info(WTI_DEFCONTEXT, 0, (&raw mut roomy).cast()) } != 0 {
         "digitizing"
     } else {
         log::warn!("WinTab: the driver gives no context");
         return;
     };
+    let context = &mut roomy.context;
     context.options |= CXO_SYSTEM | CXO_MESSAGES;
     context.status = 0;
     // its messages from WinTab's own base, as this app takes them
     context.msg_base = WT_DEFBASE;
     // where the pen is, in the tablet's own units from its top left (finer than the screen's
     // pixels, which a system context gives), put on the screen as the driver maps the tablet
-    let area = Area::of(&context);
+    let area = Area::of(context);
     if area.is_some() {
         context.out_org = [0, 0, context.out_org[2]];
         context.out_ext = [context.in_ext[0].abs(), -context.in_ext[1].abs(), context.out_ext[2]];
@@ -418,17 +487,19 @@ pub fn open(hwnd: HWND) {
     context.pkt_mode = 0;
     context.move_mask = PACKET_DATA;
     // the axes of the device the context is on
-    let device = WTI_DEVICES + context.device;
+    let device = device_category(context.device);
     let mut pressure = Axis::default();
     // SAFETY: an axis to fill
     let pressure = (unsafe { info(device, DVC_NPRESSURE, (&raw mut pressure).cast()) } != 0)
         .then_some((pressure.min, pressure.max));
     let mut orientation = [Axis::default(); 3];
     // SAFETY: room for the three axes it gives
-    let leans = unsafe { info(device, DVC_ORIENTATION, orientation.as_mut_ptr().cast()) } != 0
-        && orientation[1].max > orientation[1].min;
-    // SAFETY: the window is the app's own; the description filled above
-    let opened = unsafe { open(hwnd, &mut context, 1) };
+    let oriented = unsafe { info(device, DVC_ORIENTATION, orientation.as_mut_ptr().cast()) } != 0;
+    let leans = oriented && orientation[1].max > orientation[1].min;
+    let twists = oriented && orientation[2].max > orientation[2].min;
+    // SAFETY: the window is the app's own; the description filled above, with room past it for a
+    // driver that writes back what it made
+    let opened = unsafe { open(hwnd, (&raw mut roomy).cast(), 1) };
     if opened.is_null() {
         log::warn!("WinTab: the context couldn't be opened");
         return;
@@ -445,15 +516,16 @@ pub fn open(hwnd: HWND) {
     // SAFETY: looked up by the name WinTab gives it, with the signature WinTab gives it
     let get = unsafe { GetProcAddress(library, s!("WTGetW")) }
         .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, WtGet>(f) });
-    let mut made = BLANK;
-    // SAFETY: the context just opened, and a description to fill
-    let made = get.is_some_and(|get| unsafe { get(opened, &mut made) } != 0).then_some(made);
+    let mut made = Roomy::new(BLANK);
+    // SAFETY: the context just opened, and a description to fill, with room past it
+    let made = get.is_some_and(|get| unsafe { get(opened, (&raw mut made).cast()) } != 0).then_some(made.context);
     let (layout, base) = as_made(made.as_ref());
     let name = name(info, device, DVC_NAME);
     let range = pressure.map_or_else(|| "none".to_owned(), |(min, max)| format!("{min}..{max}"));
     log::info!(
-        "WinTab: {name}, pressure {range}, {}, queue {}, {kind} context, packets {:#x}, changes {:#x}",
+        "WinTab: {name}, pressure {range}, {}{}, queue {}, {kind} context, packets {:#x}, changes {:#x}",
         if leans { "with lean" } else { "no lean" },
+        if twists { ", barrel turn" } else { "" },
         queue.map_or_else(|| "as the driver's".to_owned(), |n| n.to_string()),
         layout.data,
         layout.relative
@@ -468,19 +540,29 @@ pub fn open(hwnd: HWND) {
     if base != WT_DEFBASE {
         log::info!("WinTab: messages from {base:#x}");
     }
+    // SAFETY: each looked up by the name WinTab gives it, with the signature WinTab gives it
+    let enable = unsafe { GetProcAddress(library, s!("WTEnable")) }
+        .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, WtEnable>(f) });
+    let close = unsafe { GetProcAddress(library, s!("WTClose")) }
+        .map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, WtClose>(f) });
     if let Ok(mut tablet) = TABLET.lock() {
         *tablet = Some(Tablet {
             info,
             packet,
             overlap,
+            enable,
+            close,
+            get,
             context: opened as usize,
             reader: Reader::new(layout),
             pressures,
             leans,
+            twists,
             area,
             cursors_told: Vec::new(),
             press_told: false,
         });
+        CONTEXT.store(opened as usize, Ordering::Relaxed);
         BASE.store(base, Ordering::Relaxed);
     }
 }
@@ -512,16 +594,279 @@ fn calls(library: HMODULE) -> Option<(WtInfo, WtOpen, WtPacket, WtOverlap)> {
     }
 }
 
-/// The window became the active one: its context goes on top of the others, as WinTab asks.
-pub fn activated() {
-    let Ok(tablet) = TABLET.lock() else { return };
-    let Some(t) = tablet.as_ref() else { return };
-    // SAFETY: the context this app opened
-    unsafe { (t.overlap)(t.context as *mut c_void, 1) };
+/// What waits for the pen to be up (the mouse with no button held) while the window is in front.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Waiting {
+    Nothing,
+    /// The window came to the front: if no packet has come by then, the context is enabled anew
+    /// and put on top again.
+    Packets,
+    /// Another context went over this one: it is put back on top.
+    Top,
+    /// The context is re-opened, for the reason given.
+    Reopen(&'static str),
 }
 
-/// A WinTab message to the window: a packet read and handed on as the mouse pen's, or the pen
-/// gone. True if it was one.
+/// What is done to the context now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Deed {
+    Nothing,
+    /// Enabled and put on top: the window came to the front.
+    Front,
+    /// Disabled and enabled again (its queue emptied) and put on top: no packet came.
+    Anew,
+    /// Put back on top.
+    Top,
+    Reopen(&'static str),
+}
+
+/// How long after the window comes to the front its context is left to give packets before it is
+/// enabled anew for want of them: a driver's first may come a moment after the mouse's first move.
+const FIRST_PACKETS: Duration = Duration::from_millis(200);
+
+/// The context as the window comes to the front and goes back: what waits for the pen to be up,
+/// when the window came to the front, whether a packet has come since, whether WinTab has given
+/// any this run (a tablet's driver gives it), and what has been done since the window came to the
+/// front for want of packets (the first packet after it told in the log) or for another context
+/// over it.
+#[derive(Clone, Copy, Debug)]
+struct Front {
+    waiting: Waiting,
+    since: Option<Instant>,
+    heard: bool,
+    any_heard: bool,
+    anew: bool,
+    reopened: bool,
+    retaken: bool,
+    mended: bool,
+}
+
+impl Front {
+    const fn new() -> Front {
+        Front {
+            waiting: Waiting::Nothing,
+            since: None,
+            heard: false,
+            any_heard: false,
+            anew: false,
+            reopened: false,
+            retaken: false,
+            mended: false,
+        }
+    }
+
+    fn came_to_front(&mut self, now: Instant) -> Deed {
+        *self = Front { waiting: Waiting::Packets, since: Some(now), any_heard: self.any_heard, ..Front::new() };
+        Deed::Front
+    }
+
+    /// Another window came to the front: nothing more is done to the context until this one does
+    /// again (a context put on top would take the pen from the app in front).
+    fn went_back(&mut self) {
+        self.waiting = Waiting::Nothing;
+    }
+
+    /// A packet came; true if it is the first since something was done for want of them.
+    fn packet(&mut self) -> bool {
+        self.heard = true;
+        self.any_heard = true;
+        if self.waiting != Waiting::Top {
+            self.waiting = Waiting::Nothing;
+        }
+        std::mem::take(&mut self.mended)
+    }
+
+    /// The mouse's button went down: if no packet has come since the context was enabled anew,
+    /// with the pen up, it is re-opened once the pen is up again.
+    fn pressed(&mut self) {
+        if !self.heard && self.anew && !self.reopened && self.waiting == Waiting::Nothing {
+            self.waiting = Waiting::Reopen("still no packets after it was enabled anew");
+        }
+    }
+
+    /// The context moved in the overlap order, now `on_top` (and enabled) or not, with this
+    /// window in `front` or not: put back on top once, should another go over it while in front.
+    fn overlapped(&mut self, on_top: bool, front: bool) {
+        if front && !on_top && !self.retaken && self.waiting == Waiting::Nothing {
+            self.retaken = true;
+            self.waiting = Waiting::Top;
+        }
+    }
+
+    /// The context is gone (the driver closed it, or it can't be enabled or put on top): it is
+    /// re-opened once the pen is up, once a time the window is in front.
+    fn lost(&mut self, why: &'static str) {
+        if !self.reopened {
+            self.waiting = Waiting::Reopen(why);
+        }
+    }
+
+    /// The pen is up (the mouse with no button held) at `now`, the window in `front` or not.
+    fn pen_up(&mut self, front: bool, now: Instant) -> Deed {
+        let early = self.since.is_some_and(|since| now < since + FIRST_PACKETS);
+        if !front || (early && self.waiting == Waiting::Packets) {
+            return Deed::Nothing;
+        }
+        match std::mem::replace(&mut self.waiting, Waiting::Nothing) {
+            Waiting::Packets if !self.heard && self.any_heard => {
+                self.anew = true;
+                self.mended = true;
+                Deed::Anew
+            }
+            Waiting::Nothing | Waiting::Packets => Deed::Nothing,
+            Waiting::Top => Deed::Top,
+            Waiting::Reopen(why) => {
+                self.reopened = true;
+                self.mended = true;
+                Deed::Reopen(why)
+            }
+        }
+    }
+}
+
+static FRONT: Mutex<Front> = Mutex::new(Front::new());
+
+fn front<T>(f: impl FnOnce(&mut Front) -> T) -> Option<T> {
+    FRONT.lock().ok().map(|mut front| f(&mut front))
+}
+
+/// The window came to the front (`active`) or went back. Coming to the front, its context is
+/// enabled and put on top of the others (as WinTab asks; called once the window has the keyboard,
+/// as a driver may give packets only to the app that has it). Going back, what WinTab said of the
+/// pen is let go: the driver gives the window nothing more of it, not even its leaving, and a
+/// press brought back would take the pressure it last read.
+pub fn activated(hwnd: HWND, active: bool) {
+    if active {
+        if let Some(deed) = front(|f| f.came_to_front(Instant::now())) {
+            act(hwnd, deed);
+        }
+    } else {
+        front(Front::went_back);
+        super::set_mouse_pen(None);
+        super::pen_flags(super::MOUSE, 0);
+    }
+}
+
+/// The mouse's left button went down (a tablet's pen moving it pressing, perhaps).
+pub fn pressed() {
+    front(Front::pressed);
+}
+
+/// The mouse pointer moved to `at` (window pixels), or pressed there. With no packet read for
+/// [`PEN_QUIET`] and the pointer elsewhere than the last one left it, the pen isn't what moves it
+/// (a mouse picked up beside the tablet, the pen left lying in its reach, whose driver says
+/// nothing of it going): what WinTab said of the pen is let go, so the mouse paints as the mouse,
+/// at full pressure, not as a pen held over the tablet, at none. A pen's packets that come after
+/// all are the pen's again (and a stroke the mouse began then becomes the pen's: see `input.rs`).
+pub fn mouse_at(at: (i32, i32)) {
+    mouse_at_after(at, started().elapsed());
+}
+
+fn mouse_at_after(at: (i32, i32), since_start: Duration) {
+    if super::mouse_pen().is_none() || ink_lately() {
+        return;
+    }
+    let read = PACKET_AT.load(Ordering::Relaxed);
+    let now = since_start.as_millis() as u64;
+    let quiet = read == 0 || now > read + PEN_QUIET.as_millis() as u64;
+    let left_there = PACKET_POINTER.lock().ok().and_then(|p| *p) == Some(at);
+    if quiet && !left_there {
+        super::set_mouse_pen(None);
+        super::pen_flags(super::MOUSE, 0);
+    }
+}
+
+/// The mouse moved, or a button came up, with none held: the pen, if it moves the mouse, is up.
+pub fn pen_up(hwnd: HWND) {
+    // SAFETY: no arguments; the window the user works in
+    let in_front = unsafe { GetForegroundWindow() } == hwnd;
+    pen_up_in_front(hwnd, in_front, Instant::now());
+}
+
+fn pen_up_in_front(hwnd: HWND, in_front: bool, now: Instant) {
+    if let Some(deed) = front(|f| f.pen_up(in_front, now)) {
+        act(hwnd, deed);
+    }
+}
+
+/// A context's status in words, for the log.
+fn standing(status: u32) -> &'static str {
+    if status & CXS_DISABLED != 0 {
+        "disabled"
+    } else if status & CXS_ONTOP != 0 {
+        "on top"
+    } else {
+        "under another"
+    }
+}
+
+/// Does `deed` to the context, with a line in the log.
+fn act(hwnd: HWND, deed: Deed) {
+    let why = match deed {
+        Deed::Nothing => return,
+        Deed::Reopen(why) => return reopen(hwnd, why),
+        Deed::Front => "the window came to the front: the context enabled and put on top",
+        Deed::Anew => {
+            "no packets since the window came to the front: the context enabled anew and put on top, the pen up"
+        }
+        Deed::Top => "another context went over this one: put back on top",
+    };
+    // the calls taken out first: the driver tells the window of the context's moves as they are
+    // made, and those messages come back here
+    let Some((enable, overlap, get, context)) =
+        TABLET.lock().ok().and_then(|t| t.as_ref().map(|t| (t.enable, t.overlap, t.get, t.context)))
+    else {
+        return;
+    };
+    let context = context as *mut c_void;
+    let mut was = Roomy::new(BLANK);
+    // SAFETY: the context this app opened, and a description to fill, with room past it
+    let was =
+        get.filter(|&get| unsafe { get(context, (&raw mut was).cast()) } != 0).map(|_| standing(was.context.status));
+    // SAFETY: the context this app opened (each call fails, and does nothing, if it is gone)
+    let enabled = enable.is_none_or(|enable| unsafe {
+        if deed == Deed::Anew {
+            enable(context, 0);
+        }
+        enable(context, 1) != 0
+    });
+    // SAFETY: as above
+    let on_top = unsafe { overlap(context, 1) } != 0;
+    log::info!("WinTab: {why}{}", was.map_or_else(String::new, |was| format!(" (it was {was})")));
+    if !enabled || !on_top {
+        log::warn!("WinTab: the context couldn't be {}", if enabled { "put on top" } else { "enabled" });
+        front(|f| f.lost("it couldn't be enabled or put on top"));
+    }
+}
+
+/// The context closed and opened again on `hwnd`, for the reason `why`: what was learnt of the
+/// pen (the pressure's range found from its presses, what the log was told) kept.
+fn reopen(hwnd: HWND, why: &str) {
+    log::info!("WinTab: the context re-opened: {why}");
+    BASE.store(0, Ordering::Relaxed);
+    CONTEXT.store(0, Ordering::Relaxed);
+    let old = TABLET.lock().ok().and_then(|mut t| t.take());
+    if let Some(old) = &old
+        && let Some(close) = old.close
+    {
+        // SAFETY: the context this app opened (closing one already gone fails, and does nothing);
+        // its messages left alone, none being open now
+        unsafe { close(old.context as *mut c_void) };
+    }
+    open(hwnd);
+    if let (Some(old), Ok(mut tablet)) = (old, TABLET.lock())
+        && let Some(new) = tablet.as_mut()
+    {
+        if new.pressures.low == old.pressures.low && new.pressures.high < old.pressures.high {
+            new.pressures = old.pressures;
+        }
+        new.cursors_told = old.cursors_told;
+        new.press_told = old.press_told;
+    }
+}
+
+/// A WinTab message to the window: a packet read and handed on as the mouse pen's, the pen gone,
+/// or this app's context closing or moving in the overlap order. True if it was one.
 pub fn message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
     let base = BASE.load(Ordering::Relaxed);
     if base == 0 {
@@ -540,6 +885,9 @@ pub fn message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             let Some(p) = (read != 0).then(|| t.layout().read(&room.0)).flatten().map(|p| t.reader.next(p)) else {
                 return true;
             };
+            if front(Front::packet) == Some(true) {
+                log::info!("WinTab: packets come again");
+            }
             if ink_lately() {
                 return true;
             }
@@ -551,6 +899,11 @@ pub fn message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             // SAFETY: a point to fill, then made the window's own
             let placed = unsafe { GetCursorPos(&mut at).is_ok() && ScreenToClient(hwnd, &mut at).as_bool() };
             super::set_mouse_pen(Some(pen));
+            super::set_mouse_pen_roll(twist(&p, t.twists));
+            PACKET_AT.store((started().elapsed().as_millis() as u64).max(1), Ordering::Relaxed);
+            if let Ok(mut p) = PACKET_POINTER.lock() {
+                *p = placed.then_some((at.x, at.y));
+            }
             if placed {
                 let pointer = (at.x as f32, at.y as f32);
                 // the window's top left on the screen, for where in it the packet puts the pen
@@ -571,6 +924,25 @@ pub fn message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> bool {
             }
             true
         }
+        // the driver closing this app's context (a context this app closes itself isn't open)
+        CTXCLOSE => {
+            if wparam.0 == CONTEXT.load(Ordering::Relaxed) {
+                log::warn!("WinTab: the driver closed the context");
+                front(|f| f.lost("the driver closed it"));
+            }
+            true
+        }
+        // the context moved in the overlap order: its status in `lparam`
+        CTXOVERLAP => {
+            if wparam.0 == CONTEXT.load(Ordering::Relaxed) {
+                let status = lparam.0 as u32;
+                let on_top = status & CXS_ONTOP != 0 && status & CXS_DISABLED == 0;
+                // SAFETY: no arguments
+                let in_front = unsafe { GetForegroundWindow() } == hwnd;
+                front(|f| f.overlapped(on_top, in_front));
+            }
+            true
+        }
         _ => false,
     }
 }
@@ -588,7 +960,7 @@ impl Tablet {
             && !self.cursors_told.contains(&cursor)
         {
             self.cursors_told.push(cursor);
-            let name = name(self.info, WTI_CURSORS + cursor, CSR_NAME);
+            let name = cursor_category(cursor).map_or_else(String::new, |at| name(self.info, at, CSR_NAME));
             log::info!("WinTab: cursor {cursor} ({name}){}", if cursor % 3 == 2 { ", an eraser" } else { "" });
         }
         let pressed = p.buttons.unwrap_or(0) & 1 != 0 || p.pressure.unwrap_or(0) > 0;
@@ -641,6 +1013,12 @@ fn reading(p: &Packet, pressure: f32, leans: bool) -> (super::MousePen, Option<(
     (super::MousePen { pressure, eraser }, lean)
 }
 
+/// How far a packet says the pen's barrel is turned (radians clockwise), if its device `twists`
+/// (an Art Pen's turn, in tenths of a degree) and the packet carries it.
+fn twist(p: &Packet, twists: bool) -> Option<f32> {
+    p.orientation.filter(|_| twists).map(|[_, _, twist]| (twist.rem_euclid(3600) as f32 / 10.0).to_radians())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,6 +1034,61 @@ mod tests {
     fn the_context_and_axis_are_laid_out_as_wintab_has_them() {
         assert_eq!(std::mem::size_of::<LogContext>(), 212);
         assert_eq!(std::mem::size_of::<Axis>(), 16);
+    }
+
+    /// A stand-in driver's name, and whether it was ever asked with no room given.
+    static NAMED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    static NO_ROOM: AtomicU32 = AtomicU32::new(0);
+
+    /// A stand-in driver's `WTInfoW` for a name: as some drivers do, it writes the name (and its
+    /// end) wherever it is asked to, room or none; it gives the size in bytes.
+    unsafe extern "system" fn stand_in_name(_: u32, _: u32, out: *mut c_void) -> u32 {
+        if out.is_null() {
+            // a driver like that would crash here
+            NO_ROOM.fetch_add(1, Ordering::Relaxed);
+            return 0;
+        }
+        let name = NAMED.lock().unwrap().clone();
+        // SAFETY: the stand-in names are kept within the room the app gives
+        unsafe { std::ptr::copy_nonoverlapping(name.as_ptr(), out.cast::<u16>(), name.len()) };
+        (name.len() * 2) as u32
+    }
+
+    #[test]
+    fn a_drivers_names_are_read_into_room_for_any_without_asking_their_size() {
+        let named = |given: &str, end: bool| {
+            let mut wide: Vec<u16> = given.encode_utf16().collect();
+            if end {
+                wide.push(0);
+            }
+            *NAMED.lock().unwrap() = wide;
+            name(stand_in_name, device_category(0), DVC_NAME)
+        };
+        assert_eq!(named("Tablet Pen", true), "Tablet Pen");
+        // longer than the 128 characters of room the app once gave
+        let long = "Pen Tablet ".repeat(30);
+        assert_eq!(named(&long, true), long);
+        // a name filling the room with no end to it: cut at the room's end
+        let full = "x".repeat(NAME_ROOM);
+        assert_eq!(named(&full, false), full);
+        assert_eq!(named("", true), "");
+        assert_eq!(NO_ROOM.load(Ordering::Relaxed), 0, "never asked with no room");
+    }
+
+    #[test]
+    fn a_devices_axes_and_a_cursors_name_are_asked_in_their_own_categories() {
+        assert_eq!(device_category(0), WTI_DEVICES);
+        assert_eq!(device_category(2), WTI_DEVICES + 2);
+        assert_eq!(device_category(99), WTI_CURSORS - 1);
+        // a context's device past them (left unfilled): the first device's, not a cursor's or
+        // another category's
+        for device in [100, 300, u32::MAX] {
+            assert_eq!(device_category(device), WTI_DEVICES, "{device}");
+        }
+        // a cursor's name likewise, none asked for a number past them
+        assert_eq!(cursor_category(1), Some(WTI_CURSORS + 1));
+        assert_eq!(cursor_category(100), None);
+        assert_eq!(cursor_category(u32::MAX), None);
     }
 
     #[test]
@@ -826,6 +1259,20 @@ mod tests {
         assert!(!reading(&Packet::default(), 1.0, true).0.eraser);
     }
 
+    #[test]
+    fn an_art_pens_barrel_turn_reads_where_the_device_gives_one() {
+        // turned half round, a quarter, and past a whole turn
+        for (tenths, degrees) in [(1800, 180.0f32), (900, 90.0), (3650, 5.0), (-900, 270.0)] {
+            let p = Packet { cursor: Some(1), orientation: Some([0, 900, tenths]), ..Packet::default() };
+            let roll = twist(&p, true).unwrap_or(-1.0);
+            assert!((roll - degrees.to_radians()).abs() < 1e-4, "{tenths}: {roll}");
+        }
+        // a device that gives no twist (most pens): none, so the brush keeps its own angle
+        let p = Packet { cursor: Some(1), orientation: Some([0, 900, 1800]), ..Packet::default() };
+        assert_eq!(twist(&p, false), None);
+        assert_eq!(twist(&Packet { cursor: Some(1), ..Packet::default() }, true), None);
+    }
+
     /// A stand-in driver: the next packet's numbers, and how many packets were taken off its queue.
     static STAND_IN: Mutex<Vec<i32>> = Mutex::new(Vec::new());
     static TAKEN: AtomicU32 = AtomicU32::new(0);
@@ -842,8 +1289,56 @@ mod tests {
         0
     }
 
-    unsafe extern "system" fn stand_in_overlap(_: *mut c_void, _: i32) -> i32 {
+    /// What the stand-in driver was asked to do to a context, in turn: (call, context, argument).
+    static ASKED: Mutex<Vec<(&'static str, usize, i32)>> = Mutex::new(Vec::new());
+    /// What the stand-in driver's calls give back (0: they fail), and the status it gives.
+    static GIVES: AtomicU32 = AtomicU32::new(1);
+    static STATUS: AtomicU32 = AtomicU32::new(CXS_ONTOP);
+
+    fn asked(call: &'static str, context: *mut c_void, argument: i32) -> i32 {
+        ASKED.lock().unwrap().push((call, context as usize, argument));
+        GIVES.load(Ordering::Relaxed) as i32
+    }
+
+    unsafe extern "system" fn stand_in_overlap(context: *mut c_void, top: i32) -> i32 {
+        asked("overlap", context, top)
+    }
+
+    unsafe extern "system" fn stand_in_enable(context: *mut c_void, on: i32) -> i32 {
+        asked("enable", context, on)
+    }
+
+    unsafe extern "system" fn stand_in_close(context: *mut c_void) -> i32 {
+        asked("close", context, 0)
+    }
+
+    unsafe extern "system" fn stand_in_get(_: *mut c_void, out: *mut LogContext) -> i32 {
+        // SAFETY: the description the app gives to fill
+        unsafe { (*out).status = STATUS.load(Ordering::Relaxed) };
         1
+    }
+
+    /// A stand-in driver's context (handle 1) whose packets are laid out as `layout`, with no
+    /// pressure range, its messages from a base of its own (0x6000).
+    fn stand_in(layout: Layout) {
+        *TABLET.lock().unwrap() = Some(Tablet {
+            info: stand_in_info,
+            packet: stand_in_packet,
+            overlap: stand_in_overlap,
+            enable: Some(stand_in_enable),
+            close: Some(stand_in_close),
+            get: Some(stand_in_get),
+            context: 1,
+            reader: Reader::new(layout),
+            pressures: Pressures::of(None),
+            leans: false,
+            twists: false,
+            area: None,
+            cursors_told: Vec::new(),
+            press_told: false,
+        });
+        CONTEXT.store(1, Ordering::Relaxed);
+        BASE.store(0x6000, Ordering::Relaxed);
     }
 
     #[test]
@@ -853,19 +1348,7 @@ mod tests {
         // a driver that gives the buttons and the pressure alone, the pressure as changes, no
         // pressure range, and its messages from a base of its own
         let layout = Layout { data: PK_BUTTONS | PK_NORMAL_PRESSURE, relative: PK_NORMAL_PRESSURE };
-        *TABLET.lock().unwrap() = Some(Tablet {
-            info: stand_in_info,
-            packet: stand_in_packet,
-            overlap: stand_in_overlap,
-            context: 1,
-            reader: Reader::new(layout),
-            pressures: Pressures::of(None),
-            leans: false,
-            area: None,
-            cursors_told: Vec::new(),
-            press_told: false,
-        });
-        BASE.store(0x6000, Ordering::Relaxed);
+        stand_in(layout);
         let send = |numbers: &[i32]| {
             *STAND_IN.lock().unwrap() = numbers.to_vec();
             message(HWND::default(), 0x6000, WPARAM(1), LPARAM(0))
@@ -896,5 +1379,191 @@ mod tests {
         *TABLET.lock().unwrap() = None;
         super::super::pen_flags(super::super::MOUSE, 0);
         assert!(!message(HWND::default(), 0x6000, WPARAM(1), LPARAM(0)), "no context open");
+    }
+
+    #[test]
+    fn the_context_is_enabled_and_put_on_top_as_the_window_comes_to_the_front_and_again_with_the_pen_up() {
+        let at = Instant::now();
+        let later = at + FIRST_PACKETS;
+        let mut front = Front::new();
+        // a tablet's driver giving packets: the window comes to the front, the pen pressing as it
+        // does (a click on the canvas), and the packets come
+        front.packet();
+        assert_eq!(front.came_to_front(at), Deed::Front);
+        front.pressed();
+        assert!(!front.packet(), "nothing was done for want of them");
+        assert_eq!(front.pen_up(true, later), Deed::Nothing);
+        // the window back in front and no packet by the time the pen is up (the driver didn't
+        // take the context put on top while the pen pressed): enabled anew and put on top
+        assert_eq!(front.came_to_front(at), Deed::Front);
+        front.pressed();
+        assert_eq!(front.pen_up(true, at), Deed::Nothing, "the driver's first packets given a moment");
+        assert_eq!(front.pen_up(true, later), Deed::Anew);
+        assert_eq!(front.pen_up(true, later), Deed::Nothing, "once");
+        // then they come: the log is told, once
+        assert!(front.packet());
+        assert!(!front.packet());
+        front.pressed();
+        assert_eq!(front.pen_up(true, later), Deed::Nothing);
+        // still none after that, at the next press: the context re-opened once the pen is up, once
+        front.came_to_front(at);
+        assert_eq!(front.pen_up(true, later), Deed::Anew);
+        front.pressed();
+        assert!(matches!(front.pen_up(true, later), Deed::Reopen(_)));
+        front.pressed();
+        assert_eq!(front.pen_up(true, later), Deed::Nothing, "once a time the window is in front");
+        // another window in front: nothing is done till this one is again (a context put on top
+        // would take the pen from it)
+        front.came_to_front(at);
+        front.went_back();
+        front.pressed();
+        assert_eq!(front.pen_up(true, later), Deed::Nothing);
+        front.came_to_front(at);
+        assert_eq!(front.pen_up(false, later), Deed::Nothing, "it went back before the pen was up");
+        assert_eq!(front.pen_up(true, later), Deed::Anew);
+        // a run whose WinTab has given no packet (a mouse; a pen display left to Windows Ink):
+        // nothing more than putting it on top as the window comes to the front
+        let mut none = Front::new();
+        assert_eq!(none.came_to_front(at), Deed::Front);
+        assert_eq!(none.pen_up(true, later), Deed::Nothing);
+        none.pressed();
+        assert_eq!(none.pen_up(true, later), Deed::Nothing);
+    }
+
+    #[test]
+    fn the_context_goes_back_on_top_once_if_another_goes_over_it_and_is_re_opened_if_lost() {
+        let at = Instant::now();
+        let later = at + FIRST_PACKETS;
+        let mut front = Front::new();
+        front.packet();
+        front.came_to_front(at);
+        front.packet();
+        // its own move to the top; another's over it with another window in front
+        front.overlapped(true, true);
+        front.overlapped(false, false);
+        assert_eq!(front.pen_up(true, later), Deed::Nothing);
+        // another's over it, or it disabled, with this window in front: put back on top, once
+        front.overlapped(false, true);
+        assert_eq!(front.pen_up(true, later), Deed::Top);
+        front.overlapped(false, true);
+        assert_eq!(front.pen_up(true, later), Deed::Nothing, "no fight with another app over the top");
+        // the driver closing it: re-opened once the pen is up, with this window in front
+        front.lost("closed");
+        assert_eq!(front.pen_up(false, later), Deed::Nothing);
+        assert_eq!(front.pen_up(true, later), Deed::Reopen("closed"));
+        front.lost("closed");
+        assert_eq!(front.pen_up(true, later), Deed::Nothing, "once a time the window is in front");
+        front.came_to_front(at);
+        front.lost("closed");
+        assert_eq!(front.pen_up(true, later), Deed::Reopen("closed"));
+        assert_eq!(standing(CXS_ONTOP), "on top");
+        assert_eq!(standing(CXS_ONTOP | CXS_DISABLED), "disabled");
+        assert_eq!(standing(0x0002), "under another");
+    }
+
+    #[test]
+    fn the_mouse_moving_the_pointer_with_no_packets_coming_is_the_mouse_not_a_pen_left_in_reach() {
+        let _one = super::super::tests::mouse_pointer_tests();
+        INK_AT.store(0, Ordering::Relaxed);
+        stand_in(Layout { data: PK_BUTTONS | PK_NORMAL_PRESSURE, relative: 0 });
+        let send = |numbers: &[i32]| {
+            *STAND_IN.lock().unwrap() = numbers.to_vec();
+            message(HWND::default(), 0x6000, WPARAM(1), LPARAM(0))
+        };
+        let read = || Duration::from_millis(PACKET_AT.load(Ordering::Relaxed));
+        // the pen lifted from the tablet, hovering, its last packet at no pressure: its moves of
+        // the pointer, the packets coming, stay the pen's
+        assert!(send(&[0, 0]));
+        *PACKET_POINTER.lock().unwrap() = Some((40, 50));
+        mouse_at_after((41, 50), read() + Duration::from_millis(8));
+        assert_eq!(super::super::mouse_pen().map(|p| p.pressure), Some(0.0));
+        // a pause where the last packet left the pointer (a move the system makes up, the pen
+        // pressing just where it stopped) is still the pen's
+        mouse_at_after((40, 50), read() + Duration::from_secs(5));
+        assert!(super::super::mouse_pen().is_some());
+        // the pen laid down within the tablet's reach, its driver saying nothing of it going: the
+        // mouse moving the pointer is the mouse, painting at full pressure, its side switches none
+        super::super::pen_flags(super::super::MOUSE, super::super::FLAG_BARREL);
+        mouse_at_after((300, 200), read() + Duration::from_millis(250));
+        assert_eq!(super::super::mouse_pen(), None);
+        let flags = super::super::FLAGS.lock().unwrap().as_ref().and_then(|f| f.get(&super::super::MOUSE).copied());
+        assert_eq!(flags.unwrap_or(0), 0);
+        // (what the mouse's press there reads: no pen, so the mouse at its full pressure)
+        assert_eq!(super::super::mouse_pen_at((300.0, 200.0)), None);
+        // the pen taken up again: its packets make it the pen's
+        assert!(send(&[1, 600]));
+        assert!(super::super::mouse_pen().is_some_and(|p| p.pressure > 0.5));
+        // while Windows Ink has the pen, WinTab's word on it is left to the system's
+        INK_AT.store((started().elapsed().as_millis() as u64).max(1), Ordering::Relaxed);
+        mouse_at_after((10, 10), read() + Duration::from_millis(250));
+        assert!(super::super::mouse_pen().is_some());
+        INK_AT.store(0, Ordering::Relaxed);
+        BASE.store(0, Ordering::Relaxed);
+        CONTEXT.store(0, Ordering::Relaxed);
+        *TABLET.lock().unwrap() = None;
+        *PACKET_POINTER.lock().unwrap() = None;
+        super::super::set_mouse_pen(None);
+        super::super::pen_flags(super::super::MOUSE, 0);
+    }
+
+    #[test]
+    fn the_window_coming_to_the_front_sees_to_the_drivers_context() {
+        let _one = super::super::tests::mouse_pointer_tests();
+        INK_AT.store(0, Ordering::Relaxed);
+        *FRONT.lock().unwrap() = Front::new();
+        let take = || std::mem::take(&mut *ASKED.lock().unwrap());
+        take();
+        stand_in(Layout { data: PK_BUTTONS | PK_NORMAL_PRESSURE, relative: 0 });
+        let hwnd = HWND::default();
+        let later = || Instant::now() + FIRST_PACKETS;
+        let send = |numbers: &[i32]| {
+            *STAND_IN.lock().unwrap() = numbers.to_vec();
+            message(hwnd, 0x6000, WPARAM(1), LPARAM(0))
+        };
+        // the pen drawing, its packets coming; another window comes to the front: what WinTab
+        // said of the pen is let go (the driver gives nothing more of it, nor its leaving)
+        assert!(send(&[1, 700]));
+        assert!(super::super::mouse_pen().is_some());
+        activated(hwnd, false);
+        assert_eq!(super::super::mouse_pen(), None);
+        assert_eq!(take(), [], "nothing done to the context");
+        // back in front: enabled and put on top; with packets coming, nothing more
+        activated(hwnd, true);
+        assert_eq!(take(), [("enable", 1, 1), ("overlap", 1, 1)]);
+        assert!(send(&[1, 300]));
+        pen_up_in_front(hwnd, true, later());
+        assert_eq!(take(), []);
+        // back in front by a press of the pen that the driver didn't take: none by the time it
+        // is up, so enabled anew (its queue emptied) and put on top
+        activated(hwnd, false);
+        activated(hwnd, true);
+        pressed();
+        take();
+        pen_up_in_front(hwnd, true, later());
+        assert_eq!(take(), [("enable", 1, 0), ("enable", 1, 1), ("overlap", 1, 1)]);
+        // still none at the next press: re-opened once it is up, the old context closed (none is
+        // opened in its place here, there being no driver)
+        pressed();
+        pen_up_in_front(hwnd, true, later());
+        assert_eq!(take().first(), Some(&("close", 1, 0)));
+        assert!(TABLET.lock().unwrap().as_ref().is_none_or(|t| t.context != 1));
+        // a driver whose calls fail (the context gone): re-opened once the pen is up
+        stand_in(Layout { data: PK_BUTTONS | PK_NORMAL_PRESSURE, relative: 0 });
+        GIVES.store(0, Ordering::Relaxed);
+        activated(hwnd, true);
+        assert_eq!(take(), [("enable", 1, 1), ("overlap", 1, 1)]);
+        GIVES.store(1, Ordering::Relaxed);
+        pen_up_in_front(hwnd, true, later());
+        assert_eq!(take().first(), Some(&("close", 1, 0)));
+        // the driver closing the context, and moving it, are the window's to hear
+        stand_in(Layout { data: PK_BUTTONS | PK_NORMAL_PRESSURE, relative: 0 });
+        assert!(message(hwnd, 0x6000 + CTXOVERLAP, WPARAM(1), LPARAM(CXS_ONTOP as isize)));
+        assert!(message(hwnd, 0x6000 + CTXCLOSE, WPARAM(1), LPARAM(0)));
+        BASE.store(0, Ordering::Relaxed);
+        CONTEXT.store(0, Ordering::Relaxed);
+        *TABLET.lock().unwrap() = None;
+        *FRONT.lock().unwrap() = Front::new();
+        super::super::set_mouse_pen(None);
+        super::super::pen_flags(super::super::MOUSE, 0);
     }
 }

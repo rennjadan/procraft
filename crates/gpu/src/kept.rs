@@ -142,8 +142,8 @@ fn write(file: &Path, data: &[u8], sum: u64) -> std::io::Result<()> {
     let mut bytes = Vec::with_capacity(data.len() + 8);
     bytes.extend_from_slice(data);
     bytes.extend_from_slice(&sum.to_le_bytes());
-    std::fs::write(&beside, &bytes)?;
-    std::fs::rename(&beside, file).inspect_err(|_| {
+    // (one cut short, the storage full, goes: it would only take room)
+    std::fs::write(&beside, &bytes).and_then(|()| std::fs::rename(&beside, file)).inspect_err(|_| {
         let _ = std::fs::remove_file(&beside);
     })
 }

@@ -10,10 +10,11 @@ pub struct Rgba {
     pub pixels: Vec<u8>,
 }
 
-/// The largest side of a picture taken, and the most bytes one may unpack to.
+/// The largest side of a picture taken, and the most bytes one may unpack to (a preset's settings
+/// that carry a big pipe come to tens of megabytes).
 #[cfg(not(target_arch = "wasm32"))]
 const MOST_SIDE: u32 = 8192;
-const MOST_UNPACKED: usize = 64 << 20;
+const MOST_UNPACKED: usize = 160 << 20;
 
 /// `data` unpacked: zlib, or raw deflate.
 fn unpack(data: &[u8], zlib: bool) -> Option<Vec<u8>> {
@@ -47,17 +48,19 @@ fn chunks(png: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])> {
     })
 }
 
-/// The text a PNG holds, by keyword (tEXt, zTXt and iTXt).
-pub fn png_texts(png: &[u8]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+/// The text a PNG holds under `key` (tEXt, zTXt or iTXt), the rest passed over: taken as it
+/// unpacks, not copied, unless it isn't UTF-8.
+pub fn png_text(png: &[u8], key: &str) -> Option<String> {
     for (kind, data) in chunks(png) {
-        let Some(zero) = data.iter().position(|&b| b == 0) else { continue };
-        let key = String::from_utf8_lossy(&data[..zero]).into_owned();
-        let rest = &data[zero + 1..];
+        let keyed = data.get(..key.len()) == Some(key.as_bytes()) && data.get(key.len()) == Some(&0);
+        if !keyed || !matches!(kind, b"tEXt" | b"zTXt" | b"iTXt") {
+            continue;
+        }
+        let rest = &data[key.len() + 1..];
         let text = match kind {
             b"tEXt" => Some(rest.to_vec()),
             b"zTXt" => rest.get(1..).and_then(|z| unpack(z, true)),
-            b"iTXt" => (|| {
+            _ => (|| {
                 let (&compressed, rest) = rest.split_first()?;
                 let rest = rest.get(1..)?;
                 let lang = rest.iter().position(|&b| b == 0)?;
@@ -66,13 +69,11 @@ pub fn png_texts(png: &[u8]) -> Vec<(String, String)> {
                 let body = &rest[translated + 1..];
                 if compressed != 0 { unpack(body, true) } else { Some(body.to_vec()) }
             })(),
-            _ => None,
         };
-        if let Some(text) = text {
-            out.push((key, String::from_utf8_lossy(&text).into_owned()));
-        }
+        return text
+            .map(|t| String::from_utf8(t).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()));
     }
-    out
+    None
 }
 
 /// The PNG with only what draws its picture: its header, palette, transparency and image data,

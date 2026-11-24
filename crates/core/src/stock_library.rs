@@ -301,6 +301,7 @@ mod tests {
         let pick = match s.pick {
             Pick::Round(h) => format!("Round({h:?})"),
             Pick::Blank => "Blank".to_owned(),
+            Pick::Point => "Point".to_owned(),
             Pick::Ours(None) => "Ours(None)".to_owned(),
             Pick::Ours(Some(i)) => format!("Ours(Some({i}))"),
             Pick::Halftone([(a, b), (c, d)]) => format!("Halftone([({a:?}, {b:?}), ({c:?}, {d:?})])"),

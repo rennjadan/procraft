@@ -85,7 +85,14 @@ fun TimeLapseReplay(vm: CanvasViewModel) {
     // skipped, and those read still show
     LaunchedEffect(Unit) {
         snapshotFlow { index }.conflate().collect { i ->
-            val image = withContext(Dispatchers.IO) { vm.timeLapseFrame(i)?.asImageBitmap() }
+            // a plain picture of its own (never one recycled or changed later), its upload to the GPU
+            // started here, off the main thread, so the frame shown is always whole
+            val image = withContext(Dispatchers.IO) {
+                vm.timeLapseFrame(i)?.let { b ->
+                    val plain = if (b.config == android.graphics.Bitmap.Config.ARGB_8888 && !b.isMutable) b else b.copy(android.graphics.Bitmap.Config.ARGB_8888, false)?.also { b.recycle() }
+                    plain?.apply { prepareToDraw() }?.asImageBitmap()
+                }
+            }
             if (image != null) {
                 shown = image
             } else if (!unreadable) {

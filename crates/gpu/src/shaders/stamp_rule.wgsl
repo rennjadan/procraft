@@ -36,13 +36,11 @@ fn rule_stamp(k: u32, p: vec2<f32>, out: ptr<function, StampOut>) -> bool {
     let look = vec4<f32>(rule_float(b + 14u), rule_float(b + 15u), rule_float(b + 16u), rule_float(b + 17u));
     let more = vec4<f32>(rule_float(b + 18u), rule_float(b + 19u), rule_float(b + 20u), rule_float(b + 21u));
     let turn = rule_float(b + 23u);
-    let gc = cos(turn);
-    let gs = sin(turn);
     (*out).pos = vec4<f32>(p, 0.0, 1.0);
     (*out).q = q;
     (*out).radius = r;
     (*out).alpha = rule_float(b + 3u);
-    (*out).grain_at = grain_offset + vec2<f32>(d.x * gc - d.y * gs, d.x * gs + d.y * gc);
+    (*out).grain_at = grain_read(grain_offset, d, turn, look.y);
     (*out).fill = flip * half / (half + QUAD_REACH);
     (*out).color = mix(tinted(su.color.rgb, tint, rule_float(b + 22u)), su.secondary.rgb, look.z);
     (*out).look = look;

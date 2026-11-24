@@ -186,11 +186,12 @@ impl Lighting {
             let side = (CUBE_SIDE >> level).max(1);
             let roughness = level as f32 / (CUBE_LEVELS - 1) as f32;
             for face in 0..6u32 {
-                let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("prefilter"),
-                    contents: bytemuck::bytes_of(&PrefilterUniform { face, side: side as f32, roughness, texels }),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
+                let uniform = crate::canvas::buffer_init(
+                    device,
+                    "prefilter",
+                    bytemuck::bytes_of(&PrefilterUniform { face, side: side as f32, roughness, texels }),
+                    wgpu::BufferUsages::UNIFORM,
+                );
                 let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("prefilter"),
                     layout: &layout,

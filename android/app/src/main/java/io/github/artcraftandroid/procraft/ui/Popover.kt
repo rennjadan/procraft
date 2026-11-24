@@ -5,6 +5,9 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
@@ -27,7 +30,6 @@ import androidx.compose.ui.graphics.Paint
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
@@ -42,11 +44,13 @@ val LocalBackdrops = staticCompositionLocalOf<Backdrops?> { null }
  */
 class Backdrops(private val send: (List<Float>, List<Float>) -> Unit) {
     /**
-     * Where the canvas's corner is on the screen (pixels): the window's (not the screen's in a split
-     * screen or a window of its own), moved in by what the interface keeps clear of, so a place on
-     * the screen is made one on the canvas.
+     * Where the canvas's corner is on the screen (pixels), so a place on the screen is made one on
+     * the canvas: see [canvasCorner].
      */
-    var windowOnScreen: () -> Offset = { Offset.Zero }
+    var canvasOnScreen: () -> Offset = { Offset.Zero }
+
+    /** Where [onScreen] (pixels) is on the canvas. */
+    fun onCanvas(onScreen: Offset): Offset = onScreen - canvasOnScreen()
 
     private val regions = LinkedHashMap<Any, FloatArray>()
     private val windows = LinkedHashMap<Any, FloatArray>()
@@ -112,23 +116,59 @@ fun rememberFrost(corner: Dp, glass: BarGlass): Modifier {
         }
     }
     return Modifier.onGloballyPositioned { c ->
-        // by the screen, so that it works from popups too, then in the window as the canvas is
-        val at = c.positionOnScreen() - backdrops.windowOnScreen()
+        // by the screen, so that it works from popups too, then on the canvas
+        val at = backdrops.onCanvas(c.positionOnScreen())
         val (left, right) = with(density) { glass.pastLeft.toPx() to glass.pastRight.toPx() }
         val below = with(density) { glass.pastBottom.toPx() }
-        box = floatArrayOf(at.x - left, at.y, at.x + c.size.width + right, at.y + c.size.height + below, with(density) { corner.toPx() })
+        box = frostBox(at, c.size.width, c.size.height, left, right, below, with(density) { corner.toPx() })
     }
 }
+
+/**
+ * Where the canvas's corner is on the screen (pixels): the corner of the window's content
+ * ([contentOnScreen]), moved in by what the interface keeps [clear] of. The content's, not the
+ * window's: in a window of its own or a split screen the window's frame holds a caption bar above
+ * the content, so the frame's corner is that much higher than the canvas's.
+ */
+internal fun canvasCorner(contentOnScreen: Offset, clear: Clearance): Offset = contentOnScreen + clear.corner
+
+/**
+ * The frosted box (x0, y0, x1, y1 and its corners' radius, canvas pixels) of a node [width] by
+ * [height] at [onCanvas], [left], [right] and [below] further out than it.
+ */
+internal fun frostBox(onCanvas: Offset, width: Int, height: Int, left: Float, right: Float, below: Float, corner: Float): FloatArray =
+    floatArrayOf(onCanvas.x - left, onCanvas.y, onCanvas.x + width + right, onCanvas.y + height + below, corner)
 
 
 /** The side of a popover its arrow sticks out of, pointing at its button; or none. */
 enum class ArrowSide { TOP, BOTTOM, LEFT, RIGHT, NONE }
 
 /**
+ * Where the panel opening now hangs from a button Edit layout moved: the side its arrow is on, and how
+ * far along that side its tip is (the panel's own dp). The panel's own popover takes it in place of
+ * an arrow up from under the top bar; nothing that opens inside it does.
+ */
+class Hang(val side: ArrowSide, val arrow: Dp)
+
+/** The hang of the panel opening now, while Edit layout moved its button. */
+val LocalHang = staticCompositionLocalOf<Hang?> { null }
+
+/**
+ * A panel floating in a window of its own (every panel may, while a plugin lets it): how wide and tall the window lays it
+ * out (its own dp), and what its strip and corner do. The panel's own popover draws as that window, with no arrow and a
+ * strip over it; nothing that opens inside it does.
+ */
+class FloatWindow(val width: Dp, val height: Dp, val frame: FloatingFrame, val sizable: Boolean)
+
+/** The window the panel showing now floats in, if it does. */
+val LocalFloat = staticCompositionLocalOf<FloatWindow?> { null }
+
+/**
  * A panel hanging from the top bar, with an arrow pointing up at its button: [arrowX] is the tip's
  * distance from the panel's left edge (from its top, for an arrow on the [side]). [popoverPlace]
  * finds where it goes. Without a [fill] of its own it is frosted over the canvas: translucent,
- * with what is behind it blurred. [width] is the body's: a side arrow adds to it.
+ * with what is behind it blurred. [width] is the body's: a side arrow adds to it. Hanging from a
+ * button Edit layout moved ([LocalHang]), an arrow that would point up points at it instead.
  */
 @Composable
 fun Popover(
@@ -140,12 +180,38 @@ fun Popover(
     side: ArrowSide = ArrowSide.TOP,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    val hang = LocalHang.current?.takeIf { side == ArrowSide.TOP }
+    val float = LocalFloat.current?.takeIf { side == ArrowSide.TOP }
+    androidx.compose.runtime.CompositionLocalProvider(LocalHang provides null, LocalFloat provides null) {
+        if (float != null) {
+            // floating: as big as its window, its strip over it and the room for its corner under it
+            PopoverBody(float.width, 0.dp, modifier.height(float.height), fill, corner, ArrowSide.NONE) {
+                FloatingTop(float.frame)
+                androidx.compose.foundation.layout.Box(Modifier.weight(1f).fillMaxWidth()) {
+                    Column(Modifier.fillMaxSize(), content = content)
+                }
+                if (float.sizable) FloatingBottom(float.frame)
+            }
+        } else {
+            PopoverBody(width, hang?.arrow ?: arrowX, modifier, fill, corner, hang?.side ?: side, content)
+        }
+    }
+}
+
+@Composable
+private fun PopoverBody(
+    width: Dp,
+    arrowX: Dp,
+    modifier: Modifier,
+    fill: Color?,
+    corner: Dp,
+    side: ArrowSide,
+    content: @Composable ColumnScope.() -> Unit,
+) {
     val backdrops = LocalBackdrops.current.takeIf { fill == null && Pc.PopoverFrost.alpha < 1f }
     val paint = fill ?: if (backdrops != null) Pc.PopoverFrost else Pc.PopoverFill
     val key = remember { Any() }
     val density = LocalDensity.current
-    // the canvas's corner in the window
-    val canvasCorner = LocalClearance.current.corner
     // the blur grows and fades with the panel: its body as drawn (already grown), and how much
     // it shows
     val look = LocalPanelLook.current
@@ -160,7 +226,8 @@ fun Popover(
         Modifier
     } else {
         Modifier.onGloballyPositioned { c ->
-            val at = c.positionInWindow() - canvasCorner
+            // by the screen, as a bar's (see rememberFrost)
+            val at = backdrops.onCanvas(c.positionOnScreen())
             val k = look.scale
             val (arrowH, radius) = with(density) { Pc.ArrowHeight.toPx() to corner.toPx() }
             val (l, t, r) = Triple(if (side == ArrowSide.LEFT) arrowH else 0f, if (side == ArrowSide.TOP) arrowH else 0f, if (side == ArrowSide.RIGHT) arrowH else 0f)

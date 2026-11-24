@@ -147,6 +147,10 @@ pub(crate) mod field {
     /// triangle, equilateral triangle, quadrilateral, rectangle, square), then its nodes, x and y as
     /// 32-bit floats (canvas pixels, before its transform).
     pub(crate) const SHAPE: u16 = 26;
+    /// Its pressure as plugins gave it, if they did: u8 1 if it was given though the pointer reports
+    /// none (a finger's), then two 32-bit floats, how far it grew from nothing at the start and fell
+    /// to nothing at the end (canvas pixels, before its transform).
+    pub(crate) const PRESSURE: u16 = 27;
     /// The first id of a plugin's own fields.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const OWN: u16 = 0x8000;
@@ -332,6 +336,9 @@ pub(crate) struct Item {
     pub(crate) region: Option<Arc<Region>>,
     /// The shape it was snapped to, if it was: its kind and nodes.
     pub(crate) shape: Option<Arc<(u8, Vec<Vec2>)>>,
+    /// Its pressure as plugins gave it: given though its pointer reports none, and how far it grew
+    /// from nothing and fell to nothing (canvas pixels; see [`StrokeBuilder::pressing`]).
+    pub(crate) pressing: (bool, [f32; 2]),
 }
 
 /// A region an item fills: its outlines (canvas pixels, before the item's transform), filled
@@ -514,6 +521,14 @@ impl Item {
             }
             r.field(field::SHAPE, &bytes);
         }
+        if self.pressing != (false, [0.0; 2]) {
+            let (given, [start, end]) = self.pressing;
+            let mut bytes = vec![u8::from(given)];
+            for v in [start, end] {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            r.field(field::PRESSURE, &bytes);
+        }
         let batches: Vec<u8> = self.batches.iter().flat_map(|b| b.to_le_bytes()).collect();
         r.field(field::BATCHES, &batches);
         r.field(field::STARTED, &self.started.to_le_bytes());
@@ -551,6 +566,7 @@ impl Item {
             clip: None,
             region: None,
             shape: None,
+            pressing: (false, [0.0; 2]),
         };
         let mut brush = None;
         for (id, bytes) in fields(record) {
@@ -591,6 +607,14 @@ impl Item {
                         let nodes = nodes.as_chunks::<2>().0.iter().map(|&[x, y]| Vec2::new(x, y));
                         Arc::new((*kind, nodes.filter(|p| p.is_finite()).take(MOST_SAMPLES).collect()))
                     });
+                }
+                field::PRESSURE => {
+                    let span = |v: f32| if v.is_finite() { v.clamp(0.0, 1e6) } else { 0.0 };
+                    if let (Some(&given), Some([start, end])) =
+                        (bytes.first(), floats::<2>(bytes.get(1..).unwrap_or_default()))
+                    {
+                        item.pressing = (given == 1, [span(start), span(end)]);
+                    }
                 }
                 field::SIZES => item.sizes = floats_of(bytes).take(4).filter(|v| v.is_finite() && *v >= 0.0).collect(),
                 field::BRUSH_NAME => item.brush_name = String::from_utf8_lossy(bytes).chars().take(256).collect(),
@@ -977,6 +1001,12 @@ impl Recording {
         item.shape = Some(Arc::new((kind, nodes.to_vec())));
     }
 
+    /// Its input turned out to come finer than whole pixels: laid again, it is read so from its
+    /// start (the stroke as drawn was read so from where that showed, a sample or two in).
+    pub(crate) fn read_finer(&mut self) {
+        self.item.whole_pixels = None;
+    }
+
     /// The last of its samples, `samples`, as the pen lifts.
     pub(crate) fn lift(&mut self, samples: &[Sample]) {
         self.add(samples);
@@ -1156,6 +1186,10 @@ impl State {
             clip: self.selection.as_ref().and_then(Clip::of).map(Arc::new),
             region: None,
             shape: None,
+            pressing: {
+                let per_point = self.canvas_per_point();
+                (self.pressing.given, self.pressing.tapers.map(|t| t * per_point))
+            },
         };
         let laid = self.laid_current(layer);
         let mut recording = Recording { layer, kind, item, started: None, laid };
@@ -1497,6 +1531,10 @@ impl State {
                 .with_input(item.input.clone())
                 .on_view_turned(item.rotation)
                 .seen_at(item.seen_at);
+            // its pressure as plugins gave it, its tapers moved with it
+            let (given, tapers) = item.pressing;
+            let builder = if given { builder.with_given_pressure() } else { builder };
+            let builder = builder.with_pressure_tapers(tapers[0] * t.scale_factor(), tapers[1] * t.scale_factor());
             let builder = match item.whole_pixels {
                 Some(zoom) => builder.read_in_whole_pixels(zoom),
                 None => builder,
@@ -1530,7 +1568,16 @@ impl State {
         let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return (IRect::EMPTY, false) };
         let engine = hooks.and_then(|hooks| {
             let look = (item.alpha_lock, false);
-            crate::plugin_brushes::engine_stroke(&hooks, &brush, item.tool.stroke_tool(), starting, look, canvas, gpu)
+            crate::plugin_brushes::engine_stroke(
+                &hooks,
+                &brush,
+                item.tool.stroke_tool(),
+                starting,
+                look,
+                canvas,
+                gpu,
+                false,
+            )
         });
         let (style, second) = match engine {
             Some(o) => {
@@ -1569,7 +1616,7 @@ impl State {
             let samples = timed.get(at..at + n).unwrap_or_default();
             at += n;
             if batch & LIFTED == 0 {
-                crate::draw_samples(canvas, &mut builder, second_builder.as_mut(), samples, &guide);
+                crate::draw_samples(canvas, &mut builder, second_builder.as_mut(), samples, &guide, false);
             } else {
                 crate::lift_samples(canvas, &mut builder, second_builder.as_mut(), samples, &guide);
             }
@@ -2230,7 +2277,7 @@ impl CanvasSession {
         let reason = |why: &str| crate::MobileError::File { reason: why.to_owned() };
         let bytes = self.plugin_export_bytes(&key).ok_or_else(|| reason("the plugin couldn't make it"))?;
         crate::project::write_atomically(std::path::Path::new(&path), |p| {
-            std::fs::write(p, &bytes).map_err(|e| reason(&format!("writing the file: {e}")))
+            crate::storage::write(p, &bytes).map_err(|e| reason(&format!("writing the file: {e}")))
         })
     }
 
@@ -2493,6 +2540,7 @@ mod tests {
             clip: Some(Arc::new(Clip { x: 3, y: 4, width: 3, height: 2, coverage: vec![0, 0, 255, 255, 255, 9] })),
             region: None,
             shape: Some(Arc::new((4, vec![Vec2::new(1.0, 2.0), Vec2::new(3.0, 4.0)]))),
+            pressing: (true, [12.0, 30.5]),
         }
     }
 

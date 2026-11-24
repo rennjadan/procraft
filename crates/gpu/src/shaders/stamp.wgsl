@@ -56,7 +56,8 @@ struct StampIn {
     @location(6) flip: vec2<f32>,
     // the tint: the hue's turn, the saturation's keep and add, the brightness's keep
     @location(7) tint: vec4<f32>,
-    // a moving grain's depth and tile size as multiples of the brush's; the secondary colour's share
+    // a moving grain's depth and tile size as multiples of the brush's (the size below 0: read
+    // mirrored); the secondary colour's share
     @location(8) look: vec4<f32>,
     // how far the paint fills a moving grain in, and room for more
     @location(9) more: vec4<f32>,
@@ -94,6 +95,16 @@ struct StampOut {
     @location(11) @interpolate(flat) finish: vec3<f32>,
 }
 
+// where a moving grain is read for a point `from_middle` (canvas pixels) from a stamp's middle,
+// which is `offset` in the grain: the patch turned by `turn`; for a stamp whose tile size `size`
+// is below 0, mirrored (the point's way turned over top to bottom first: see `Stamp::grain_mirrored`)
+fn grain_read(offset: vec2<f32>, from_middle: vec2<f32>, turn: f32, size: f32) -> vec2<f32> {
+    let d = select(from_middle, vec2<f32>(from_middle.x, -from_middle.y), size < 0.0);
+    let gc = cos(turn);
+    let gs = sin(turn);
+    return offset + vec2<f32>(d.x * gc - d.y * gs, d.x * gs + d.y * gc);
+}
+
 @vertex
 fn vs_stamp(@builtin(vertex_index) vi: u32, inst: StampIn) -> StampOut {
     var corners = array<vec2<f32>, 6>(
@@ -114,10 +125,7 @@ fn vs_stamp(@builtin(vertex_index) vi: u32, inst: StampIn) -> StampOut {
     o.q = q;
     o.radius = r;
     o.alpha = inst.alpha;
-    let gc = cos(inst.grain_turn);
-    let gs = sin(inst.grain_turn);
-    let from_middle = p - inst.center;
-    o.grain_at = inst.grain_offset + vec2<f32>(from_middle.x * gc - from_middle.y * gs, from_middle.x * gs + from_middle.y * gc);
+    o.grain_at = grain_read(inst.grain_offset, p - inst.center, inst.grain_turn, inst.look.y);
     o.fill = inst.flip * half / (half + QUAD_REACH);
     o.color = mix(tinted(su.color.rgb, inst.tint, inst.brightness_add), su.secondary.rgb, inst.look.z);
     o.look = inst.look;
@@ -265,7 +273,7 @@ fn stamp_paint(i: StampOut) -> vec4<f32> {
         }
     }
     if (su.grain >= 0) {
-        let scale = su.grain_scale * i.look.y;
+        let scale = su.grain_scale * abs(i.look.y);
         let gc = cos(su.grain_rotation);
         let gs = sin(su.grain_rotation);
         let at = i.grain_at;

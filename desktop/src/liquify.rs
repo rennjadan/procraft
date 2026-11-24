@@ -67,7 +67,10 @@ impl Liquify {
         let screen = ctx.content_rect();
         let wide = screen.width() > screen.height();
         let (w, h) = if wide { WIDE } else { UPRIGHT };
-        let rect = Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.bottom() - PANEL_RISE - h), vec2(w, h));
+        let rect = crate::panel::bottom_rect(
+            ctx,
+            Rect::from_min_size(pos2(screen.center().x - w / 2.0, screen.bottom() - PANEL_RISE - h), vec2(w, h)),
+        );
         // the popovers point at a button: the first (the way) upright, Adjust (the ninth) wide
         let (tip_x, tip_y) = if wide {
             (rect.left() + 86.0 + 94.0 * 8.0 + 37.5, rect.top() + 28.0)

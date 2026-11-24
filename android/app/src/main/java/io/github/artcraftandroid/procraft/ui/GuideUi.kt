@@ -34,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -174,6 +175,7 @@ fun GuideEditor(vm: CanvasViewModel) {
         }
         GuideToolbar(vm, Modifier.align(Alignment.BottomCenter)) { keypad = SizeKeypad(g.sizeText, g.unit) }
         SymmetryOptions(vm, maxWidth, maxHeight)
+        GuideNodeMenu(vm)
         open?.let { k ->
             // each key changes the size at once; a unit chosen clears what was typed
             fun type(typed: String) {
@@ -196,6 +198,33 @@ fun GuideEditor(vm: CanvasViewModel) {
                 },
                 onDone = { keypad = null },
             )
+        }
+    }
+}
+
+/**
+ * The menu of a handle tapped in the guide editor, as a curve node's: Delete for a perspective
+ * guide's point, Reset for the centre of the others. Centred over the handle, its bottom 11 above
+ * it; under it, 11 below, where the handle is within 80 of the window's top.
+ */
+@Composable
+private fun GuideNodeMenu(vm: CanvasViewModel) {
+    val menu = vm.guideNodeMenu ?: return
+    val offset = with(androidx.compose.ui.platform.LocalDensity.current) {
+        val below = menu.at.y < 80.dp.toPx()
+        androidx.compose.ui.unit.IntOffset(
+            (menu.at.x - (NodeMenuWidth / 2 + NodeMenuHalo).toPx()).roundToInt(),
+            (if (below) menu.at.y + (11.dp - NodeMenuHalo).toPx() else menu.at.y - (11.dp + NodeMenuRow + NodeMenuHalo).toPx()).roundToInt(),
+        )
+    }
+    PcPopup(offset = offset, onDismissRequest = { vm.guideNodeMenu = null }, properties = androidx.compose.ui.window.PopupProperties(focusable = true, clippingEnabled = false)) {
+        Box(
+            Modifier.padding(NodeMenuHalo).size(NodeMenuWidth, NodeMenuRow)
+                .shadow(14.dp, RoundedCornerShape(12.dp), ambientColor = Color.Black, spotColor = Color.Black)
+                .clip(RoundedCornerShape(12.dp)).background(NodeMenuFill).tap { vm.guideNodeAction(menu) },
+            contentAlignment = Alignment.Center,
+        ) {
+            Text(if (menu.point != null) "Delete" else "Reset", color = Color.White, fontSize = 17.sp, maxLines = 1)
         }
     }
 }

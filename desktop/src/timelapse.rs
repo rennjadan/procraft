@@ -138,7 +138,8 @@ It can't be brought back."
             session.record_time_lapse(Arc::clone(&lapse));
             // one that couldn't be kept is told once, from the window's thread
             if let Some(text) = lapse.take_problem() {
-                crate::files::tell_later("Can't keep the time-lapse", &text);
+                let title = if text == procraft_core::NO_ROOM { "Storage full" } else { "Can't keep the time-lapse" };
+                crate::files::tell_later(title, &text);
             }
             let _ = tx.send(());
         });

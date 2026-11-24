@@ -12,13 +12,13 @@
 //! (field 4) instead (field 3 is the brush studio's: the settings as they came).
 
 use crate::brush::Brush;
-use crate::files::{Zip, png_picture_only, png_texts};
+use crate::files::{Zip, png_picture_only, png_text};
 use crate::preset::Preset;
 use crate::rec::{Record, fields};
 
 /// The preset a `.kpp` holds: its XML text.
 fn preset_text(kpp: &[u8]) -> Option<String> {
-    png_texts(kpp).into_iter().find(|(k, _)| k == "preset").map(|(_, t)| t)
+    png_text(kpp, "preset")
 }
 
 /// The brushes made of a file called `name` (`bytes`): a bundle's or a preset's, as the record the
@@ -89,9 +89,14 @@ fn mypaint_json(preset: &Preset) -> Option<String> {
 
 /// A brush made of preset `kpp`, its pictures found in it or by `find`, if it is one this engine
 /// draws.
+///
+/// The pictures a preset carries can make up nearly all of its text (tens of megabytes of base64 for
+/// a big pipe), so its settings are read without them and each picture it wants is read off the text
+/// where it lies; each is copied once, into the record made.
 fn add(made: &mut Record, kpp: &[u8], find: &dyn Fn(&str) -> Option<Vec<u8>>) {
     let Some(text) = preset_text(kpp) else { return };
-    let Some(preset) = Preset::read(&text) else { return };
+    let light = without_resources(&text);
+    let Some(preset) = Preset::read(&light) else { return };
     // Krita's MyPaint engine's: the MyPaint brush it keeps
     if preset.paintop == "mypaintbrush" {
         if let Some(json) = mypaint_json(&preset) {
@@ -102,40 +107,73 @@ fn add(made: &mut Record, kpp: &[u8], find: &dyn Fn(&str) -> Option<Vec<u8>>) {
     if !crate::brush::ENGINES.contains(&preset.paintop.as_str()) {
         return;
     }
-    let mut data = Record::new();
-    let (settings, pattern) = without_pattern(&without_resources(&text), &preset);
-    data.field(1, settings.as_bytes());
-    let mut added = Vec::new();
-    if let Some((name, bytes)) = pattern {
-        let mut r = Record::new();
-        r.field(1, name.as_bytes()).field(2, &bytes);
-        data.field(2, &r.bytes());
-        added.push(name);
+    let (settings, pattern) = without_pattern(&light, &preset);
+    drop(light);
+    let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+    if let Some(pattern) = pattern {
+        files.push(pattern);
     }
-    for file in preset.wanted_files().into_iter().filter(|f| !added.contains(f)) {
-        let bytes = match preset.resource(&file) {
-            Some(r) => r.bytes(),
-            None => find(&file),
-        };
-        if let Some(bytes) = bytes {
-            let mut r = Record::new();
-            r.field(1, file.as_bytes()).field(2, &bytes);
-            data.field(2, &r.bytes());
+    let wanted: Vec<String> =
+        preset.wanted_files().into_iter().filter(|f| !files.iter().any(|(n, _)| n == f)).collect();
+    for file in wanted {
+        if let Some(bytes) = carried(&text, &file).or_else(|| find(&file)) {
+            files.push((file, bytes));
         }
     }
-    let mut brush = Record::new();
-    brush.field(1, preset.name.as_bytes()).field(2, &data.bytes());
-    if let Some(png) = png_picture_only(kpp) {
-        brush.field(3, &png);
+    drop(text);
+    // the record, each picture copied once
+    let file_size = |n: &str, b: &[u8]| Record::size(n.len()) + Record::size(b.len());
+    let data = Record::size(settings.len()) + files.iter().map(|(n, b)| Record::size(file_size(n, b))).sum::<usize>();
+    let png = png_picture_only(kpp);
+    let brush =
+        Record::size(preset.name.len()) + Record::size(data) + png.as_ref().map_or(0, |p| Record::size(p.len()));
+    made.head(1, brush).field(1, preset.name.as_bytes()).head(2, data).field(1, settings.as_bytes());
+    for (name, bytes) in &files {
+        made.head(2, file_size(name, bytes)).field(1, name.as_bytes()).field(2, bytes);
     }
-    made.field(1, &brush.bytes());
+    if let Some(png) = png {
+        made.field(3, &png);
+    }
+}
+
+/// The picture called `file` a preset's `text` carries in its `resources` (by its file name, else
+/// by its name, as [`Preset::resource`] finds one), unpacked: read off the text where it lies, the
+/// rest of the text neither parsed nor copied.
+fn carried(text: &str, file: &str) -> Option<Vec<u8>> {
+    let plain = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    let stem = plain.rsplit_once('.').map_or(plain, |(stem, _)| stem);
+    let from = text.find("<resources")?;
+    let end = text.rfind("</resources>").filter(|&end| end > from)?;
+    let section = text.get(from..end)?;
+    // each picture: its file name, its name and its text
+    let mut found: Vec<(String, String, &str)> = Vec::new();
+    let mut at = 0;
+    while let Some(start) = section.get(at..).and_then(|s| s.find("<resource ")) {
+        let tag_from = at + start;
+        let tag_end = tag_from + section.get(tag_from..)?.find('>')?;
+        let tag = section.get(tag_from..tag_end)?;
+        let closed = tag.ends_with('/');
+        let element = crate::xml::parse(&format!("{}/>", tag.trim_end_matches('/')))?;
+        let body_from = tag_end + 1;
+        let body_end = if closed { body_from } else { body_from + section.get(body_from..)?.find("</resource>")? };
+        let named = |key: &str| element.attribute(key).unwrap_or_default().to_owned();
+        found.push((named("filename"), named("name"), section.get(body_from..body_end)?));
+        at = body_end;
+    }
+    let (_, _, body) =
+        found.iter().find(|(f, ..)| f == plain).or_else(|| found.iter().find(|(_, n, _)| n == plain || n == stem))?;
+    let body = body.trim();
+    let body = body.strip_prefix("<![CDATA[").and_then(|b| b.strip_suffix("]]>")).unwrap_or(body);
+    crate::files::base64(body.trim())
 }
 
 /// A preset's text without the pictures it carries (its `resources`).
 fn without_resources(text: &str) -> String {
     let Some(from) = text.find("<resources") else { return text.to_owned() };
-    let to = match text[from..].find("</resources>") {
-        Some(end) => from + end + "</resources>".len(),
+    // (pictures, being base64, hold no tags: theirs end at the last end of one, past which only a
+    // preset's few settings follow)
+    let to = match text.rfind("</resources>").filter(|&end| end > from) {
+        Some(end) => end + "</resources>".len(),
         // an empty one
         None => match text[from..].find("/>") {
             Some(end) => from + end + 2,
@@ -871,6 +909,113 @@ mod tests {
         let (_, file) = fields(data).find(|(f, _)| *f == 2).unwrap();
         let file: Vec<(u16, &[u8])> = fields(file).collect();
         assert_eq!(file, [(1, &b"t.png"[..]), (2, &b"hello"[..])]);
+    }
+
+    /// A brush of a pipe of `count` one-pixel colour cells, each its number in red and green, `ranks`
+    /// and `selections` its settings line's (as `rank0:18 sel0:angular`): read whole.
+    fn pipe_brush(count: u32, settings: &str) -> crate::brush::Brush {
+        let mut pipe = format!("cells\n{count} ncells:{count} {settings}\n").into_bytes();
+        for i in 0..count {
+            for x in [28 + 2, 2, 1, 1, 4] {
+                pipe.extend_from_slice(&u32::to_be_bytes(x));
+            }
+            pipe.extend_from_slice(b"GIMP");
+            pipe.extend_from_slice(&10_u32.to_be_bytes());
+            pipe.extend_from_slice(b"c\0");
+            pipe.extend_from_slice(&[(i & 255) as u8, (i >> 8) as u8, 7, 255]);
+        }
+        let xml = r#"<Preset name="P" paintopid="paintbrush"><param name="brush_definition"><![CDATA[<Brush type="gbr_brush" filename="cells.gih" spacing="0.1" scale="1" BrushVersion="2" brushApplication="1"/>]]></param></Preset>"#;
+        let mut file = Record::new();
+        file.field(1, b"cells.gih").field(2, &pipe);
+        let mut data = Record::new();
+        data.field(1, xml.as_bytes()).field(2, &file.bytes());
+        load(&data.bytes(), false).unwrap()
+    }
+
+    /// The cells a stroke of `brush` along `samples` lays, by the numbers they had in the pipe.
+    fn cells_laid(brush: crate::brush::Brush, samples: &[Sample]) -> Vec<u32> {
+        let masks: Vec<Vec<u8>> = brush.tip.masks.iter().map(|m| m.pixels.clone()).collect();
+        let mut stroke = Stroke::new(
+            Rc::new(brush),
+            Begin { colour: [0.0; 3], secondary: [1.0; 3], diameter: 1.0, start_diameter: 1.0, seed: 3, turn: 0.0 },
+        );
+        stroke.add(samples);
+        stroke.finish();
+        stroke.out.iter().map(|d| masks[d.tip as usize][0] as u32 | (masks[d.tip as usize][1] as u32) << 8).collect()
+    }
+
+    /// A pipe of more cells than a tip may have is sampled down to what fits, each dimension evenly
+    /// over all it had, and a stroke still walks the whole of it: by pressure from its first cell to
+    /// its last, in turn through cells spread over all of them, by the drawing angle all round.
+    #[test]
+    fn a_pipe_of_more_cells_than_fit_is_sampled_down_and_still_walked_whole() {
+        let ranks = |brush: &crate::brush::Brush| match &brush.tip.tips {
+            crate::brush::Tips::Images { pipe: Some(p), .. } => p.ranks.clone(),
+            _ => Vec::new(),
+        };
+        // 738 cells, 18 angles by 41 in turn (a real impasto pipe's): 10 by 25
+        let big = pipe_brush(738, "dim:2 rank0:18 sel0:angular rank1:41 sel1:incremental");
+        assert_eq!((big.tip.masks.len(), ranks(&big)), (250, vec![10, 25]));
+        let line = |n: usize, pressure: &dyn Fn(f32) -> f32| -> Vec<Sample> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / (n - 1) as f32;
+                    Sample {
+                        x: 10.0 + i as f32,
+                        y: 50.0,
+                        pressure: pressure(t),
+                        ms: i as f64 * 4.0,
+                        ..Sample::default()
+                    }
+                })
+                .collect()
+        };
+        // in turn, along a line (one angle): the 25 steps of 41 kept, spread over them all
+        let laid = cells_laid(big, &line(400, &|_| 1.0));
+        let turns: std::collections::BTreeSet<u32> = laid.iter().map(|c| c % 41).collect();
+        assert_eq!(turns.len(), 25, "{turns:?}");
+        assert!(*turns.first().unwrap() <= 1 && *turns.last().unwrap() >= 39, "{turns:?}");
+        // by pressure, 300 cells: from the first to the last
+        let pressed = pipe_brush(300, "dim:1 rank0:300 sel0:pressure");
+        assert_eq!((pressed.tip.masks.len(), ranks(&pressed)), (255, vec![255]));
+        let laid = cells_laid(pressed, &line(600, &|t| t));
+        assert_eq!((laid.iter().min(), laid.iter().max()), (Some(&0), Some(&299)), "the whole range");
+        assert!(laid.windows(2).all(|w| w[0] <= w[1]), "in order as the pressure grows");
+        // by the drawing angle, 400 cells: a circle's dabs pick all round
+        let turned = pipe_brush(400, "dim:1 rank0:400 sel0:angular");
+        assert_eq!(turned.tip.masks.len(), 255);
+        let circle: Vec<Sample> = (0..2000)
+            .map(|i| {
+                let a = i as f32 / 2000.0 * std::f32::consts::TAU;
+                Sample {
+                    x: 200.0 + 150.0 * a.cos(),
+                    y: 200.0 + 150.0 * a.sin(),
+                    pressure: 1.0,
+                    ms: i as f64 * 4.0,
+                    ..Sample::default()
+                }
+            })
+            .collect();
+        let laid: std::collections::BTreeSet<u32> = cells_laid(turned, &circle).into_iter().collect();
+        assert!(laid.len() > 200, "{} of 255", laid.len());
+        assert!(*laid.first().unwrap() < 4 && *laid.last().unwrap() > 395, "{laid:?}");
+        // one that fits is as it was
+        let small = pipe_brush(200, "dim:1 rank0:200 sel0:incremental");
+        assert_eq!((small.tip.masks.len(), ranks(&small)), (200, vec![200]));
+    }
+
+    /// A picture a preset carries is read off its text as reading the whole preset finds it: by its
+    /// file name, else by its name.
+    #[test]
+    fn a_carried_picture_is_read_off_the_text_as_the_preset_finds_it() {
+        let xml = r#"<Preset name="P" paintopid="paintbrush"><resources><resource name="tip" filename="a.gbr" type="brushes"><![CDATA[aGVsbG8=]]></resource><resource name="paper" filename="p.pat">d29ybGQ=</resource><resource name="empty" filename="e.png"/></resources><param name="x"><![CDATA[1]]></param></Preset>"#;
+        let preset = Preset::read(xml).unwrap();
+        for file in ["a.gbr", "dir/a.gbr", "tip", "tip.gbr", "paper", "p.pat", "e.png", "none.png"] {
+            assert_eq!(carried(xml, file), preset.resource(file).and_then(|r| r.bytes()), "{file}");
+        }
+        assert_eq!(carried(xml, "tip.gbr").unwrap(), b"hello");
+        assert_eq!(carried(xml, "p.pat").unwrap(), b"world");
+        assert_eq!(carried("<Preset/>", "a.gbr"), None);
     }
 
     /// Read only to draw (the app holding its look), a brush lays the same dabs as read whole: a pipe

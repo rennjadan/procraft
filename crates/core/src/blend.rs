@@ -60,7 +60,7 @@ pub(crate) fn begin_draft(st: &mut crate::State, name: &'static str) -> bool {
     if st.doc.is_locked(current) || layer.drawn_from_data() {
         return false;
     }
-    let Some(before) = st.current_pixels() else { return false };
+    let Some(before) = st.layer_pixels(current) else { return false };
     let selection = st.reach_selection();
     if let Some(canvas) = st.canvas.as_mut() {
         canvas.hold_layer(current);

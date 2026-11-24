@@ -14,8 +14,6 @@ use std::borrow::Cow;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
-use wgpu::util::DeviceExt;
-
 use super::plugin_filter::{BIG_STACK, COMPILE_LIMIT, FilterCode, PICTURE, PICTURE_6, PICTURE_PLACES, read_kind};
 use super::{blended_pipeline, read_texture, render_pass, texture};
 use crate::{Gpu, GpuError};
@@ -57,6 +55,12 @@ pub struct PictureCode {
 }
 
 impl PictureCode {
+    /// The module as read, for a test to translate.
+    #[cfg(test)]
+    pub(crate) fn module(&self) -> &wgpu::naga::Module {
+        self.code.module()
+    }
+
     /// The most a pixel can cost.
     pub fn worst(&self) -> u64 {
         self.code.worst()
@@ -191,11 +195,7 @@ impl Gpu {
         } else {
             bytemuck::bytes_of(&PictureUniform { a: [hue, 0.0, 0.0, 0.0], size }).to_vec()
         };
-        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("plugin picture"),
-            contents: &contents,
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let buffer = super::buffer_init(device, "plugin picture", &contents, wgpu::BufferUsages::UNIFORM);
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("plugin picture"),
             layout: &program.layout,
@@ -215,7 +215,8 @@ impl Gpu {
             }
             let sent = Instant::now();
             self.queue.submit([encoder.finish()]);
-            let waited = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(DRAW_LIMIT) });
+            let waited =
+                crate::poll(device, wgpu::PollType::Wait { submission_index: None, timeout: Some(DRAW_LIMIT) });
             if self.is_lost() {
                 return Err(PictureStop::Lost);
             }

@@ -55,7 +55,11 @@ class SaveToGalleryActivity : ComponentActivity() {
         Executors.newSingleThreadExecutor().execute {
             val saved = files.count { f ->
                 val put = { if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) insert(f, video) else copyShared(f, video) }
-                runCatching(put).getOrDefault(false)
+                // a file that can't go is said in the log, with why
+                runCatching(put)
+                    .onFailure { AppLog.e("ProCraft", "saving ${f.name} (${f.length()} bytes, $mime) to the gallery", it) }
+                    .getOrDefault(false)
+                    .also { if (!it) AppLog.w("ProCraft", "${f.name} (${f.length()} bytes, $mime) wasn't saved to the gallery") }
             }
             runOnUiThread {
                 val text = when {

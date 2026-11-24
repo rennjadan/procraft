@@ -34,6 +34,8 @@ use super::{
 use crate::{Gpu, GpuError};
 
 const TEMPLATE: &str = include_str!("../shaders/plugin_filter_1.wgsl");
+const LAYER_TEMPLATE: &str = include_str!("../shaders/plugin_filter_layer_17.wgsl");
+const LAYER_TABLE_TEMPLATE: &str = include_str!("../shaders/plugin_filter_layer_18.wgsl");
 const PICTURE_TEMPLATE: &str = include_str!("../shaders/plugin_picture_2.wgsl");
 const PICTURE_TEMPLATE_6: &str = include_str!("../shaders/plugin_picture_6.wgsl");
 
@@ -46,6 +48,9 @@ pub(super) const PICTURE_PLACES: [&str; 16] =
     ["a.x", "a.y", "a.z", "a.w", "b.x", "b.y", "b.z", "b.w", "c.x", "c.y", "c.z", "c.w", "d.x", "d.y", "d.z", "d.w"];
 /// What a pixel may spend in loops, in roughly simple operations, and in code that isn't in one.
 const BUDGET: u64 = 1 << 16;
+/// What a filter layer's filter may spend in loops for a pixel: what it makes is made again each
+/// time the canvas is drawn where it shows, not once, so it has an eighth of a filter's.
+const LAYER_BUDGET: u64 = 1 << 13;
 const MOST_STRAIGHT: u64 = 1 << 16;
 /// The most one of its types may be, and one function's variables, in bytes: a pixel's memory is
 /// kept per pixel, and a large array stops a shader compiler or the GPU.
@@ -64,14 +69,15 @@ pub(super) const COMPILE_LIMIT: Duration = Duration::from_secs(15);
 /// Parsing and compiling recurse over what the file holds.
 pub(super) const BIG_STACK: usize = 64 << 20;
 /// How many pixels each way the probe looks at.
-const PROBE_SIZE: u32 = 16;
+pub(super) const PROBE_SIZE: u32 = 16;
 
 /// What the template's own names are, among those a filter's text can't use.
 const OWN_GLOBALS: [&str; 5] = ["host_copy", "host_chosen", "host_u", "v", "host_budget"];
 const OWN_ENTRIES: [&str; 3] = ["host_main", "host_probe", "host_vs"];
 const OWN_PREFIX: &str = "host_";
-/// The template's functions a filter may call.
+/// The template's functions a filter may call; a filter layer's with an editor, `table` too.
 const GIVEN: [&str; 2] = ["layer_at", "canvas_size"];
+const GIVEN_TABLE: [&str; 3] = ["layer_at", "canvas_size", "table"];
 /// The one function it must have.
 const PIXEL: &str = "pixel";
 /// What an author may well call it, which WGSL keeps for itself: said so, not left to the parser.
@@ -87,16 +93,43 @@ pub(super) struct Kind {
     entry: &'static str,
     /// Where the values it is given are in its uniform (none: it is given none).
     places: &'static [&'static str],
+    /// What a pixel may spend in loops.
+    budget: u64,
 }
 
-const FILTER: Kind =
-    Kind { template: TEMPLATE, own_globals: &OWN_GLOBALS, given: &GIVEN, entry: PIXEL, places: &VALUE_PLACES };
+const FILTER: Kind = Kind {
+    template: TEMPLATE,
+    own_globals: &OWN_GLOBALS,
+    given: &GIVEN,
+    entry: PIXEL,
+    places: &VALUE_PLACES,
+    budget: BUDGET,
+};
+/// A filter layer's filter with an editor (interface 18): given what the editor set, too.
+const LAYER_TABLE_FILTER: Kind = Kind {
+    template: LAYER_TABLE_TEMPLATE,
+    own_globals: &["host_copy", "host_u", "host_table", "v", "host_budget", "host_at"],
+    given: &GIVEN_TABLE,
+    entry: PIXEL,
+    places: &VALUE_PLACES,
+    budget: LAYER_BUDGET,
+};
+/// A filter layer's filter (interface 17): a filter's function, run over what is below the layer.
+const LAYER_FILTER: Kind = Kind {
+    template: LAYER_TEMPLATE,
+    own_globals: &["host_copy", "host_u", "v", "host_budget", "host_at"],
+    given: &GIVEN,
+    entry: PIXEL,
+    places: &VALUE_PLACES,
+    budget: LAYER_BUDGET,
+};
 pub(super) const PICTURE: Kind = Kind {
     template: PICTURE_TEMPLATE,
     own_globals: &["host_u", "host_budget"],
     given: &["hue", "picture_size"],
     entry: "picture",
     places: &[],
+    budget: BUDGET,
 };
 /// A picture written to interface 6: given its plugin's controls as `v`, as a filter is.
 pub(super) const PICTURE_6: Kind = Kind {
@@ -105,6 +138,7 @@ pub(super) const PICTURE_6: Kind = Kind {
     given: &["hue", "picture_size"],
     entry: "picture",
     places: &PICTURE_PLACES,
+    budget: BUDGET,
 };
 
 /// A filter's code that has held up, with what its loops pay written in. Nothing has run.
@@ -129,6 +163,12 @@ impl FilterCode {
     pub(super) fn into_module(self) -> Module {
         self.module
     }
+
+    /// The module as read, for a test to translate.
+    #[cfg(test)]
+    pub(crate) fn module(&self) -> &Module {
+        &self.module
+    }
 }
 
 /// `work` on a stack that parsing or compiling what a file holds can't run out of: a stack
@@ -145,6 +185,19 @@ pub fn read_filter(text: &str, keys: &[String]) -> Result<FilterCode, String> {
     }
     let (text, keys) = (text.to_owned(), keys.to_vec());
     on_a_big_stack(move || read(&text, &keys, &FILTER)).unwrap_or_else(|| Err("reading it panicked".to_owned()))
+}
+
+/// Reads `text`, a filter layer's filter's code, for a filter whose values are `keys`, in the
+/// manifest's order, as [`read_filter`] reads a filter's. It is run with an eighth of the budget a
+/// filter on a layer has for its loops.
+pub fn read_layer_filter(text: &str, keys: &[String]) -> Result<FilterCode, String> {
+    read_kind(text, &LAYER_FILTER, keys)
+}
+
+/// Reads `text`, the code of a filter layer's filter with an editor (interface 18), as
+/// [`read_layer_filter`] does: given `table(row, x)` too, what the editor set.
+pub fn read_layer_table_filter(text: &str, keys: &[String]) -> Result<FilterCode, String> {
+    read_kind(text, &LAYER_TABLE_FILTER, keys)
 }
 
 /// Reads `text`, code of `kind` given the values of `keys` (none for a kind given none), as
@@ -175,7 +228,7 @@ fn joined(text: &str, keys: &[String], kind: &Kind) -> String {
         .template
         .replace("/*VALUES*/", &fields)
         .replace("/*READ*/", &read)
-        .replace("/*BUDGET*/", &BUDGET.to_string());
+        .replace("/*BUDGET*/", &kind.budget.to_string());
     format!("{template}\n{text}\n")
 }
 
@@ -277,7 +330,7 @@ fn read(text: &str, keys: &[String], kind: &Kind) -> Result<FilterCode, String> 
     let loops = module.functions.iter().any(|(_, function)| has_a_loop(&function.body));
     pay_in_loops(&mut module, &costs).ok_or("the template has no budget")?;
     validate(&module, &whole)?;
-    Ok(FilterCode { module, worst: straight + if loops { BUDGET } else { 0 }, loops })
+    Ok(FilterCode { module, worst: straight + if loops { kind.budget } else { 0 }, loops })
 }
 
 fn validate(module: &Module, text: &str) -> Result<(), String> {
@@ -513,6 +566,25 @@ pub struct FilterProgram {
     loops: bool,
 }
 
+impl FilterProgram {
+    /// The most a pixel can cost.
+    pub fn worst(&self) -> u64 {
+        self.worst
+    }
+
+    pub(super) fn draw_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.draw
+    }
+
+    pub(super) fn probe_pipeline(&self) -> &wgpu::RenderPipeline {
+        &self.probe
+    }
+
+    pub(super) fn probe_target(&self) -> &wgpu::Texture {
+        &self.probe_target
+    }
+}
+
 /// How a filter's draw went.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FilterRun {
@@ -578,7 +650,7 @@ impl Gpu {
 }
 
 /// How many rows of a canvas `width` across go in a piece, for a filter at `worst` a pixel.
-fn rows_at_once(width: u32, worst: u64) -> u32 {
+pub(super) fn rows_at_once(width: u32, worst: u64) -> u32 {
     let row = u64::from(width.max(1)).saturating_mul(worst.max(1));
     u32::try_from(WORK_AT_ONCE / row).unwrap_or(u32::MAX).max(1)
 }
@@ -650,7 +722,8 @@ impl Canvas {
         };
         // waits for what was sent; whether it finished and the device stands
         let finished = |gpu: &Gpu| -> Result<(), FilterRun> {
-            let waited = gpu.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(PIECE_LIMIT) });
+            let waited =
+                crate::poll(&gpu.device, wgpu::PollType::Wait { submission_index: None, timeout: Some(PIECE_LIMIT) });
             if gpu.is_lost() {
                 return Err(FilterRun::Lost);
             }
@@ -659,7 +732,7 @@ impl Canvas {
 
         // what came before goes first, and however long that takes isn't held against the filter
         self.send_now(gpu, encoder, uniforms);
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = gpu.wait();
         let mut run = || -> Result<Duration, FilterRun> {
             if gpu.is_lost() {
                 return Err(FilterRun::Lost);
@@ -932,6 +1005,8 @@ mod tests {
         assert!(cost.unwrap() > 400, "{cost:?}");
     }
 
+    // Apple's systems have no OpenGL, so no GLSL writer to read it from
+    #[cfg(not(target_vendor = "apple"))]
     #[test]
     fn the_same_code_goes_to_each_backend_with_its_loops_paying() {
         use naga::back::glsl;

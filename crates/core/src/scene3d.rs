@@ -397,7 +397,7 @@ pub fn unpack_model_artwork(path: String, dir: String) -> bool {
         let bytes = zip.read(name).ok_or(())?;
         let to = root.join(name);
         to.parent().map_or(Ok(()), fs::create_dir_all).map_err(|_| ())?;
-        fs::write(to, bytes).map_err(|_| ())
+        crate::storage::write(to, bytes).map_err(|_| ())
     });
     if wrote.is_err() {
         let _ = fs::remove_dir_all(root);
@@ -1864,7 +1864,9 @@ impl CanvasSession {
             zip.add(file, png);
         }
         let bytes = zip.finish();
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("exporting the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("exporting the model", e))
+        })
     }
 
     /// The artwork, saved to `dir` first, as one file at `path` that comes back whole in another
@@ -1876,7 +1878,7 @@ impl CanvasSession {
         let mut zip = procraft_engine::zip::ZipWriter::new();
         zip_folder(&mut zip, root, root).map_err(|e| file_error("saving", e))?;
         let bytes = zip.finish();
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("saving", e)))
+        write_atomically(Path::new(&path), |p| crate::storage::write(p, &bytes).map_err(|e| file_error("saving", e)))
     }
 
     /// Writes the model as a glTF binary at `path`, for a viewer that shows it in the room: as
@@ -1910,7 +1912,9 @@ impl CanvasSession {
             })
             .collect();
         let bytes = procraft_engine::gltf::write_glb(&mesh, &parts);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("exporting the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("exporting the model", e))
+        })
     }
 
     /// Writes the model as a USDZ package at `path`: the mesh with a preview-surface material
@@ -1918,7 +1922,9 @@ impl CanvasSession {
     pub fn export_model_usdz(&self, path: String) -> Result<(), MobileError> {
         let files = self.model_files()?;
         let bytes = procraft_engine::usd::write_usdz(&files.mesh, &files.images);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("exporting the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("exporting the model", e))
+        })
     }
 }
 
@@ -1940,7 +1946,9 @@ impl CanvasSession {
                 .chain(images.occlusion.iter().map(|(_, png)| ("AmbientOcclusion", png)));
             for (channel, png) in named {
                 let path = dir.join(format!("{name}-{channel}.png"));
-                write_atomically(&path, |p| fs::write(p, png).map_err(|e| file_error("exporting the textures", e)))?;
+                write_atomically(&path, |p| {
+                    crate::storage::write(p, png).map_err(|e| file_error("exporting the textures", e))
+                })?;
                 out.push(path.to_string_lossy().into_owned());
             }
         }
@@ -1952,22 +1960,28 @@ impl CanvasSession {
     pub fn export_model_render(&self, path: String, transparent: bool) -> Result<(), MobileError> {
         let (w, h, rgba) = self.model_picture(transparent)?;
         let png = crate::project::rgba_png(w, h, &rgba);
-        write_atomically(Path::new(&path), |p| fs::write(p, &png).map_err(|e| file_error("rendering the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &png).map_err(|e| file_error("rendering the model", e))
+        })
     }
 
     /// The model as the window shows it, on the canvas's surround, as a JPEG at `path`.
     pub fn export_model_jpeg(&self, path: String) -> Result<(), MobileError> {
         let (w, h, rgba) = self.model_picture(false)?;
-        let rgb = crate::project::onto_white(&crate::project::straight_alpha(&rgba));
+        let rgb = crate::project::onto_white(&crate::project::straight_alpha(&rgba))?;
         let bytes = procraft_engine::jpeg::encode(&rgb, w, h, crate::project::JPEG_QUALITY);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("rendering the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("rendering the model", e))
+        })
     }
 
     /// The model as the window shows it, on the canvas's surround, as a TIFF at `path`.
     pub fn export_model_tiff(&self, path: String) -> Result<(), MobileError> {
         let (w, h, rgba) = self.model_picture(false)?;
         let bytes = procraft_engine::formats::tiff(w, h, 72.0, &[], &rgba);
-        write_atomically(Path::new(&path), |p| fs::write(p, &bytes).map_err(|e| file_error("rendering the model", e)))
+        write_atomically(Path::new(&path), |p| {
+            crate::storage::write(p, &bytes).map_err(|e| file_error("rendering the model", e))
+        })
     }
 }
 
@@ -2092,7 +2106,7 @@ impl CanvasSession {
             self.exported(0.95 * (i + 1) as f32 / count as f32);
         }
         let bytes = gif.ok_or_else(|| file_error("saving", "there are no frames"))?.finish();
-        write_atomically(Path::new(&path), |f| fs::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
+        write_atomically(Path::new(&path), |f| crate::storage::write(f, &bytes).map_err(|e| file_error("saving", e)))?;
         self.exported(1.0);
         Ok(())
     }
@@ -2338,7 +2352,8 @@ fn to_waiting(gpu: &Gpu, set: &mut TextureSet) {
 /// A texture set's canvas becoming the session's: paged as the session's canvases are, its brush
 /// images made now so the first stroke doesn't wait for them.
 fn to_session(gpu: &Gpu, canvas: &mut Canvas) {
-    canvas.set_resident_budget(crate::layers::resident_budget());
+    let (w, h) = canvas.size();
+    canvas.set_resident_budget(crate::layers::canvas_budget(w, h));
     canvas.prepare_brush_images(gpu);
 }
 
@@ -2532,13 +2547,15 @@ impl State {
 pub(crate) fn write_model(saved: &mut SavedSets, dir: &Path, model: &ModelSnapshot) -> Result<(), MobileError> {
     let file = dir.join(format!("model.{}", model.source.extension));
     if !file.exists() {
-        write_atomically(&file, |p| fs::write(p, &model.source.bytes).map_err(|e| file_error("saving the model", e)))?;
+        write_atomically(&file, |p| {
+            crate::storage::write(p, &model.source.bytes).map_err(|e| file_error("saving the model", e))
+        })?;
     }
     let mtl = dir.join("model.mtl");
     if let Some(text) = model.source.mtl.as_ref()
         && !mtl.exists()
     {
-        write_atomically(&mtl, |p| fs::write(p, text).map_err(|e| file_error("saving the model", e)))?;
+        write_atomically(&mtl, |p| crate::storage::write(p, text).map_err(|e| file_error("saving the model", e)))?;
     }
     let side = model.saved.texture_size;
     // the maps, written once: they don't change
@@ -3164,10 +3181,10 @@ impl State {
         self.strokes = self.strokes.wrapping_add(1);
         self.info.strokes = self.info.strokes.saturating_add(1);
         let seed = self.strokes.wrapping_mul(0x9e37_79b9);
-        let mut builder = StrokeBuilder::with_seed(brush.clone(), diameter, pointer.into(), seed)
-            .with_input(self.input.clone())
-            .scaled(zoom)
-            .seen_at(1.0);
+        let builder =
+            StrokeBuilder::with_seed(brush.clone(), diameter, pointer.into(), seed).with_input(self.input.clone());
+        // (its samples in window pixels)
+        let mut builder = self.pressing.applied(builder.scaled(zoom).seen_at(1.0), self.display_scale);
         // a brush engine's, drawn by it (on the screen's canvas, where it gets its tips)
         let engine = self.hooks.clone().filter(|_| brush.engine.is_some()).map(|hooks| {
             let starting = crate::plugin_brushes::Starting {
@@ -3227,8 +3244,16 @@ impl State {
         // the screen's canvas holds its own copies of the brush's shape and grain
         screen.use_sources(gpu, &mut style, &brush);
         if let Some((hooks, starting)) = engine
-            && let Some(o) =
-                crate::plugin_brushes::engine_stroke(&hooks, &brush, style.tool, starting, (false, false), screen, gpu)
+            && let Some(o) = crate::plugin_brushes::engine_stroke(
+                &hooks,
+                &brush,
+                style.tool,
+                starting,
+                (false, false),
+                screen,
+                gpu,
+                false,
+            )
         {
             style = o.style;
             builder = builder.with_engine(Box::new(o.first));
@@ -4076,6 +4101,50 @@ mod tests {
         assert!(distance(&s) < far, "{} from {far}", distance(&s));
         frame(&s, 200);
         assert_eq!(painted(&s), kept);
+    }
+
+    #[test]
+    fn a_mouse_following_touch_turns_a_model_as_a_finger_does() {
+        let s = CanvasSession::open_model(CUBE.into(), "cube.obj".into(), Vec::new(), "Cube".into(), 128).unwrap();
+        if !shown(&s) {
+            return;
+        }
+        frame(&s, 200);
+        let orbit = |s: &CanvasSession| s.shared.lock().scene.as_ref().and_then(|c| c.view.as_ref()).map(|v| v.orbit);
+        let drag = |s: &CanvasSession, t: f64| {
+            s.touch_down(1, PointerKind::Mouse, vec![sample(70.0, 100.0, t)]);
+            frame(s, 200);
+            s.touch_move(1, (1..16).map(|i| sample(70.0 + i as f32 * 4.0, 100.0, t + f64::from(i) * 8.0)).collect());
+            frame(s, 200);
+            let out = s.touch_up(1, vec![sample(134.0, 100.0, t + 140.0)]);
+            frame(s, 200);
+            out
+        };
+        // a tablet's: the mouse turns it, painting nothing
+        s.set_touch_settings(crate::TouchSettings { pointer_follows_touch: true, ..Default::default() });
+        let before = orbit(&s);
+        let out = drag(&s, 0.0);
+        assert!(!out.contains(&crate::TouchCommand::StrokeEnded), "{out:?}");
+        assert_ne!(orbit(&s), before);
+        assert_eq!(painted(&s), 0);
+        // set to paint the model with a finger, it paints it as a finger would
+        s.set_touch_settings(crate::TouchSettings {
+            pointer_follows_touch: true,
+            model_finger_paint: true,
+            ..Default::default()
+        });
+        let turned = orbit(&s);
+        drag(&s, 1000.0);
+        assert_eq!(orbit(&s), turned);
+        let kept = painted(&s);
+        assert!(kept > 100, "{kept}");
+        // a desktop's: the mouse paints it as the pen does
+        s.set_touch_settings(crate::TouchSettings::default());
+        let _ = s.undo();
+        assert_eq!(painted(&s), 0);
+        drag(&s, 2000.0);
+        assert_eq!(orbit(&s), turned);
+        assert!(painted(&s) > 100);
     }
 
     /// Two squares facing the camera side by side, Left and Right, one material: Left on the left
@@ -5841,9 +5910,324 @@ f 1/1 2/2",
             let _ = std::fs::remove_dir_all(&dir);
             s.save(dir.to_string_lossy().into_owned()).unwrap();
             let opened = CanvasSession::open(dir.to_string_lossy().into_owned()).unwrap();
-            let _ = std::fs::remove_dir_all(&dir);
             assert!(shown(&opened));
+            let _ = std::fs::remove_dir_all(&dir);
             assert!(all(&opened) == end, "seed {seed}: reopened, after {done:?}");
         }
+    }
+
+    /// Models of every awkward shape (no texture coordinates, none of a triangle's area, a flat
+    /// one, ones far too big or small, coordinates that are no numbers, texture coordinates far
+    /// outside the texture, several materials with no file for them) opened and then turned,
+    /// pinched, held, painted with the pen, a finger, the mouse and the eraser, on each channel and
+    /// texture set, undone, redone and saved, a frame drawn after each: on this GPU, and as an old
+    /// GPU's. Each either opens and takes all of it, or is refused as it opens; none fails.
+    #[test]
+    fn models_of_every_shape_take_turning_and_painting_without_failing() {
+        const SQUARE: &str = "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n";
+        let models: Vec<(&str, String)> = vec![
+            ("cube", CUBE.to_owned()),
+            ("no texture coordinates", "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nf 1 2 3 4\n".to_owned()),
+            ("normals", format!("{SQUARE}vn 0 0 1\nf 1/1/1 2/2/1 3/3/1 4/4/1\n")),
+            ("facing away", format!("{SQUARE}f 4/4 3/3 2/2 1/1\n")),
+            ("one point", "v 0 0 0\nv 0 0 0\nv 0 0 0\nvt 0 0\nvt 0 0\nvt 0 0\nf 1/1 2/2 3/3\n".to_owned()),
+            ("a line", "v 0 0 0\nv 1 0 0\nv 2 0 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n".to_owned()),
+            (
+                "huge",
+                "v -1e30 -1e30 0\nv 1e30 -1e30 0\nv 1e30 1e30 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n".to_owned(),
+            ),
+            ("past f32", "v -1e39 -1 0\nv 1e39 -1 0\nv 1 1 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n".to_owned()),
+            (
+                "tiny",
+                "v -1e-30 -1e-30 0\nv 1e-30 -1e-30 0\nv 1e-30 1e-30 0\nvt 0 0\nvt 1 0\nvt 1 1\nf 1/1 2/2 3/3\n"
+                    .to_owned(),
+            ),
+            ("no numbers", format!("{SQUARE}v nan inf 0\nvt nan inf\nf 1/1 2/2 3/3 4/4\nf 5/5 1/1 2/2\n")),
+            (
+                "far texture coordinates",
+                "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nvt -3 -2\nvt 5 -2\nvt 5 7\nvt -3 7\nf 1/1 2/2 3/3 4/4\n"
+                    .to_owned(),
+            ),
+            (
+                "huge texture coordinates",
+                "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nvt -1e30 0\nvt 1e30 0\nvt 0 1e30\nf 1/1 2/2 3/3\n".to_owned(),
+            ),
+            (
+                "two materials",
+                format!("{SQUARE}v -1 -1 1\nv 1 -1 1\nv 1 1 1\nusemtl a\nf 1/1 2/2 3/3 4/4\nusemtl b\nf 5/1 6/2 7/3\n"),
+            ),
+            ("no faces", "v 0 0 0\nv 1 0 0\nv 0 1 0\n".to_owned()),
+            ("nothing", String::new()),
+        ];
+        let (Ok(_), Ok(_)) = (Gpu::headless(), Gpu::headless_old()) else { return eprintln!("skipped: no GPU") };
+        let mut failed = Vec::new();
+        for old in [false, true] {
+            for (name, text) in &models {
+                for side in [64, 2048].into_iter().filter(|&side| side == 64 || *name == "cube") {
+                    let gpu = if old { Gpu::headless_old() } else { Gpu::headless() }.unwrap();
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        work_a_model(text, gpu.clone(), side);
+                    }));
+                    let errors = gpu.errors();
+                    let what = format!("{name} at {side}{}", if old { ", old GPU" } else { "" });
+                    if let Err(panic) = run {
+                        failed.push(format!("{what}: {}", procraft_gpu::panic_message(panic.as_ref())));
+                    } else if errors > 0 {
+                        failed.push(format!("{what}: {errors} GPU errors"));
+                    }
+                }
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    /// `text`, an OBJ, opened with `side` texture sets on `gpu` and put through what a hand does
+    /// to a model (see `models_of_every_shape_take_turning_and_painting_without_failing`).
+    fn work_a_model(text: &str, gpu: Gpu, side: u32) {
+        let Ok(s) = CanvasSession::open_model(text.into(), "model.obj".into(), Vec::new(), "Model".into(), side) else {
+            return;
+        };
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (200, 200);
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+        }
+        let draw = |s: &CanvasSession| {
+            let mut guard = s.shared.lock();
+            let st = &mut *guard;
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let target = st.gpu.as_ref().unwrap().device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("test frame"),
+                size: wgpu::Extent3d { width: 200, height: 200, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            st.render_scene(&view, format, (200, 200), None);
+        };
+        let settings =
+            crate::TouchSettings { hold: Some(crate::GestureAction::Eyedropper), ..crate::TouchSettings::default() };
+        s.set_touch_settings(settings.clone());
+        draw(&s);
+        let mut t = 0.0;
+        // a finger turns it, a long way
+        s.touch_down(1, PointerKind::Finger, vec![sample(70.0, 100.0, t)]);
+        for i in 1..12 {
+            t += 16.0;
+            s.touch_move(1, vec![sample(70.0 + i as f32 * 25.0, 100.0 + i as f32 * 9.0, t)]);
+            draw(&s);
+        }
+        t += 16.0;
+        s.touch_up(1, vec![sample(345.0, 199.0, t)]);
+        s.turn_model(5000.0, -3000.0);
+        draw(&s);
+        // two fingers pinch it nearer, then far away, and move it
+        for (from, to) in [(40.0, 5.0), (5.0, 400.0)] {
+            t += 100.0;
+            s.touch_down(2, PointerKind::Finger, vec![sample(100.0 - from, 100.0, t)]);
+            t += 5.0;
+            s.touch_down(3, PointerKind::Finger, vec![sample(100.0 + from, 100.0, t)]);
+            for i in 1..=8 {
+                t += 16.0;
+                let gap = from + (to - from) * i as f32 / 8.0;
+                s.touch_moves(vec![
+                    crate::touch::TouchMove { id: 2, samples: vec![sample(100.0 - gap, 100.0 + i as f32, t)] },
+                    crate::touch::TouchMove { id: 3, samples: vec![sample(100.0 + gap, 100.0 + i as f32, t)] },
+                ]);
+                draw(&s);
+            }
+            t += 16.0;
+            s.touch_up(3, vec![sample(100.0 + to, 108.0, t)]);
+            s.touch_up(2, vec![sample(100.0 - to, 108.0, t)]);
+        }
+        draw(&s);
+        // a finger held still picks a colour off it
+        t += 100.0;
+        s.touch_down(4, PointerKind::Finger, vec![sample(100.0, 100.0, t)]);
+        t += settings.hold_ms + 10.0;
+        for c in s.touch_tick(t) {
+            if let crate::TouchCommand::Pick { x, y } = c {
+                let _ = s.pick(x, y, 11);
+            }
+        }
+        t += 16.0;
+        s.touch_up(4, vec![sample(100.0, 100.0, t)]);
+        draw(&s);
+        // painted across the middle by the pen (pausing long enough to snap a shape), a finger set
+        // to paint the model, the mouse, and the pen's eraser end, on each channel
+        let across = |s: &CanvasSession, id: u64, kind: PointerKind, t: &mut f64| {
+            s.touch_down(id, kind, vec![sample(20.0, 100.0, *t)]);
+            draw(s);
+            for i in 1..20 {
+                *t += 8.0;
+                s.touch_move(id, vec![sample(20.0 + i as f32 * 8.0, 100.0 + (i % 5) as f32 * 4.0, *t)]);
+                if i == 10 {
+                    *t += 1000.0;
+                    let _ = s.touch_tick(*t);
+                }
+                draw(s);
+            }
+            *t += 8.0;
+            s.touch_up(id, vec![sample(180.0, 100.0, *t)]);
+            draw(s);
+        };
+        // (a panel open over half of it, frosted)
+        s.shared.lock().backdrops = vec![[0.0, 0.0, 100.0, 200.0, 0.0, 1.0]];
+        for channel in 0..3 {
+            s.set_model_channel(channel);
+            across(&s, 5, PointerKind::Stylus, &mut t);
+            across(&s, 6, PointerKind::Mouse, &mut t);
+            s.set_touch_settings(crate::TouchSettings { model_finger_paint: true, ..settings.clone() });
+            across(&s, 7, PointerKind::Finger, &mut t);
+            s.set_touch_settings(settings.clone());
+            across(&s, 8, PointerKind::StylusEraser, &mut t);
+            s.set_tool(crate::ToolKind::Smudge);
+            across(&s, 9, PointerKind::Stylus, &mut t);
+            s.set_tool(crate::ToolKind::Paint);
+        }
+        s.set_model_channel(0);
+        // on each texture set
+        let sets = s.model_info().map_or(0, |info| info.texture_sets.len());
+        for set in 0..sets {
+            s.choose_texture_set(set as u32);
+            draw(&s);
+            across(&s, 10, PointerKind::Stylus, &mut t);
+        }
+        for _ in 0..4 {
+            let _ = s.undo();
+            draw(&s);
+        }
+        for _ in 0..2 {
+            let _ = s.redo();
+            draw(&s);
+        }
+        // saved (as the autosave does) and opened again
+        let dir = std::env::temp_dir().join(format!("procraft-awkward-model-{}-{side}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let gpu = s.shared.lock().gpu.clone();
+        if s.save(dir.to_string_lossy().into_owned()).is_ok()
+            && let (Ok(opened), Some(gpu)) = (CanvasSession::open(dir.to_string_lossy().into_owned()), gpu)
+        {
+            // and turned and painted there too
+            {
+                let mut st = opened.shared.lock();
+                st.window_size = (200, 200);
+                st.gpu = Some(gpu);
+                st.ensure_canvas();
+            }
+            opened.set_touch_settings(settings.clone());
+            draw(&opened);
+            t += 100.0;
+            opened.touch_down(1, PointerKind::Finger, vec![sample(70.0, 100.0, t)]);
+            t += 16.0;
+            opened.touch_move(1, vec![sample(150.0, 130.0, t)]);
+            draw(&opened);
+            t += 16.0;
+            opened.touch_up(1, vec![sample(150.0, 130.0, t)]);
+            across(&opened, 11, PointerKind::Stylus, &mut t);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a model holds on the GPU as it is turned and painted (two texture sets at the default
+    /// size, in a window of a tablet's size): turning it a hundred frames takes nothing more after
+    /// the first few (a frame left anything behind, a tablet would soon run out as a finger turns
+    /// it); the first stroke makes the screen's canvas and the roughness and metalness it paints,
+    /// and later strokes keep only their undo steps. How much each takes is printed.
+    #[test]
+    fn turning_a_model_holds_no_more_gpu_memory_and_painting_it_little() {
+        let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        let held = || {
+            gpu.flush();
+            gpu.device.generate_allocator_report().map_or(0, |r| r.total_allocated_bytes)
+        };
+        if held() == 0 {
+            return eprintln!("skipped: the device can't say what it holds");
+        }
+        const TWO_PARTS: &str = "v -1 -1 0\nv 1 -1 0\nv 1 1 0\nv -1 1 0\nv -1 -1 1\nv 1 -1 1\nv 1 1 1\n\
+                                 vt 0 0\nvt 1 0\nvt 1 1\nvt 0 1\n\
+                                 usemtl a\nf 1/1 2/2 3/3 4/4\nusemtl b\nf 5/1 6/2 7/3\n";
+        let s = CanvasSession::open_model(TWO_PARTS.into(), "two.obj".into(), Vec::new(), "Two".into(), 0).unwrap();
+        let window = (1600u32, 1000u32);
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("test window"),
+            size: wgpu::Extent3d { width: window.0, height: window.1, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        {
+            let mut st = s.shared.lock();
+            st.window_size = window;
+            st.gpu = Some(gpu.clone());
+            st.ensure_canvas();
+        }
+        let draw = || s.shared.lock().render_scene(&view, format, window, None);
+        let mut t = 0.0;
+        let turn = |frames: usize, t: &mut f64| {
+            *t += 100.0;
+            s.touch_down(1, PointerKind::Finger, vec![sample(600.0, 500.0, *t)]);
+            for i in 0..frames {
+                *t += 16.0;
+                s.touch_move(1, vec![sample(600.0 + (i % 40) as f32 * 10.0, 500.0 + (i % 7) as f32 * 3.0, *t)]);
+                draw();
+            }
+            s.touch_up(1, vec![sample(600.0, 500.0, *t + 16.0)]);
+        };
+        let stroke = |t: &mut f64| {
+            *t += 100.0;
+            s.touch_down(2, PointerKind::Stylus, vec![sample(500.0, 500.0, *t)]);
+            for i in 1..30 {
+                *t += 8.0;
+                s.touch_move(2, vec![sample(500.0 + i as f32 * 8.0, 500.0, *t)]);
+                if i % 5 == 0 {
+                    draw();
+                }
+            }
+            s.touch_up(2, vec![sample(740.0, 500.0, *t + 8.0)]);
+            draw();
+        };
+        let mb = |b: u64| b as f64 / 1e6;
+        let more = |after: u64, before: u64| (after as f64 - before as f64) / 1e6;
+        draw();
+        let opened = held();
+        turn(10, &mut t);
+        let settled = held();
+        turn(100, &mut t);
+        let turned = held();
+        stroke(&mut t);
+        let first_stroke = held();
+        turn(100, &mut t);
+        let turned_after = held();
+        for _ in 0..5 {
+            stroke(&mut t);
+        }
+        let five_more = held();
+        eprintln!(
+            "model on the GPU: opened {:.1} MB, turned {:+.1}, then 100 frames {:+.1}; first stroke {:+.1}, 100 frames {:+.1}, five strokes {:+.1}",
+            mb(opened),
+            more(settled, opened),
+            more(turned, settled),
+            more(first_stroke, turned),
+            more(turned_after, first_stroke),
+            more(five_more, turned_after),
+        );
+        assert!(turned <= settled, "turning held {:.1} MB more", more(turned, settled));
+        assert!(
+            turned_after <= first_stroke,
+            "turning after a stroke held {:.1} MB more",
+            more(turned_after, first_stroke)
+        );
+        assert_eq!(gpu.errors(), 0);
     }
 }

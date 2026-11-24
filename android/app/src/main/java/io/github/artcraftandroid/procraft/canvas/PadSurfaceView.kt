@@ -84,8 +84,8 @@ class PadSurfaceView(context: Context, private val vm: CanvasViewModel) : Surfac
                 strokePointer = e.getPointerId(0)
                 // the first stroke of one's own takes the sample scribble's place
                 pad.beginOwnStroke()
-                val kind = kindOf(e)
-                if (kind != PointerKind.FINGER) pad.setPenTiltKnown(tiltKnown(e))
+                val kind = pointerKindOf(e, 0)
+                if (kind == PointerKind.STYLUS || kind == PointerKind.STYLUS_ERASER) pad.setPenTiltKnown(tiltKnown(e))
                 pad.strokeBegin(kind, samples(e, 0))
             }
             MotionEvent.ACTION_MOVE -> {
@@ -99,12 +99,6 @@ class PadSurfaceView(context: Context, private val vm: CanvasViewModel) : Surfac
             MotionEvent.ACTION_CANCEL -> pad.strokeCancel()
         }
         return true
-    }
-
-    private fun kindOf(e: MotionEvent): PointerKind = when (e.getToolType(0)) {
-        MotionEvent.TOOL_TYPE_STYLUS -> PointerKind.STYLUS
-        MotionEvent.TOOL_TYPE_ERASER -> PointerKind.STYLUS_ERASER
-        else -> PointerKind.FINGER
     }
 
     private fun samples(e: MotionEvent, i: Int): List<PenSample> {

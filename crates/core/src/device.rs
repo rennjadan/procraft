@@ -8,13 +8,16 @@
 //! canvas first shows on it. A start that finds a try never finished begins from the next
 //! backend; one that drew a canvas is kept for good, until the app or the system is updated: new
 //! shaders to compile or a new driver can crash where the old ones drew, and a backend kept for
-//! good would then crash every start.
+//! good would then crash every start. A driver that crashes the app later, once drawing, is told
+//! from how the last runs ended (see [`driver_crashes`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use procraft_gpu::Gpu;
+
+mod driver_crashes;
 
 static DEVICE: Mutex<Option<Gpu>> = Mutex::new(None);
 
@@ -67,9 +70,17 @@ pub(crate) fn available_in(meminfo: &str) -> Option<u64> {
 /// the app and system it is kept for (see [`set_gpu_record_folder`]); none, none kept.
 static RECORD_FOLDER: Mutex<Option<(PathBuf, String)>> = Mutex::new(None);
 
-/// The record's file in [`RECORD_FOLDER`]: "<backend> trying|made|drew", and on a second line the
-/// build that wrote it.
+/// The record's file in [`RECORD_FOLDER`]: "<backend> trying|made|drew", on a second line the
+/// build that wrote it, and on a third what its GPU drivers' crashes came to (see
+/// [`driver_crashes`]), once one has.
 pub(crate) const RECORD: &str = "gpu-start.txt";
+
+/// Held while the record is read and written again, so that two threads' changes don't cross.
+static WRITING: Mutex<()> = Mutex::new(());
+
+fn writing() -> MutexGuard<'static, ()> {
+    WRITING.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Whether a canvas has shown in this run (so nothing is at risk any more).
 #[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
@@ -127,15 +138,18 @@ pub fn set_gpu_record_folder(dir: String, build: String) {
 
 /// The log, to Android's (tag "procraft") and to the app's log file once that has begun (see
 /// `app_log`), with a panic's message and place in it (the platform drops what the standard error
-/// says); once.
+/// says); once. On the iPad, to the file alone: the app's share of the system's log is its own.
 pub(crate) fn start_log() {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     {
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| {
-            crate::app_log::install(android_logger::AndroidLogger::new(
+            #[cfg(target_os = "android")]
+            crate::app_log::install(Some(Box::new(android_logger::AndroidLogger::new(
                 android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("procraft"),
-            ));
+            ))));
+            #[cfg(target_os = "ios")]
+            crate::app_log::install(None);
             let before = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |info| {
                 log::error!("{info}");
@@ -146,9 +160,10 @@ pub(crate) fn start_log() {
 }
 
 /// The backend to start from: the next one after a try that never finished (see the module's
-/// note), else the one used last.
+/// note), else the one used last; OpenGL ES, not Vulkan, where Vulkan's driver crashed the app
+/// (see [`start_in`]).
 pub(crate) fn first_backend() -> usize {
-    record().map_or(0, |(dir, _)| start_in(&dir, Gpu::backend_count()))
+    record().map_or(0, |(dir, _)| start_in(&dir, &Gpu::backends()))
 }
 
 /// Backend `backend` is about to be tried.
@@ -235,31 +250,61 @@ fn note(backend: usize, stage: Stage) {
 /// Records in `dir`, for `build`, that `backend` got to `stage`, unless it has drawn already in
 /// the same build.
 fn note_in(dir: &Path, build: &str, backend: usize, stage: Stage) {
+    let _writing = writing();
     let path = dir.join(RECORD);
     let saved = std::fs::read_to_string(&path).unwrap_or_default();
     let build = build.trim();
     if read(&saved) == Some((backend, Stage::Drew)) && built_by(&saved) == build {
         return;
     }
-    let text = if build.is_empty() {
-        format!("{backend} {}", stage.word())
+    write_record(&path, &format!("{backend} {}", stage.word()), build, after_build(&saved));
+}
+
+/// The record's lines after the build's (what its drivers' crashes came to), trimmed.
+fn after_build(saved: &str) -> &str {
+    saved.splitn(3, '\n').nth(2).map_or("", str::trim)
+}
+
+/// Writes the record at `path` whole: its `first` line, the `build` and the lines after (`rest`),
+/// leaving out what is empty at its end.
+fn write_record(path: &Path, first: &str, build: &str, rest: &str) {
+    let text = if !rest.is_empty() {
+        format!("{first}\n{build}\n{rest}")
+    } else if !build.is_empty() {
+        format!("{first}\n{build}")
     } else {
-        format!("{backend} {}\n{build}", stage.word())
+        first.to_owned()
     };
-    let written = crate::project::write_atomically(&path, |tmp| {
-        std::fs::write(tmp, &text).map_err(|e| crate::project::file_error("the GPU record", e))
+    let written = crate::project::write_atomically(path, |tmp| {
+        crate::storage::write(tmp, &text).map_err(|e| crate::project::file_error("the GPU record", e))
     });
     if let Err(e) = written {
         log::warn!("{e}");
     }
 }
 
-/// The backend to start from, of `count`, by the record in `dir`.
-fn start_in(dir: &Path, count: usize) -> usize {
+/// The backend to start from, of those in `order`, by the record in `dir`. Where Vulkan's driver
+/// crashed the app (and wasn't settled on as the one crashing less, see [`driver_crashes`]), the
+/// GPU is told so, and a start the record leaves on Vulkan, there after OpenGL ES failed with an
+/// error, is on OpenGL ES (a try that never finished still moves on).
+fn start_in(dir: &Path, order: &[procraft_gpu::wgpu::Backends]) -> usize {
+    use procraft_gpu::wgpu::Backends;
     let saved = std::fs::read_to_string(dir.join(RECORD)).unwrap_or_default();
-    let start = next_start(&saved, count);
-    if let Some((backend, Stage::Trying)) = read(&saved) {
+    let mut start = next_start(&saved, order.len());
+    let recorded = read(&saved);
+    if let Some((backend, Stage::Trying)) = recorded {
         log::warn!("graphics backend {backend} never finished its try (the app crashed): starting from {start}");
+    }
+    let crashed = driver_crashes::vulkan_crashed(&saved);
+    procraft_gpu::vulkan_crashed(crashed);
+    let opengl = order.iter().position(|b| *b == Backends::GL);
+    if crashed
+        && !matches!(recorded, Some((_, Stage::Trying)))
+        && order.get(start) == Some(&Backends::VULKAN)
+        && let Some(opengl) = opengl
+    {
+        log::warn!("Vulkan's driver crashed the app on this GPU: starting on OpenGL ES again, not Vulkan");
+        start = opengl;
     }
     start
 }
@@ -277,10 +322,10 @@ fn read(saved: &str) -> Option<(usize, Stage)> {
     Some((backend, stage))
 }
 
-/// The build that wrote the record `saved` (its second line; empty in a record from before builds
-/// were kept, or kept with none).
+/// The build that wrote the record `saved` (its second line alone; empty in a record from before
+/// builds were kept, or kept with none).
 fn built_by(saved: &str) -> &str {
-    saved.split_once('\n').map_or("", |(_, build)| build.trim())
+    saved.lines().nth(1).map_or("", str::trim)
 }
 
 /// The backend to start from, of `count`, after the record `saved`: the next one if its try
@@ -297,6 +342,10 @@ fn next_start(saved: &str, count: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use procraft_gpu::wgpu::Backends;
+
+    /// Android's backends, Vulkan first.
+    const TWO: [Backends; 2] = [Backends::VULKAN, Backends::GL];
 
     #[test]
     fn warming_makes_the_apps_device_once() {
@@ -305,6 +354,17 @@ mod tests {
         warm_gpu();
         let again = kept().clone().unwrap();
         assert!(first.device == again.device);
+    }
+
+    /// An artwork exported from the gallery, never shown, draws on the app's own device (on the
+    /// backend chosen for the machine), not on one made from whichever backend comes first.
+    #[test]
+    fn an_artwork_exported_unseen_draws_on_the_apps_device() {
+        warm_gpu();
+        let Some(app) = kept().clone() else { return eprintln!("skipped: no GPU") };
+        let s = crate::CanvasSession::new(64, 64);
+        assert!(s.prepare_offscreen());
+        assert!(s.shared.lock().gpu.as_ref().is_some_and(|gpu| gpu.device == app.device));
     }
 
     #[test]
@@ -327,23 +387,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("procraft-gpu-record-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let _ = std::fs::remove_file(dir.join(RECORD));
-        assert_eq!(start_in(&dir, 2), 0);
+        assert_eq!(start_in(&dir, &TWO), 0);
         // the first made its device; then crashed before a canvas showed
         note_in(&dir, "", 0, Stage::Trying);
         note_in(&dir, "", 0, Stage::Made);
-        assert_eq!(start_in(&dir, 2), 0);
+        assert_eq!(start_in(&dir, &TWO), 0);
         note_in(&dir, "", 0, Stage::Trying);
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         // the second draws, and stays so
         note_in(&dir, "", 1, Stage::Trying);
         note_in(&dir, "", 1, Stage::Made);
         note_in(&dir, "", 1, Stage::Drew);
         note_in(&dir, "", 1, Stage::Trying);
         assert_eq!(std::fs::read_to_string(dir.join(RECORD)).unwrap(), "1 drew");
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         // a crash on the other, tried since (the one that drew failing with an error): back to it
         note_in(&dir, "", 0, Stage::Trying);
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         // nothing left beside it
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(Result::ok).collect();
         assert_eq!(files.len(), 1);
@@ -365,27 +425,29 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.join(RECORD)).unwrap(), format!("0 drew\n{before}"));
         // in the same build a crash making its device later doesn't count against it
         note_in(&dir, before, 0, Stage::Trying);
-        assert_eq!(start_in(&dir, 2), 0);
+        assert_eq!(start_in(&dir, &TWO), 0);
         // updated, its try counts again: a crash in it (new shaders, a new driver) sends the next
         // start to the next backend, not round to the same crash
         note_in(&dir, after, 0, Stage::Trying);
         assert_eq!(std::fs::read_to_string(dir.join(RECORD)).unwrap(), format!("0 trying\n{after}"));
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         // that one draws, and is kept while the build stays
         note_in(&dir, after, 1, Stage::Trying);
         note_in(&dir, after, 1, Stage::Made);
         note_in(&dir, after, 1, Stage::Drew);
         note_in(&dir, after, 1, Stage::Trying);
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         // the system updated, without a crash: the same backend, drawing as before
         note_in(&dir, later, 1, Stage::Trying);
         note_in(&dir, later, 1, Stage::Made);
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         // a record from before builds were kept (one line) is another build's
         std::fs::write(dir.join(RECORD), "0 drew").unwrap();
         assert_eq!(built_by("0 drew"), "");
+        // the drivers' crashes on a third line aren't the build's
+        assert_eq!(built_by(&format!("0 drew\n{after}\ndriver crashes: vulkan 1")), after);
         note_in(&dir, after, 0, Stage::Trying);
-        assert_eq!(start_in(&dir, 2), 1);
+        assert_eq!(start_in(&dir, &TWO), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

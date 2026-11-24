@@ -326,6 +326,10 @@ impl Brush {
                 self.extra.insert(key.to_owned(), value.round().clamp(0.0, GRAIN_LINEAR_HEIGHT as f32));
             }
             "flow" => self.flow = unit.powf(FLOW_POWER),
+            // a file's jitter goes on past the slider's end (see `stroke::MOST_JITTER`)
+            "jitter_lateral" | "jitter_linear" => {
+                self.extra.insert(key.to_owned(), value.clamp(0.0, crate::stroke::MOST_JITTER));
+            }
             "jitter_size" => self.shape.size_jitter = unit,
             "jitter_opacity" => self.shape.opacity_jitter = unit,
             "pressure_size" => self.pressure_size = both,

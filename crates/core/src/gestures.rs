@@ -277,6 +277,13 @@ pub fn gesture_options(purpose: GesturePurpose) -> Vec<GestureOption> {
             ),
             own("ROTATE", "Rotate with pinch zoom", "Two fingers turn the canvas as they zoom it", true, false),
             own(
+                "LIQUIFY_ROLL",
+                "Turn Liquify with the pen",
+                "Rolling the pen's barrel turns Liquify's twirl",
+                true,
+                false,
+            ),
+            own(
                 "MODEL_FINGER",
                 "3D painting with a finger",
                 "A finger paints a model; with □ held it turns it",
@@ -463,6 +470,7 @@ impl GestureSettings {
             one_finger_pan: pan,
             undo_taps: !general("NO_UNDO"),
             rotate: general("ROTATE"),
+            liquify_roll: general("LIQUIFY_ROLL"),
             model_finger_paint: general("MODEL_FINGER"),
             draw_and_hold: self.is_on(GesturePurpose::Quickshape, "DRAW_HOLD".to_owned()),
             touch: if pan { None } else { action(self.purpose_of(Trigger::Touch)) },
@@ -479,6 +487,11 @@ impl GestureSettings {
             hold_ms: f64::from(self.delay(hold.unwrap_or(GesturePurpose::Eyedropper))) * 1000.0,
             quickshape_ms: f64::from(self.delay(GesturePurpose::Quickshape)) * 1000.0,
             rapid_undo_ms,
+            pointer_follows_touch: false,
+            pen_button_does: None,
+            pen_second_button_does: None,
+            pen_button_runs: None,
+            pen_second_button_runs: None,
         }
     }
 }

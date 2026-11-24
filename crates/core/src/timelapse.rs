@@ -30,6 +30,8 @@ use crate::project::{PackageTimeLapse, file_error, write_atomically};
 pub const TIME_LAPSE_FPS: u32 = 30;
 /// A frame's longest side kept, pixels.
 pub(crate) const FRAME_SIDE: u32 = 1280;
+/// The longest a save (or a frame taken with none drawn) waits for the frames taken to be kept.
+pub(crate) const KEEP_MOST: std::time::Duration = std::time::Duration::from_secs(5);
 const JPEG_QUALITY: u8 = 85;
 /// A package's videos are made again as one rather than be more than this (while every frame is
 /// still a picture to make them of).
@@ -60,6 +62,86 @@ fn noting(artwork: &Path) -> Arc<Mutex<()>> {
     let lock = Arc::new(Mutex::new(()));
     folders.push((key, Arc::downgrade(&lock)));
     lock
+}
+
+/// Keeps the time-lapse frames taken (their pictures' copies started on the GPU) one after
+/// another, in the order taken, on a thread of its own: each picture waited for, made into a JPEG
+/// and written there, so what took it (a frame) never waits for the GPU or the disk. The thread
+/// starts when there is a picture to keep and ends when none is left.
+#[derive(Clone, Default)]
+pub(crate) struct FrameKeeper {
+    inner: Arc<Keeping>,
+}
+
+#[derive(Default)]
+struct Keeping {
+    queue: Mutex<KeepQueue>,
+    kept: parking_lot::Condvar,
+}
+
+#[derive(Default)]
+struct KeepQueue {
+    pictures: std::collections::VecDeque<(Arc<TimeLapse>, procraft_gpu::PendingThumbnail)>,
+    /// The thread is keeping them (one it took from the queue, it may be).
+    running: bool,
+}
+
+impl FrameKeeper {
+    /// `picture` to be kept as `lapse`'s next frame, after those handed over before it.
+    pub(crate) fn keep(&self, lapse: Arc<TimeLapse>, picture: procraft_gpu::PendingThumbnail) {
+        let mut queue = self.inner.queue.lock();
+        queue.pictures.push_back((lapse, picture));
+        if queue.running {
+            return;
+        }
+        queue.running = true;
+        drop(queue);
+        let inner = Arc::clone(&self.inner);
+        let started = std::thread::Builder::new().name("time-lapse".into()).spawn(move || inner.run());
+        if let Err(e) = started {
+            log::error!("keeping time-lapse frames: {e}");
+            let mut queue = self.inner.queue.lock();
+            queue.pictures.clear();
+            queue.running = false;
+            self.inner.kept.notify_all();
+        }
+    }
+
+    /// Waits until every picture handed over is kept, for at most `most`: whether they are.
+    pub(crate) fn settle(&self, most: std::time::Duration) -> bool {
+        let until = std::time::Instant::now() + most;
+        let mut queue = self.inner.queue.lock();
+        while queue.running || !queue.pictures.is_empty() {
+            if self.inner.kept.wait_until(&mut queue, until).timed_out() {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl Keeping {
+    /// Keeps the pictures handed over until none is left.
+    fn run(&self) {
+        loop {
+            let next = {
+                let mut queue = self.queue.lock();
+                let next = queue.pictures.pop_front();
+                if next.is_none() {
+                    queue.running = false;
+                    self.kept.notify_all();
+                }
+                next
+            };
+            let Some((lapse, picture)) = next else { return };
+            match picture.pixels() {
+                Ok(t) => {
+                    lapse.record(t.rgba, t.width, t.height);
+                }
+                Err(e) => log::warn!("a time-lapse frame couldn't be read: {e}"),
+            }
+        }
+    }
 }
 
 /// A video being made is named so, apart from the ones noted, until it is noted.
@@ -144,7 +226,14 @@ pub struct TimeLapse {
     state: Mutex<State>,
     /// A frame or its note couldn't be written (the disk full, say): [`Problem`], as a number.
     problem: std::sync::atomic::AtomicU8,
+    /// When a frame last found the storage full: it records nothing more until a save of the
+    /// artwork works again (there is room), or [`RETRY_FULL`] later.
+    full_at: Mutex<Option<std::time::Instant>>,
 }
+
+/// How long a time-lapse that found the storage full waits before it tries a frame again, if no
+/// save says there is room before (in tests, longer than any test paints).
+const RETRY_FULL: std::time::Duration = std::time::Duration::from_secs(if cfg!(test) { 600 } else { 30 });
 
 /// Where the time-lapse stands with writing: all written, or a write failed and not yet told, or
 /// told (not again until a write works).
@@ -153,6 +242,8 @@ enum Problem {
     Fine = 0,
     Untold = 1,
     Told = 2,
+    /// The storage was full: told as the storage's notice is, once for every write that meets it.
+    UntoldFull = 3,
 }
 
 /// What [`TimeLapse::take_problem`] says.
@@ -193,6 +284,7 @@ impl TimeLapse {
             noting,
             state: Mutex::new(State { count: 0, last: None, taking: None }),
             problem: std::sync::atomic::AtomicU8::new(Problem::Fine as u8),
+            full_at: Mutex::new(None),
         };
         let count = {
             let _noting = lapse.noting.lock();
@@ -221,7 +313,7 @@ impl TimeLapse {
         let json = serde_json::json!({ "resolution": s.resolution, "quality": s.quality, "hevc": s.hevc });
         let written = fs::create_dir_all(&self.dir).map_err(|e| e.to_string()).and_then(|()| {
             write_atomically(&self.dir.join("settings.json"), |p| {
-                fs::write(p, json.to_string()).map_err(|e| file_error("saving", e))
+                crate::storage::write(p, json.to_string()).map_err(|e| file_error("saving", e))
             })
             .map_err(|e| e.to_string())
         });
@@ -243,7 +335,7 @@ impl TimeLapse {
                 _ => Ok(()),
             }
         } else {
-            fs::create_dir_all(&self.dir).and_then(|()| fs::write(&off, b""))
+            fs::create_dir_all(&self.dir).and_then(|()| crate::storage::write(&off, b""))
         };
         if let Err(e) = done {
             log::warn!("switching the time-lapse: {e}");
@@ -291,7 +383,7 @@ impl TimeLapse {
     /// recording, or the picture is the same as the last. True when kept.
     pub fn record(&self, rgba: Vec<u8>, width: u32, height: u32) -> bool {
         let len = (width as usize).saturating_mul(height as usize).saturating_mul(4);
-        if !self.recording() || width == 0 || height == 0 || rgba.len() < len {
+        if !self.recording() || width == 0 || height == 0 || rgba.len() < len || self.waits_for_room() {
             return false;
         }
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -410,7 +502,7 @@ impl TimeLapse {
         // broken frame
         let part = PathBuf::from(format!("{}{PART}", path.to_string_lossy()));
         let written = fs::create_dir_all(&self.dir).map_err(|e| e.to_string()).and_then(|()| {
-            let file = fs::File::create(&part).map_err(|e| e.to_string())?;
+            let file = crate::storage::create(&part).map_err(|e| e.to_string())?;
             let mut out = BufWriter::new(file);
             let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, JPEG_QUALITY);
             picture.write_with_encoder(encoder).map_err(|e| e.to_string())?;
@@ -428,7 +520,14 @@ impl TimeLapse {
             }
             Err(e) => {
                 log::warn!("keeping a time-lapse frame: {e}");
-                self.failed();
+                if crate::storage::says_full(&e) {
+                    // paused: no frame is read or encoded only to be refused
+                    crate::storage::found_full();
+                    *self.full_at.lock() = Some(std::time::Instant::now());
+                    self.failed_as(Problem::UntoldFull);
+                } else {
+                    self.failed();
+                }
                 false
             }
         }
@@ -436,12 +535,30 @@ impl TimeLapse {
 
     /// A write failed: to be told, unless it was and nothing has been written since.
     fn failed(&self) {
+        self.failed_as(Problem::Untold);
+    }
+
+    fn failed_as(&self, problem: Problem) {
         let _ = self.problem.compare_exchange(
             Problem::Fine as u8,
-            Problem::Untold as u8,
+            problem as u8,
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Whether it records nothing for now, the storage full: until a save of the artwork works
+    /// again, or [`RETRY_FULL`] after the last frame found it full, when one more is tried.
+    pub(crate) fn waits_for_room(&self) -> bool {
+        let mut at = self.full_at.lock();
+        match *at {
+            Some(when) if crate::storage::full() && when.elapsed() < RETRY_FULL => true,
+            Some(_) => {
+                *at = None;
+                false
+            }
+            None => false,
+        }
     }
 }
 
@@ -450,13 +567,14 @@ impl TimeLapse {
     /// What to tell, once, when the time-lapse couldn't be written (the disk full, say); none
     /// otherwise, and none again until a write has worked and another failed.
     pub fn take_problem(&self) -> Option<String> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let told = Problem::Told as u8;
+        if self.problem.compare_exchange(Problem::UntoldFull as u8, told, Relaxed, Relaxed).is_ok() {
+            // the storage full is told once, by this or a save, whichever meets it first
+            return crate::storage::tell_full().then(|| crate::storage::NO_ROOM.to_owned());
+        }
         self.problem
-            .compare_exchange(
-                Problem::Untold as u8,
-                Problem::Told as u8,
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-            )
+            .compare_exchange(Problem::Untold as u8, told, Relaxed, Relaxed)
             .is_ok()
             .then(|| PROBLEM_TEXT.to_owned())
     }
@@ -595,8 +713,13 @@ impl TimeLapse {
     /// The video a package still needs made so every frame is in one (the ones made before kept,
     /// so a share makes only what is new); none when they all are. The ones made before go when
     /// the settings changed, they are broken, or there would be too many, while their frames are
-    /// still pictures to make them again of.
+    /// still pictures to make them again of. None either while a frame found the storage full and
+    /// no save has found room since: a video isn't encoded only to be refused (the frames stay
+    /// pictures, and go into one once there is room).
     pub fn segment_plan(&self) -> Option<SegmentPlan> {
+        if self.waits_for_room() {
+            return None;
+        }
         let _noting = self.noting.lock();
         self.plan()
     }
@@ -1007,7 +1130,7 @@ impl TimeLapse {
             let plan = serde_json::json!({ "moves": moves, "placing": false, "videos": videos, "note": after });
             log::info!("a time-lapse's {m} videos set aside, {total} frames made before it, put back in front of it");
             let kept = write_atomically(&self.dir.join(RENUMBERING), |p| {
-                fs::write(p, plan.to_string()).map_err(|e| file_error("saving", e))
+                crate::storage::write(p, plan.to_string()).map_err(|e| file_error("saving", e))
             });
             if kept.is_err() || !self.finish_renumbering() {
                 return;
@@ -1120,7 +1243,7 @@ impl TimeLapse {
         let moves: Vec<(u32, u32)> = pictures.iter().zip(from..).map(|(&(_, was), now)| (was, now)).collect();
         let plan = serde_json::json!({ "moves": moves, "placing": false });
         let written = write_atomically(&self.dir.join(RENUMBERING), |p| {
-            fs::write(p, plan.to_string()).map_err(|e| file_error("saving", e))
+            crate::storage::write(p, plan.to_string()).map_err(|e| file_error("saving", e))
         });
         if let Err(e) = written {
             log::warn!("numbering a time-lapse's pictures again: {e}");
@@ -1151,8 +1274,9 @@ impl TimeLapse {
             if let Some(p) = placing.as_object_mut() {
                 p.insert("placing".to_owned(), serde_json::Value::Bool(true));
             }
-            let written =
-                write_atomically(&note, |p| fs::write(p, placing.to_string()).map_err(|e| file_error("saving", e)));
+            let written = write_atomically(&note, |p| {
+                crate::storage::write(p, placing.to_string()).map_err(|e| file_error("saving", e))
+            });
             if written.is_err() {
                 return false;
             }
@@ -1174,7 +1298,7 @@ impl TimeLapse {
         }
         if let Some(after) = plan.get("note") {
             let kept = write_atomically(&self.dir.join("segments.json"), |p| {
-                fs::write(p, after.to_string()).map_err(|e| file_error("saving", e))
+                crate::storage::write(p, after.to_string()).map_err(|e| file_error("saving", e))
             });
             if kept.is_err() {
                 return false;
@@ -1189,7 +1313,7 @@ impl TimeLapse {
     fn write_segments(&self, k: &Segments) {
         let written = serde_json::to_string(k).map_err(|e| e.to_string()).and_then(|text| {
             write_atomically(&self.dir.join("segments.json"), |p| {
-                fs::write(p, text).map_err(|e| file_error("saving", e))
+                crate::storage::write(p, text).map_err(|e| file_error("saving", e))
             })
             .map_err(|e| e.to_string())
         });

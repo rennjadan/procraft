@@ -275,6 +275,12 @@ pub struct Colours {
     /// How far the picker is scrolled, in a window too short for all of it.
     scrolled: f32,
     short_menu: crate::menu::Menu,
+    /// Plugins' menus at Classic's corner: their choices (none: no button), the button there and
+    /// its menu, and a choice picked from it, for the app to make and keep.
+    classic_choices: Vec<procraft_core::PluginChoice>,
+    classic_button: Rect,
+    classic_menu: crate::menu::Menu,
+    pub classic_chosen: Option<String>,
     /// Floating: where the window is (its top-left), where the pointer holds its grabber while
     /// it moves, and whether its Value shows red, green and blue.
     pub floating: Option<Pos2>,
@@ -286,6 +292,10 @@ pub struct Colours {
     floating_scale: f32,
     floating_picker_only: bool,
     floating_transform: egui::emath::TSTransform,
+    /// The floating panels' layout, while a plugin lays them out: the window goes where it has it,
+    /// snapping, folding and kept; and whether it changed something to keep.
+    pub layout: Option<std::sync::Arc<procraft_core::PanelLayout>>,
+    pub layout_changed: bool,
     /// The colour model's button left of the swatches, its menu, and a model chosen there (for
     /// the preferences to keep).
     model_button: Rect,
@@ -299,6 +309,11 @@ pub struct Colours {
     /// it to the background); and the tick tapped.
     pub background: bool,
     pub background_done: bool,
+    /// A plugin has the sliders step one unit at a click on either end, and the swatch show the
+    /// colour as the panel opened (`before`, while it is open) beside the colour now (interface 12).
+    pub steps: bool,
+    pub before_shown: bool,
+    before: Option<u32>,
 }
 
 impl Default for Colours {
@@ -310,9 +325,18 @@ impl Default for Colours {
             other: kept.1,
             on_mask: false,
             secondary: [1.0, 1.0, 1.0],
-            history: ColourHistory::new(),
+            // kept from one run to the next, as the palettes are (a test's strokes leave the
+            // file be)
+            history: if cfg!(test) {
+                ColourHistory::new()
+            } else {
+                ColourHistory::open(crate::files::app_dir().join("colour-history.json").to_string_lossy().into_owned())
+            },
             palettes: Palettes::open(crate::files::app_dir().join("palettes.json").to_string_lossy().into_owned()),
             pickers: Pickers::default(),
+            steps: false,
+            before_shown: false,
+            before: None,
             mode: Mode::default(),
             harmony: HarmonyKind::default(),
             harmony_menu: crate::menu::Menu::default(),
@@ -327,12 +351,18 @@ impl Default for Colours {
             short_dots: Rect::NOTHING,
             scrolled: 0.0,
             short_menu: crate::menu::Menu::default(),
+            classic_choices: Vec::new(),
+            classic_button: Rect::NOTHING,
+            classic_menu: crate::menu::Menu::default(),
+            classic_chosen: None,
             floating: None,
             floating_grab: None,
             floating_rgb: false,
             floating_scale: 1.0,
             floating_picker_only: false,
             floating_transform: egui::emath::TSTransform::IDENTITY,
+            layout: None,
+            layout_changed: false,
             model_button: Rect::NOTHING,
             model_menu: crate::menu::Menu::default(),
             model_chosen: None,
@@ -393,6 +423,11 @@ impl Colours {
     /// its.
     pub fn set_picker(&mut self, picker: Option<(Arc<Plugins>, Arc<CanvasSession>)>) {
         self.pickers.picker = picker;
+    }
+
+    /// The choices plugins' menus offer at Classic's corner (none: no button there).
+    pub fn set_classic_menu(&mut self, choices: Vec<procraft_core::PluginChoice>) {
+        self.classic_choices = choices;
     }
 
     /// How big the floating window shows next to the rest of the interface (1: as the rest), and
@@ -556,11 +591,28 @@ impl Colours {
         self.send(session);
     }
 
-    /// The last colour in the history other than the current one, back; false if there is none.
+    /// The colour and the previous one trade places (the colour button held, or the quick menu's
+    /// Previous colour), so another hold comes back; false if there is none to go to.
     pub fn previous(&mut self, session: &CanvasSession) -> bool {
-        let Some(before) = self.history.previous(to_hex(self.rgb())) else { return false };
+        let Some(before) = self.history.swap_previous(to_hex(self.rgb()), self.on_mask) else { return false };
         self.set_rgb(session, before);
         true
+    }
+
+    /// The eyedropper picked `rgb`: the colour it replaces is the previous colour.
+    pub fn picked(&mut self, session: &CanvasSession, rgb: u32) {
+        let before = to_hex(self.rgb());
+        self.set_rgb(session, rgb);
+        self.history.chose(before, to_hex(self.rgb()), self.on_mask);
+    }
+
+    /// Whether the colour panel shows (docked, `docked`, or floating), told each frame: closed on
+    /// another colour than it opened on, that one is the previous colour.
+    pub fn panel_shown(&mut self, docked: bool) {
+        let shown = docked || self.floating.is_some();
+        self.history.panel_shown(shown, to_hex(self.rgb()), self.on_mask);
+        // the colour as it opened, while it is open
+        self.before = if shown { self.before.or(Some(to_hex(self.rgb()))) } else { None };
     }
 
     /// The current and second colours trade places.
@@ -612,7 +664,7 @@ impl Colours {
         history_shown: &mut bool,
         backdrops: &mut Vec<f32>,
     ) -> Rect {
-        let screen = ctx.content_rect();
+        let screen = panel::screen(ctx);
         let (left, arrow_x) = panel::place(ctx, PANEL_WIDTH, button.center().x);
         let top = screen.top() + pc::BAR_HEIGHT;
         // the header (with Harmony's kind under its title), the picker, the history (44 and 36),
@@ -651,195 +703,206 @@ impl Colours {
         self.scrolled = self.scrolled.min(overflow);
         let mut hex_row = Rect::NOTHING;
         let rect = Rect::from_min_size(pos2(left, top), vec2(PANEL_WIDTH, height));
-        egui::Area::new(egui::Id::unique("colour panel")).fixed_pos(rect.min).order(egui::Order::Foreground).show(
-            ctx,
-            |ui| {
-                ui.allocate_rect(rect, Sense::click());
-                panel::frame(ui, look, "colour frame", rect, arrow_x, backdrops);
-                let body = panel::body(rect);
-                if self.background {
-                    // titled so on every page, with a tick 12 in from the right that closes it
-                    panel::header(ui, look, body, "Background", 20.0, false, false);
-                    let tick =
-                        Rect::from_min_size(pos2(body.right() - 12.0 - 44.0, body.top() + 19.0), vec2(44.0, 44.0));
-                    ui.painter().circle_filled(tick.center(), 22.0, argb(pc::ACCENT));
-                    look.icon(ui, &icons::DONE_TICK, tick.center(), 40.0, Color32::WHITE);
-                    if ui.interact(tick, ui.scope_id().with("background done"), Sense::click()).clicked() {
-                        self.background_done = true;
-                    }
-                } else if self.mode == Mode::Palettes {
-                    panel::header(ui, look, body, "Palettes", 20.0, false, false);
-                    // the plus: a new palette, from a file or a picture, or the examples back
-                    let plus =
-                        Rect::from_min_size(pos2(body.right() - 17.0 - 40.0, body.top() + 12.0), vec2(40.0, 41.0));
-                    look.icon(ui, &icons::PLUS_MEDIUM, plus.center(), 41.0, argb(panel::PANEL_GLYPH));
-                    self.new_palette_button = plus;
-                    if ui.interact(plus, ui.scope_id().with("new palette"), Sense::click()).clicked() {
-                        self.new_palette_menu.open();
-                    }
-                } else {
-                    panel::header(ui, look, body, "Colors", 20.0, false, false);
+        let rect = panel::hung_rect(ctx, rect, whole, PANEL_MARGIN);
+        panel::area(ctx, egui::Id::unique("colour panel"), rect).show(ctx, |ui| {
+            ui.allocate_rect(rect, Sense::click());
+            panel::frame(ui, look, "colour frame", rect, arrow_x, backdrops);
+            let body = panel::body_in(ui.ctx(), rect);
+            if self.background {
+                // titled so on every page, with a tick 12 in from the right that closes it
+                panel::header(ui, look, body, "Background", 20.0, false, false);
+                let tick = Rect::from_min_size(pos2(body.right() - 12.0 - 44.0, body.top() + 19.0), vec2(44.0, 44.0));
+                ui.painter().circle_filled(tick.center(), 22.0, argb(pc::ACCENT));
+                look.icon(ui, &icons::DONE_TICK, tick.center(), 40.0, Color32::WHITE);
+                if ui.interact(tick, ui.scope_id().with("background done"), Sense::click()).clicked() {
+                    self.background_done = true;
                 }
-                // the current colour (edged) and the second, which swaps with it when tapped
-                let swatch = vec2(43.0, 25.0);
-                let second = Rect::from_min_size(pos2(body.right() - 20.0 - swatch.x, body.top() + 21.5), swatch);
-                let first = second.translate(vec2(-(swatch.x + 7.0), 0.0));
-                if self.mode != Mode::Palettes && !self.background {
-                    // the colour model, for the pages that work in one
-                    if self.mode != Mode::Harmony {
-                        let model =
-                            Rect::from_min_size(pos2(first.left() - 8.0 - 70.0, first.top()), vec2(70.0, swatch.y));
-                        self.model_button(ui, model);
+            } else if self.mode == Mode::Palettes {
+                panel::header(ui, look, body, "Palettes", 20.0, false, false);
+                // the plus: a new palette, from a file or a picture, or the examples back
+                let plus = Rect::from_min_size(pos2(body.right() - 17.0 - 40.0, body.top() + 12.0), vec2(40.0, 41.0));
+                look.icon(ui, &icons::PLUS_MEDIUM, plus.center(), 41.0, argb(panel::PANEL_GLYPH));
+                self.new_palette_button = plus;
+                if ui.interact(plus, ui.scope_id().with("new palette"), Sense::click()).clicked() {
+                    self.new_palette_menu.open();
+                }
+            } else {
+                panel::header(ui, look, body, "Colors", 20.0, false, false);
+            }
+            // the current colour (edged) and the second, which swaps with it when tapped
+            let swatch = vec2(43.0, 25.0);
+            let second = Rect::from_min_size(pos2(body.right() - 20.0 - swatch.x, body.top() + 21.5), swatch);
+            let first = second.translate(vec2(-(swatch.x + 7.0), 0.0));
+            if self.mode != Mode::Palettes && !self.background {
+                // the colour model, for the pages that work in one
+                if self.mode != Mode::Harmony {
+                    let model = Rect::from_min_size(pos2(first.left() - 8.0 - 70.0, first.top()), vec2(70.0, swatch.y));
+                    self.model_button(ui, model);
+                }
+                match self.before.filter(|_| self.before_shown) {
+                    // a plugin's: the colour before (a click goes back to it) beside the colour now
+                    Some(before) => {
+                        let was = Rect::from_min_max(first.min, pos2(first.center().x, first.max.y));
+                        let now = Rect::from_min_max(pos2(first.center().x, first.min.y), first.max);
+                        let left = egui::CornerRadius { nw: 6, sw: 6, ne: 0, se: 0 };
+                        let right = egui::CornerRadius { nw: 0, sw: 0, ne: 6, se: 6 };
+                        ui.painter().rect_filled(was, left, srgb(of_hex(before)));
+                        ui.painter().rect_filled(now, right, srgb(self.rgb()));
+                        if ui.interact(was, ui.scope_id().with("colour before"), Sense::click()).clicked() {
+                            self.set_rgb(session, before);
+                        }
                     }
-                    ui.painter().rect_filled(first, 6, srgb(self.rgb()));
-                    ui.painter().rect_stroke(
-                        first,
-                        6,
-                        egui::Stroke::new(1.0, argb(SWATCH_EDGE)),
-                        egui::StrokeKind::Inside,
-                    );
-                    ui.painter().rect_filled(second, 6, srgb(self.secondary));
-                    if ui.interact(second, ui.scope_id().with("swap"), Sense::click()).clicked() {
-                        self.swap(session);
+                    None => {
+                        ui.painter().rect_filled(first, 6, srgb(self.rgb()));
                     }
                 }
-                let grabber = Rect::from_center_size(pos2(body.center().x, body.top() + 6.0), vec2(40.0, 4.0));
-                ui.painter().rect_filled(grabber, 2, argb(GRABBER));
-                // dragged out by its grabber, the panel floats as a window of its own (not while
-                // it picks the background's colour)
-                let handle = Rect::from_center_size(pos2(body.center().x, body.top() + 15.0), vec2(150.0, 30.0));
-                let held = ui.interact(handle, ui.scope_id().with("undock"), Sense::drag());
-                if !self.background
-                    && held.dragged()
-                    && let (Some(p), Some(from)) = (held.interact_pointer_pos(), ui.input(|i| i.pointer.press_origin()))
-                    && p.distance(from) > UNDOCK_DRAG
-                {
-                    self.float_at(p - floating::GRAB * self.floating_scale);
+                ui.painter().rect_stroke(first, 6, egui::Stroke::new(1.0, argb(SWATCH_EDGE)), egui::StrokeKind::Inside);
+                ui.painter().rect_filled(second, 6, srgb(self.secondary));
+                if ui.interact(second, ui.scope_id().with("swap"), Sense::click()).clicked() {
+                    self.swap(session);
                 }
+            }
+            let grabber = Rect::from_center_size(pos2(body.center().x, body.top() + 6.0), vec2(40.0, 4.0));
+            ui.painter().rect_filled(grabber, 2, argb(GRABBER));
+            // dragged out by its grabber, the panel floats as a window of its own (not while
+            // it picks the background's colour)
+            let handle = Rect::from_center_size(pos2(body.center().x, body.top() + 15.0), vec2(150.0, 30.0));
+            let held = ui.interact(handle, ui.scope_id().with("undock"), Sense::drag());
+            if !self.background
+                && held.dragged()
+                && let (Some(p), Some(from)) = (held.interact_pointer_pos(), ui.input(|i| i.pointer.press_origin()))
+                && let p = panel::to_window(ctx) * p
+                && p.distance(from) > UNDOCK_DRAG
+            {
+                self.float_at(p - floating::GRAB * self.floating_scale);
+            }
 
-                let top = body.top() + header;
-                if self.mode == Mode::Harmony {
-                    self.harmony_kind_button(ui, body);
-                }
-                // on a window too short for it all the picker scrolls, by the wheel or a drag
-                // between its controls, the tabs staying
-                let clip = ui.clip_rect();
-                let top = if overflow > 0.0 {
-                    let view = Rect::from_min_max(pos2(body.left(), top), pos2(body.right(), body.bottom() - 70.0));
-                    let dragged = ui.interact(view, ui.scope_id().with("scroll"), Sense::drag()).drag_delta().y;
-                    let wheel = if ui.rect_contains_pointer(view) {
-                        ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y))
-                    } else {
-                        0.0
-                    };
-                    self.scrolled = (self.scrolled - dragged - wheel).clamp(0.0, overflow);
-                    ui.set_clip_rect(clip.intersect(view));
-                    top - self.scrolled
+            let top = body.top() + header;
+            if self.mode == Mode::Harmony {
+                self.harmony_kind_button(ui, body);
+            }
+            // on a window too short for it all the picker scrolls, by the wheel or a drag
+            // between its controls, the tabs staying
+            let clip = ui.clip_rect();
+            let top = if overflow > 0.0 {
+                let view = Rect::from_min_max(pos2(body.left(), top), pos2(body.right(), body.bottom() - 70.0));
+                let dragged = ui.interact(view, ui.scope_id().with("scroll"), Sense::drag()).drag_delta().y;
+                let wheel = if ui.rect_contains_pointer(view) {
+                    ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y))
                 } else {
-                    top
+                    0.0
                 };
-                match self.mode {
-                    Mode::Palettes => self.palettes_view(ui, look, session, body, top, shape.palette_list),
-                    Mode::Disc => {
-                        let at = pos2(body.left() + 6.0, top + if short { 0.0 } else { 8.0 });
-                        let picker = Rect::from_min_size(at, vec2(PICKER, PICKER));
-                        if self.model_disc(ui, picker) {
-                            self.send(session);
-                        }
-                        // HSY′: its saturation and luma on sliders under the wheel
-                        if self.model() == ColourModel::Hsy && self.luma_sliders(ui, body, picker.bottom() + 4.0) {
-                            self.send(session);
-                        }
+                self.scrolled = (self.scrolled - dragged - wheel).clamp(0.0, overflow);
+                ui.set_clip_rect(clip.intersect(view));
+                top - self.scrolled
+            } else {
+                top
+            };
+            match self.mode {
+                Mode::Palettes => self.palettes_view(ui, look, session, body, top, shape.palette_list),
+                Mode::Disc => {
+                    let at = pos2(body.left() + 6.0, top + if short { 0.0 } else { 8.0 });
+                    let picker = Rect::from_min_size(at, vec2(PICKER, PICKER));
+                    if self.model_disc(ui, picker) {
+                        self.send(session);
                     }
-                    Mode::Classic => self.classic(ui, session, body, top, shape.square),
-                    Mode::Harmony => self.harmony(ui, session, body, top, shape),
-                    Mode::Value => hex_row = self.value(ui, session, body, top, shape),
+                    // HSY′: its saturation and luma on sliders under the wheel
+                    if self.model() == ColourModel::Hsy && self.luma_sliders(ui, body, picker.bottom() + 4.0) {
+                        self.send(session);
+                    }
                 }
+                Mode::Classic => self.classic(ui, session, body, top, shape.square),
+                Mode::Harmony => self.harmony(ui, session, body, top, shape),
+                Mode::Value => hex_row = self.value(ui, session, body, top, shape),
+            }
 
-                if self.mode != Mode::Palettes && short {
-                    // the history or the palette, as the "•••" beside its title says
-                    let y = top + picker_height;
-                    let band = if history { 44.0 } else { 34.0 };
-                    if history {
-                        let at = pos2(body.left() + 21.0, y + 13.0);
-                        text(ui.painter(), at, Align2::LEFT_TOP, "History", 14.0, Weight::SemiBold, argb(PANEL_TITLE));
-                        self.history_strip(ui, session, body, y + band);
-                    } else {
-                        let at = pos2(body.left() + 21.0, y + 8.0);
-                        let name = self.palette_name();
-                        text(ui.painter(), at, Align2::LEFT_TOP, &name, 14.0, Weight::SemiBold, argb(PANEL_TITLE));
-                        self.palette_rows(ui, session, drop, rect, body, y + band);
-                    }
-                    // three dots in a 44 x 34 box 9 in from the right, level with the title
-                    let dots =
-                        Rect::from_min_size(pos2(body.right() - 9.0 - 44.0, y + (band - 34.0) / 2.0), vec2(44.0, 34.0));
-                    for i in -1..=1 {
-                        ui.painter().circle_filled(dots.center() + vec2(i as f32 * 6.5, 0.0), 1.8, argb(PANEL_TITLE));
-                    }
-                    self.short_dots = dots;
-                    if ui.interact(dots, ui.scope_id().with("short menu"), Sense::click()).clicked() {
-                        self.short_menu.open();
-                    }
-                } else if self.mode != Mode::Palettes {
-                    let mut y = top + picker_height;
-                    // the history: its title, Clear, and the last ten colours
-                    let ink = argb(PANEL_TITLE);
-                    text(
-                        ui.painter(),
-                        pos2(body.left() + 21.0, y + 13.0),
-                        Align2::LEFT_TOP,
-                        "History",
-                        14.0,
-                        Weight::SemiBold,
-                        ink,
-                    );
-                    let clear = Rect::from_min_size(pos2(body.right() - 16.0 - 86.0, y + 11.0), vec2(86.0, 22.5));
-                    ui.painter().rect_filled(clear, 7, argb(SET_CELL));
-                    text(
-                        ui.painter(),
-                        clear.center(),
-                        Align2::CENTER_CENTER,
-                        "Clear",
-                        13.0,
-                        Weight::Regular,
-                        argb(CLEAR_TEXT),
-                    );
-                    if ui.interact(clear, ui.scope_id().with("clear history"), Sense::click()).clicked() {
-                        self.history.clear();
-                    }
-                    y += 44.0;
-                    self.history_strip(ui, session, body, y);
-                    y += 36.0;
+            if self.mode != Mode::Palettes && short {
+                // the history or the palette, as the "•••" beside its title says
+                let y = top + picker_height;
+                let band = if history { 44.0 } else { 34.0 };
+                if history {
+                    let at = pos2(body.left() + 21.0, y + 13.0);
+                    text(ui.painter(), at, Align2::LEFT_TOP, "History", 14.0, Weight::SemiBold, argb(PANEL_TITLE));
+                    self.history_strip(ui, session, body, y + band);
+                } else {
+                    let at = pos2(body.left() + 21.0, y + 8.0);
                     let name = self.palette_name();
-                    text(
-                        ui.painter(),
-                        pos2(body.left() + 21.0, y + 13.0),
-                        Align2::LEFT_TOP,
-                        &name,
-                        14.0,
-                        Weight::SemiBold,
-                        ink,
-                    );
-                    y += 44.0;
-                    self.palette_rows(ui, session, drop, rect, body, y);
+                    text(ui.painter(), at, Align2::LEFT_TOP, &name, 14.0, Weight::SemiBold, argb(PANEL_TITLE));
+                    self.palette_rows(ui, session, drop, rect, body, y + band);
                 }
-                ui.set_clip_rect(clip);
-                let tabs = Rect::from_min_max(pos2(body.left(), body.bottom() - 70.0), body.max);
-                if let Some(mode) = mode_tabs(ui, look, tabs, self.mode) {
-                    self.mode = mode;
-                    self.hex = None;
-                    self.scrolled = 0.0;
+                // three dots in a 44 x 34 box 9 in from the right, level with the title
+                let dots =
+                    Rect::from_min_size(pos2(body.right() - 9.0 - 44.0, y + (band - 34.0) / 2.0), vec2(44.0, 34.0));
+                for i in -1..=1 {
+                    ui.painter().circle_filled(dots.center() + vec2(i as f32 * 6.5, 0.0), 1.8, argb(PANEL_TITLE));
                 }
-            },
-        );
+                self.short_dots = dots;
+                if ui.interact(dots, ui.scope_id().with("short menu"), Sense::click()).clicked() {
+                    self.short_menu.open();
+                }
+            } else if self.mode != Mode::Palettes {
+                let mut y = top + picker_height;
+                // the history: its title, Clear, and the last ten colours
+                let ink = argb(PANEL_TITLE);
+                text(
+                    ui.painter(),
+                    pos2(body.left() + 21.0, y + 13.0),
+                    Align2::LEFT_TOP,
+                    "History",
+                    14.0,
+                    Weight::SemiBold,
+                    ink,
+                );
+                let clear = Rect::from_min_size(pos2(body.right() - 16.0 - 86.0, y + 11.0), vec2(86.0, 22.5));
+                ui.painter().rect_filled(clear, 7, argb(SET_CELL));
+                text(
+                    ui.painter(),
+                    clear.center(),
+                    Align2::CENTER_CENTER,
+                    "Clear",
+                    13.0,
+                    Weight::Regular,
+                    argb(CLEAR_TEXT),
+                );
+                if ui.interact(clear, ui.scope_id().with("clear history"), Sense::click()).clicked() {
+                    self.history.clear();
+                }
+                y += 44.0;
+                self.history_strip(ui, session, body, y);
+                y += 36.0;
+                let name = self.palette_name();
+                text(
+                    ui.painter(),
+                    pos2(body.left() + 21.0, y + 13.0),
+                    Align2::LEFT_TOP,
+                    &name,
+                    14.0,
+                    Weight::SemiBold,
+                    ink,
+                );
+                y += 44.0;
+                self.palette_rows(ui, session, drop, rect, body, y);
+            }
+            ui.set_clip_rect(clip);
+            let tabs = Rect::from_min_max(pos2(body.left(), body.bottom() - 70.0), body.max);
+            if let Some(mode) = mode_tabs(ui, look, tabs, self.mode) {
+                self.mode = mode;
+                self.hex = None;
+                self.scrolled = 0.0;
+            }
+        });
         if self.mode == Mode::Harmony {
             self.harmony_menu(ctx, look, rect, backdrops);
         }
         if self.mode != Mode::Palettes {
             self.model_menu(ctx, look, backdrops);
         }
+        if self.mode == Mode::Classic {
+            self.classic_menu(ctx, look, backdrops);
+        }
+        // the keypad by its row as it shows
         if self.mode == Mode::Value
-            && let Some(rgb) = hex_pad(ctx, look, &mut self.hex, hex_row)
+            && let Some(rgb) = hex_pad(ctx, look, &mut self.hex, panel::to_window(ctx).mul_rect(hex_row))
         {
             self.set_rgb(session, rgb);
         }
@@ -894,7 +957,7 @@ impl Colours {
                 let slot = (row * 10 + i) as u32;
                 let id = ui.scope_id().with(("palette swatch", slot));
                 match rgb {
-                    Some(c) => match drop.source(ui, session, id, cell, c, true, true, Some(panel)) {
+                    Some(c) => match drop.source(ui, session, id, cell, c, true, Some(panel)) {
                         Some(Touch::Tap) => self.set_rgb(session, c),
                         Some(Touch::Hold) => self.palettes.set_swatch(index, slot, None),
                         Some(Touch::Dragged) | None => {}
@@ -1277,6 +1340,12 @@ impl Colours {
     fn classic(&mut self, ui: &Ui, session: &CanvasSession, body: Rect, top: f32, side: f32) {
         let square = Rect::from_min_size(pos2(body.left() + 16.0, top), vec2(SQUARE, side));
         let mut changed = self.model_square(ui, square);
+        // plugins' menus, from a button in the square's lower left corner
+        if self.model() == ColourModel::Hsb && !self.classic_choices.is_empty() {
+            self.classic_menu_button(ui, square);
+        } else {
+            self.classic_button = Rect::NOTHING;
+        }
         let row = |i: f32| {
             Rect::from_min_size(
                 pos2(body.left() + 20.0, square.bottom() + SLIDER_ROW * i),
@@ -1294,6 +1363,61 @@ impl Colours {
         }
     }
 
+    /// The button for plugins' menus at Classic's corner, in the lower left corner of `square`: three
+    /// dots on a dark disc, its touch 36 across; a tap opens them.
+    fn classic_menu_button(&mut self, ui: &Ui, square: Rect) {
+        let button = Rect::from_min_size(pos2(square.left(), square.bottom() - 36.0), vec2(36.0, 36.0));
+        ui.painter().circle_filled(button.center(), 13.0, Color32::from_black_alpha(115));
+        for i in -1..=1 {
+            ui.painter().circle_filled(button.center() + vec2(i as f32 * 5.5, 0.0), 1.6, Color32::WHITE);
+        }
+        self.classic_button = button;
+        if ui.interact(button, ui.scope_id().with("classic plugin menu"), Sense::click()).clicked() {
+            self.classic_menu.open();
+        }
+    }
+
+    /// Plugins' menus at Classic's corner: their choices' icons in a row above the button, those
+    /// that stand now lit; one picked closes it.
+    fn classic_menu(&mut self, ctx: &egui::Context, look: &mut Look, backdrops: &mut Vec<f32>) {
+        let button = self.classic_button;
+        if button == Rect::NOTHING {
+            self.classic_menu.close();
+            return;
+        }
+        let size = vec2(12.0 + 48.0 * self.classic_choices.len() as f32, 56.0);
+        let rect = Rect::from_min_size(pos2(button.left(), button.top() - 6.0 - size.y), size);
+        let glass = crate::menu::Glass {
+            fill: crate::menu::OVER_PANEL,
+            edge: Some(SHORT_MENU_EDGE),
+            frost: false,
+            corner: SHORT_MENU_CORNER,
+            shadow: false,
+        };
+        let choices = &self.classic_choices;
+        let mut chosen = None;
+        self.classic_menu.show(ctx, "classic plugin menu", rect, button.center_top(), glass, backdrops, |ui| {
+            for (i, choice) in choices.iter().enumerate() {
+                let cell =
+                    Rect::from_min_size(pos2(rect.left() + 6.0 + 48.0 * i as f32, rect.top() + 6.0), vec2(48.0, 44.0));
+                let accent = argb(pc::ACCENT);
+                if choice.chosen {
+                    ui.painter().rect_filled(cell, 11, accent.gamma_multiply(0.18));
+                }
+                let ink = if choice.chosen { accent } else { argb(crate::menu::INK) };
+                look.path_icon(ui, &choice.icon, Rect::from_center_size(cell.center(), vec2(26.0, 26.0)), ink);
+                let tapped = ui.interact(cell, ui.scope_id().with(("classic choice", i)), Sense::click());
+                if tapped.on_hover_text(&choice.label).clicked() {
+                    chosen = Some(choice.key.clone());
+                }
+            }
+        });
+        if let Some(key) = chosen {
+            self.classic_chosen = Some(key);
+            self.classic_menu.close();
+        }
+    }
+
     /// Harmony's kind under the title; a tap lists the kinds.
     fn harmony_kind_button(&mut self, ui: &Ui, body: Rect) {
         let at = pos2(body.left() + 20.0, body.top() + 50.0 + 14.0);
@@ -1308,7 +1432,7 @@ impl Colours {
     /// Harmony's kinds: a menu left of the panel, its top level with the wheel; the kind shown
     /// ticked.
     fn harmony_menu(&mut self, ctx: &egui::Context, look: &mut Look, panel: Rect, backdrops: &mut Vec<f32>) {
-        let body = panel::body(panel);
+        let body = panel::body_in(ctx, panel);
         let rect = Rect::from_min_size(
             pos2(body.left() + 20.0 - 204.0, body.top() + 50.0 + 36.0),
             vec2(195.0, 9.0 * 2.0 + 38.0 * HarmonyKind::ALL.len() as f32),
@@ -1441,7 +1565,17 @@ impl Colours {
                 );
                 let track =
                     Rect::from_center_size(pos2(row.left() + 32.0 + 132.0, row.center().y), vec2(264.0, SLIDER_ROW));
-                let Some(to) = slider_row(ui, track, ("value", k, i), value, &colours) else { continue };
+                // a plugin's steps: a degree of hue, a percent, a level of red, green or blue
+                let unit = match (k, i) {
+                    (0, 0) if model != ColourModel::Oklab => 1.0 / 360.0,
+                    (0, _) => 0.01,
+                    _ => 1.0 / 255.0,
+                };
+                let Some(to) =
+                    slider_row_stepped(ui, track, ("value", k, i), value, &colours, self.steps.then_some(unit))
+                else {
+                    continue;
+                };
                 let byte = (to * 255.0).round() as u32;
                 match (k, i) {
                     (0, _) if model == ColourModel::Oklab => {
@@ -1583,6 +1717,7 @@ impl Colours {
             || self.short_menu.is_open()
             || self.harmony_menu.is_open()
             || self.model_menu.is_open()
+            || self.classic_menu.is_open()
             || self.takes_keys()
     }
 
@@ -1918,6 +2053,23 @@ pub(crate) fn slider_row(
     value: f32,
     colours: &[Color32],
 ) -> Option<f32> {
+    slider_row_stepped(ui, rect, id, value, colours, None)
+}
+
+/// How far in from either end of a slider a click steps it, while a plugin has them step.
+const STEP_END: f32 = 18.0;
+
+/// [`slider_row`], stepping `step` (a share of the track) at a click within [`STEP_END`] of either
+/// end, while a plugin has the sliders step: a drag from anywhere, or a click between, goes where it
+/// is.
+pub(crate) fn slider_row_stepped(
+    ui: &Ui,
+    rect: Rect,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    value: f32,
+    colours: &[Color32],
+    step: Option<f32>,
+) -> Option<f32> {
     let response = ui.interact(rect, ui.scope_id().with(id), Sense::click_and_drag());
     let y = rect.center().y;
     let track = Rect::from_min_max(pos2(rect.left(), y - 2.0), pos2(rect.right(), y + 2.0));
@@ -1926,6 +2078,20 @@ pub(crate) fn slider_row(
     let x = (rect.left() + value * rect.width()).clamp(rect.left() + pill.x / 2.0, rect.right() - pill.x / 2.0);
     ui.painter().rect_filled(Rect::from_center_size(pos2(x, y), pill), pill.y / 2.0, colour_along(colours, value));
     let p = response.interact_pointer_pos()?;
+    if let Some(unit) = step {
+        let from = ui.input(|i| i.pointer.press_origin()).unwrap_or(p);
+        let side = if from.x < rect.left() + STEP_END {
+            -1.0
+        } else if from.x > rect.right() - STEP_END {
+            1.0
+        } else {
+            0.0
+        };
+        if side != 0.0 && !response.dragged() {
+            // pressed at an end: a step as it is let go, nothing until then
+            return response.clicked().then(|| (value + side * unit).clamp(0.0, 1.0));
+        }
+    }
     Some(((p.x - rect.left()) / rect.width()).clamp(0.0, 1.0))
 }
 
@@ -2260,6 +2426,30 @@ mod tests {
             let back = hue_at(HueControl::Slider, hue_position(HueControl::Slider, hue));
             assert!((back - hue).abs() < 1e-3, "{hue} came back {back}");
         }
+    }
+
+    #[test]
+    fn the_colour_button_s_hold_trades_the_colour_with_the_one_before_the_last_chosen() {
+        let session = CanvasSession::new(64, 64);
+        let mut colours = Colours::default();
+        colours.set_rgb(&session, 0xFF0000);
+        // nothing chosen or painted yet: nothing to go back to
+        assert!(!colours.previous(&session));
+        // the eyedropper picks green over red: held, red; held again, green
+        colours.picked(&session, 0x00FF00);
+        assert!(colours.previous(&session));
+        assert_eq!(to_hex(colours.rgb()), 0xFF0000);
+        assert!(colours.previous(&session));
+        assert_eq!(to_hex(colours.rgb()), 0x00FF00);
+        // the panel opened on green, closed on blue: held, green, not what it passed
+        colours.panel_shown(true);
+        colours.set_rgb(&session, 0x123456);
+        colours.set_rgb(&session, 0x0000FF);
+        colours.panel_shown(true);
+        colours.panel_shown(false);
+        assert!(colours.previous(&session));
+        assert_eq!(to_hex(colours.rgb()), 0x00FF00);
+        assert_eq!(procraft_core::COLOUR_HOLD_MS, 300);
     }
 
     #[test]

@@ -531,7 +531,8 @@ fun CurvesPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
             }
         }
         Column(Modifier.width(111.dp).fillMaxHeight().clip(RoundedCornerShape(13.dp)), verticalArrangement = Arrangement.spacedBy(1.dp)) {
-            listOf("Gamma", "Red", "Green", "Blue").forEachIndexed { i, name ->
+            // a filter layer's curves have alpha too
+            listOf("Gamma", "Red", "Green", "Blue", "Alpha").take(vm.curveChannels.coerceIn(1, 5)).forEachIndexed { i, name ->
                 val chosen = vm.curveChannel == i
                 Box(Modifier.fillMaxWidth().weight(1f).background(if (chosen) Pc.Accent else PanelButton).tap { vm.chooseCurveChannel(i) }, contentAlignment = Alignment.Center) {
                     Text(name, color = if (chosen) Color.White else PanelButtonText, fontSize = 16.sp, maxLines = 1)
@@ -1371,8 +1372,9 @@ fun BloomPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
 @Composable
 fun PluginFilterPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
     val controls = vm.pluginFilter?.controls ?: return
-    androidx.compose.runtime.LaunchedEffect(Unit) {
-        while (true) {
+    // (not while the app is away: nothing changes there)
+    androidx.compose.runtime.LaunchedEffect(vm.inFront) {
+        while (vm.inFront) {
             kotlinx.coroutines.delay(150)
             vm.checkPluginFilter()
         }
@@ -1392,7 +1394,7 @@ fun PluginFilterPanel(vm: CanvasViewModel, modifier: Modifier = Modifier) {
                         Box(Modifier.tap { vm.setPluginFilterSwitch(control.control.key, !control.control.on) }) { Switch(control.control.on, enabled = true) }
                     }
                     // (a filter has none)
-                    is PluginControl.File -> {}
+                    is PluginControl.File, is PluginControl.Texture -> {}
                 }
             }
         }

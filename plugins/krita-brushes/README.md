@@ -14,7 +14,9 @@ It comes with the app, off.
   pictures (their filled shapes drawn as Krita draws an SVG tip: grey over white, 1000 pixels
   across), GIMP
   brushes (`.gbr`) and pipes (`.gih`, a cell picked per dab by each dimension's selection: constant,
-  incremental, random, pressure, angular, velocity, tilt), applied as the preset says: as a mask,
+  incremental, random, pressure, angular, velocity, tilt; a pipe of more than the 255 cells a tip
+  may have sampled down, each dimension evenly over all its steps, its first and last kept where it
+  is picked along a range), applied as the preset says: as a mask,
   stamped in their own colours, as a lightness map (its strength an option of its own) or as a
   gradient map (from the colour to the secondary colour), a colour picture's grey through its
   middle point, brightness and contrast; older presets' scale and adjustments read as Krita reads
@@ -122,7 +124,9 @@ comes with the sensor it follows and its curve.
 The app keeps how each brush looks (its tips drawn, its texture's mask) with the plugin, so only a
 brush's first stroke ever waits for them; after that the plugin only reads the brush's settings.
 In the app, the app's utilities unpack bundles and decode pictures, much faster than the plugin's own
-readers (which its tests use) run in it.
+readers (which its tests use) run in it. A preset's settings are read without the pictures it carries
+(nearly all of a big one's text), each picture it wants read off the text where it lies and copied
+once into the brush, so a bundle of a few hundred megabytes fits the memory an import has.
 
 ## Not yet
 

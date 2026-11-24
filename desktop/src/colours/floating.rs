@@ -6,7 +6,7 @@
 
 use egui::emath::TSTransform;
 use egui::{Align2, Color32, LayerId, Order, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2};
-use procraft_core::CanvasSession;
+use procraft_core::{CanvasSession, LayoutPiece};
 
 use super::{
     Colours, EMPTY_SLOT, GRABBER, HarmonyKind, Mode, PALETTE_TILE, colours_in_p3, hex_pad, of_hex, rgb_to_hsv, srgb,
@@ -41,6 +41,38 @@ impl Colours {
     pub(super) fn float_at(&mut self, at: Pos2) {
         self.floating = Some(at);
         self.floating_grab = Some(GRAB);
+        // where the layout has it, held from its grabber
+        if let Some(layout) = &self.layout {
+            let pointer = at + GRAB * self.floating_scale;
+            if layout.holding() != Some(LayoutPiece::Colours) {
+                layout.open_at(LayoutPiece::Colours, pointer.x, pointer.y, GRAB.y);
+            }
+        }
+    }
+
+    /// Where the layout has the window this frame, while a plugin lays the panels out: held by its
+    /// grabber, following the pointer (snapping) until let go and kept; else where it was left.
+    /// None for where the window is as the app has it; `Err` with its tab, folded.
+    fn laid_out(&mut self, ctx: &egui::Context, height: f32) -> Option<Result<Pos2, procraft_core::PieceShown>> {
+        let layout = self.layout.clone()?;
+        layout.set_colours_size(WIDTH, height);
+        if self.floating_grab.is_some() {
+            let (pointer, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
+            match pointer {
+                Some(p) if down && layout.holding() == Some(LayoutPiece::Colours) => {
+                    layout.drag(p.x, p.y);
+                }
+                _ => {
+                    self.floating_grab = None;
+                    self.layout_changed |= layout.let_go();
+                }
+            }
+        }
+        let shown = layout.shown(LayoutPiece::Colours)?;
+        if shown.folded {
+            return Some(Err(shown));
+        }
+        Some(Ok(pos2(shown.x, shown.y)))
     }
 
     /// The floating window, while there is one: returns where it is.
@@ -51,7 +83,10 @@ impl Colours {
         session: &CanvasSession,
         backdrops: &mut Vec<f32>,
     ) -> Option<Rect> {
-        let mut at = self.floating?;
+        // hidden from its menu: unseen until its button or Show Hidden brings it back
+        if self.layout.as_ref().is_some_and(|l| l.look().on && l.is_hidden(LayoutPiece::Colours)) {
+            return None;
+        }
         let (k, alone) = (self.floating_scale, self.floating_picker_only);
         let height = if alone {
             PICKER_TOP + PICKER + if self.hue_ringed() { 0.0 } else { HUE_ROW } + 6.0
@@ -60,12 +95,42 @@ impl Colours {
         } else {
             390.0
         };
-        // held by its grabber, it follows the pointer until let go
-        let (pointer, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
-        if let Some(grab) = self.floating_grab {
-            match pointer {
-                Some(p) if down => at = p - grab * k,
-                _ => self.floating_grab = None,
+        // kept floating where the layout has it, it comes back where it was
+        if self.floating.is_none()
+            && let Some(layout) = &self.layout
+            && let Some(shown) = layout.shown(LayoutPiece::Colours)
+        {
+            self.floating = Some(pos2(shown.x, shown.y));
+        }
+        let mut at = self.floating?;
+        match self.laid_out(ctx, height) {
+            Some(Ok(laid)) => at = laid,
+            // folded, its tab: a tap unfolds it, a press moves it
+            Some(Err(tab)) => {
+                let title = if self.mode == Mode::Palettes { "Palettes" } else { "Colors" };
+                let touch = crate::floating_panels::tab(ctx, look, tab, title, backdrops);
+                if let Some(layout) = &self.layout {
+                    if touch.unfold {
+                        layout.set_folded(LayoutPiece::Colours, false);
+                        self.layout_changed = true;
+                    } else if touch.pressed
+                        && let Some(from) = ctx.input(|i| i.pointer.press_origin())
+                    {
+                        layout.hold(LayoutPiece::Colours, false, from.x, from.y);
+                        self.floating_grab = Some(GRAB);
+                    }
+                }
+                return None;
+            }
+            None => {
+                // held by its grabber, it follows the pointer until let go
+                let (pointer, down) = ctx.input(|i| (i.pointer.interact_pos(), i.pointer.primary_down()));
+                if let Some(grab) = self.floating_grab {
+                    match pointer {
+                        Some(p) if down => at = p - grab * k,
+                        _ => self.floating_grab = None,
+                    }
+                }
             }
         }
         // kept on the screen, and clear of the side bar as the panels are, at its scale
@@ -87,8 +152,10 @@ impl Colours {
         let mut closed = !self.modal() && crate::ui::escape(ctx);
         let mut hex_row = Rect::NOTHING;
         let mut kind_button = Rect::NOTHING;
-        // under the panels, which open over it, however it was last touched
-        egui::Area::new(area).fixed_pos(rect.min).order(Order::Middle).show(ctx, |ui| {
+        // under the panels, which open over it, however it was last touched; kept to the window,
+        // and clipped to it, as the window measures it at its scale
+        let measured = transform.inverse().mul_rect(screen);
+        egui::Area::new(area).fixed_pos(rect.min).order(Order::Middle).constrain_to(measured).show(ctx, |ui| {
             // the canvas under it takes no touch
             ui.allocate_rect(rect, Sense::click_and_drag());
             panel::floating_frame(ui, look, "floating colours", rect, k, backdrops);
@@ -100,6 +167,11 @@ impl Colours {
                 && let Some(p) = held.interact_pointer_pos()
             {
                 self.floating_grab = Some(p - at);
+                if let Some(layout) = &self.layout
+                    && let Some(from) = ui.input(|i| i.pointer.press_origin())
+                {
+                    layout.hold(LayoutPiece::Colours, false, from.x, from.y);
+                }
             }
             if alone {
                 // Classic's picker alone, Close over its top right
@@ -120,6 +192,31 @@ impl Colours {
             let close = Rect::from_min_size(pos2(at.x + 216.0, at.y + 4.0), vec2(40.0, 40.0));
             close_button(ui, close);
             closed |= ui.interact(close, ui.scope_id().with("floating close"), Sense::click()).clicked();
+            // beside Close, while the panels fold
+            if self.layout.as_ref().is_some_and(|l| l.look().fold)
+                && panel::fold_button(ui, close.translate(vec2(-40.0, 0.0)))
+                && let Some(layout) = &self.layout
+            {
+                layout.set_folded(LayoutPiece::Colours, true);
+                self.layout_changed = true;
+            }
+            // its menu, while a plugin lays the panels out
+            if let Some(layout) = self.layout.clone().filter(|l| l.look().on) {
+                panel::window_pinned(ui.ctx(), layout.is_pinned(LayoutPiece::Colours));
+                if let Some(act) = panel::window_menu(ui, close.translate(vec2(-80.0, 0.0))) {
+                    match act {
+                        panel::WindowAct::Fold => layout.set_folded(LayoutPiece::Colours, true),
+                        panel::WindowAct::Hide => layout.set_hidden(LayoutPiece::Colours, true),
+                        panel::WindowAct::Pin => {
+                            layout.set_pinned(LayoutPiece::Colours, !layout.is_pinned(LayoutPiece::Colours))
+                        }
+                        panel::WindowAct::Reset => {
+                            layout.reset_place(LayoutPiece::Colours);
+                        }
+                    }
+                    self.layout_changed = true;
+                }
+            }
             match self.mode {
                 Mode::Disc => {
                     let disc = Rect::from_min_size(pos2(at.x + 10.0, at.y + 53.0), vec2(240.0, 240.0));
@@ -188,6 +285,10 @@ impl Colours {
             self.floating_grab = None;
             self.hex = None;
             self.harmony_menu.close();
+            if let Some(layout) = &self.layout {
+                layout.close(LayoutPiece::Colours);
+                self.layout_changed = true;
+            }
         }
         Some(transform * rect)
     }

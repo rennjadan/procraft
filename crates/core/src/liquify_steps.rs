@@ -2,8 +2,10 @@
 //! Reset is a step of its own, undone and redone one at a time; undone past its first, Liquify
 //! closes, and a redo opens it again. Once it closes its whole work is one step, which undone opens
 //! it again with its steps as they were (and redone past its last, keeps it and closes it again).
-//! The field's side of each step is the canvas's (`Canvas::liquify_mark`); here are their names
-//! and the Adjust amount on either side of each.
+//! A stroke taken back as more fingers land (to tap undo or redo, or to move the view) is no step,
+//! and leaves the field as it was and what was undone to redo. The field's side of each step is
+//! the canvas's (`Canvas::liquify_mark`); here are their names and the Adjust amount on either side
+//! of each.
 
 use procraft_engine::document::LayerId;
 use procraft_gpu::Filter;
@@ -120,19 +122,22 @@ impl State {
         self.adjust.liquify_follows(amount, liquified);
     }
 
-    /// Closes the step under way (its field's side too): it can be undone now.
+    /// Closes the step under way (its field's side too): it can be undone now, and nothing is left
+    /// to redo, in Liquify or on the canvas.
     pub(crate) fn close_liquify_step(&mut self) {
         let Some(mut step) = self.liquify_steps.open.take() else { return };
         step.after = self.liquify_amount_now();
         self.liquify_steps.undo.push(step);
         self.liquify_steps.redo.clear();
+        self.liquify_steps.origin = None;
         if let Some(canvas) = self.canvas.as_mut() {
             canvas.liquify_mark();
+            canvas.forget_redo();
         }
     }
 
-    /// A step of `kind` begins (the one under way closed): nothing is left to redo, in Liquify or
-    /// on the canvas.
+    /// A step of `kind` begins (the one under way closed). What was undone can still be redone
+    /// until it closes: a stroke taken back as more fingers land leaves it to redo.
     fn open_liquify_step(&mut self, kind: StepKind, name: &'static str) {
         if !self.liquify_open() {
             return;
@@ -140,11 +145,24 @@ impl State {
         self.close_liquify_step();
         let before = self.liquify_amount_now();
         self.liquify_steps.open = Some(Step { kind, name, before, after: before });
-        self.liquify_steps.redo.clear();
-        self.liquify_steps.origin = None;
-        if let Some(canvas) = self.canvas.as_mut() {
-            canvas.forget_redo();
+    }
+
+    /// The stroke under way taken back, what it did and set going with it: fingers landing after
+    /// it make the touch a gesture (two tapped undo, three redo), or it was called off. The field
+    /// and the Adjust amount are as the last step left them, and what was undone is still there
+    /// to redo. False if no stroke was under way.
+    pub(crate) fn take_back_liquify_stroke(&mut self) -> bool {
+        if !self.liquify_open() {
+            return false;
         }
+        let Some(step) = self.liquify_steps.open.filter(|s| s.kind == StepKind::Stroke) else { return false };
+        self.liquify_steps.open = None;
+        self.liquify.halt();
+        if let Some(canvas) = self.canvas.as_mut() {
+            canvas.liquify_take_back();
+        }
+        self.show_liquify_amount(step.before);
+        true
     }
 
     /// A stroke of `kind` begins.
@@ -221,6 +239,18 @@ impl State {
 }
 
 impl CanvasSession {
+    /// Takes back the liquify stroke under way (see [`State::take_back_liquify_stroke`]); false if
+    /// there was none.
+    pub(crate) fn take_back_liquify(&self) -> bool {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let taken = st.take_back_liquify_stroke();
+        if taken {
+            self.shared.frame(st);
+        }
+        taken
+    }
+
     /// Undo (`undo`) or redo while Liquify is open: a step at a time; undone past its first, it
     /// closes; redone past its last after it came back by an undo, its work is kept again and it
     /// closes. Returns the step's name, or none when Liquify isn't open.

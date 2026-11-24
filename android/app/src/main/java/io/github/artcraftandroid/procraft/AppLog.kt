@@ -27,6 +27,12 @@ object AppLog {
     /** The most of a trace that is read, bytes (the core tells at most 48 KB of it). */
     private const val TRACE_READ_MOST = 4 shl 20
 
+    /** How many of the last runs' ends the GPU's start looks at (see the core's gpu_last_runs). */
+    private const val GPU_RUNS = 3
+
+    /** The most of a crash's trace read for the GPU's start, bytes: its threads come before the rest. */
+    private const val GPU_TRACE_READ_MOST = 1 shl 20
+
     /** Where the newest end told is kept (its time), so that each trace is told once. */
     private const val PREFS = "log"
     private const val EXIT_TOLD = "exitTold"
@@ -70,6 +76,12 @@ object AppLog {
         val file = File(File(context.cacheDir, "exports").apply { mkdirs() }, "procraft-log.txt")
         val written = runCatching { io.github.artcraftandroid.procraft.core.writeLogToShare(context.filesDir.path, file.path) }
         return file.takeIf { written.getOrDefault(false) }
+    }
+
+    /** A fact a report may need (what input the device gives), to the system's log and the file. */
+    fun i(tag: String, message: String) {
+        Log.i(tag, message)
+        toFile(LogLevel.INFO, tag, message)
     }
 
     /** A warning, to the system's log and the file. */
@@ -119,6 +131,32 @@ object AppLog {
             toFile(LogLevel.INFO, "last runs", exitLine(exit) + (trace?.let { "\n" + it.trimEnd().prependIndent("    ") } ?: ""))
         }
         prefs.edit().putLong(EXIT_TOLD, exits.maxOf { it.timestamp }).apply()
+    }
+
+    /**
+     * Hands the core how the last runs ended, with the system's trace of each crash in native code,
+     * so that a GPU driver that crashed them is left for the other graphics backend (see the core's
+     * gpu_last_runs). Call it once the core's GPU record has its folder, before the GPU's device is
+     * made. Quick: a trace is read only for a recent crash in native code.
+     */
+    fun toGpuStart(context: Context) {
+        val runs = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) endedRuns(context) else emptyList()
+        runCatching { io.github.artcraftandroid.procraft.core.gpuLastRuns(runs, Build.FINGERPRINT) }
+            .onFailure { w(TAG, "how the last runs ended, for the GPU", it) }
+    }
+
+    @RequiresApi(Build.VERSION_CODES.R)
+    private fun endedRuns(context: Context): List<io.github.artcraftandroid.procraft.core.EndedRun> = runCatching {
+        context.getSystemService(ActivityManager::class.java)
+            ?.getHistoricalProcessExitReasons(context.packageName, 0, GPU_RUNS).orEmpty()
+            .map { exit ->
+                val native = exit.reason == ApplicationExitInfo.REASON_CRASH_NATIVE
+                val trace = if (native) runCatching { exit.traceInputStream?.use { readAtMost(it, GPU_TRACE_READ_MOST) } }.getOrNull() else null
+                io.github.artcraftandroid.procraft.core.EndedRun(exit.timestamp, native, trace)
+            }
+    }.getOrElse {
+        w(TAG, "how the last runs ended couldn't be read for the GPU", it)
+        emptyList()
     }
 
     @RequiresApi(Build.VERSION_CODES.R)
@@ -200,6 +238,34 @@ object AppLog {
                     "the app's heap up to ${Runtime.getRuntime().maxMemory() shr 20} MB",
             )
             appendLine("screen: ${screen.widthPixels}×${screen.heightPixels}, ${screen.densityDpi} dpi")
+            appendLine(display(context))
         }
+    }
+
+    /**
+     * What a report of the screen showing the app wrongly needs: the chip (Android 12 on), whether
+     * the screen takes wide colour and HDR, the colour space a wide-colour window is drawn in there,
+     * and whether Wide Color is on.
+     */
+    private fun display(context: Context): String {
+        val config = context.resources.configuration
+        val chip = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) "${Build.SOC_MANUFACTURER} ${Build.SOC_MODEL}" else "not told before Android 12"
+        val wideSpace = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            runCatching {
+                context.getSystemService(android.hardware.display.DisplayManager::class.java)
+                    ?.getDisplay(android.view.Display.DEFAULT_DISPLAY)?.preferredWideGamutColorSpace?.name
+            }.getOrNull() ?: "none"
+        } else {
+            "not told before Android 10"
+        }
+        val wideColor = runCatching {
+            context.getSharedPreferences("interface", Context.MODE_PRIVATE).getBoolean(
+                io.github.artcraftandroid.procraft.canvas.CanvasViewModel.WIDE_COLOR,
+                io.github.artcraftandroid.procraft.canvas.wideColorByDefault(),
+            )
+        }.getOrNull()
+        return "chip: $chip; screen: wide colour ${if (config.isScreenWideColorGamut) "yes" else "no"}, " +
+            "HDR ${if (config.isScreenHdr) "yes" else "no"}, a wide window drawn in $wideSpace; " +
+            "Wide Color ${when (wideColor) { true -> "on"; false -> "off"; null -> "unknown" }}"
     }
 }

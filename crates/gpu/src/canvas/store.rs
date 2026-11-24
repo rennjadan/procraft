@@ -292,12 +292,8 @@ impl Canvas {
         if !laid.is_empty()
             && let Some(target) = self.layers.get(&height)
         {
-            use wgpu::util::DeviceExt;
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("store heights"),
-                contents: bytemuck::cast_slice(&laid),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+            let buffer =
+                super::buffer_init(device, "store heights", bytemuck::cast_slice(&laid), wgpu::BufferUsages::VERTEX);
             let mut pass = render_pass(encoder, "store heights", &target.view, wgpu::LoadOp::Load);
             pass.set_pipeline(&store.height);
             pass.set_bind_group(0, brush, &[]);

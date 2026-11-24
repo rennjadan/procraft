@@ -425,6 +425,30 @@ const FIRST_SHIPPED: [u32; 6] = [3, 3, 3, 2, 2, 2];
 /// and sliders, and how many brushes of each shipped set it has seen.
 pub(crate) const LIBRARY_FILE: &str = "library.json";
 
+/// A copy's name: `name` numbered on from its own number (one if it has none, so "Yarra" gives
+/// "Yarra 2" and "Brush 7" gives "Brush 8"), the first such that isn't `taken`.
+fn numbered_copy(name: &str, taken: impl Fn(&str) -> bool) -> String {
+    let (base, own) = match name.rsplit_once(' ') {
+        Some((base, n)) if !base.trim().is_empty() && !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()) => {
+            (base, n.parse::<u64>().unwrap_or(u64::MAX / 2))
+        }
+        _ => (name, 1),
+    };
+    let mut n = own.saturating_add(1).max(2);
+    // (every name in a set can't be taken: a set holds far fewer brushes)
+    for _ in 0..100_000 {
+        let next = format!("{base} {n}");
+        if !taken(&next) {
+            return next;
+        }
+        n = n.saturating_add(1);
+    }
+    format!("{base} {n}")
+}
+
+/// Said when Combine is tapped with a combined brush among the two.
+const COMBINED_ALREADY: &str = "A combined brush can't take another one. Uncombine it first.";
+
 /// Held while a library or its choices are read out and written, and while another library is
 /// brought into use, so that writes from two threads (a window's, one keeping it in the background)
 /// land in the order they read it, and none lands in a library's files once it was left.
@@ -448,6 +472,14 @@ struct LastLibrary {
     library: Vec<LibrarySet>,
 }
 
+/// Whether brushes dragged from set `from` and let go on set `to` are copied there, those dragged
+/// staying where they were (a green plus on them says so while they are dragged over it): onto
+/// another set they are; along their own set they move.
+#[uniffi::export]
+pub fn brush_drop_copies(from: u32, to: u32) -> bool {
+    from != to
+}
+
 /// Reads the library in use kept in folder `dir` ahead of the first artwork (while the gallery
 /// shows), so that it opens without reading it (see [`CanvasSession::open_brushes`]); nothing if it
 /// is held already or there is none. Slow with many brushes brought in: call it off the main thread.
@@ -455,12 +487,13 @@ struct LastLibrary {
 pub fn prepare_brushes(dir: String) {
     // the brushes the app comes with first, kept or not
     crate::stock_library::prepare();
-    let (library, first) = crate::brush_libraries::file_in_use(std::path::Path::new(&dir));
+    crate::big_pictures::use_folder(std::path::Path::new(&dir));
+    let library = crate::brush_libraries::file_in_use(std::path::Path::new(&dir));
     if holds(&LAST_LIBRARY, &library) || !library.is_file() {
         return;
     }
     let started = std::time::Instant::now();
-    if CanvasSession::new(1, 1).load_library_file(&library, !first) {
+    if CanvasSession::new(1, 1).load_library_file(&library, true) {
         log::info!("the brushes read ahead in {} ms", started.elapsed().as_millis());
     }
 }
@@ -543,6 +576,9 @@ fn remembered(slot: &std::sync::Mutex<Option<LastLibrary>>, path: &std::path::Pa
 }
 pub(crate) const CHOICES_FILE: &str = "choices.json";
 const SEEN_FILE: &str = "seen.txt";
+/// Where it is written down, beside the brushes, which plugins' sets of brushes were given to the
+/// library: an id a line.
+const PLUGIN_SETS_FILE: &str = "plugin-sets.txt";
 
 /// Puts what an earlier version kept elsewhere into folder `dir` for [`CanvasSession::open_brushes`]:
 /// the shipped brushes it had seen (`seen`, numbers joined by commas) and the brushes in use
@@ -555,7 +591,11 @@ pub fn adopt_kept_brushes(dir: String, seen: Option<String>, choices: Option<Str
     [(SEEN_FILE, seen), (CHOICES_FILE, choices)].into_iter().all(|(name, text)| {
         let path = dir.join(name);
         match text {
-            Some(text) if !path.exists() => std::fs::write(&path, text).is_ok(),
+            // whole or not at all: a list cut short (the storage full) would bring back brushes seen
+            Some(text) if !path.exists() => crate::project::write_atomically(&path, |p| {
+                crate::storage::write(p, &text).map_err(|e| crate::project::file_error("keeping the brushes", e))
+            })
+            .is_ok(),
             _ => true,
         }
     })
@@ -713,10 +753,11 @@ impl State {
                     .map(|(k, c)| (brushfile::pressure_curve_key(k).to_owned(), points(c)))
                     .collect()
             }),
-            // a stock shape's is made again from its name when the brush comes back
-            shape_source: own(&brush.shape.source, &base.shape.source).filter(|_| brush.stock.shape.is_none()),
+            // a stock shape's is made again from its name when the brush comes back (so it isn't
+            // drawn, nor written out, to be kept)
+            shape_source: brush.stock.shape.is_none().then(|| own(&brush.shape.source, &base.shape.source)).flatten(),
             // a stock grain's is made again from its name when the brush comes back
-            grain_source: own(&brush.grain.source, &base.grain.source).filter(|_| brush.stock.grain.is_none()),
+            grain_source: brush.stock.grain.is_none().then(|| own(&brush.grain.source, &base.grain.source)).flatten(),
             grain_file: brush
                 .grain_file_now()
                 .map(|f| SavedGrainFile { width: f.width, full: f.full.as_ref().map(|g| (g.id, g.side)) }),
@@ -1146,12 +1187,14 @@ impl CanvasSession {
         st.pinned_brushes.clear();
     }
 
-    /// A copy of a brush just above it in its set; returns the copy's index.
+    /// A copy of a brush just above it in its set, numbered after it ("Yarra" gives "Yarra 2", then
+    /// "Yarra 3"); returns the copy's index.
     pub fn duplicate_brush(&self, set: u32, index: u32) -> Option<u32> {
         let mut st = self.shared.lock();
         let (s, i) = (set as usize, index as usize);
         let entry = st.library.get_mut(s)?;
-        let brush = entry.brushes.get(i)?.clone();
+        let mut brush = entry.brushes.get(i)?.clone();
+        brush.name = numbered_copy(&brush.name, |name| entry.brushes.iter().any(|b| b.name == name));
         let origin = entry.origins.get(i).copied().flatten();
         entry.brushes.insert(i, brush);
         entry.origins.insert(i, origin);
@@ -1190,6 +1233,113 @@ impl CanvasSession {
             Some((rs, if rs == ts && ri >= ti { ri + 1 } else { ri }))
         });
         true
+    }
+
+    /// Moves brushes `indices` of `set` together, in their order, to place `to_index` of set
+    /// `to_set` (counted without them there): several brushes dragged at once onto a set, or along
+    /// their own. A tool that used one keeps it, wherever it goes. False, moving none, if any isn't
+    /// a brush there or there is no such set.
+    pub fn move_brushes(&self, set: u32, indices: Vec<u32>, to_set: u32, to_index: u32) -> bool {
+        let mut st = self.shared.lock();
+        let (s, ts) = (set as usize, to_set as usize);
+        let mut moving: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
+        moving.sort_unstable();
+        moving.dedup();
+        let held = st.library.get(s).map_or(0, |e| e.brushes.len());
+        if moving.is_empty() || ts >= st.library.len() || moving.iter().any(|&i| i >= held) {
+            return false;
+        }
+        let Some(entry) = st.library.get_mut(s) else { return false };
+        // out of their set from the last up, so the places of the rest hold
+        let mut taken = Vec::with_capacity(moving.len());
+        for &i in moving.iter().rev() {
+            let brush = entry.brushes.remove(i);
+            let origin = if i < entry.origins.len() { entry.origins.remove(i) } else { None };
+            taken.push((brush, origin));
+        }
+        taken.reverse();
+        let Some(target) = st.library.get_mut(ts) else { return false };
+        let ti = (to_index as usize).min(target.brushes.len());
+        for (k, (brush, origin)) in taken.into_iter().enumerate() {
+            target.brushes.insert(ti + k, brush);
+            if ti + k <= target.origins.len() {
+                target.origins.insert(ti + k, origin);
+            } else {
+                target.origins.push(origin);
+            }
+        }
+        let count = moving.len();
+        st.move_brush_refs(|(rs, ri)| {
+            if rs == s
+                && let Ok(k) = moving.binary_search(&ri)
+            {
+                return Some((ts, ti + k));
+            }
+            // out of their old places, then into the new ones
+            let ri = if rs == s { ri - moving.partition_point(|&m| m < ri) } else { ri };
+            Some((rs, if rs == ts && ri >= ti { ri + count } else { ri }))
+        });
+        true
+    }
+
+    /// Copies brushes `indices` of `set` together, in their order, to place `to_index` of set
+    /// `to_set` (its top at 0), each with its own name and what it started as; the brushes copied
+    /// stay where they were, and a tool keeps the brush it had. False, copying none, if any isn't a
+    /// brush there or there is no such set.
+    pub fn copy_brushes(&self, set: u32, indices: Vec<u32>, to_set: u32, to_index: u32) -> bool {
+        let mut st = self.shared.lock();
+        let (s, ts) = (set as usize, to_set as usize);
+        let mut copying: Vec<usize> = indices.iter().map(|&i| i as usize).collect();
+        copying.sort_unstable();
+        copying.dedup();
+        let Some(entry) = st.library.get(s) else { return false };
+        if copying.is_empty() || ts >= st.library.len() || copying.iter().any(|&i| i >= entry.brushes.len()) {
+            return false;
+        }
+        let copies: Vec<(Brush, Option<(usize, usize)>)> = copying
+            .iter()
+            .filter_map(|&i| Some((entry.brushes.get(i)?.clone(), entry.origins.get(i).copied().flatten())))
+            .collect();
+        let count = copies.len();
+        let Some(target) = st.library.get_mut(ts) else { return false };
+        let ti = (to_index as usize).min(target.brushes.len());
+        for (k, (brush, origin)) in copies.into_iter().enumerate() {
+            target.brushes.insert(ti + k, brush);
+            if ti + k <= target.origins.len() {
+                target.origins.insert(ti + k, origin);
+            } else {
+                target.origins.push(origin);
+            }
+        }
+        // the brushes after them in their new set move down past them
+        st.move_brush_refs(|(rs, ri)| Some((rs, if rs == ts && ri >= ti { ri + count } else { ri })));
+        true
+    }
+
+    /// Brushes `indices` of `set` dragged and let go at place `to_index` of set `to_set` (counted
+    /// without them there): along their own set they move there; onto another set they are copied
+    /// there, those dragged staying where they were (see [`brush_drop_copies`]). Whether any moved
+    /// or were copied.
+    pub fn drop_brushes(&self, set: u32, indices: Vec<u32>, to_set: u32, to_index: u32) -> bool {
+        if brush_drop_copies(set, to_set) {
+            self.copy_brushes(set, indices, to_set, to_index)
+        } else {
+            self.move_brushes(set, indices, to_set, to_index)
+        }
+    }
+
+    /// Names brush `index` of `set` (from its menu in the library), as a set is named: trimmed, at
+    /// most 256 characters; a name of nothing but spaces leaves it as it was. Whether it changed.
+    pub fn rename_brush(&self, set: u32, index: u32, name: String) -> bool {
+        let name: String = name.trim().chars().take(256).collect();
+        let mut st = self.shared.lock();
+        match st.library.get_mut(set as usize).and_then(|s| s.brushes.get_mut(index as usize)) {
+            Some(brush) if !name.is_empty() && brush.name != name => {
+                brush.name = name;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Removes a brush; a tool that used it takes the one now in its place.
@@ -1248,6 +1398,15 @@ impl CanvasSession {
             Some((rs, if ri > b { ri - 1 } else { ri }))
         });
         true
+    }
+
+    /// Why brushes `first` and `second` of `set`, both picked, can't be combined, in words to show;
+    /// none when they can be. A combined brush takes no other until it is uncombined.
+    pub fn combine_refusal(&self, set: u32, first: u32, second: u32) -> Option<String> {
+        let st = self.shared.lock();
+        let brushes = &st.library.get(set as usize)?.brushes;
+        let dual = |i: u32| brushes.get(i as usize).is_some_and(|b| b.secondary.is_some());
+        (dual(first) || dual(second)).then(|| COMBINED_ALREADY.to_owned())
     }
 
     /// Dual brush `index` of `set` comes apart: its second goes back into the set just below it.
@@ -1327,11 +1486,12 @@ impl CanvasSession {
         }
     }
 
-    /// Removes a set and its brushes (not the last set).
+    /// Removes a set and its brushes; the last one too, leaving the library with none (it shows
+    /// as a library with no brushes yet, a set made with its "+").
     pub fn delete_brush_set(&self, set: u32) -> bool {
         let mut st = self.shared.lock();
         let s = set as usize;
-        if s >= st.library.len() || st.library.len() <= 1 {
+        if s >= st.library.len() {
             return false;
         }
         st.library.remove(s);
@@ -1427,7 +1587,7 @@ impl CanvasSession {
             let _ = std::fs::create_dir_all(&dir);
             // whole or not at all: cut short, the next start would add shipped brushes again
             let kept = crate::project::write_atomically(&seen_file, |p| {
-                std::fs::write(p, &text).map_err(|e| crate::project::file_error("keeping the brushes seen", e))
+                crate::storage::write(p, &text).map_err(|e| crate::project::file_error("keeping the brushes seen", e))
             });
             if let Err(e) = kept {
                 log::error!("{e}");
@@ -1444,7 +1604,60 @@ impl CanvasSession {
             drop(st);
             crate::brush_pictures::forget_unnamed(&dir.join(crate::brush_pictures::FOLDER), &libraries);
         }
+        // the tools' brushes ready by the first stroke, their big pictures too where they are kept
+        // (none is made for a brush not chosen)
+        let mut st = self.shared.lock();
+        st.warm_tools_brushes();
+        st.big_pictures_kept(&dir);
+        // the sets of brushes plugins on come with, now the library is open
+        st.brushes_dir = Some(dir);
+        drop(st);
+        self.give_plugin_sets();
         loaded
+    }
+
+    /// Gives the library in use the set of brushes of each plugin on it hasn't been given before
+    /// ([`State::plugin_sets`]), each a set of its own at the top, once the brushes are open
+    /// ([`Self::open_brushes`]): kept with the library, then written down as given beside the
+    /// brushes, so each plugin's set comes once, and one deleted stays deleted. Cut short between
+    /// the two, a set comes again rather than never. The library changed, as a plugin changing a
+    /// brush changes it ([`Self::take_brushes_changed`]): every set after the new one is a place on.
+    pub(crate) fn give_plugin_sets(&self) {
+        let (dir, sets) = {
+            let st = self.shared.lock();
+            match &st.brushes_dir {
+                Some(dir) if !st.plugin_sets.is_empty() => (dir.clone(), st.plugin_sets.clone()),
+                _ => return,
+            }
+        };
+        let file = dir.join(PLUGIN_SETS_FILE);
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        let mut given: Vec<String> = text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_owned).collect();
+        let due: Vec<_> = sets.into_iter().filter(|(id, _)| !given.contains(id)).collect();
+        if due.is_empty() {
+            return;
+        }
+        for (id, set) in due {
+            // one that can't be read never will be: written down all the same
+            if self.import_brushes(set.to_vec()).is_none() {
+                log::warn!("the brushes plugin {id} comes with couldn't be added");
+            }
+            given.push(id);
+        }
+        self.shared.lock().brushes_changed = true;
+        let (library, choices) = self.files_in_use(&dir);
+        if self.save_brush_library_file(library.to_string_lossy().into_owned()) {
+            let _writing = library_writes();
+            Self::write_choices(&choices, &self.saved_brush_choices());
+        }
+        let text = given.join("\n");
+        let kept = crate::project::write_atomically(&file, |p| {
+            crate::storage::write(p, &text)
+                .map_err(|e| crate::project::file_error("keeping the plugins' brushes given", e))
+        });
+        if let Err(e) = kept {
+            log::error!("{e}");
+        }
     }
 }
 
@@ -1539,7 +1752,8 @@ impl CanvasSession {
             let _ = std::fs::create_dir_all(dir);
         }
         let written = crate::project::write_atomically(path, |p| {
-            std::fs::write(p, choices.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+            crate::storage::write(p, choices.as_bytes())
+                .map_err(|e| crate::project::file_error("keeping the brushes", e))
         });
         if let Err(e) = &written {
             log::error!("{e}");
@@ -1557,7 +1771,7 @@ fn keep_library_text(path: &std::path::Path, json: &str, pictures: &[(String, cr
         return false;
     }
     let written = crate::project::write_atomically(path, |p| {
-        std::fs::write(p, json.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+        crate::storage::write(p, json.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
     });
     if let Err(e) = &written {
         log::error!("{e}");
@@ -1857,6 +2071,51 @@ impl CanvasSession {
 #[cfg(test)]
 mod keeping {
     use crate::CanvasSession;
+
+    /// A copy is numbered on from its brush's own number, the first one the set doesn't have.
+    #[test]
+    fn a_copy_is_numbered_on_from_its_brush() {
+        use super::numbered_copy;
+        let set = ["Yarra", "Yarra 2", "Yarra 4", "Brush 7", "Pen 2 1"];
+        let taken = |name: &str| set.contains(&name);
+        assert_eq!(numbered_copy("Yarra", taken), "Yarra 3");
+        assert_eq!(numbered_copy("Yarra", |_| false), "Yarra 2");
+        assert_eq!(numbered_copy("Yarra 2", taken), "Yarra 3");
+        assert_eq!(numbered_copy("Yarra 4", taken), "Yarra 5");
+        assert_eq!(numbered_copy("Brush 7", taken), "Brush 8");
+        assert_eq!(numbered_copy("Pen 2 1", taken), "Pen 2 2");
+        // a name of a number alone, or a number with no space before it, is a name like any
+        assert_eq!(numbered_copy("42", taken), "42 2");
+        assert_eq!(numbered_copy("6B", taken), "6B 2");
+        assert_eq!(numbered_copy(" 3", taken), " 3 2");
+    }
+
+    #[test]
+    fn a_brush_renamed_from_its_menu_keeps_the_name_and_its_settings() {
+        let s = CanvasSession::new(32, 32);
+        let library = s.brush_library();
+        let stock = library.first().and_then(|set| set.brushes.get(1)).cloned().expect("a stock brush");
+        assert!(s.select_brush(0, 1));
+        let size = s.info().size;
+        // trimmed; the current brush's name follows; nothing but spaces, or the same name, changes nothing
+        assert!(s.rename_brush(0, 1, "  My pencil ".into()));
+        assert_eq!(s.current_brush().name, "My pencil");
+        assert!(!s.rename_brush(0, 1, "   ".into()));
+        assert!(!s.rename_brush(0, 1, "My pencil".into()));
+        assert!(!s.rename_brush(0, 9999, "Nowhere".into()) && !s.rename_brush(9999, 0, "Nowhere".into()));
+        assert!(s.rename_brush(0, 1, "x".repeat(300)));
+        assert_eq!(s.current_brush().name.chars().count(), 256);
+        assert!(s.rename_brush(0, 1, "My pencil".into()));
+        // the others keep theirs, and the brush draws as before
+        assert_eq!(s.brush_library()[0].brushes[0].name, library[0].brushes[0].name);
+        assert_eq!(s.info().size, size);
+        assert_ne!(stock.name, "My pencil");
+        // kept with the library, and read back
+        let kept = s.saved_brush_library();
+        let other = CanvasSession::new(32, 32);
+        assert!(other.load_brush_library(kept));
+        assert_eq!(other.brush_library()[0].brushes[1].name, "My pencil");
+    }
 
     #[test]
     fn brushes_moved_deleted_and_combined_at_random_leave_every_place_sound() {
@@ -2318,6 +2577,26 @@ mod recent {
     /// The Recent set as places: its list keys its rows by them, and a place twice stops the app.
     fn places(s: &CanvasSession) -> Vec<(u32, u32)> {
         s.recent_brushes().iter().map(|r| (r.set, r.index)).collect()
+    }
+
+    /// Two plain brushes picked combine; a combined one among two picked is refused, in words to
+    /// show, until it is uncombined.
+    #[test]
+    fn combine_refuses_a_combined_brush_until_it_is_uncombined() {
+        let s = CanvasSession::new(32, 32);
+        // in the set of ours from before, whose first brushes are no dual brushes
+        let l = s.brush_library().len() as u32 - 1;
+        assert_eq!(s.combine_refusal(l, 0, 1), None);
+        assert!(s.combine_brushes(l, 0, 1));
+        // the pair is first now, the third brush second
+        let refusal = s.combine_refusal(l, 0, 1).expect("refused");
+        assert!(refusal.contains("Uncombine"), "{refusal}");
+        assert_eq!(s.combine_refusal(l, 1, 0), Some(refusal));
+        assert!(s.uncombine_brush(l, 0));
+        assert_eq!(s.combine_refusal(l, 0, 1), None);
+        // nothing there: nothing to refuse
+        assert_eq!(s.combine_refusal(l, 0, 9999), None);
+        assert_eq!(s.combine_refusal(9999, 0, 1), None);
     }
 
     #[test]

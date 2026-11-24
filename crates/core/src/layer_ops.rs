@@ -38,6 +38,16 @@ impl State {
         canvas.read_layer_part(gpu, id, rect).ok()
     }
 
+    /// [`State::layer_part`] started: the copy queued (everything queued drawn first), its pixels
+    /// waited for once the lock is let go.
+    pub(crate) fn start_layer_part(&mut self, id: LayerId, rect: IRect) -> Option<procraft_gpu::Readback> {
+        self.finish_stroke();
+        self.settle();
+        self.flush();
+        let (Some(canvas), Some(gpu)) = (self.canvas.as_ref(), self.gpu.as_ref()) else { return None };
+        canvas.start_reading_layer_part(gpu, id, rect).ok()
+    }
+
     /// Where layer `id` is painted (as the GPU finds it, everything queued drawn first); none if
     /// nowhere, the whole canvas if the GPU can't tell.
     pub(crate) fn painted_box(&mut self, id: LayerId) -> Option<IRect> {

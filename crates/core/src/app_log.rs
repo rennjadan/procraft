@@ -11,7 +11,10 @@
 //! files is left out of every line (see [`redact`]).
 //!
 //! Help's Share log hands both logs on as one text file, with the GPU start record the device
-//! module keeps (see [`write_log_to_share`]).
+//! module keeps (see [`write_log_to_share`]); so does the gallery's question about an artwork whose
+//! opening closed the app. Each log begins with its run's process, so that the log of a run that
+//! closed while it opened an artwork is kept apart as well (see [`keep_log_of_ended_runs`]): the
+//! starts after it would otherwise push it out before it is shared.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -22,6 +25,8 @@ use std::time::Instant;
 /// The log, and the run before's, in the app's own folder.
 const LOG: &str = "procraft.log";
 const PREVIOUS_LOG: &str = "procraft-previous.log";
+/// The log of a run that closed while it opened an artwork, kept while the open marks name it.
+const CRASHED_LOG: &str = "procraft-crashed.log";
 
 /// How large a log grows, bytes.
 const MOST: usize = 1 << 20;
@@ -50,6 +55,8 @@ static BEGAN: OnceLock<Instant> = OnceLock::new();
 
 std::thread_local! {
     /// Whether this thread is writing into the log's file.
+    // (already const: clippy 1.99 asks for it again when built for Android)
+    #[allow(clippy::missing_const_for_thread_local)]
     static WRITING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -87,6 +94,7 @@ pub fn start_log_file(dir: String, header: String) {
         kept.is_some()
     };
     if begun {
+        write(&process_line(std::process::id()));
         write(&header);
     } else {
         log::warn!("the log's file couldn't be made");
@@ -107,12 +115,39 @@ pub fn log_line(level: LogLevel, tag: String, message: String) {
 #[uniffi::export]
 pub fn trace_text(trace: Vec<u8>) -> String {
     let text = match std::str::from_utf8(&trace) {
-        Ok(text) if text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t')) => text.to_owned(),
+        Ok(text) if is_text(text) => text.to_owned(),
         _ => {
             tombstone::read(&trace).unwrap_or_else(|| format!("(a trace of {} bytes the app can't read)", trace.len()))
         }
     };
     trimmed(&text, TRACE_MOST)
+}
+
+/// Whether a trace is text (a frozen app's, an older system's crash), not a record in binary form.
+fn is_text(text: &str) -> bool {
+    text.chars().all(|c| !c.is_control() || matches!(c, '\n' | '\r' | '\t'))
+}
+
+/// The files the frames of the thread that crashed were in, innermost first, from the system's
+/// trace of a crash in native code (its record in binary form, or as text: the first backtrace's),
+/// as much of it as was read; none if it names none.
+pub(crate) fn crashed_frame_files(trace: &[u8]) -> Vec<String> {
+    let text = match std::str::from_utf8(trace) {
+        Ok(text) => Some(text),
+        // cut short inside a character
+        Err(e) if e.error_len().is_none() => trace.get(..e.valid_up_to()).and_then(|t| std::str::from_utf8(t).ok()),
+        Err(_) => None,
+    };
+    match text {
+        Some(text) if is_text(text) => text
+            .lines()
+            .map(str::trim_start)
+            .skip_while(|line| !line.starts_with("#00 pc "))
+            .take_while(|line| line.starts_with('#') && line.split_whitespace().nth(1) == Some("pc"))
+            .filter_map(|line| line.split_whitespace().nth(3).map(str::to_owned))
+            .collect(),
+        _ => tombstone::crashed_files(trace),
+    }
 }
 
 /// Writes the log to share into the file `to`: what the GPU start record says and the GPU each run
@@ -125,7 +160,47 @@ pub fn write_log_to_share(dir: String, to: String) -> bool {
     if let Some(folder) = to.parent() {
         let _ = fs::create_dir_all(folder);
     }
-    fs::write(to, text).map_err(|e| log::warn!("the log to share: {e}")).is_ok()
+    crate::storage::write(to, text).map_err(|e| log::warn!("the log to share: {e}")).is_ok()
+}
+
+/// The line a log begins with: the run (process) it is of.
+fn process_line(run: u32) -> String {
+    format!("process {run}\n")
+}
+
+/// The run a log is of, by its first line; none for a log from before logs said.
+fn process_of(log: &[u8]) -> Option<u32> {
+    let first = log.split(|&b| b == b'\n').next()?;
+    std::str::from_utf8(first).ok()?.trim().strip_prefix("process ")?.parse().ok()
+}
+
+/// Keeps the run before's log apart as [`CRASHED_LOG`] when that run closed while it opened an
+/// artwork (`ended`: the runs that did, as the open marks say), so that it is still there to share
+/// after later starts; one kept for a run the marks no longer name (its artwork opened since) goes.
+pub(crate) fn keep_log_of_ended_runs(ended: &[u32]) {
+    // (the lock let go first: a line logged meanwhile takes it)
+    let dir = kept().as_ref().and_then(|f| f.path.parent().map(Path::to_path_buf));
+    if let Some(dir) = dir {
+        keep_ended_in(&dir, ended);
+    }
+}
+
+fn keep_ended_in(dir: &Path, ended: &[u32]) {
+    let crashed = dir.join(CRASHED_LOG);
+    if let Ok(before) = fs::read(dir.join(PREVIOUS_LOG))
+        && process_of(&before).is_some_and(|run| ended.contains(&run))
+    {
+        let written = crate::project::write_atomically(&crashed, |p| {
+            crate::storage::write(p, &before).map_err(|e| crate::project::file_error("keeping the log", e))
+        });
+        if let Err(e) = written {
+            log::warn!("{e}");
+        }
+        return;
+    }
+    if fs::read(&crashed).ok().and_then(|log| process_of(&log)).is_some_and(|run| !ended.contains(&run)) {
+        let _ = fs::remove_file(&crashed);
+    }
 }
 
 /// The log to share, from `dir` (see [`write_log_to_share`]), with what could name the person left
@@ -134,20 +209,29 @@ fn shared_log(dir: &Path) -> String {
     use std::fmt::Write as _;
     let read = |name: &str| fs::read(dir.join(name)).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
     let (now, before) = (read(LOG), read(PREVIOUS_LOG));
+    // a run that closed while it opened an artwork, unless that is the run before
+    let run_before = before.as_deref().and_then(|b| process_of(b.as_bytes()));
+    let crashed = read(CRASHED_LOG).filter(|c| process_of(c.as_bytes()) != run_before);
     let record = read(crate::device::RECORD).map(|r| r.trim().to_owned()).filter(|r| !r.is_empty());
     let mut out = String::from("ProCraft's log\n\n");
-    // "<backend> trying|made|drew", and on a second line the build it was kept for
+    // "<backend> trying|made|drew", on a second line the build it was kept for, and on a third
+    // what the GPU's drivers' crashes came to
     let record = match record {
         Some(r) => {
             let mut lines = r.lines();
             let first = lines.next().unwrap_or_default().trim().to_owned();
             let build = lines.next().map(str::trim).filter(|b| !b.is_empty());
+            let crashes = lines.next().map(str::trim).filter(|c| !c.is_empty());
             let shown = match first.split_whitespace().next().and_then(|b| b.parse::<usize>().ok()) {
                 Some(backend) => format!("{first} (backend {backend} is {})", procraft_gpu::Gpu::backend_name(backend)),
                 None => first,
             };
-            match build {
+            let shown = match build {
                 Some(build) => format!("{shown}, kept for the build {build}"),
+                None => shown,
+            };
+            match crashes {
+                Some(crashes) => format!("{shown}; {crashes}"),
                 None => shown,
             }
         }
@@ -163,6 +247,13 @@ fn shared_log(dir: &Path) -> String {
             out.push('\n');
         }
     }
+    if let Some(log) = crashed {
+        let _ =
+            write!(out, "\n===== An earlier run, which closed while it opened an artwork ({CRASHED_LOG}) =====\n{log}");
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+    }
     redact(&out, &app_folders(dir))
 }
 
@@ -171,30 +262,36 @@ fn gpu_line(log: &str) -> Option<&str> {
     log.lines().rev().find_map(|line| line.find("] GPU: ").and_then(|at| line.get(at + 7..)))
 }
 
-/// The core's log to Android's (through `android`) and into the file, from `info` up.
-#[cfg(target_os = "android")]
-pub(crate) fn install(android: android_logger::AndroidLogger) {
-    struct Both(android_logger::AndroidLogger);
-
-    impl log::Log for Both {
-        fn enabled(&self, metadata: &log::Metadata) -> bool {
-            metadata.level() <= log::Level::Info
-        }
-
-        fn log(&self, record: &log::Record) {
-            if !self.enabled(record.metadata()) {
-                return;
-            }
-            log::Log::log(&self.0, record);
-            write(&line(record.level(), record.target(), &record.args().to_string()));
-        }
-
-        fn flush(&self) {}
-    }
-
-    if log::set_logger(Box::leak(Box::new(Both(android)))).is_ok() {
+/// The core's log into the file, from `info` up, and to the platform's own log (`system`: Android's)
+/// where it has one the core writes to.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) fn install(system: Option<Box<dyn log::Log>>) {
+    if log::set_logger(Box::leak(Box::new(Both(system)))).is_ok() {
         log::set_max_level(log::LevelFilter::Info);
     }
+}
+
+/// The core's log into the file, and to the platform's own log if it has one.
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+struct Both(Option<Box<dyn log::Log>>);
+
+#[cfg(any(target_os = "android", target_os = "ios", test))]
+impl log::Log for Both {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        if let Some(system) = &self.0 {
+            system.log(record);
+        }
+        write(&line(record.level(), record.target(), &record.args().to_string()));
+    }
+
+    fn flush(&self) {}
 }
 
 /// A line of the log: how long after it began, how serious, where from, and what.
@@ -632,6 +729,30 @@ mod tombstone {
         lines
     }
 
+    /// A thread from the record's map of them: each under its number, as a pair of fields.
+    fn thread_entry(bytes: &[u8]) -> Option<Thread> {
+        Fields(bytes).find_map(|(n, v)| match (n, v) {
+            (2, Value::Bytes(b)) => Some(thread(b)),
+            _ => None,
+        })
+    }
+
+    /// The files the crashed thread's frames were in, innermost first (see
+    /// [`super::crashed_frame_files`]).
+    pub(super) fn crashed_files(bytes: &[u8]) -> Vec<String> {
+        let mut crashed = None;
+        let mut threads = Vec::new();
+        for (n, value) in Fields(bytes) {
+            match (n, value) {
+                (6, Value::Number(v)) => crashed = Some(v),
+                (16, Value::Bytes(b)) => threads.extend(thread_entry(b)),
+                _ => {}
+            }
+        }
+        let thread = threads.into_iter().find(|t| Some(t.id) == crashed);
+        thread.map(|t| t.frames.into_iter().map(|f| f.file).collect()).unwrap_or_default()
+    }
+
     /// The record `bytes` as text: none if it isn't one (no signal and no threads in it).
     pub(super) fn read(bytes: &[u8]) -> Option<String> {
         let (mut crashed, mut uptime, mut said) = (None, None, None);
@@ -646,11 +767,7 @@ mod tombstone {
                     (1, Value::Bytes(b)) => Some(text(b)),
                     _ => None,
                 })),
-                // each thread under its number, as a pair of fields
-                (16, Value::Bytes(b)) => threads.extend(Fields(b).find_map(|(n, v)| match (n, v) {
-                    (2, Value::Bytes(b)) => Some(thread(b)),
-                    _ => None,
-                })),
+                (16, Value::Bytes(b)) => threads.extend(thread_entry(b)),
                 (18, Value::Bytes(b)) => logs.extend(log_lines(b)),
                 (20, Value::Number(v)) => uptime = Some(v),
                 _ => {}
@@ -738,6 +855,46 @@ mod tests {
         LogFile::begin(&dir).unwrap();
         assert_eq!(fs::read_to_string(dir.join(PREVIOUS_LOG)).unwrap(), "the second run\n");
         assert_eq!(fs::read_to_string(dir.join(LOG)).unwrap(), "");
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// The log of a run that closed while it opened an artwork outlasts the starts after it, until
+    /// that artwork opens: shared with this run's and the run before's, as itself, once.
+    #[test]
+    fn the_log_of_a_run_that_closed_opening_an_artwork_outlasts_the_starts_after_it() {
+        let dir = folder("crashed");
+        let run = |pid: u32, said: &str| {
+            let mut log = LogFile::begin(&dir).unwrap();
+            log.write(&process_line(pid));
+            log.write(said);
+        };
+        // run 7 closes while it opens an artwork (its mark stays); run 8 starts
+        run(7, "opening the artwork that closes the app\n");
+        run(8, "the gallery, once\n");
+        keep_ended_in(&dir, &[7]);
+        let kept = fs::read(dir.join(CRASHED_LOG)).unwrap();
+        assert_eq!(process_of(&kept), Some(7));
+        assert_eq!(kept, fs::read(dir.join(PREVIOUS_LOG)).unwrap());
+        // the run before is it: shared once, not twice
+        let shared = shared_log(&dir);
+        assert_eq!(shared.matches("opening the artwork that closes the app").count(), 1, "{shared}");
+        // run 9 starts: run 7's log is no longer the run before's, and is still shared
+        run(9, "the gallery again\n");
+        keep_ended_in(&dir, &[7]);
+        let shared = shared_log(&dir);
+        assert_eq!(process_of(&fs::read(dir.join(PREVIOUS_LOG)).unwrap()), Some(8));
+        assert!(shared.contains("===== An earlier run, which closed while it opened an artwork"), "{shared}");
+        assert_eq!(shared.matches("opening the artwork that closes the app").count(), 1, "{shared}");
+        assert!(shared.contains("the gallery, once") && shared.contains("the gallery again"));
+        // its artwork opened since (no mark names run 7): it goes
+        run(10, "opened it anyway\n");
+        keep_ended_in(&dir, &[]);
+        assert!(!dir.join(CRASHED_LOG).exists());
+        assert!(!shared_log(&dir).contains("opening the artwork that closes the app"));
+        // a log from before logs said their run is never taken for one that closed
+        fs::write(dir.join(PREVIOUS_LOG), "no process line\n").unwrap();
+        keep_ended_in(&dir, &[7]);
+        assert!(!dir.join(CRASHED_LOG).exists());
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }
 
@@ -862,6 +1019,38 @@ mod tests {
     }
 
     #[test]
+    fn the_core_s_log_goes_on_to_the_platform_s_from_info_up() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Counted(Arc<AtomicUsize>);
+        impl log::Log for Counted {
+            fn enabled(&self, _: &log::Metadata) -> bool {
+                true
+            }
+            fn log(&self, _: &log::Record) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn flush(&self) {}
+        }
+        let heard = Arc::new(AtomicUsize::new(0));
+        let both = Both(Some(Box::new(Counted(Arc::clone(&heard)))));
+        for level in [log::Level::Error, log::Level::Warn, log::Level::Info, log::Level::Debug, log::Level::Trace] {
+            log::Log::log(
+                &both,
+                &log::Record::builder().level(level).target("procraft").args(format_args!("a line")).build(),
+            );
+        }
+        // error, warn and info reach it; debug and trace don't
+        assert_eq!(heard.load(Ordering::SeqCst), 3);
+        assert!(!log::Log::enabled(&both, &log::Metadata::builder().level(log::Level::Debug).build()));
+        // without a platform's log (the iPad's), lines go to the file alone, and nothing fails
+        log::Log::log(
+            &Both(None),
+            &log::Record::builder().level(log::Level::Warn).args(format_args!("a line")).build(),
+        );
+    }
+
+    #[test]
     fn a_line_says_how_long_after_the_start_how_serious_and_where_from() {
         let l = line(log::Level::Warn, "ProCraft", "importing a PSD");
         assert!(l.starts_with('['), "{l}");
@@ -979,6 +1168,51 @@ mod tests {
         }
         assert!(!text.contains("memory map"), "{text}");
         assert!(!text.contains("#04"), "{text}");
+    }
+
+    /// The files the crashed thread's frames were in, innermost first, from the record in binary
+    /// form (the crashed thread's, wherever it is among the others), from one cut short after its
+    /// threads, and from text (the first backtrace's, as the log tells it).
+    #[test]
+    fn a_native_crash_s_frames_are_told_by_the_files_they_were_in() {
+        let files = [
+            "/vendor/lib64/hw/vulkan.mt6761.so",
+            "/system/lib64/libvulkan.so",
+            "/data/app/~~a==/io.github.artcraftandroid.procraft-b==/base.apk",
+        ];
+        let mut t = number(1, 31694);
+        t.extend(bytes(2, b"procraft-render"));
+        for (i, file) in files.iter().enumerate() {
+            let mut f = number(1, 0x6d2f8 + i as u64);
+            f.extend(bytes(6, file.as_bytes()));
+            t.extend(bytes(4, &f));
+        }
+        let mut entry = number(1, 31694);
+        entry.extend(bytes(2, &t));
+        let mut record = number(6, 31694);
+        record.extend(thread(31304, "ndroid.procraft", 4));
+        record.extend(bytes(16, &entry));
+        record.extend(thread(31305, "Signal Catcher", 2));
+        record.extend(bytes(17, &[0x7f; 64]));
+        assert_eq!(crashed_frame_files(&record), files);
+        assert_eq!(crashed_frame_files(&record[..record.len() - 20]), files);
+        let text = trace_text(record);
+        assert_eq!(crashed_frame_files(text.as_bytes()), files);
+        // text cut short inside a character
+        let mut cut = format!("{text}\u{e9}").into_bytes();
+        cut.pop();
+        assert_eq!(crashed_frame_files(&cut), files);
+        // a system's own text tombstone: its backtrace
+        let tombstone = "pid: 1, tid: 2, name: procraft-render  >>> io.github.artcraftandroid.procraft <<<\n\
+                         backtrace:\n      #00 pc 0000000000001234  /vendor/lib64/egl/libGLESv2_mtk.so (BuildId: 0a)\n      \
+                         #01 pc 0000000000005678  /system/lib64/libGLESv2.so (glDrawArrays+28)\n\nmemory near x0:\n";
+        assert_eq!(
+            crashed_frame_files(tombstone.as_bytes()),
+            ["/vendor/lib64/egl/libGLESv2_mtk.so", "/system/lib64/libGLESv2.so"]
+        );
+        // no thread that crashed, or neither form
+        assert!(crashed_frame_files(&thread(4000, "main", 3)).is_empty());
+        assert!(crashed_frame_files(&[8, 1, 0xff]).is_empty());
     }
 
     #[test]

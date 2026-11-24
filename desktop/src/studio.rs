@@ -730,9 +730,11 @@ pub struct Studio {
     randomise_tapped: bool,
     /// The frame the pad menu opened in (the press that opened it doesn't close it).
     pad_menu_frame: u64,
-    /// The brush's sample stroke, and when it is drawn again.
+    /// The brush's sample stroke, when it is drawn again, and the one being drawn on a thread of its
+    /// own (a plugin's brush engine may take seconds over a brush's first).
     preview: Option<TextureHandle>,
     preview_due: Option<Instant>,
+    preview_drawing: Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>>,
     /// The source images, by kind; the Disclosure cards open.
     sources: HashMap<String, TextureHandle>,
     open_cards: HashSet<&'static str>,
@@ -1050,9 +1052,19 @@ impl Studio {
             return None;
         }
         self.plugin_rows = plugin_rows(&prefs.plugins);
-        if self.preview_due.is_some_and(|due| Instant::now() >= due) {
+        if let Some(drawing) = &self.preview_drawing {
+            match drawing.try_recv() {
+                Ok(image) => {
+                    self.preview = image.map(|i| ctx.load_texture("studio preview", i, egui::TextureOptions::LINEAR));
+                    self.preview_drawing = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => ctx.request_repaint_after(Duration::from_millis(50)),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.preview_drawing = None,
+            }
+        }
+        if self.preview_due.is_some_and(|due| Instant::now() >= due) && self.preview_drawing.is_none() {
             self.preview_due = None;
-            self.preview = brush_preview(ctx, session);
+            self.preview_drawing = brush_preview(session);
         } else if let Some(due) = self.preview_due {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
@@ -2032,12 +2044,20 @@ fn control_height(c: &Control, width: f32) -> f32 {
     }
 }
 
-/// The brush's sample stroke for the Preview page's card.
-fn brush_preview(ctx: &egui::Context, session: &CanvasSession) -> Option<TextureHandle> {
-    let b = session.current_brush();
-    let t = session.brush_preview(b.set, b.index, 1060, 324)?;
-    let image = egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba);
-    Some(ctx.load_texture("studio preview", image, egui::TextureOptions::LINEAR))
+/// The brush's sample stroke for the Preview page's card, drawn on a thread of its own: the
+/// interface never waits on it (a plugin's brush engine may take seconds over a brush's first).
+fn brush_preview(session: &Arc<CanvasSession>) -> Option<std::sync::mpsc::Receiver<Option<egui::ColorImage>>> {
+    let (done, drawing) = std::sync::mpsc::channel();
+    let session = Arc::clone(session);
+    let thread = std::thread::Builder::new().name("studio preview".into());
+    let started = thread.spawn(move || {
+        let b = session.current_brush();
+        let image = session
+            .brush_preview(b.set, b.index, 1060, 324)
+            .map(|t| egui::ColorImage::from_rgba_premultiplied([t.width as usize, t.height as usize], &t.rgba));
+        let _ = done.send(image);
+    });
+    started.ok().map(|_| drawing)
 }
 
 /// A blend mode's name, as the picker shows it (a file may give the grain a layer mode its list

@@ -22,26 +22,55 @@ pub struct Source {
 }
 
 /// A source's pixels: drawn, or drawn the first time they are read (a stand-in, which most brushes
-/// holding it never draw with), once for every brush sharing them. They read as the pixels.
+/// holding it never draw with), once for every brush sharing them. They read as the pixels. A
+/// stand-in can be drawn bigger too, sharper, for a big stamp or tile (see [`Pixels::sharper`]).
 #[derive(Clone)]
 pub struct Pixels(Arc<PixelCell>);
 
 struct PixelCell {
     drawn: std::sync::OnceLock<Arc<Vec<u8>>>,
-    draw: Option<Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>>,
+    /// Draws them at a side (`TEXTURE_SIZE`, or up to `most`).
+    draw: Option<Box<DrawAt>>,
+    most: usize,
 }
+
+/// What draws a source's pixels at a side it is given.
+type DrawAt = dyn Fn(usize) -> Option<Vec<u8>> + Send + Sync;
 
 impl Pixels {
     /// Pixels drawn already.
     pub fn drawn(pixels: Arc<Vec<u8>>) -> Pixels {
         let drawn = std::sync::OnceLock::new();
         let _ = drawn.set(pixels);
-        Pixels(Arc::new(PixelCell { drawn, draw: None }))
+        Pixels(Arc::new(PixelCell { drawn, draw: None, most: TEXTURE_SIZE }))
     }
 
     /// Pixels `draw` draws the first time they are read (`TEXTURE_SIZE` square; blank if it can't).
     pub fn later(draw: impl Fn() -> Option<Vec<u8>> + Send + Sync + 'static) -> Pixels {
-        Pixels(Arc::new(PixelCell { drawn: std::sync::OnceLock::new(), draw: Some(Box::new(draw)) }))
+        Pixels::later_at(TEXTURE_SIZE, move |_| draw())
+    }
+
+    /// Pixels `draw` draws at a side it is given: `TEXTURE_SIZE` the first time they are read, and
+    /// up to `most` (a power of two) for [`Pixels::sharper`].
+    pub fn later_at(most: usize, draw: impl Fn(usize) -> Option<Vec<u8>> + Send + Sync + 'static) -> Pixels {
+        let most = if most.is_power_of_two() { most.max(TEXTURE_SIZE) } else { TEXTURE_SIZE };
+        Pixels(Arc::new(PixelCell { drawn: std::sync::OnceLock::new(), draw: Some(Box::new(draw)), most }))
+    }
+
+    /// The most pixels a side they can be drawn at: `TEXTURE_SIZE` for any but a stand-in drawn
+    /// sharper bigger.
+    pub fn most_side(&self) -> usize {
+        self.0.most
+    }
+
+    /// The same picture drawn `side` pixels across (a power of two over `TEXTURE_SIZE`, up to
+    /// [`Pixels::most_side`]), sharper, for a stamp or tile bigger than `TEXTURE_SIZE`: drawn
+    /// again each time (slow at the biggest sides; whoever wants it keeps it); none past the most.
+    pub fn sharper(&self, side: usize) -> Option<Vec<u8>> {
+        if side <= TEXTURE_SIZE || side > self.0.most || !side.is_power_of_two() {
+            return None;
+        }
+        self.0.draw.as_ref().and_then(|draw| draw(side)).filter(|p| p.len() == side * side)
     }
 
     /// The pixels, to share (drawn now if they weren't).
@@ -67,7 +96,7 @@ impl Pixels {
     fn now(&self) -> &Arc<Vec<u8>> {
         self.0.drawn.get_or_init(|| {
             let side = TEXTURE_SIZE * TEXTURE_SIZE;
-            let drawn = self.0.draw.as_ref().and_then(|draw| draw()).filter(|p| p.len() == side);
+            let drawn = self.0.draw.as_ref().and_then(|draw| draw(TEXTURE_SIZE)).filter(|p| p.len() == side);
             Arc::new(drawn.unwrap_or_else(|| vec![0; side]))
         })
     }
@@ -81,9 +110,11 @@ impl std::ops::Deref for Pixels {
     }
 }
 
+// (the same whether drawn yet or not: what a brush looks like is told by its source's id, and the
+// app keeps sample strokes by that, see core's `drawn_previews`)
 impl std::fmt::Debug for Pixels {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Pixels({})", if self.is_drawn() { "drawn" } else { "to draw" })
+        f.write_str("Pixels")
     }
 }
 

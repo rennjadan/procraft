@@ -20,17 +20,22 @@ mod copy_paste;
 mod crop;
 mod curve;
 mod custom_canvas;
+mod edit_layout;
 mod export_card;
 mod files;
+mod filter_list;
 #[cfg(target_os = "macos")]
 mod finder;
+mod floating_panels;
 mod full_screen;
 mod gallery;
 mod gesture_controls;
 mod gradient_map;
 mod guide_editor;
+mod held_layers;
 mod icons;
 mod input;
+mod interface_pass;
 mod layer_choice;
 mod layers;
 mod library;
@@ -62,6 +67,7 @@ mod stroke_sound;
 mod studio;
 mod system_clipboard;
 mod text;
+mod textures;
 mod timelapse;
 mod tool_header;
 mod touch_keyboard;
@@ -134,9 +140,40 @@ impl Importing {
     }
 }
 
+/// On a laptop of two GPUs, the drivers give OpenGL the discrete one when the app says so with these
+/// (NVIDIA's Optimus, AMD's PowerXpress), as Direct3D 12 and Vulkan are given the faster by wgpu
+/// itself: OpenGL drew on the integrated one, its frames taking 100 to 480 ms. The linker exports
+/// them from the .exe (build.rs).
+#[cfg(windows)]
+#[allow(unsafe_code, non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static NvOptimusEnablement: u32 = 1;
+#[cfg(windows)]
+#[allow(unsafe_code, non_upper_case_globals)]
+#[unsafe(no_mangle)]
+pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
+
 /// What the layers' textures may take on the GPU, bytes: past it, the layers not worked on are kept
-/// compressed in memory until needed.
+/// compressed in memory until needed. A graphics card's (see [`layers_on_gpu`]).
 const LAYERS_ON_GPU: u64 = 2 << 30;
+/// The least they may take on a GPU that shares the computer's memory.
+const LAYERS_ON_SHARED_GPU_LEAST: u64 = 512 << 20;
+
+/// What the layers' textures may take on the GPU (see [`LAYERS_ON_GPU`]), on a GPU that has its own
+/// memory or `shares` the computer's `memory` (bytes, none if the system doesn't say). A graphics
+/// card holds 2 GiB of them. An integrated GPU has at most half the computer's memory (as Windows
+/// gives it), which the system and every other app draw on too, and running out of it loses the
+/// device (wgpu loses it on a copy it can't make room for): its layers take an eighth of the
+/// computer's memory, 512 MiB to 2 GiB. A laptop of 8 GB gives them 1 GiB, which the canvas takes
+/// for a device of little memory: its history's older steps kept compressed off the GPU, and fewer
+/// of wet paint's marks to go back to.
+fn layers_on_gpu(shares: bool, memory: Option<u64>) -> u64 {
+    match (shares, memory) {
+        (false, _) => LAYERS_ON_GPU,
+        (true, Some(memory)) => (memory / 8).clamp(LAYERS_ON_SHARED_GPU_LEAST, LAYERS_ON_GPU),
+        (true, None) => LAYERS_ON_GPU / 2,
+    }
+}
 
 /// The computer's memory, bytes; none if the system doesn't say.
 #[cfg(windows)]
@@ -233,6 +270,9 @@ fn getting_ready_note(ctx: &egui::Context) {
 fn main() {
     // the log, to the app folder's file too, and a crash's message into it
     startup::init();
+    // artworks being opened, noted until they show: one the app ended while opening is asked about
+    // when next picked, not opened at once into the same end
+    procraft_core::set_open_marks_file(files::app_dir().join("opening.txt").to_string_lossy().into_owned());
     // one identity with its shortcuts: pinned to the taskbar, the pin is the running app's icon
     set_app_identity();
     // the layers may take half the computer's memory, as on the tablet (so how many a canvas holds
@@ -250,6 +290,10 @@ fn main() {
         }
     };
     event_loop.set_control_flow(ControlFlow::Wait);
+    // the devices' own raw input, which nothing here reads: under X11 a tablet's pen sends it for
+    // each of its moves, besides the window's own events
+    #[cfg(target_os = "linux")]
+    event_loop.listen_device_events(winit::event_loop::DeviceEvents::Never);
     // a Mac hands the files opened from the Finder to the app as it runs, not in its arguments
     #[cfg(target_os = "macos")]
     finder::watch();
@@ -285,6 +329,8 @@ fn main() {
         dropped: std::env::args_os().skip(1).map(std::path::PathBuf::from).filter(|p| p.is_file()).collect(),
         tap_held: None,
         interface_touches: input::InterfaceTouches::default(),
+        modifiers: winit::keyboard::ModifiersState::empty(),
+        maximised_before_full_screen: false,
         closed: false,
         full: full_screen::FullScreen::kept(),
         update_alert: alert::Alert::default(),
@@ -303,6 +349,12 @@ fn main() {
             std::process::exit(101);
         }
     }
+}
+
+/// Whether `window` is an X11 one.
+fn is_x11(window: &Window) -> bool {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    matches!(window.window_handle().map(|h| h.as_raw()), Ok(RawWindowHandle::Xlib(_) | RawWindowHandle::Xcb(_)))
 }
 
 struct App {
@@ -358,6 +410,10 @@ struct App {
     tap_held: Option<(u64, winit::dpi::PhysicalPosition<f64>, Instant)>,
     /// Which touch the interface follows: a finger on it beside a hand resting on the canvas.
     interface_touches: input::InterfaceTouches,
+    /// The keyboard's modifiers held now, for Alt+Enter.
+    modifiers: winit::keyboard::ModifiersState,
+    /// The window was maximised as it went full screen, and is maximised again as it comes back.
+    maximised_before_full_screen: bool,
     /// The window was closed (the artwork open kept): the app's end needs nothing more.
     closed: bool,
     /// Full screen as F11 makes it, the taskbar covered, and a swipe up from the bottom edge to
@@ -423,6 +479,39 @@ fn window_icon() -> Option<winit::window::Icon> {
     winit::window::Icon::from_rgba(rgba.into_raw(), width, height).ok()
 }
 
+/// Whether `key` pressed with `modifiers` held is the window's full screen key: F11, or off a Mac
+/// Alt+Enter as well (Ctrl with Alt is AltGr, typing).
+fn full_screen_key(key: &winit::keyboard::Key, modifiers: winit::keyboard::ModifiersState) -> bool {
+    use winit::keyboard::{Key, NamedKey};
+    match key {
+        Key::Named(NamedKey::F11) => true,
+        Key::Named(NamedKey::Enter) => {
+            !cfg!(target_os = "macos") && modifiers.alt_key() && !modifiers.control_key() && !modifiers.super_key()
+        }
+        _ => false,
+    }
+}
+
+/// The window fills its screen without its frame, or goes back to a window. On Windows a maximised
+/// window is put back to its own size first and maximised again as it comes back: left maximised,
+/// Windows keeps it to the screen less the task bar, and the task bar's strip shows black.
+fn toggle_full_screen(window: &Window, maximised_before: &mut bool) {
+    if window.fullscreen().is_some() {
+        pen::set_full_screen(false);
+        window.set_fullscreen(None);
+        if std::mem::take(maximised_before) {
+            window.set_maximized(true);
+        }
+        return;
+    }
+    *maximised_before = cfg!(windows) && window.is_maximized();
+    if *maximised_before {
+        window.set_maximized(false);
+    }
+    pen::set_full_screen(true);
+    window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+}
+
 /// Tap Assistance holds a finger's touch where it landed this long.
 const TAP_HOLD: std::time::Duration = std::time::Duration::from_millis(300);
 /// How far it may drift meanwhile and still be held (points): farther, it is a scroll or a drag.
@@ -466,6 +555,8 @@ impl ApplicationHandler for App {
         files::dialogs_over(&window);
         // a pen's lean, which winit's touches leave out (on Wayland the whole pen)
         pen::watch(&window, self.wake.clone());
+        // an X11 window manager may hold each touch back and hand it on whole
+        input::set_whole_touches(is_x11(&window));
         // the brushes read while the gallery shows, so the first artwork opens without reading them
         let read = std::thread::Builder::new().name("procraft-read-brushes".to_owned());
         if let Err(e) = read.spawn(|| procraft_core::prepare_brushes(files::brushes_dir())) {
@@ -484,6 +575,13 @@ impl ApplicationHandler for App {
         let screen = match Screen::new(window, &display, order, from, tried, startup::gpu_trying, self.wake.clone()) {
             Ok((s, backend)) => {
                 startup::gpu_made(backend);
+                // on OpenGL, whether the drivers gave it the GPU Direct3D 12 would draw with
+                startup::gpu_drawing(&s.gpu.adapter.get_info());
+                // the layers' room on the GPU, by whether its memory is the computer's (before any
+                // canvas is made)
+                let layers = layers_on_gpu(s.gpu.shares_memory(), memory_total());
+                log::info!("the layers' textures may take {} MB on the GPU", layers >> 20);
+                procraft_core::set_resident_budget(layers);
                 s
             }
             Err(e) => {
@@ -519,6 +617,11 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // X11 gives each axis of a pen's move (its pressure, its tilts) as an event of its own as
+        // well, which nothing here reads: several for every move a tablet's pen makes
+        if matches!(event, WindowEvent::AxisMotion { .. }) {
+            return;
+        }
         let _timed =
             Timed(if event == WindowEvent::RedrawRequested { "a frame" } else { "a window event" }, Instant::now());
         if self.projection.as_ref().is_some_and(|p| p.window.id() == id) {
@@ -603,6 +706,20 @@ impl ApplicationHandler for App {
         if self.screen.as_ref().is_some_and(|s| s.gpu.is_lost()) {
             self.gpu_lost(event_loop);
             return;
+        }
+        // the interface's last frame couldn't go up to the GPU: what is kept is let go of and it is
+        // drawn again, and frame after frame missed, the app starts again as on a device lost
+        match self.screen.as_mut().map(Screen::take_after_frame) {
+            Some(interface_pass::AfterFrame::LetGoAndRetry) => self.let_go_of_kept(),
+            Some(interface_pass::AfterFrame::StartAgain) => {
+                log::error!(
+                    "the interface's frames couldn't go up to the GPU {} times in a row",
+                    interface_pass::MISSES_MOST
+                );
+                self.gpu_lost(event_loop);
+                return;
+            }
+            Some(interface_pass::AfterFrame::Fine) | None => {}
         }
         if let Some(fine) = self.screen.as_mut().and_then(Screen::canvases_made) {
             self.canvases_made(fine, event_loop);
@@ -693,19 +810,19 @@ impl App {
         if response.repaint && event != WindowEvent::RedrawRequested {
             redraw_paced(&screen.window, self.last_frame, self.gap, &mut self.input_frame);
         }
-        // F11: the window fills its screen without its frame (a pen display's whole screen for
-        // the canvas, as the tablet's), or goes back to a window
+        // F11, or Alt+Enter off a Mac: the window fills its screen without its frame (a pen
+        // display's whole screen for the canvas, as the tablet's), or goes back to a window
+        if let WindowEvent::ModifiersChanged(m) = &event {
+            self.modifiers = m.state();
+        }
         if let WindowEvent::KeyboardInput { event: key, .. } = &event
             && key.state.is_pressed()
             && !key.repeat
-            && key.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11)
+            && full_screen_key(&key.logical_key, self.modifiers)
         {
-            let full = screen.window.fullscreen().is_none();
-            self.full.chosen(full);
-            screen.window.set_fullscreen(full.then_some(winit::window::Fullscreen::Borderless(None)));
-            if !full {
-                screen.window.set_maximized(true);
-            }
+            // the curtain knows it was chosen (a swipe from the taskbar's edge isn't asked for)
+            self.full.chosen(screen.window.fullscreen().is_none());
+            toggle_full_screen(&screen.window, &mut self.maximised_before_full_screen);
         }
         match event {
             WindowEvent::CloseRequested => {
@@ -723,6 +840,8 @@ impl App {
             WindowEvent::Resized(size) => {
                 screen.resize(size.width, size.height);
                 if let Some(session) = &session {
+                    // the moves waiting were made in the window as it was
+                    self.input.flush(session);
                     session.resize_window(size.width, size.height);
                     // minimised, time on the artwork stops counting; back, it counts again
                     session.set_tracking(!screen.minimised());
@@ -731,6 +850,7 @@ impl App {
             }
             WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                 if let Some(session) = &session {
+                    self.input.flush(session);
                     session.set_display_scale(scale_factor as f32);
                     let interface = scale_factor as f32 * screen.egui.egui_ctx().zoom_factor();
                     self.ui.place_canvas(session, interface);
@@ -748,12 +868,13 @@ impl App {
                 // exported, or a plugin finishes a fill, none reaches it (nothing either would end is
                 // started)
                 let through = self.ui.popover_open && self.ui.panel_lets_through;
-                let blocked = (self.ui.popover_open && !through)
-                    || files::exporting_since().is_some()
-                    || session.pour_finishing();
                 session.set_touch_panel_open(through);
                 let canvas = self.ui.canvas_rect;
-                let over = |p: (f32, f32)| blocked || screen.over_interface(p, canvas);
+                // asked only of a press (a stroke's moves would wait on the canvas each)
+                let blocked = || {
+                    (self.ui.popover_open && !through) || files::exporting_since().is_some() || session.pour_finishing()
+                };
+                let over = |p: (f32, f32)| blocked() || screen.over_interface(p, canvas);
                 if self.input.on_event(&session, &event, response.consumed, over) {
                     redraw_paced(&screen.window, self.last_frame, self.gap, &mut self.input_frame);
                 }
@@ -1013,6 +1134,19 @@ impl App {
             // the New canvas list offers the kinds of artwork the plugins on make
             gallery.kinds = interface.plugins().kinds();
             asked = gallery.show(ui.ctx(), &mut interface.look, &interface.colours);
+            // layers held out of an artwork: held a moment over another, it opens; let go here,
+            // they go nowhere
+            if let Some(held) = interface.held.as_mut() {
+                let at = ui.ctx().input(|i| i.pointer.latest_pos());
+                let under = at.and_then(|at| gallery.artwork_at(at)).map(held_layers::Spring::Artwork);
+                match held.frame(ui.ctx(), under, false) {
+                    held_layers::Outcome::Open(held_layers::Spring::Artwork(dir)) => {
+                        asked = Some(gallery::Asked::Open(dir));
+                    }
+                    held_layers::Outcome::Holding | held_layers::Outcome::Open(_) => {}
+                    held_layers::Outcome::Dropped(_) | held_layers::Outcome::Gone => interface.held = None,
+                }
+            }
             // a pen's buttons do nothing here, and nothing in the artwork opened next either
             crate::pen::take_button_presses();
             // a share from the gallery shows its card there
@@ -1096,8 +1230,9 @@ impl App {
             Some(gallery::Asked::Share(list, format)) => {
                 files::share_artworks(&list, format, 100, &mut self.ui.export_card);
             }
-            Some(gallery::Asked::SharePdf(list, quality)) => {
-                files::share_artworks(&list, files::Format::Pdf, quality, &mut self.ui.export_card);
+            // several as one PDF, a page each
+            Some(gallery::Asked::SharePdf(list, quality, group)) => {
+                files::share_pdf(&list, quality, &group, &mut self.ui.export_card);
             }
             Some(gallery::Asked::DragOut(artwork)) => self.drag_out(&artwork),
             // opened (read as Open reads it), then shared
@@ -1303,6 +1438,10 @@ impl App {
     /// Starts reading the artwork in gallery folder `dir` on a thread of its own, to open it (to
     /// share it as `shared_as`, if given): the one read ahead, if it is that one, unchanged.
     fn read_artwork(&mut self, dir: String, shared_as: Option<animated_export::Animated>) {
+        // one whose opening ended the app last time is opened again only when asked to
+        if !files::open_anyway(&dir) {
+            return;
+        }
         let folder = dir.clone();
         let ahead = self.prefetch.take().filter(|p| p.dir == dir && p.stamp == artwork_stamp(&dir));
         let reading = std::thread::spawn(move || match ahead.and_then(|p| p.reading.join().ok().flatten()) {
@@ -1431,6 +1570,23 @@ impl App {
     #[cfg(not(any(windows, target_os = "macos")))]
     fn drag_out(&mut self, _artwork: &procraft_core::GalleryArtwork) {}
 
+    /// The interface's frame couldn't go up to the GPU (short of memory): what is kept on it only to
+    /// be quicker is let go of (the brush library's sample strokes, the canvas's spares and the
+    /// buffers kept, the preview's canvas), the GPU given the time to free it, and the window drawn
+    /// again.
+    fn let_go_of_kept(&mut self) {
+        log::warn!("letting go of what is kept on the GPU, to draw the interface again");
+        if let Some(session) = &self.session {
+            session.trim_memory();
+        }
+        self.ui.let_go_of_kept();
+        if let Some(screen) = &self.screen {
+            screen.gpu.let_go_of_kept_buffers();
+            screen.gpu.flush();
+            screen.window.request_redraw();
+        }
+    }
+
     /// The graphics device was lost (its driver reset or stopped), and all it held: nothing is
     /// saved from it (the gallery keeps the artwork as it was last saved, seconds before); the
     /// windows go, and the app says so and starts again.
@@ -1501,22 +1657,48 @@ impl App {
         waits
     }
 
-    /// The artwork open is put away and kept; false if it couldn't be.
+    /// The artwork open is put away and kept; false while it stays open. One that can't be saved (the
+    /// storage full, say) stays, kept saved again, unless the person chooses to leave it without
+    /// saving (the core's rule, as the tablet's).
     fn leave_artwork(&mut self) -> bool {
         if let Some(session) = self.session.clone() {
             // its time counted up to now, saved with it
             session.set_tracking(false);
             self.ui.closing(&session);
-            // no save of its own after this one
-            session.stop_autosave();
         }
-        let kept = self.keep_artwork();
-        // still open: kept saved again
-        if !kept && let (Some(session), Some(dir)) = (&self.session, &self.artwork) {
+        let left = self.keep_artwork_to_leave();
+        // still open: its time counts again
+        if !left && let Some(session) = &self.session {
             session.set_tracking(true);
-            Arc::clone(session).start_autosave(dir.clone());
         }
-        kept
+        left
+    }
+
+    /// Saves the artwork open to leave it (and the brushes as it left them): true once it is kept,
+    /// or once the person chose to leave it without saving when it couldn't be; false to stay.
+    fn keep_artwork_to_leave(&mut self) -> bool {
+        let (Some(session), Some(dir)) = (self.session.clone(), self.artwork.clone()) else { return true };
+        // its canvas made first (it is being made on a thread of its own), so the save has its picture
+        if let Some((_, made)) = self.opening.take() {
+            let _ = made.join();
+        }
+        files::keep_brushes(&session);
+        let (brush, mask) = self.ui.colours.brush_and_mask();
+        files::keep_colours(brush, mask);
+        let edits = session.edits();
+        match Arc::clone(&session).save_to_leave(dir) {
+            procraft_core::Leaving::Left => {
+                self.ui.saved_edits = edits;
+                true
+            }
+            procraft_core::Leaving::Stays { title, message } => {
+                let leave = files::leave_without_saving(&title, &message);
+                if leave {
+                    session.stop_autosave();
+                }
+                leave
+            }
+        }
     }
 
     /// Saves the artwork open into its folder in the gallery (and the brushes as it left them);
@@ -1537,7 +1719,11 @@ impl App {
                 true
             }
             Err(e) => {
-                files::tell("Can't keep the artwork", &e.to_string());
+                // (the storage full said plainly: it stays open until there is room)
+                let why = e.to_string();
+                let said =
+                    if procraft_core::storage_was_full(why.clone()) { procraft_core::NO_ROOM.to_owned() } else { why };
+                files::tell("Can't keep the artwork", &said);
                 false
             }
         }
@@ -1638,5 +1824,43 @@ mod tests {
     fn the_computers_memory_is_read() {
         let total = super::memory_total().expect("the system says how much memory there is");
         assert!(total >= 1 << 30, "{total} bytes");
+    }
+
+    /// The .exe asks the drivers for the discrete GPU for OpenGL: the two values are exported, set
+    /// (the test's .exe is linked as the app's is).
+    #[cfg(windows)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn the_exe_asks_the_drivers_for_the_discrete_gpu() {
+        use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+        // SAFETY: the module of this process, which stays loaded
+        let me = unsafe { GetModuleHandleW(None) }.unwrap();
+        for name in
+            [windows::core::s!("NvOptimusEnablement"), windows::core::s!("AmdPowerXpressRequestHighPerformance")]
+        {
+            // SAFETY: a name ending in a nul, looked up in this module's exports
+            let at = unsafe { GetProcAddress(me, name) };
+            let at = at.map(|f| f as usize).unwrap_or_else(|| panic!("{name:?} isn't exported"));
+            // SAFETY: the export is one of the u32 statics above, there for the process's life
+            assert_eq!(unsafe { std::ptr::read(at as *const u32) }, 1);
+        }
+    }
+
+    #[test]
+    fn a_gpu_sharing_the_computers_memory_gives_the_layers_an_eighth_of_it() {
+        use super::layers_on_gpu;
+        const GB: u64 = 1 << 30;
+        // a graphics card: 2 GiB, whatever the computer has
+        assert_eq!(layers_on_gpu(false, Some(8 * GB)), 2 * GB);
+        assert_eq!(layers_on_gpu(false, None), 2 * GB);
+        // an integrated GPU: an eighth of the computer's memory, 512 MiB to 2 GiB (a laptop of 8 GB,
+        // as #341's, 1 GiB: a device of little memory to the canvas, at most 1280 MiB)
+        assert_eq!(layers_on_gpu(true, Some(8 * GB)), GB);
+        assert!(layers_on_gpu(true, Some(8 * GB)) <= 1280 << 20);
+        assert_eq!(layers_on_gpu(true, Some(4 * GB)), 512 << 20);
+        assert_eq!(layers_on_gpu(true, Some(2 * GB)), 512 << 20);
+        assert_eq!(layers_on_gpu(true, Some(16 * GB)), 2 * GB);
+        assert_eq!(layers_on_gpu(true, Some(64 * GB)), 2 * GB);
+        assert_eq!(layers_on_gpu(true, None), GB);
     }
 }

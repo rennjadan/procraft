@@ -138,6 +138,12 @@ impl Alert {
         self.open
     }
 
+    /// What it asks, or last asked.
+    #[cfg(test)]
+    pub fn asking(&self) -> Option<&Asking> {
+        self.asking.as_ref()
+    }
+
     fn close(&mut self) {
         self.open = false;
         self.since = Some(Instant::now());

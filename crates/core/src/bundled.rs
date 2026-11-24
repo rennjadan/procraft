@@ -7,21 +7,19 @@
 
 /// Each by its folder's name under `plugins/`, and the file packed from it.
 pub(crate) const BUNDLED: &[(&str, &[u8])] = &[
-    ("brush-sounds", include_bytes!("../bundled-plugins/brush-sounds.procraft-plugin")),
-    ("colordrop-tools", include_bytes!("../bundled-plugins/colordrop-tools.procraft-plugin")),
-    ("colour-triangle", include_bytes!("../bundled-plugins/colour-triangle.procraft-plugin")),
-    ("effects", include_bytes!("../bundled-plugins/effects.procraft-plugin")),
-    ("interface", include_bytes!("../bundled-plugins/interface.procraft-plugin")),
+    ("brush-extras", include_bytes!("../bundled-plugins/brush-extras.procraft-plugin")),
+    ("colour-tools", include_bytes!("../bundled-plugins/colour-tools.procraft-plugin")),
+    ("edit-layout", include_bytes!("../bundled-plugins/edit-layout.procraft-plugin")),
+    ("infinite-plugins", include_bytes!("../bundled-plugins/infinite-plugins.procraft-plugin")),
+    ("interface-look", include_bytes!("../bundled-plugins/interface-look.procraft-plugin")),
     ("keyboard-shortcuts", include_bytes!("../bundled-plugins/keyboard-shortcuts.procraft-plugin")),
     ("krita-brushes", include_bytes!("../bundled-plugins/krita-brushes.procraft-plugin")),
-    ("layer-fills", include_bytes!("../bundled-plugins/layer-fills.procraft-plugin")),
-    ("layer-tools", include_bytes!("../bundled-plugins/layer-tools.procraft-plugin")),
-    ("quickshape-curves", include_bytes!("../bundled-plugins/quickshape-curves.procraft-plugin")),
+    ("layer-toolbox", include_bytes!("../bundled-plugins/layer-toolbox.procraft-plugin")),
+    ("pop-up-palette", include_bytes!("../bundled-plugins/pop-up-palette.procraft-plugin")),
     ("radial-segments", include_bytes!("../bundled-plugins/radial-segments.procraft-plugin")),
-    ("randomise-brush", include_bytes!("../bundled-plugins/randomise-brush.procraft-plugin")),
-    ("touch-offset", include_bytes!("../bundled-plugins/touch-offset.procraft-plugin")),
     ("tweening", include_bytes!("../bundled-plugins/tweening.procraft-plugin")),
     ("vector-layers", include_bytes!("../bundled-plugins/vector-layers.procraft-plugin")),
+    ("view-tools", include_bytes!("../bundled-plugins/view-tools.procraft-plugin")),
 ];
 
 #[cfg(test)]

@@ -3,7 +3,8 @@
 //! kind's look and assisted drawing), the guide's handles over the canvas, the grid size typed on a
 //! keypad from its chip. The canvas takes the pointers as it always does (input.rs): the core's
 //! touches drag the handles (a perspective guide's points added by a tap) and move and zoom the
-//! view, as the wheel and a trackpad's pinch do. The guide itself is the core's (guide.rs).
+//! view, as the wheel and a trackpad's pinch do; a handle tapped shows its menu (a point's Delete,
+//! a centre's Reset). The guide itself is the core's (guide.rs).
 
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, pos2, vec2};
 use procraft_core::{CanvasSession, GuideInfo, GuideType, GuideUnit, SymmetryType};
@@ -81,6 +82,9 @@ pub struct GuideEditor {
     symmetry_open: bool,
     /// The grid size's keypad, while it is up.
     keypad: Option<SizeKeypad>,
+    /// The menu of a handle tapped, while it shows: a perspective guide's point (its place) or the
+    /// centre of the others (none), where it shows, and the frame it opened in.
+    node_menu: Option<(Option<u32>, Rect, u64)>,
 }
 
 /// The grid size's keypad: what is typed (the size as it was to start with) and in which unit.
@@ -213,6 +217,7 @@ impl GuideEditor {
         self.open = true;
         self.symmetry_open = false;
         self.keypad = None;
+        self.node_menu = None;
     }
 
     fn end(&mut self, session: &CanvasSession, keep: bool) {
@@ -221,11 +226,47 @@ impl GuideEditor {
         self.open = false;
         self.symmetry_open = false;
         self.keypad = None;
+        self.node_menu = None;
     }
 
-    /// A touch came down on the canvas: symmetry's options close.
+    /// A touch came down on the canvas: symmetry's options and a handle's menu close.
     pub fn touched(&mut self) {
         self.symmetry_open = false;
+        self.node_menu = None;
+    }
+
+    /// A handle was tapped at `at` (points): its menu shows, centred over it with its bottom 11
+    /// above it (under it, 11 below, where it is within 80 of the window's top).
+    pub fn node_tapped(&mut self, ctx: &egui::Context, point: Option<u32>, at: Pos2) {
+        use crate::curve::{MENU_ROW, MENU_WIDTH};
+        let top = if at.y - ctx.content_rect().top() < 80.0 { at.y + 11.0 } else { at.y - 11.0 - MENU_ROW };
+        let menu = Rect::from_min_size(pos2(at.x - MENU_WIDTH / 2.0, top), vec2(MENU_WIDTH, MENU_ROW));
+        self.node_menu = Some((point, menu, ctx.cumulative_frame_nr()));
+    }
+
+    /// A handle's menu shows: a press on the canvas only closes it.
+    pub fn menu_open(&self) -> bool {
+        self.open && self.node_menu.is_some()
+    }
+
+    /// The handle's menu, while it shows: Delete deletes the point, Reset puts the centre back; a
+    /// press elsewhere closes it.
+    fn node_menu(&mut self, ctx: &egui::Context, session: &CanvasSession) {
+        let Some((point, menu, opened)) = self.node_menu else { return };
+        let label = if point.is_some() { "Delete" } else { "Reset" };
+        if crate::curve::node_menu(ctx, "guide node menu", menu, &[label]).is_some() {
+            match point {
+                Some(i) => _ = session.remove_vanishing_point(i),
+                None => _ = session.reset_guide_place(),
+            }
+            self.node_menu = None;
+            return;
+        }
+        let pressed_elsewhere =
+            ctx.input(|i| i.pointer.any_pressed() && i.pointer.interact_pos().is_some_and(|p| !menu.contains(p)));
+        if pressed_elsewhere && ctx.cumulative_frame_nr() != opened {
+            self.node_menu = None;
+        }
     }
 
     /// Shows the editor while it is open, the frost of what it shows added to `glass`; returns true
@@ -313,6 +354,7 @@ impl GuideEditor {
             }
         });
         self.toolbar(ctx, look, session, &g, screen);
+        self.node_menu(ctx, session);
         // the grid size's keypad over the toolbar, while the kind has a grid
         if !matches!(g.kind, GuideType::Grid | GuideType::Isometric) {
             self.keypad = None;
@@ -334,7 +376,7 @@ impl GuideEditor {
     fn toolbar(&mut self, ctx: &egui::Context, look: &mut Look, session: &CanvasSession, g: &GuideInfo, screen: Rect) {
         let wide = screen.width() > screen.height();
         let (w, h) = if wide { (screen.width() - 16.0, 137.0) } else { (652.0, 199.0) };
-        let rect = panel_rect(screen, w, h);
+        let rect = panel_rect(ctx, screen, w, h);
         let mut options_button = Rect::NOTHING;
         let set_look =
             |opacity: f32, thickness: f32, size: f32| _ = session.set_guide_look(opacity, thickness, size, g.hue);
@@ -346,6 +388,7 @@ impl GuideEditor {
             {
                 session.set_guide_kind(k.0);
                 self.symmetry_open = false;
+                self.node_menu = None;
             }
             let (slider_w, gap) = if wide { (257.0, 19.0) } else { (300.0, 20.0) };
             let row_top = if wide { rect.top() + 16.0 + 34.0 + 16.0 } else { rect.top() + 14.0 + 34.0 + 14.0 };

@@ -50,6 +50,7 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.layout.ContentScale
@@ -61,8 +62,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.PadSurfaceView
+import io.github.artcraftandroid.procraft.core.ListSliderTouch
 import io.github.artcraftandroid.procraft.core.SourceKind
 import io.github.artcraftandroid.procraft.core.curveSamples
+import io.github.artcraftandroid.procraft.core.listSliderTouch
 import io.github.artcraftandroid.procraft.core.sliderExtras
 import kotlin.math.pow
 import kotlin.math.roundToInt
@@ -122,6 +125,20 @@ private val StudioDone get() = Pc.tinted(Color(0xFF0190FF))
 /** Where the settings start below the drawing pad (points from the top). */
 private val PadHeight = 510.dp
 private val TabsWidth = 81.dp
+
+/** The landscape studio's pages card (with its margin), its settings and the line after them. */
+private val PagesAndSettings = 330.dp + SettingsWidth + 1.dp
+
+/** The least the pad beside them needs: its Drawing Pad button and Cancel and Done, apart. */
+internal val PadLeast = 360.dp
+
+/**
+ * Whether the studio in a window [width] wide lays its pages, settings and pad side by side: in
+ * landscape where the pad still has room for its buttons (on a phone held sideways it had about 80
+ * across, and Done was squeezed to nothing), else the pages as a rail beside the pad over the
+ * settings, as upright.
+ */
+internal fun studioSideBySide(landscape: Boolean, width: Dp) = landscape && width >= PagesAndSettings + PadLeast
 
 /**
  * How a slider reads; [SIZE] reads the size the control sets (the brush's most size × place^2.2) as a
@@ -655,7 +672,7 @@ private fun Studio(vm: CanvasViewModel) {
     BoxWithConstraints(
         Modifier.fillMaxSize().background(StudioBack).pointerInput(Unit) { awaitEachGesture { awaitFirstDown().consume() } },
     ) {
-        if (landscape) {
+        if (studioSideBySide(landscape, maxWidth)) {
             // the pages listed by name on a card, the settings beside them, the pad on the right
             Row(Modifier.fillMaxSize()) {
                 StudioPagesCard(vm)
@@ -683,7 +700,8 @@ private fun Studio(vm: CanvasViewModel) {
 /** Portrait: the pages as icons down the left. */
 @Composable
 private fun StudioRail(vm: CanvasViewModel) {
-    Column(Modifier.width(TabsWidth).fillMaxHeight().background(StudioTabs).padding(top = 46.dp)) {
+    // scrolling where the window is too short for all of them (a phone held sideways)
+    Column(Modifier.width(TabsWidth).fillMaxHeight().background(StudioTabs).verticalScroll(rememberScrollState()).padding(top = 46.dp)) {
         STUDIO_TABS.forEachIndexed { i, tab ->
             val on = vm.studioTab == i
             Box(
@@ -1250,15 +1268,29 @@ internal fun StudioSlider(
                 if (!enabled) return@pointerInput
                 awaitEachGesture {
                     val down = awaitFirstDown()
-                    down.consume()
+                    val span = if (both) 2f else 1f
+                    val travel = (size.width - 2 * KNOB_INSET.toPx()).coerceAtLeast(1f)
+                    // landing on the knob it is the slider's at once; elsewhere the first ten points
+                    // either way decide, so a finger scrolling the list over a slider leaves it be
+                    val t = (if (both) (current + 1f) / 2f else current).coerceIn(0f, 1f)
+                    val knob = Offset(KNOB_INSET.toPx() + travel * t, size.height / 2f)
+                    val pen = down.type == PointerType.Stylus || down.type == PointerType.Eraser
+                    val fromKnob = (down.position - knob).getDistance().toDp().value
+                    var owner = listSliderTouch(fromKnob, pen, 0f, 0f)
+                    if (owner == ListSliderTouch.SLIDER) down.consume()
                     var last = down.position.x
                     var v = current
                     while (true) {
                         val ev = awaitPointerEvent().changes.firstOrNull { it.id == down.id } ?: break
                         if (!ev.pressed) break
+                        if (owner == ListSliderTouch.UNDECIDED) {
+                            val moved = ev.position - down.position
+                            owner = listSliderTouch(fromKnob, pen, moved.x.toDp().value, moved.y.toDp().value)
+                        }
+                        // the list's: it scrolls, the slider as it was
+                        if (owner == ListSliderTouch.LIST) break
+                        if (owner == ListSliderTouch.UNDECIDED) continue
                         // relative: the knob follows the drag, as far as it travels
-                        val span = if (both) 2f else 1f
-                        val travel = (size.width - 2 * KNOB_INSET.toPx()).coerceAtLeast(1f)
                         v = (v + (ev.position.x - last) / travel * span).coerceIn(if (both) -1f else 0f, 1f)
                         last = ev.position.x
                         change(v)
@@ -1840,7 +1872,8 @@ private fun NodeMenu(points: List<Offset>, index: Int, box: androidx.compose.ui.
     }
 }
 
-private val NodeMenuFill = Color(0xFF101010)
-private val NodeMenuHalo = 16.dp
-private val NodeMenuWidth = 70.dp
-private val NodeMenuRow = 36.dp
+/** A node menu's look (a curve's, the guide editor's handles'): its fill, the room round it for its shadow, its width and its rows' height. */
+internal val NodeMenuFill = Color(0xFF101010)
+internal val NodeMenuHalo = 16.dp
+internal val NodeMenuWidth = 70.dp
+internal val NodeMenuRow = 36.dp

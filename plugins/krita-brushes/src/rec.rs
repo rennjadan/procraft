@@ -32,6 +32,21 @@ impl Record {
         self.field(id, &value.to_le_bytes())
     }
 
+    /// The head of field `id` holding `len` bytes, which the fields written after it make up: a
+    /// record written inside another without being copied into it.
+    pub fn head(&mut self, id: u16, len: usize) -> &mut Record {
+        if let Ok(len) = u32::try_from(len) {
+            self.0.extend_from_slice(&id.to_le_bytes());
+            self.0.extend_from_slice(&len.to_le_bytes());
+        }
+        self
+    }
+
+    /// How many bytes a field holding `len` bytes takes, its head too.
+    pub fn size(len: usize) -> usize {
+        6 + len
+    }
+
     pub fn bytes(self) -> Vec<u8> {
         self.0
     }

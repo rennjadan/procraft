@@ -6,7 +6,9 @@
 struct LayerUniform {
     opacity: f32,
     // 0: no stroke on this layer, 1: the stroke paints, 2: it erases, 3: it paints alpha-locked,
-    // 4: it takes the layer's place where it reaches
+    // 4: it takes the layer's place where it reaches (5: the same, 8 bits a channel); 6: the
+    // colour `solid` fills what is selected (the selection bound as the stroke), 7: the same
+    // alpha-locked
     stroke_mode: u32,
     stroke_opacity: f32,
     blend: u32,
@@ -52,6 +54,13 @@ struct LayerUniform {
     // where this one's top left is in those (x: the scale, yz: the point): grain fixed to the
     // canvas is read where it is on that canvas
     scaled: vec4<f32>,
+    // the paper: how strongly its hollows take the stroke's paint away (0: the stroke takes no
+    // paper), how many canvas pixels a pixel of its tile covers, how deep it shows in the
+    // background (0: a flat colour), and its tooth (0: soft, 1: only what stands above the
+    // strength takes paint)
+    paper: vec4<f32>,
+    // where the grain fixed to the canvas starts, in tiles (xy): a fill's place of its own
+    grain_start: vec4<f32>,
 }
 
 // in stroke_blend: the stroke mixed in by its coverage in squared colour (nearer to light)
@@ -74,6 +83,7 @@ const CLIP_BASE: u32 = 3u;
 @group(0) @binding(6) var mask_tex: texture_2d<f32>;
 @group(0) @binding(7) var second_tex: texture_2d<f32>;
 @group(0) @binding(8) var clip_mask_tex: texture_2d<f32>;
+@group(0) @binding(9) var paper_tex: texture_2d<f32>;
 @group(1) @binding(0) var<uniform> lu: LayerUniform;
 
 // one triangle covering the target
@@ -124,7 +134,7 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
         let at = (vec2<f32>(p) + 0.5) / lu.scaled.x + lu.scaled.yz;
         let gc = cos(lu.grain_rotation);
         let gs = sin(lu.grain_rotation);
-        let uv = vec2<f32>(at.x * gc - at.y * gs, at.x * gs + at.y * gc) / lu.grain_scale;
+        let uv = vec2<f32>(at.x * gc - at.y * gs, at.x * gs + at.y * gc) / lu.grain_scale + lu.grain_start.xy;
         let sharp = lu.grain_sharp > 0.5;
         // a brush file's own image has the fine detail itself; ours only stands in for it
         let own = lu.grain_side > 256.0;
@@ -141,9 +151,22 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
         }
         let g = grain_look(raw);
         // the coverage and the grain combined by the grain's blend mode, as deep as it says, and
-        // only where the stroke is
-        let a = grain_combine(s.a, g, lu.grain_depth, lu.grain_blend);
+        // only where the stroke is; a rise held to what the stamps laid (with a second, once
+        // that is combined too)
+        var a = grain_combine(s.a, g, lu.grain_depth, lu.grain_blend);
+        if (lu.dual == 0u) {
+            a = rise_held(a, laid);
+        }
         s = s * (a / max(s.a, 1e-6));
+    }
+    // the paper, fixed to the canvas, whatever the brush: its hollows take a share of the paint
+    if (lu.paper.x > 0.0) {
+        let at = (vec2<f32>(p) + 0.5) / lu.scaled.x + lu.scaled.yz;
+        let h = paper_height(at);
+        // soft, a share by how low it is; with a tooth, a step a little below the strength
+        let soft = 1.0 - lu.paper.x * (1.0 - h);
+        let sharp = smoothstep(lu.paper.x - 2.0 * TOOTH_EDGE, lu.paper.x, h);
+        s = s * mix(soft, sharp, lu.paper.w);
     }
     // a dual brush's second: its coverage (cut at its threshold) combined with the first's by
     // the dual mode, or by Normal showing where the first doesn't
@@ -154,7 +177,7 @@ fn stroke_pixel(p: vec2<i32>) -> StrokePixel {
             b = select(0.0, 1.0, b > lu.dual_threshold);
         }
         let mode = dual_mode(lu.dual);
-        let a = dual_rise(dual_combine(s.a, b, mode), built, mode);
+        let a = dual_rise(dual_combine(s.a, b, mode), laid, mode);
         // the first's colour; by Normal turned toward the second's (drawn in the stroke's colour)
         // as far as the second shows where the first laid little, so where the first fades out
         // the two meet smoothly, not at a seam of whatever colour the first's faintest paint
@@ -208,6 +231,14 @@ fn with_stroke(c0: vec4<f32>, p: vec2<i32>) -> vec4<f32> {
         // the same in a stroke of 8 bits a channel: its alpha a half more, halved
         let t = textureLoad(stroke_tex, p, 0);
         return select(c0, vec4<f32>(t.rgb, 2.0 * t.a - 1.0), t.a >= 0.25);
+    }
+    if (lu.stroke_mode == 6u || lu.stroke_mode == 7u) {
+        // a colour (solid) filling what is selected (the stroke's red): over the layer as much as
+        // is selected (6), or only over its paint with its alpha kept (7)
+        let k = textureLoad(stroke_tex, p, 0).r;
+        let locked = vec4<f32>(lu.solid.rgb * (k * c0.a) + c0.rgb * (1.0 - k), c0.a);
+        let over = vec4<f32>(lu.solid.rgb * k, k) + c0 * (1.0 - k);
+        return select(over, locked, lu.stroke_mode == 7u);
     }
     if (lu.stroke_mode != 0u) {
         let px = stroke_pixel(p);
@@ -284,9 +315,57 @@ fn fs_blend(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return select(r, c, lu.clipped == CLIP_BASE);
 }
 
-// the background colour (written, not blended)
+// A filter layer: what is below it (the backdrop) run through its filter (layer_tex), taken as far
+// as the layer's mask shows it; by a mode other than normal, that blended with the backdrop (the
+// filtered colour as it is where nothing was below); then taken as far as the layer's opacity, and
+// the base it is clipped to, say. Clipped in a clipping group, it shows only as much as the base
+// does.
 @fragment
-fn fs_solid() -> @location(0) vec4<f32> {
+fn fs_filter(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let p = vec2<i32>(pos.xy);
+    let b = textureLoad(backdrop_tex, p, 0);
+    var m = textureLoad(layer_tex, p, 0);
+    if (lu.masked > 0.5) {
+        m = mix(b, m, clamp(dot(textureLoad(mask_tex, p, 0).rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0));
+    }
+    var r = m;
+    if (lu.blend != 0u && m.a > 0.0 && b.a > 0.0) {
+        r = vec4<f32>(clamp(blend_rgb(unpremultiply(b), unpremultiply(m), lu.blend), vec3<f32>(0.0), vec3<f32>(1.0)) * m.a, m.a);
+    }
+    if (lu.clipped == CLIP_ATOP) {
+        r = vec4<f32>(unpremultiply(r) * b.a, b.a);
+    }
+    var k = lu.opacity;
+    if (lu.clipped == CLIP_BY_BASE) {
+        var base = textureLoad(clip_tex, p, 0).a;
+        if (lu.clip_masked > 0.5) {
+            base = base * clamp(dot(textureLoad(clip_mask_tex, p, 0).rgb, vec3<f32>(0.299, 0.587, 0.114)), 0.0, 1.0);
+        }
+        k = k * base;
+    }
+    return mix(b, r, clamp(k, 0.0, 1.0));
+}
+
+// how far below the strength a paper's tooth begins to take paint, and is half way
+const TOOTH_EDGE: f32 = 0.04;
+
+// how high the paper stands at canvas point `at` (0 a hollow, 1 a peak): its tile repeated, each
+// of its pixels lu.paper.y canvas pixels across
+fn paper_height(at: vec2<f32>) -> f32 {
+    let side = f32(textureDimensions(paper_tex).x);
+    let level = max(log2(1.0 / lu.paper.y), 0.0);
+    return textureSampleLevel(paper_tex, grain_smp, at / (lu.paper.y * side), level).r;
+}
+
+// the background colour (written, not blended); with a paper that shows in it, its hollows
+// darker as deep as it says
+@fragment
+fn fs_solid(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    if (lu.paper.z > 0.0 && lu.solid.a > 0.0) {
+        let at = pos.xy / lu.scaled.x + lu.scaled.yz;
+        let shade = 1.0 - lu.paper.z * (1.0 - paper_height(at));
+        return vec4<f32>(lu.solid.rgb * shade, lu.solid.a);
+    }
     return lu.solid;
 }
 

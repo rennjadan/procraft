@@ -567,7 +567,8 @@ fn toolbar_rect(ctx: &egui::Context, count: usize, roomy: f32, icon: f32) -> (Re
         pos2(screen.center().x - fit.width / 2.0, screen.bottom() - TOOLBAR_BOTTOM - TOOLBAR_HEIGHT),
         vec2(fit.width, TOOLBAR_HEIGHT),
     );
-    (bar, fit)
+    // (floating, where the layout has it: its buttons and the popovers pointing at them with it)
+    (crate::panel::bottom_rect(ctx, bar), fit)
 }
 
 /// Where a popover over button `index` of a toolbar of `count` (`roomy` wide with room) points:

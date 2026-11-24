@@ -29,6 +29,12 @@ impl Holder {
         *self.last.lock() = Some(Taken { at, thread, since: Instant::now() });
     }
 
+    /// The thread that took the lock last (the tests put a wait on it down to that thread).
+    #[cfg(test)]
+    pub(crate) fn thread(&self) -> Option<Arc<str>> {
+        self.last.lock().as_ref().map(|t| Arc::clone(&t.thread))
+    }
+
     /// Who took the lock last, where and how long ago, as the log says it.
     pub(crate) fn said(&self) -> String {
         match self.last.lock().clone() {

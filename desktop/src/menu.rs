@@ -150,7 +150,8 @@ impl Menu {
 
     /// Draws the menu at `rect` (its size when open), growing from and shrinking to `pivot`: its
     /// `glass` (any frost's blur going into `backdrops`), then `content`. A press elsewhere closes
-    /// it (and goes no further), as does Escape.
+    /// it (and goes no further), as does Escape. Opened from a panel, `rect` and `pivot` are in
+    /// the panel's space.
     #[allow(clippy::too_many_arguments)]
     pub fn show(
         &mut self,
@@ -180,18 +181,25 @@ impl Menu {
             });
         }
         let area = Id::unique((id, "menu"));
-        let shown = Rect::from_min_max(pivot + (rect.min - pivot) * scale, pivot + (rect.max - pivot) * scale);
+        // from where its pivot shows: in a panel shown bigger or smaller, still at the menus' size
+        let hang = crate::panel::to_window(ctx) * pivot;
+        let shown = Rect::from_min_max(hang + (rect.min - pivot) * scale, hang + (rect.max - pivot) * scale);
         if glass.frost {
             let ppp = ctx.pixels_per_point();
             let blur = [shown.left(), shown.top(), shown.right(), shown.bottom(), corner * scale];
             backdrops.extend(blur.map(|v| v * ppp));
             backdrops.push(alpha);
         }
-        let transform = TSTransform::from_translation(pivot.to_vec2())
+        let transform = TSTransform::from_translation(hang.to_vec2())
             * TSTransform::from_scaling(scale)
             * TSTransform::from_translation(-pivot.to_vec2());
         ctx.set_transform_layer(LayerId::new(Order::Tooltip, area), transform);
-        egui::Area::new(area).fixed_pos(rect.min).order(Order::Tooltip).interactable(self.open).show(ctx, |ui| {
+        let mut menu = egui::Area::new(area).fixed_pos(rect.min).order(Order::Tooltip).interactable(self.open);
+        // from a panel shown bigger or smaller, kept to the window and clipped to it as it shows
+        if crate::panel::to_window(ctx) != TSTransform::IDENTITY {
+            menu = menu.constrain_to(transform.inverse().mul_rect(ctx.content_rect()));
+        }
+        menu.show(ctx, |ui| {
             ui.multiply_opacity(alpha);
             ui.allocate_rect(rect, Sense::click());
             if glass.shadow {

@@ -10,7 +10,7 @@ use crate::document::BlendMode;
 use crate::geom::Vec2;
 use crate::keyed::{Archive, Builder, Object};
 use crate::plist::Value;
-use crate::zip::{ZipReader, ZipWriter};
+use crate::zip::{Ready, ZipReader, ZipWriter};
 
 /// A brush as a brush file holds it.
 #[derive(Clone, Debug, PartialEq)]
@@ -91,6 +91,8 @@ pub enum Pick {
     /// Round dots on a lattice (its two sets of rows as their cycles across and down the tile), each
     /// as big as the stock tip's ink there.
     Halftone([(f32, f32); 2]),
+    /// A small soft dot in the middle of the stamp's square (see [`crate::textures::point_at`]).
+    Point,
 }
 
 /// Canvas pixels a stamp's square is across at the most size, for each 1 of the file's `maxSize`.
@@ -464,12 +466,28 @@ pub fn read(bytes: &[u8]) -> Option<BrushFile> {
     read_in(&ZipReader::new(bytes)?, "")
 }
 
+/// Reads the brush file that is the archive `zip`; none if it isn't one.
+pub fn read_zip(zip: &ZipReader<'_>) -> Option<BrushFile> {
+    read_in(zip, "")
+}
+
 /// Reads a set file: the set's name and its brushes in order; none if it isn't one.
 pub fn read_set(bytes: &[u8]) -> Option<(String, Vec<BrushFile>)> {
     let zip = ZipReader::new(bytes)?;
-    let (name, folders) = set_list(&zip.read("brushset.plist")?)?;
-    let brushes: Vec<BrushFile> = folders.iter().filter_map(|f| read_in(&zip, &format!("{f}/"))).collect();
+    let (name, folders) = set_folders(&zip)?;
+    let brushes: Vec<BrushFile> = folders.iter().filter_map(|f| read_folder(&zip, f)).collect();
     (!brushes.is_empty()).then_some((name, brushes))
+}
+
+/// A set file's name and its brushes' folders, in order, from its list; none if `zip` isn't one.
+/// Its brushes can then be read a folder at a time ([`read_folder`]), a big set never all at once.
+pub fn set_folders(zip: &ZipReader<'_>) -> Option<(String, Vec<String>)> {
+    set_list(&zip.read("brushset.plist")?)
+}
+
+/// The brush in `folder` of set file `zip`; none if it holds none.
+pub fn read_folder(zip: &ZipReader<'_>, folder: &str) -> Option<BrushFile> {
+    read_in(zip, &format!("{folder}/"))
 }
 
 /// The set's name and its brushes' folders from `brushset.plist` (XML or binary).
@@ -766,6 +784,10 @@ fn read_in(zip: &ZipReader<'_>, prefix: &str) -> Option<BrushFile> {
             }
         }
     };
+    // the rows plugins add to the brush studio, as the brush keeps them
+    for (key, value) in zip.read(&format!("{prefix}{PLUGIN_ROWS}")).as_deref().map(plugin_rows).unwrap_or_default() {
+        set(&key, value);
+    }
     // sizes are kept as the size the slider sets (its place to the power of its curve)
     let place = |v: Vec<f32>| v.into_iter().map(|s| s.max(0.0).powf(1.0 / SIZE_CURVE)).collect::<Vec<f32>>();
     let notches = Notches {
@@ -848,6 +870,26 @@ const SLIDERS: [(&str, &str); 3] =
     [("paintSize", "paintOpacity"), ("smudgeSize", "smudgeOpacity"), ("eraseSize", "eraseOpacity")];
 
 const AUTHOR_PICTURE: &str = "AuthorPicture/AuthorPicture.png";
+/// Where a brush's folder keeps the rows plugins add to the brush studio (`plugin:<id>:<key>`, each
+/// a choice by its place): a line each, its key, a space and its value. Other apps pass it over.
+const PLUGIN_ROWS: &str = "Plugins/Rows.txt";
+/// The most rows of plugins' a brush file keeps, and the longest key of one.
+const MOST_PLUGIN_ROWS: usize = 256;
+const MOST_PLUGIN_ROW_KEY: usize = 256;
+
+/// The plugins' rows in `text` (see [`PLUGIN_ROWS`]), as many as hold up: a key of a plugin's row,
+/// then a whole number from 0 to 255.
+fn plugin_rows(text: &[u8]) -> Vec<(String, f32)> {
+    let text = String::from_utf8_lossy(text);
+    let rows = text.lines().filter_map(|line| {
+        let (key, value) = line.trim().rsplit_once(' ')?;
+        let value: f32 = value.parse().ok()?;
+        let fits = key.starts_with("plugin:") && key.len() <= MOST_PLUGIN_ROW_KEY && !key.contains(char::is_whitespace);
+        (fits && (0.0..=255.0).contains(&value)).then(|| (key.to_owned(), value.round()))
+    });
+    rows.take(MOST_PLUGIN_ROWS).collect()
+}
+
 /// Where a brush's folder keeps the brush engine that draws it, and its data for it.
 const ENGINE_KEY: &str = "Engine/Key.txt";
 const ENGINE_DATA: &str = "Engine/Data.bin";
@@ -864,27 +906,90 @@ pub fn write(brush: &Brush, author: &str, pictures: &Pictures<'_>) -> Vec<u8> {
     zip.finish()
 }
 
+/// Writes `brush` as a brush file by `author`, with `pictures`, into `out` as it goes: `out`, or
+/// why the file isn't whole.
+pub fn write_to<W: std::io::Write>(out: W, brush: &Brush, author: &str, pictures: &Pictures<'_>) -> std::io::Result<W> {
+    let mut zip = ZipWriter::to(out);
+    add_brush(&mut zip, "", brush, author, pictures);
+    zip.finish_to()
+}
+
 /// Writes a set file named `name` of `brushes` (each with its author and pictures), each in a
 /// folder named by `id`.
 pub fn write_set(name: &str, brushes: &[(&Brush, &str, Pictures<'_>)], id: impl Fn(usize) -> String) -> Vec<u8> {
-    let mut zip = ZipWriter::new();
-    let folders: Vec<String> = (0..brushes.len()).map(id).collect();
-    let mut list = String::from(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>brushes</key>\n\t<array>\n",
-    );
-    for f in &folders {
-        list.push_str(&format!("\t\t<string>{}</string>\n", escape(f)));
+    let mut set = SetWriter::begin(Vec::new(), name, brushes.len(), id);
+    for (brush, author, pictures) in brushes {
+        set.add(brush, author, pictures);
     }
-    list.push_str(&format!("\t</array>\n\t<key>name</key>\n\t<string>{}</string>\n</dict>\n</plist>\n", escape(name)));
-    zip.add("brushset.plist", list.as_bytes());
-    for ((brush, author, pictures), folder) in brushes.iter().zip(&folders) {
-        add_brush(&mut zip, &format!("{folder}/"), brush, author, pictures);
+    set.finish().unwrap_or_default()
+}
+
+/// A set file written into a writer a brush at a time: its list of folders first, then each
+/// brush's files as it is added, so that however big the set, only the brush being added is held.
+pub struct SetWriter<W: std::io::Write> {
+    zip: ZipWriter<W>,
+    /// Each brush's folder, in order, and how many have been added.
+    folders: Vec<String>,
+    added: usize,
+}
+
+impl<W: std::io::Write> SetWriter<W> {
+    /// A set named `name` of `count` brushes, each in a folder named by `id`, written into `out`.
+    pub fn begin(out: W, name: &str, count: usize, id: impl Fn(usize) -> String) -> SetWriter<W> {
+        let mut zip = ZipWriter::to(out);
+        let folders: Vec<String> = (0..count).map(id).collect();
+        let mut list = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\">\n<dict>\n\t<key>brushes</key>\n\t<array>\n",
+        );
+        for f in &folders {
+            list.push_str(&format!("\t\t<string>{}</string>\n", escape(f)));
+        }
+        list.push_str(&format!(
+            "\t</array>\n\t<key>name</key>\n\t<string>{}</string>\n</dict>\n</plist>\n",
+            escape(name)
+        ));
+        zip.add("brushset.plist", list.as_bytes());
+        SetWriter { zip, folders, added: 0 }
     }
-    zip.finish()
+
+    /// The next brush (by `author`, with `pictures`), into its folder; one past the count the
+    /// set began with is left out.
+    pub fn add(&mut self, brush: &Brush, author: &str, pictures: &Pictures<'_>) {
+        let Some(folder) = self.folders.get(self.added) else { return };
+        let prefix = format!("{folder}/");
+        add_brush(&mut self.zip, &prefix, brush, author, pictures);
+        self.added += 1;
+    }
+
+    /// The set can't be made whole (`e`, what went wrong): [`SetWriter::finish`] fails.
+    pub fn fail(&mut self, e: std::io::Error) {
+        self.zip.fail(e);
+    }
+
+    /// Ends the set: the writer, or why the file isn't whole (a write failed, or fewer brushes
+    /// were added than it began with).
+    pub fn finish(mut self) -> std::io::Result<W> {
+        if self.added < self.folders.len() {
+            self.zip.fail(std::io::Error::other(format!("{} of {} brushes added", self.added, self.folders.len())));
+        }
+        self.zip.finish_to()
+    }
+}
+
+/// A picture already compressed (a PNG), kept as it is in the archive: deflating it again takes
+/// time and makes it no smaller.
+fn add_picture<W: std::io::Write>(zip: &mut ZipWriter<W>, name: &str, png: &[u8]) {
+    zip.add_ready(name, Ready::of(png, false));
 }
 
 /// A brush's files into `zip` under `prefix`.
-fn add_brush(zip: &mut ZipWriter, prefix: &str, brush: &Brush, author: &str, pictures: &Pictures<'_>) {
+fn add_brush<W: std::io::Write>(
+    zip: &mut ZipWriter<W>,
+    prefix: &str,
+    brush: &Brush,
+    author: &str,
+    pictures: &Pictures<'_>,
+) {
     let mut b = Builder::new();
     let root = b.reserve();
     let mut fields: Vec<(String, Value)> = Vec::new();
@@ -1021,28 +1126,34 @@ fn add_brush(zip: &mut ZipWriter, prefix: &str, brush: &Brush, author: &str, pic
     b.fill(&root, &["SilicaBrush", "ValkyrieBrush", "NSObject"], refs);
     let archive = b.finish(root);
     zip.add(&format!("{prefix}Brush.archive"), &archive);
-    zip.add(&format!("{prefix}Shape.png"), pictures.shape_png);
+    add_picture(zip, &format!("{prefix}Shape.png"), pictures.shape_png);
     for (name, png) in [
         ("Grain.png", pictures.grain_png),
         ("Metallic.png", pictures.metallic_png),
         ("Roughness.png", pictures.roughness_png),
     ] {
         if let Some(png) = png {
-            zip.add(&format!("{prefix}{name}"), png);
+            add_picture(zip, &format!("{prefix}{name}"), png);
         }
     }
     // (a dual brush's second has no preview of its own)
     if !pictures.thumbnail_png.is_empty() {
-        zip.add(&format!("{prefix}QuickLook/Thumbnail.png"), pictures.thumbnail_png);
+        add_picture(zip, &format!("{prefix}QuickLook/Thumbnail.png"), pictures.thumbnail_png);
     }
     for (path, png) in [(AUTHOR_PICTURE, pictures.author_png), (SIGNATURE, pictures.signature_png)] {
         if let Some(png) = png {
-            zip.add(&format!("{prefix}{path}"), png);
+            add_picture(zip, &format!("{prefix}{path}"), png);
         }
     }
     if let Some(engine) = &brush.engine {
         zip.add(&format!("{prefix}{ENGINE_KEY}"), engine.engine.as_bytes());
         zip.add(&format!("{prefix}{ENGINE_DATA}"), &engine.data);
+    }
+    // the rows plugins add to the brush studio, as it keeps them
+    let rows: Vec<String> =
+        brush.extra.iter().filter(|(key, _)| key.starts_with("plugin:")).map(|(key, v)| format!("{key} {v}")).collect();
+    if !rows.is_empty() {
+        zip.add(&format!("{prefix}{PLUGIN_ROWS}"), rows.join("\n").as_bytes());
     }
     if let (Some(second), Some(pictures)) = (&brush.secondary, &pictures.secondary) {
         add_brush(zip, &format!("{prefix}{SECONDARY}"), second, author, pictures);
@@ -1174,6 +1285,59 @@ mod tests {
     }
 
     #[test]
+    fn a_dual_brush_s_second_keeps_every_setting_of_its_own_through_its_file() {
+        // the second set otherwise than the first in every control a file keeps, its size range,
+        // curves and pictures its own
+        let mut second = Brush { name: "Second".to_owned(), ..Brush::round_pen() };
+        for (k, (key, _, kept)) in PLAIN.iter().enumerate() {
+            let v = match kept {
+                Kept::Switch | Kept::Whole | Kept::LastTwoSwapped => (k % 2) as f32,
+                _ => 0.05 + (k % 17) as f32 / 20.0,
+            };
+            second.set_setting(key, v);
+        }
+        second.set_setting("rendering_mode", 4.0);
+        second.set_setting("blend_mode", BlendMode::Multiply.id() as f32);
+        second.set_setting("max_size", 0.8);
+        second.set_setting("min_size", 0.1);
+        second.size_curve = crate::curve::Curve::new(&[Vec2::new(0.0, 0.1), Vec2::new(0.6, 0.3), Vec2::new(1.0, 1.0)]);
+        let mut first =
+            Brush { name: "First".to_owned(), secondary: Some(Box::new(second.clone())), ..Brush::round_pen() };
+        first.set_setting("dual_blend", BlendMode::ColorDodge.id() as f32);
+        let pictures = |shape: &'static [u8], grain: &'static [u8], secondary| Pictures {
+            shape_png: shape,
+            grain_png: Some(grain),
+            metallic_png: None,
+            roughness_png: None,
+            thumbnail_png: b"thumb",
+            author_png: None,
+            signature_png: None,
+            secondary,
+        };
+        let file =
+            write(&first, "", &pictures(b"shape", b"grain", Some(Box::new(pictures(b"shape2", b"grain2", None)))));
+        let back = read(&file).unwrap();
+        assert!(back.settings.iter().any(|(k, v)| k == "dual_blend" && *v == BlendMode::ColorDodge.id() as f32));
+        let theirs = back.secondary.unwrap();
+        assert_eq!(theirs.name, "Second");
+        assert_eq!(theirs.shape, Texture::Image { bytes: b"shape2".to_vec(), inverted: false });
+        assert_eq!(theirs.grain, Texture::Image { bytes: b"grain2".to_vec(), inverted: false });
+        let curve = theirs.size_curve.as_ref().unwrap();
+        assert!((curve[1] - Vec2::new(0.6, 0.3)).length() < 1e-5);
+        let mut again = Brush::round_pen();
+        for (k, v) in &theirs.settings {
+            again.set_setting(k, *v);
+        }
+        set_sizes(&mut again, theirs.max_size, theirs.min_size);
+        let keys = PLAIN.iter().map(|(key, _, _)| *key).chain(["rendering_mode", "blend_mode", "max_size", "min_size"]);
+        let off: Vec<(&str, f32, f32)> = keys
+            .filter(|key| (again.setting(key) - second.setting(key)).abs() > 1e-3)
+            .map(|key| (key, second.setting(key), again.setting(key)))
+            .collect();
+        assert!(off.is_empty(), "the second's settings changed: {off:?}");
+    }
+
+    #[test]
     fn a_dual_brush_s_blend_mode_is_kept_whatever_its_number() {
         // a layer mode past Multiply and the grain's own heights, as the setting and as read
         for mode in [BlendMode::ColorBurn.id(), BlendMode::Divide.id(), GRAIN_HEIGHT, GRAIN_LINEAR_HEIGHT] {
@@ -1273,6 +1437,36 @@ mod tests {
             again.set_setting(key, mode.unwrap());
             assert_eq!(again.setting(key), BRUSH_BEHIND as f32, "{key}");
         }
+    }
+
+    #[test]
+    fn a_brush_keeps_its_plugins_rows_through_its_file_and_odd_lines_are_left_out() {
+        let mut brush = Brush::round_pen();
+        brush.set_setting("plugin:org.example.fill:fill", 1.0);
+        brush.set_setting("plugin:org.example.sounds:sound", 7.0);
+        let pictures = Pictures {
+            shape_png: b"s",
+            grain_png: None,
+            metallic_png: None,
+            roughness_png: None,
+            thumbnail_png: b"t",
+            author_png: None,
+            signature_png: None,
+            secondary: None,
+        };
+        let back = read(&write(&brush, "", &pictures)).unwrap();
+        let mut again = Brush::round_pen();
+        for (key, value) in &back.settings {
+            again.set_setting(key, *value);
+        }
+        assert_eq!(again.setting("plugin:org.example.fill:fill"), 1.0);
+        assert_eq!(again.setting("plugin:org.example.sounds:sound"), 7.0);
+        // a brush with none writes none
+        let plain = write(&Brush::round_pen(), "", &pictures);
+        assert!(!crate::zip::ZipReader::new(&plain).unwrap().names().any(|n| n.ends_with(PLUGIN_ROWS)));
+        // lines that aren't a plugin's row, or a value past its choices, are left out
+        let text = b"plugin:a:b 3\nnot_a_row 1\nplugin:a:c 300\nplugin:a:d x\nplugin:a:e -1\n  plugin:a:f 2  \n";
+        assert_eq!(plugin_rows(text), [("plugin:a:b".to_owned(), 3.0), ("plugin:a:f".to_owned(), 2.0)]);
     }
 
     #[test]
@@ -1388,6 +1582,45 @@ mod tests {
         let get = |k: &str| back.settings.iter().rev().find(|(key, _)| key == k).map(|(_, v)| *v);
         assert!(get("jitter_lateral").is_some());
         assert_eq!(get("jitter_linear"), get("jitter_lateral"));
+    }
+
+    #[test]
+    fn a_files_jitter_past_the_sliders_end_is_kept_and_written_out_again() {
+        // a spatter brush's: 13.67 across and 13.78 along, past the slider's 3
+        let mut b = Builder::new();
+        let root = b.reserve();
+        let name = b.string("Spatter");
+        b.fill(
+            &root,
+            &["SilicaBrush", "ValkyrieBrush", "NSObject"],
+            vec![("name", name), ("plotJitter", Value::Real(13.67)), ("plotJitterLongitudinal", Value::Real(13.78))],
+        );
+        let mut zip = ZipWriter::new();
+        zip.add("Brush.archive", &b.finish(root));
+        let read_back = read(&zip.finish()).unwrap();
+        let mut brush = Brush::round_pen();
+        for (k, v) in &read_back.settings {
+            brush.set_setting(k, *v);
+        }
+        // the controls past 1, as the file says (none cut back to the slider's 3)
+        let file = |control: f32| crate::stroke::JITTER_FILE_SCALE * control.powf(2.2);
+        let (across, along) = (file(brush.setting("jitter_lateral")), file(brush.setting("jitter_linear")));
+        assert!((across - 13.67).abs() < 0.01 && (along - 13.78).abs() < 0.01, "{across} {along}");
+        // and written out as they came in
+        let pictures = Pictures {
+            shape_png: b"s",
+            grain_png: None,
+            metallic_png: None,
+            roughness_png: None,
+            thumbnail_png: b"t",
+            author_png: None,
+            signature_png: None,
+            secondary: None,
+        };
+        let again = read(&write(&brush, "", &pictures)).unwrap();
+        let get = |k: &str| again.settings.iter().rev().find(|(key, _)| key == k).map(|(_, v)| file(*v));
+        let (across, along) = (get("jitter_lateral").unwrap(), get("jitter_linear").unwrap());
+        assert!((across - 13.67).abs() < 0.01 && (along - 13.78).abs() < 0.01, "{across} {along}");
     }
 
     #[test]

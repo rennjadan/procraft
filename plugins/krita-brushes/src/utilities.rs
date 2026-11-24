@@ -12,9 +12,10 @@ mod app {
     }
 }
 
-/// The most bytes it takes back from one: past it the plugin's memory would run out.
+/// The most bytes it takes back from one: a preset's settings that carry a big pipe unpack to tens
+/// of megabytes (77 MB in a real one), and past this the plugin's memory would run out.
 #[cfg(target_arch = "wasm32")]
-const MOST: usize = 64 << 20;
+const MOST: usize = 160 << 20;
 
 /// What the app made, `len` bytes, read into the plugin's memory.
 #[cfg(target_arch = "wasm32")]

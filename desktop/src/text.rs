@@ -182,6 +182,16 @@ struct SidePress {
     dragging: bool,
 }
 
+/// A press on the text: where it began and was last (points), and whether it is moving the text
+/// yet (past the slop). Let go before that, it was a click: one puts the caret there, two choose
+/// the word, three all of it.
+#[derive(Clone, Copy)]
+struct TextPress {
+    from: Pos2,
+    last: Pos2,
+    moving: bool,
+}
+
 /// Where the text stands on the canvas: its box (left, top, width, height) and the caret before
 /// the first and after the last letter chosen (x, top, bottom; none for vertical text).
 struct Geometry {
@@ -211,8 +221,10 @@ pub struct TextEditor {
     geometry: Option<Geometry>,
     /// The chosen letters ringed, for which text and letters, and where on the canvas.
     ring: Option<(Chosen, Option<Picture>)>,
-    /// A drag moving the text: where (points) it was last.
-    dragging: Option<Pos2>,
+    /// A press on the text, perhaps dragging it.
+    dragging: Option<TextPress>,
+    /// Letters chosen by clicks on the text, for the field to take next (first and last).
+    clicked: Option<(usize, usize)>,
     /// The layer's box and typeface are pinned (Lock Position): only its words change.
     pinned: bool,
     /// A press on a side's dot, dragged: the box's width.
@@ -263,6 +275,7 @@ impl TextEditor {
         self.geometry = None;
         self.ring = None;
         self.dragging = None;
+        self.clicked = None;
         self.side = None;
     }
 
@@ -327,6 +340,7 @@ impl TextEditor {
         self.before_style = None;
         self.dragging = None;
         self.pinned = false;
+        self.clicked = None;
         self.side = None;
         self.drawer.forget();
         self.info = Some(info);
@@ -424,6 +438,7 @@ impl TextEditor {
         self.geometry = None;
         self.ring = None;
         self.dragging = None;
+        self.clicked = None;
         if self.side.take().is_some_and(|s| s.dragging) {
             session.text_side_end();
         }
@@ -491,8 +506,9 @@ impl TextEditor {
     }
 
     /// Over the canvas: the box, the caret or the letters chosen, the field typed into, and the
-    /// touches (a press outside the box ends the edit, keeping it; a drag inside moves the text; a
-    /// side's dot dragged moves that side, the box's width).
+    /// touches (a press outside the box ends the edit, keeping it; a drag inside moves the text,
+    /// a click there puts the caret at it, two choose the word and three all of it; a side's dot
+    /// dragged moves that side, the box's width).
     fn canvas_part(&mut self, ctx: &egui::Context, session: &CanvasSession) -> Option<Said> {
         let info = self.info.clone()?;
         let ppp = ctx.pixels_per_point();
@@ -545,10 +561,7 @@ impl TextEditor {
                     if let Some(side) = session.text_side_at(p.x * ppp, p.y * ppp, SIDE_REACH * ppp) {
                         self.side = Some(SidePress { side, from: p, dragging: false });
                     } else if upright.contains(p) {
-                        // pinned, the box stays where it is
-                        if !self.pinned {
-                            self.dragging = Some(p);
-                        }
+                        self.dragging = Some(TextPress { from: p, last: p, moving: false });
                     } else {
                         ended = true;
                     }
@@ -624,18 +637,45 @@ impl TextEditor {
                 self.side = None;
             }
         }
-        // dragged, the text follows
+        // dragged past the slop, the text follows; let go before that, a click chooses letters
         match (self.dragging, at) {
-            (Some(last), Some(now)) if down => {
-                if let (Some(a), Some(b)) = (to_canvas(m, ppp, last), to_canvas(m, ppp, now))
-                    && now != last
+            (Some(mut press), Some(now)) if down => {
+                press.moving = press.moving || now.distance(press.from) > SLOP;
+                // pinned, the box stays where it is
+                if press.moving
+                    && !self.pinned
+                    && now != press.last
+                    && let (Some(a), Some(b)) = (to_canvas(m, ppp, press.last), to_canvas(m, ppp, now))
                 {
                     self.change(session, |i| {
                         i.x += b.0 - a.0;
                         i.y += b.1 - a.1;
                     });
+                    press.last = now;
                 }
-                self.dragging = Some(now);
+                self.dragging = Some(press);
+            }
+            (Some(press), _) => {
+                let taps = ctx.input(|i| {
+                    let button = egui::PointerButton::Primary;
+                    if i.pointer.button_triple_clicked(button) {
+                        3
+                    } else if i.pointer.button_double_clicked(button) {
+                        2
+                    } else {
+                        u32::from(i.pointer.button_clicked(button))
+                    }
+                });
+                if !press.moving
+                    && taps > 0
+                    && let Some((x, y)) = to_canvas(m, ppp, press.from)
+                    && let Some([start, end]) = session.text_tap(x, y, taps).as_deref()
+                {
+                    self.chosen = (*start as usize, *end as usize);
+                    self.told = self.chosen;
+                    self.clicked = Some(self.chosen);
+                }
+                self.dragging = None;
             }
             _ => self.dragging = None,
         }
@@ -681,6 +721,10 @@ impl TextEditor {
         if let Some(range) = output.cursor_range {
             let (a, b) = (range.primary.index, range.secondary.index);
             self.chosen = (usize::from(a.min(b)), usize::from(a.max(b)));
+        }
+        // letters chosen by clicks on the text: the field's too, so typing goes there
+        if let Some((from, to)) = self.clicked.take() {
+            self.choose(ui.ctx(), &mut output.state, from, to);
         }
         self.typed = typed;
     }

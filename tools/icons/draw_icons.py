@@ -1,7 +1,9 @@
 """Draws ProCraft's own interface icons from plain geometry (docs/icons/STYLE_GUIDE.md), takes in the
 ones contributors drew (assets/icons/contributed/), and puts them in place: an SVG master per icon
 (assets/icons/procraft/<name>.svg, a 24-unit grid), and its path data, scaled into its slot
-(assets/icons/slots.tsv), in Icons.kt.
+(assets/icons/slots.tsv), in Icons.kt. The plugins' own icons (PLUGIN_ICONS) go the same way into
+their folders: a master in plugins/<plugin>/icons/<key>.svg, and its path data, on the grid, into the
+manifest's menu choice of that key.
 Needs shapely. Run from anywhere:
 
     python tools/icons/draw_icons.py
@@ -20,6 +22,7 @@ MASTERS = os.path.join(ROOT, 'assets', 'icons', 'procraft')
 SLOTS = os.path.join(ROOT, 'assets', 'icons', 'slots.tsv')
 ICONS = os.path.join(ROOT, 'android', 'app', 'src', 'main', 'java', 'io', 'github',
                      'artcraftandroid', 'procraft', 'ui', 'Icons.kt')
+PLUGINS = os.path.join(ROOT, 'plugins')
 
 GAP = 1.2  # a knockout's width
 SQ2 = math.sqrt(0.5)
@@ -1042,6 +1045,18 @@ def solid_quad():
     return soft(Polygon([(6.5, 5.5), (17.5, 5.5), (22.0, 18.5), (2.0, 18.5)]), 1.0)
 
 
+def picker_triangle():
+    """A colour triangle: a solid triangle with equal sides, pointing up."""
+    return solid_triangle(True)
+
+
+def triangle_in_ring():
+    """A colour triangle in a hue ring: a ring, and inside it a solid triangle pointing up."""
+    r = 5.6
+    corners = [(12.0 + r * math.cos(a), 12.6 + r * math.sin(a)) for a in (-math.pi / 2, math.pi / 6, 5 * math.pi / 6)]
+    return unary_union([ring(12.0, 12.0, 8.8, 2.4), soft(Polygon(corners), 0.6)])
+
+
 def solid_rect(square):
     """Rectangle (or square): a solid one, its corners rounded."""
     return soft(box(3.0, 3.0, 21.0, 21.0) if square else box(2.0, 6.5, 22.0, 17.5), 1.4)
@@ -1771,6 +1786,14 @@ DRAWINGS.update({f'set-{k}': draw for k, draw in enumerate(SET_ICONS)})
 DRAWINGS.update({f'blend-{k}': draw for k, draw in BLENDS.items()})
 
 
+# The plugins' own icons: (plugin folder, menu choice key) -> drawing.
+PLUGIN_ICONS = {
+    ('colour-tools', 'square'): lambda: solid_rect(True),
+    ('colour-tools', 'triangle'): picker_triangle,
+    ('colour-tools', 'ring'): triangle_in_ring,
+}
+
+
 def fmt(v):
     s = f'{v:.2f}'.rstrip('0').rstrip('.')
     return '0' if s in ('-0', '') else s
@@ -1827,6 +1850,29 @@ def main():
             raise SystemExit(f'{name}: {n} places in Icons.kt')
     open(ICONS, 'w', encoding='utf-8', newline='').write(src)
     print(f'{len(DRAWINGS)} icons drawn')
+    plugin_icons()
+
+
+def plugin_icons():
+    """Each plugin's own icons: its master in its folder, its path data (on the grid, as drawn) in the
+    menu choice of its key in its manifest."""
+    for (plugin, key), draw in PLUGIN_ICONS.items():
+        d = path_data(draw().simplify(0.02))
+        folder = os.path.join(PLUGINS, plugin)
+        os.makedirs(os.path.join(folder, 'icons'), exist_ok=True)
+        with open(os.path.join(folder, 'icons', f'{key}.svg'), 'w', encoding='utf-8', newline='\n') as f:
+            f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">\n'
+                    f'  <!-- ProCraft {plugin} plugin icon "{key}": original, drawn by tools/icons/draw_icons.py. '
+                    'MIT OR Apache-2.0. -->\n'
+                    f'  <path fill="currentColor" fill-rule="evenodd" d="{d}"/>\n</svg>\n')
+        manifest = os.path.join(folder, 'craft-extension.json')
+        text = open(manifest, encoding='utf-8', newline='').read()
+        choice = re.compile(r'("key": "' + re.escape(key) + r'",[^{}]*?"icon": ")[^"]*(")')
+        text, n = choice.subn(lambda m: m.group(1) + d + m.group(2), text)
+        if n != 1:
+            raise SystemExit(f'{plugin}/{key}: {n} menu choices in its manifest')
+        open(manifest, 'w', encoding='utf-8', newline='').write(text)
+    print(f'{len(PLUGIN_ICONS)} plugin icons drawn')
 
 
 if __name__ == '__main__':

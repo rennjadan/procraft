@@ -142,6 +142,9 @@ windows = { version = "0.62", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# A copy put on the system's clipboard as PNG and CF_DIBV5, both made before it is opened (the
+# version arboard already brings in)
+clipboard-win = "5.4"
 
 # A tablet's pen under X11, which winit gives as the mouse: its pressure, lean and eraser end from
 # its own XInput 2 events

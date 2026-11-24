@@ -530,8 +530,75 @@ fn pictures(bytes: &[u8], light: bool) -> Option<Pictures> {
     }
     let pipe = gimp::gih(bytes, !light)?;
     let colourful = !pipe.grey && !light && pipe.cells.first().is_some_and(|c| !gimp::all_grey(c));
-    let pick = PipePick { ranks: pipe.ranks, selections: pipe.selections };
-    Some(Pictures { cells: pipe.cells, image: !pipe.grey, colourful, pipe: Some(pick) })
+    let (cells, pick) = sampled(pipe.cells, PipePick { ranks: pipe.ranks, selections: pipe.selections });
+    Some(Pictures { cells, image: !pipe.grey, colourful, pipe: Some(pick) })
+}
+
+/// The most pictures a tip may have: what the app takes of a look.
+pub const MOST_CELLS: usize = 255;
+
+/// A pipe of more cells than a tip may have, sampled down: each dimension keeps as many of its
+/// steps as fit, about the same share of each, spread evenly over all it had, and the cells kept
+/// are those at the steps kept. How it picks stays as it was, over the steps left: a dimension
+/// picked going round (by the drawing angle, in turn, at random) keeps steps evenly round it; one
+/// picked along a range (pressure, speed, tilt) keeps its first and last.
+fn sampled<T: Clone>(cells: Vec<T>, pick: PipePick) -> (Vec<T>, PipePick) {
+    let count = cells.len();
+    if count <= MOST_CELLS || pick.ranks.is_empty() {
+        return (cells, pick);
+    }
+    let ranks: Vec<u32> = pick.ranks.iter().map(|&r| r.max(1)).collect();
+    let product: f64 = ranks.iter().map(|&r| f64::from(r)).product();
+    let share = (MOST_CELLS as f64 / product).powf(1.0 / ranks.len() as f64).min(1.0);
+    let mut kept: Vec<u32> = ranks.iter().map(|&r| ((f64::from(r) * share).floor() as u32).clamp(1, r)).collect();
+    let cells_kept = |kept: &[u32]| kept.iter().map(|&k| k as usize).product::<usize>();
+    // what still fits, a step at a time, to the dimension the most was taken from
+    loop {
+        let fits = (0..kept.len()).filter(|&i| {
+            let mut more = kept.clone();
+            more[i] += 1;
+            kept[i] < ranks[i] && cells_kept(&more) <= MOST_CELLS
+        });
+        let Some(i) = fits.max_by(|&a, &b| {
+            let taken = |i: usize| f64::from(ranks[i]) / f64::from(kept[i]);
+            taken(a).total_cmp(&taken(b))
+        }) else {
+            break;
+        };
+        kept[i] += 1;
+    }
+    // the step each dimension's step kept was
+    let step = |i: usize, k: u32| -> u32 {
+        let (r, n) = (ranks[i], kept[i]);
+        let round = matches!(
+            pick.selections.get(i),
+            Some(Selection::Angular | Selection::Incremental | Selection::Random | Selection::Constant) | None
+        );
+        if n <= 1 {
+            0
+        } else if round {
+            ((2 * u64::from(k) + 1) * u64::from(r) / (2 * u64::from(n))) as u32
+        } else {
+            ((f64::from(k) * f64::from(r - 1) / f64::from(n - 1)).round() as u32).min(r - 1)
+        }
+    };
+    // the last dimension steps fastest, as the pipe's cells go
+    let strides = |ranks: &[u32]| {
+        let mut strides = vec![1_usize; ranks.len()];
+        for i in (0..ranks.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * ranks[i + 1] as usize;
+        }
+        strides
+    };
+    let (was, now) = (strides(&ranks), strides(&kept));
+    let picked: Vec<T> = (0..cells_kept(&kept))
+        .map(|at| {
+            let index: usize =
+                (0..kept.len()).map(|i| was[i] * step(i, (at / now[i] % kept[i] as usize) as u32) as usize).sum();
+            cells[index % count].clone()
+        })
+        .collect();
+    (picked, PipePick { ranks: kept, selections: pick.selections })
 }
 
 /// How Krita applies a picture tip, by what its `Brush` element says (and, for presets from before

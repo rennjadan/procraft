@@ -51,16 +51,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel.DropBand
+import io.github.artcraftandroid.procraft.core.PressTurn
 import kotlin.math.roundToInt
-
-/** What a touch on a colour that can be dragged out turned out to be. */
-private enum class DropTouch { TAP, HOLD, DRAG, GONE }
 
 /**
  * A colour that can be dragged out onto the canvas to fill there (the colour button, or a swatch
  * with [swatch] giving its colour): tapped it does [onTap], held still [onHold]; dragged, its colour
  * is pulled out (of the colour button's centre, or where the swatch was pressed) and goes with the
- * finger, filling where it is let go below the top bar.
+ * finger, filling where it is let go below the top bar. The core tells which a press is
+ * ([DropPress]): the colour button's held still goes back to the previous colour and then drags
+ * nothing out; moved far enough first, it drags.
  */
 internal fun Modifier.dropSource(vm: CanvasViewModel, swatch: (() -> Int)? = null, onHold: (() -> Unit)? = null, onTap: () -> Unit): Modifier = composed {
     val tap by rememberUpdatedState(onTap)
@@ -79,30 +79,39 @@ internal fun Modifier.dropSource(vm: CanvasViewModel, swatch: (() -> Int)? = nul
         awaitEachGesture {
             val down = awaitFirstDown()
             down.consume()
-            // whichever comes first: lifted, moved past the slop, or (when holding does something) held
-            val wait = if (hold != null) viewConfiguration.longPressTimeoutMillis else Long.MAX_VALUE
-            val touch = withTimeoutOrNull(wait) {
-                var seen: DropTouch? = null
-                while (seen == null) {
-                    val c = awaitPointerEvent().changes.firstOrNull { it.id == down.id }
-                    seen = when {
-                        c == null -> DropTouch.GONE
-                        !c.pressed -> DropTouch.TAP.also { c.consume() }
-                        (c.position - down.position).getDistance() > viewConfiguration.touchSlop -> DropTouch.DRAG
-                        else -> null
-                    }
+            // the core says what the press is: lifted, held, or moved far enough to drag (a swatch
+            // holds only when holding does something)
+            val holdMs = if (hold != null) viewConfiguration.longPressTimeoutMillis else null
+            val press = DropPress.of(down.position, down.uptimeMillis, vm.density, colour != null, holdMs, viewConfiguration.touchSlop)
+            var turn = PressTurn.NONE
+            var pos = down.position
+            var ms = down.uptimeMillis
+            while (turn == PressTurn.NONE) {
+                val wait = press.wait(SystemClock.uptimeMillis())
+                val event = if (wait == null) awaitPointerEvent() else withTimeoutOrNull(wait) { awaitPointerEvent() }
+                if (event == null) {
+                    turn = press.waited(SystemClock.uptimeMillis())
+                    continue
                 }
-                seen
-            } ?: DropTouch.HOLD
-            when (touch) {
-                DropTouch.TAP -> tap()
-                DropTouch.HOLD -> hold?.invoke()
-                DropTouch.GONE -> Unit
-                DropTouch.DRAG -> {
-                    var at = origin + down.position
+                val c = event.changes.firstOrNull { it.id == down.id } ?: break
+                pos = c.position
+                ms = c.uptimeMillis
+                if (!c.pressed) {
+                    c.consume()
+                    turn = press.lifted(ms)
+                    break
+                }
+                turn = press.moved(pos, ms)
+            }
+            when (turn) {
+                PressTurn.TAP -> tap()
+                PressTurn.HOLD -> hold?.invoke()
+                PressTurn.NONE -> Unit
+                PressTurn.DRAG -> {
+                    var at = origin + pos
                     val pen = down.type == PointerType.Stylus || down.type == PointerType.Eraser
                     val swatchRgb = colour?.invoke()
-                    vm.dropDragStart(at, swatchRgb, pen, down.uptimeMillis, from = if (swatchRgb == null) centre else origin + down.position)
+                    vm.dropDragStart(at, swatchRgb, pen, ms, from = if (swatchRgb == null) centre else origin + down.position)
                     var lifted = false
                     while (true) {
                         // held still a moment, the colour comes to rest (a slide then sets the threshold)

@@ -230,7 +230,7 @@ impl AnimatedExport {
                 Animated::Png => session.export_apng(file, side, fps, transparent).map_err(|e| e.to_string()),
                 Animated::Mp4 | Animated::Hevc => {
                     let info = session.info();
-                    let order = session.animation_sequence();
+                    let order = session.animation_play_order();
                     let most = if web_ready { WEB_READY_SIDE } else { MAX_VIDEO_SIDE };
                     let hevc = format == Animated::Hevc;
                     crate::video::write_mp4(

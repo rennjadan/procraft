@@ -373,6 +373,26 @@ impl CanvasSession {
         }
     }
 
+    /// The letters chosen by `taps` quick taps at canvas point (`x`, `y`) on the text being
+    /// edited: one puts the caret at the place nearest it, two choose the word there (the letters
+    /// between spaces), three all of it. They are what is chosen from then on (as
+    /// [`CanvasSession::text_select`] tells): first and last, as the core counts. None when no text
+    /// is being edited, or for vertical text.
+    pub fn text_tap(&self, x: f32, y: f32, taps: u32) -> Option<Vec<u32>> {
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let edit = st.text_edit.as_mut()?;
+        let info = TextInfo::from(st.doc.layer(edit.layer)?.text.as_ref()?);
+        let at = crate::text_draw::index_at(&info, x, y)?;
+        let (start, end) = match taps {
+            0 | 1 => (at, at),
+            2 => crate::text_draw::word_at(&info.text, at),
+            _ => (0, info.text.chars().count()),
+        };
+        edit.typing.choose(start, end);
+        Some(vec![start as u32, end as u32])
+    }
+
     /// Changes the look of characters `start`..`end` of the text being edited (as the core counts
     /// them) by `change`; with none chosen (`start` == `end`), the look of what is typed there next
     /// (and the whole text's, while it has no characters). The text as it now stands; none when no
@@ -976,5 +996,121 @@ mod tests {
         assert_eq!(s.layer_text(id).map(|t| (t.runs.len(), t.size)), Some((0, 20.0)));
         assert_eq!(s.redo().as_deref(), Some("Text editing"));
         assert_eq!(s.layer_text(id).map(|t| t.each_run().len()), Some(2));
+    }
+
+    /// A style change, and how it reads on a run (to see it took).
+    type Change = (TextStyleChange, fn(&TextRun) -> bool);
+
+    /// Each style change the sheet makes.
+    fn changes() -> Vec<Change> {
+        vec![
+            (TextStyleChange::Font { family: "serif".to_owned() }, |r| r.font == "serif"),
+            (TextStyleChange::Style { name: "Bold".to_owned() }, |r| r.style == "Bold"),
+            (TextStyleChange::Size { size: 40.0 }, |r| r.size == 40.0),
+            (TextStyleChange::Kerning { value: 0.5 }, |r| r.kerning == 0.5),
+            (TextStyleChange::Tracking { value: -0.25 }, |r| r.tracking == -0.25),
+            (TextStyleChange::Baseline { value: 0.3 }, |r| r.baseline == 0.3),
+            (TextStyleChange::Opacity { value: 0.4 }, |r| r.opacity == 0.4),
+            (TextStyleChange::Underline { on: true }, |r| r.underline),
+            (TextStyleChange::Outline { on: true }, |r| r.outline),
+        ]
+    }
+
+    #[test]
+    fn a_style_picked_with_a_caret_is_typed_next_with_some_letters_theirs_and_with_all_the_whole_text() {
+        for (change, took) in changes() {
+            let s = CanvasSession::new(400, 400);
+            let id = s.text_begin(None, text("ab rd")).unwrap();
+            let before = s.layer_text(id).unwrap();
+            // only the caret (after "ab"): the text as it was; what is typed there next takes it
+            s.text_select(2, 2);
+            let now = s.text_restyle(2, 2, change.clone()).unwrap();
+            assert_eq!(now, before, "{change:?}");
+            let look = s.text_look(2, 2).unwrap();
+            assert!(took(&TextRun::from(look)), "{change:?}");
+            let typed = s.set_text(TextInfo { text: "abx rd".to_owned(), ..now }).unwrap();
+            s.text_select(3, 3);
+            let runs = typed.each_run();
+            assert_eq!(runs.iter().map(|r| (r.len, took(r))).collect::<Vec<_>>(), [(2, false), (1, true), (3, false)]);
+            // some letters ("rd"): theirs alone
+            s.text_select(4, 6);
+            let some = s.text_restyle(4, 6, change.clone()).unwrap();
+            let runs = some.each_run();
+            assert_eq!(runs.last().map(|r| (r.len, took(r))), Some((2, true)), "{change:?}");
+            assert!(runs.first().is_some_and(|r| !took(r)), "{change:?}");
+            // all of them: the whole text, one look throughout
+            s.text_select(0, 6);
+            let all = s.text_restyle(0, 6, change.clone()).unwrap();
+            assert!(all.runs.is_empty() && took(&all.each_run()[0]), "{change:?} {all:?}");
+            s.text_end(true);
+        }
+    }
+
+    #[test]
+    fn a_text_opened_again_takes_a_style_picked_straight_away_whole() {
+        // as before letters could be chosen: a text opened for editing (and new text before
+        // anything is typed) has all of it chosen, so a look picked then is the whole text's
+        for (change, took) in changes() {
+            let s = CanvasSession::new(400, 400);
+            s.text_begin(None, text("Text")).unwrap();
+            let new = s.text_restyle(0, 4, change.clone()).unwrap();
+            assert!(new.runs.is_empty() && took(&new.each_run()[0]), "{change:?}");
+            s.text_end(true);
+            let id = s.text_begin(None, text("Hello there")).unwrap();
+            s.text_end(true);
+            assert!(s.text_begin(Some(id), s.layer_text(id).unwrap()).is_some());
+            let whole = s.text_restyle(0, 11, change.clone()).unwrap();
+            assert!(whole.runs.is_empty() && took(&whole.each_run()[0]), "{change:?} {whole:?}");
+            let look = TextRun::from(s.text_look(0, 11).unwrap());
+            assert!(look.len == 11 && took(&look), "{change:?}");
+            s.text_end(true);
+        }
+    }
+
+    #[test]
+    fn taps_on_the_text_choose_the_caret_a_word_or_all_of_it() {
+        crate::add_text_font(include_bytes!("../../../android/app/src/main/assets/fonts/Inter-Regular.ttf").to_vec());
+        let s = CanvasSession::new(400, 400);
+        let words = TextInfo { width: 0.0, ..text("Hello there\nfriend") };
+        let id = s.text_begin(None, words).unwrap();
+        let info = s.layer_text(id).unwrap();
+        // a canvas point on the caret before character `i`, halfway down its line
+        let on = |i: u32| {
+            let c = crate::text_caret(info.clone(), i);
+            (c[0], (c[1] + c[2]) / 2.0)
+        };
+        // one tap: the caret at the place nearest, a little either side of it
+        for i in [0, 3, 5, 8, 11, 12, 15, 18] {
+            let (x, y) = on(i);
+            assert_eq!(s.text_tap(x + 1.0, y, 1), Some(vec![i, i]), "{i}");
+            assert_eq!(s.text_tap(x - 1.0, y + 3.0, 1), Some(vec![i, i]), "{i}");
+        }
+        // past a line's end, above or below the text: that line's end, the first line, the last
+        let (end, y) = on(11);
+        assert_eq!(s.text_tap(end + 80.0, y, 1), Some(vec![11, 11]));
+        assert_eq!(s.text_tap(on(2).0, -500.0, 1), Some(vec![2, 2]));
+        assert_eq!(s.text_tap(on(14).0, 900.0, 1), Some(vec![14, 14]));
+        // two: the word there (in "there", after "Hello" and on its last letter); three: all
+        let (x, y) = on(8);
+        assert_eq!(s.text_tap(x, y, 2), Some(vec![6, 11]));
+        assert_eq!(s.text_tap(on(5).0 - 1.0, on(5).1, 2), Some(vec![0, 5]));
+        assert_eq!(s.text_tap(on(17).0, on(17).1, 2), Some(vec![12, 18]));
+        assert_eq!(s.text_tap(x, y, 3), Some(vec![0, 18]));
+        // the word chosen is what a look picked changes
+        let [start, end] = s.text_tap(x, y, 2).unwrap()[..] else { panic!() };
+        let now = s.text_restyle(start, end, TextStyleChange::Size { size: 30.0 }).unwrap();
+        let sizes: Vec<(u32, f32)> = now.each_run().iter().map(|r| (r.len, r.size)).collect();
+        assert_eq!(sizes, [(6, 20.0), (5, 30.0), (7, 20.0)]);
+        // capitals: a letter that shows as two is still one place
+        let caps = TextInfo { all_caps: true, ..text("straße x") };
+        assert!(s.set_text(caps).is_some());
+        let caps = s.layer_text(id).unwrap();
+        let after = crate::text_caret(caps.clone(), 6);
+        assert_eq!(s.text_tap(after[0] + 1.0, (after[1] + after[2]) / 2.0, 1), Some(vec![6, 6]));
+        // vertical text shows no caret, so taps choose nothing
+        assert!(s.set_text(TextInfo { vertical: true, ..caps }).is_some());
+        assert_eq!(s.text_tap(110.0, 60.0, 1), None);
+        s.text_end(true);
+        assert_eq!(s.text_tap(110.0, 60.0, 1), None);
     }
 }

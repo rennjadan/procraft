@@ -468,6 +468,7 @@ fn without_its_environment_the_model_stands_on_the_surround_grid() {
         top: 4.0,
         width: 2.0,
         color: [0.5, 0.5, 0.5],
+        picture: None,
     }));
     let px = draw(&gpu, &mut view);
     // at the corner, a line's pixel and the clear colour beside it; nothing over the grid's top

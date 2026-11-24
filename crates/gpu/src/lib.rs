@@ -7,22 +7,31 @@
 mod canvas;
 #[cfg(windows)]
 mod compiler;
+// (naga's GLSL writer comes with the OpenGL backend, which Apple's systems go without)
+#[cfg(all(test, not(target_vendor = "apple")))]
+mod gles_shaders;
 mod kept;
 mod lighting;
+mod placed;
 mod scene;
 mod sphere;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-pub use canvas::plugin_filter::{FilterCode, FilterProgram, FilterRun, read_filter};
+pub use canvas::filter_layers::{FilterReach, FilterTable, LayerFilterProgram, MOST_LAYER_FILTER_VALUES};
+pub use canvas::plugin_filter::{
+    FilterCode, FilterProgram, FilterRun, read_filter, read_layer_filter, read_layer_table_filter,
+};
 pub use canvas::plugin_picture::{PictureCode, PictureProgram, PictureStop, read_picture, read_picture_given};
 pub use canvas::{
-    Backdrop, Canvas, DisplayLut, Filter, FineThumbnail, LayerStore, LayerThumbnailStep, LiquifyMode, LiquifyStamp,
-    MOST_TIPS, PendingAlphas, PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample, STORE_LIT, SecondStroke,
-    SelectionLook, SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid, Target, Thumbnail,
-    TipKind, most_resident, read_texture, start_reading, textures_bytes,
+    Backdrop, Canvas, DisplayLut, FillPreview, Filter, FineThumbnail, LayerStore, LayerThumbnailStep, LiquifyMode,
+    LiquifyStamp, MOST_TIPS, PendingAlphas, PendingThumbnail, Readback, ReadyToPark, RemakeStats, Resample, STORE_LIT,
+    SecondStroke, SelectionLook, SharedStroke, SmallScene, Stripes, StrokeStyle, StrokeTool, SurroundGrid, Target,
+    Thumbnail, TipKind, VEIL_GRID, VeilCell, VeilCells, grey_levels, most_resident, read_texture, start_reading,
+    textures_bytes,
 };
+pub use canvas::{CanvasPaper, GREY_LOOK, ViewLook};
 pub use kept::keep_pipelines_in;
 pub use lighting::Lighting;
 pub use scene::{
@@ -54,6 +63,54 @@ pub(crate) fn textures_uncompressed() -> bool {
 /// What a panic said (its message, when it gave one as text).
 pub fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic.downcast_ref::<&str>().copied().or_else(|| panic.downcast_ref::<String>().map(String::as_str)).unwrap_or("")
+}
+
+/// Whether a wait on the GPU that failed has been told in the log: only the first is.
+static WAIT_FAILED_TOLD: AtomicBool = AtomicBool::new(false);
+
+/// Polls `device` as `how` says (waiting for what was sent to it, or not), failing soft: wgpu's own
+/// poll panics where the device is lost or out of memory (errors it can't return), which here is
+/// [`GpuError::Lost`], and any other failure [`GpuError::Failed`], the first of them logged. A wait
+/// that runs out of time fails too, as nothing wrong: not logged. A wait without end goes in slices
+/// (see [`WAIT_SLICE`]).
+pub fn poll(device: &wgpu::Device, how: wgpu::PollType) -> Result<wgpu::PollStatus, GpuError> {
+    let submission_index = match how {
+        wgpu::PollType::Wait { submission_index, timeout: None } => submission_index,
+        how => return polled(|| device.poll(how)),
+    };
+    loop {
+        let slice = wgpu::PollType::Wait { submission_index: submission_index.clone(), timeout: Some(WAIT_SLICE) };
+        let polled_now = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| device.poll(slice)));
+        if !matches!(polled_now, Ok(Err(wgpu::PollError::Timeout))) {
+            return told(polled_now);
+        }
+        // the context let go a moment, for a thread waiting on it to take it
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// The longest a wait on the GPU holds it at once: on OpenGL a wait holds the one context the whole
+/// time, and wgpu panics in any other thread kept from it for a second (the window's frame, as an
+/// export waited for a big canvas to be read back). Between slices the context is let go.
+const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// [`poll`] with the poll given, as wgpu's might go.
+fn polled(poll: impl FnOnce() -> Result<wgpu::PollStatus, wgpu::PollError>) -> Result<wgpu::PollStatus, GpuError> {
+    told(std::panic::catch_unwind(std::panic::AssertUnwindSafe(poll)))
+}
+
+/// What a poll came to, as [`poll`] gives it, the first failure logged.
+fn told(polled: std::thread::Result<Result<wgpu::PollStatus, wgpu::PollError>>) -> Result<wgpu::PollStatus, GpuError> {
+    let (error, why) = match polled {
+        Ok(Ok(status)) => return Ok(status),
+        Ok(Err(wgpu::PollError::Timeout)) => return Err(GpuError::Failed("the GPU took too long".to_owned())),
+        Ok(Err(e)) => (GpuError::Failed(format!("waiting on the GPU: {e}")), e.to_string()),
+        Err(panic) => (GpuError::Lost, panic_message(panic.as_ref()).to_owned()),
+    };
+    if !WAIT_FAILED_TOLD.swap(true, Ordering::Relaxed) {
+        log::error!("waiting on the GPU failed ({why}); later failures aren't logged");
+    }
+    Err(error)
 }
 
 /// The graphics APIs in `backends` by name ("Vulkan", "Direct3D 12", "OpenGL", ...).
@@ -141,6 +198,75 @@ fn keeps_textures_uncompressed(name: &str, backend: wgpu::Backend) -> bool {
     backend == wgpu::Backend::Vulkan && name.to_ascii_lowercase().contains("mali")
 }
 
+/// Whether a GPU named `name` starts on OpenGL ES on Android: an old PowerVR Rogue (GE8100,
+/// GE8300, GE8320 and the like, in budget MediaTek and Unisoc phones and tablets), whose Vulkan
+/// driver crashed the app in the queue's submit some seconds after a canvas opened.
+fn crashes_on_vulkan(name: &str) -> bool {
+    name.to_ascii_lowercase().contains("powervr rogue")
+}
+
+/// The backends on Android, best first, for the GPUs Vulkan sees (`vulkan_gpus`): Vulkan, then
+/// OpenGL ES (for a device whose Vulkan is missing or fails); the other way round for a GPU whose
+/// Vulkan driver is known to crash (see [`crashes_on_vulkan`]).
+fn android_backends(vulkan_gpus: &[String]) -> Vec<wgpu::Backends> {
+    if vulkan_gpus.iter().any(|name| crashes_on_vulkan(name)) {
+        vec![wgpu::Backends::GL, wgpu::Backends::VULKAN]
+    } else {
+        vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+    }
+}
+
+/// Whether a device on `backend` whose canvases' pipelines failed in part is kept, not given up
+/// for the next backend: OpenGL ES, not lost, where it is kept whatever fails (`kept`, see
+/// [`opengl_kept`]). What needs the pipelines that failed doesn't draw; the rest does.
+fn takes_opengl_with_errors(backend: wgpu::Backend, lost: bool, kept: bool) -> bool {
+    let taken = backend == wgpu::Backend::Gl && !lost && kept;
+    if taken {
+        log::warn!(
+            "OpenGL ES kept all the same, as Vulkan's driver crashes on this GPU: only what needs the pipelines \
+             that failed (above) won't draw"
+        );
+    }
+    taken
+}
+
+/// Whether the app's record says Vulkan's driver crashed the app on this device and system (see
+/// [`vulkan_crashed`]).
+static VULKAN_CRASHED: AtomicBool = AtomicBool::new(false);
+
+/// Tells the GPU whether Vulkan's driver crashed the app on this device and system, as the app's
+/// record of its starts says: OpenGL ES is then kept even where some of the canvases' pipelines
+/// fail on it (see [`Gpu::for_canvases`]).
+pub fn vulkan_crashed(crashed: bool) {
+    VULKAN_CRASHED.store(crashed, Ordering::Relaxed);
+}
+
+/// Whether OpenGL ES is kept whatever pipelines fail on it, never giving way to Vulkan: Vulkan's
+/// driver crashed the app here (see [`vulkan_crashed`]), or is known to crash on this GPU (see
+/// [`crashes_on_vulkan`]). A crash takes the app down where a pipeline that fails costs only what
+/// needs it.
+fn opengl_kept() -> bool {
+    VULKAN_CRASHED.load(Ordering::Relaxed)
+        || (cfg!(target_os = "android") && vulkan_gpus().iter().any(|name| crashes_on_vulkan(name)))
+}
+
+/// The GPUs Vulkan sees, by name, asked once (it lists them, making no device); none where it
+/// can't.
+fn vulkan_gpus() -> &'static [String] {
+    static SEEN: OnceLock<Vec<String>> = OnceLock::new();
+    SEEN.get_or_init(|| {
+        let seen: Vec<String> = std::panic::catch_unwind(|| Gpu::adapters(wgpu::Backends::VULKAN))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| a.name)
+            .collect();
+        if let Some(name) = seen.iter().find(|name| crashes_on_vulkan(name)) {
+            log::info!("{name}: its Vulkan driver is known to crash, so OpenGL ES first");
+        }
+        seen
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum GpuError {
     #[error("no suitable GPU: {0}")]
@@ -181,6 +307,9 @@ pub struct Gpu {
     readbacks: Arc<std::sync::Mutex<Vec<wgpu::Buffer>>>,
     /// Made as an old GPU's (see [`Gpu::headless_old`]).
     old: bool,
+    /// Whether its copies are made as Direct3D 12 without unrestricted copy pitches makes them
+    /// (see [`Gpu::emulate_placed_copies`]).
+    placed: Arc<placed::Placed>,
 }
 
 /// Elsewhere there's no Direct3D 12 to choose a shader compiler for.
@@ -199,7 +328,8 @@ impl Gpu {
 
     /// The backends a device is made from, best first: those `WGPU_BACKEND` names if it is set
     /// (to try another when a driver fails); on Android Vulkan, then OpenGL ES (for a device
-    /// whose Vulkan is missing or fails); on Windows Vulkan and Direct3D 12, Direct3D 12 first on
+    /// whose Vulkan is missing or fails), the other way round for a GPU whose Vulkan driver is
+    /// known to crash (see [`android_backends`]); on Windows Vulkan and Direct3D 12, Direct3D 12 first on
     /// ARM (the Snapdragon X's Vulkan driver fails as a canvas opens), then OpenGL (a GPU or
     /// driver too old for either); on Linux Vulkan, then OpenGL (the same); elsewhere the native
     /// API. A backend's index here is the one the other calls take.
@@ -208,7 +338,7 @@ impl Gpu {
             return vec![chosen];
         }
         if cfg!(target_os = "android") {
-            vec![wgpu::Backends::VULKAN, wgpu::Backends::GL]
+            android_backends(vulkan_gpus())
         } else if cfg!(all(windows, target_arch = "aarch64")) {
             vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN, wgpu::Backends::GL]
         } else if cfg!(windows) {
@@ -268,9 +398,16 @@ impl Gpu {
     /// staged in are let go.
     pub fn flush(&self) {
         self.queue.submit(std::iter::empty());
-        if let Err(e) = self.device.poll(wgpu::PollType::wait_indefinitely()) {
-            log::error!("flushing uploads: {e}");
+        let _ = self.wait();
+    }
+
+    /// Waits for everything sent to the device; an error (logged once) if the device is lost or
+    /// the wait fails (see [`poll`]), never a panic.
+    pub fn wait(&self) -> Result<(), GpuError> {
+        if self.is_lost() {
+            return Err(GpuError::Lost);
         }
+        poll(&self.device, wgpu::PollType::wait_indefinitely()).map(|_| ())
     }
 
     /// A device for offscreen work (tests, exports), from the first instance that makes one. With
@@ -278,6 +415,9 @@ impl Gpu {
     pub fn headless() -> Result<Gpu, GpuError> {
         if std::env::var_os("PROCRAFT_HEADLESS_OLD").is_some() {
             return Gpu::headless_old();
+        }
+        if std::env::var_os("PROCRAFT_HEADLESS_DOWNLEVEL").is_some() {
+            return Gpu::headless_limited(wgpu::Limits::downlevel_defaults());
         }
         Gpu::first_that(0, |_| {}, |_| true).map(|(gpu, _)| gpu)
     }
@@ -288,12 +428,35 @@ impl Gpu {
     #[doc(hidden)]
     pub fn headless_old() -> Result<Gpu, GpuError> {
         let instance = Gpu::instance_after(0).ok_or_else(|| GpuError::NoAdapter("no backend".to_owned()))?;
-        Gpu::create(instance, None, true)
+        Gpu::create(instance, None, true, false)
+    }
+
+    /// [`Gpu::headless`] held to `limits` (where the GPU's own are lower, to those), as a weak
+    /// phone's GPU that reports less: for testing what the canvas does within them. With
+    /// `PROCRAFT_HEADLESS_DOWNLEVEL` set, [`Gpu::headless`] is held to wgpu's downlevel limits.
+    #[doc(hidden)]
+    pub fn headless_limited(limits: wgpu::Limits) -> Result<Gpu, GpuError> {
+        let instance = Gpu::instance_after(0).ok_or_else(|| GpuError::NoAdapter("no backend".to_owned()))?;
+        Gpu::create_within(instance, None, Some(limits), false, false)
+    }
+
+    /// [`Gpu::headless_old`] on the system's software GPU (Direct3D 12's WARP, Vulkan's lavapipe),
+    /// where it has one: a GPU as slow as an old phone's, for testing what waits on the GPU.
+    #[doc(hidden)]
+    pub fn headless_software_old() -> Result<Gpu, GpuError> {
+        let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        desc.backends = wgpu::Backends::PRIMARY;
+        let gpu = Gpu::create(wgpu::Instance::new(with_compiler(desc)), None, true, true)?;
+        if gpu.adapter.get_info().device_type != wgpu::DeviceType::Cpu {
+            return Err(GpuError::NoAdapter("no software GPU".to_owned()));
+        }
+        Ok(gpu)
     }
 
     /// The app's device, the canvases' pipelines made: from the first instance that makes one
     /// and builds them without an error or losing it (a driver that fails on them gives way to
-    /// the next backend; the last is kept as it is).
+    /// the next backend; the last is kept as it is). OpenGL ES with pipelines failing on it is
+    /// kept all the same where Vulkan's driver crashes (see [`opengl_kept`]).
     pub fn for_canvases() -> Result<Gpu, GpuError> {
         Gpu::for_canvases_from(0, |_| {}).map(|(gpu, _)| gpu)
     }
@@ -308,7 +471,7 @@ impl Gpu {
             if !fine {
                 log::warn!("the canvases' pipelines: {} GPU errors, lost {}", gpu.errors(), gpu.is_lost());
             }
-            fine
+            fine || takes_opengl_with_errors(gpu.adapter.get_info().backend, gpu.is_lost(), opengl_kept())
         })
     }
 
@@ -330,7 +493,7 @@ impl Gpu {
             let last = tries + 1 >= count;
             trying(backend);
             let made = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                Gpu::create(instance, None, false).map(|gpu| {
+                Gpu::create(instance, None, false, false).map(|gpu| {
                     let taken = last || fine(&gpu);
                     (gpu, taken)
                 })
@@ -348,10 +511,29 @@ impl Gpu {
 
     /// A device that can present to `surface` (made from `instance`).
     pub fn for_surface(instance: wgpu::Instance, surface: &wgpu::Surface<'_>) -> Result<Gpu, GpuError> {
-        Gpu::create(instance, Some(surface), false)
+        Gpu::create(instance, Some(surface), false, false)
     }
 
-    fn create(instance: wgpu::Instance, surface: Option<&wgpu::Surface<'_>>, old: bool) -> Result<Gpu, GpuError> {
+    /// A device from `instance` (for `surface`), held to an old GPU's limits if `old`, on the
+    /// software GPU if `software`.
+    fn create(
+        instance: wgpu::Instance,
+        surface: Option<&wgpu::Surface<'_>>,
+        old: bool,
+        software: bool,
+    ) -> Result<Gpu, GpuError> {
+        Gpu::create_within(instance, surface, old.then(old_gpu_limits), old, software)
+    }
+
+    /// [`Gpu::create`], held to `within` where given (a test's limits; where the GPU's own are
+    /// lower, to those).
+    fn create_within(
+        instance: wgpu::Instance,
+        surface: Option<&wgpu::Surface<'_>>,
+        within: Option<wgpu::Limits>,
+        old: bool,
+        software: bool,
+    ) -> Result<Gpu, GpuError> {
         // a driver's own description can run over several lines: one line in the log
         fn one_line(text: &str) -> String {
             text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -376,7 +558,7 @@ impl Gpu {
             // the faster GPU of a laptop's two, unless `WGPU_POWER_PREF` says (`low`: to try the
             // other when one fails or lags)
             power_preference: wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
-            force_fallback_adapter: false,
+            force_fallback_adapter: software,
             compatible_surface: surface,
             apply_limit_buckets: false,
         }))
@@ -402,7 +584,8 @@ impl Gpu {
             // where the GPU has it: the pipelines' compiled form to keep between runs
             required_features: adapter.features() & wgpu::Features::PIPELINE_CACHE,
             // the adapter's own limits, so large canvases fit where the GPU allows them
-            required_limits: if old { old_gpu_limits() } else { adapter.limits() },
+            required_limits:
+                within.clone().map_or_else(|| adapter.limits(), |l| l.or_worse_values_from(&adapter.limits())),
             // memory taken in small blocks (a few MB up to 64): a block of each kind, once made,
             // is kept for good, and the larger ones held what was never used (a first read back
             // of a few bytes kept 64 MB the CPU can see)
@@ -411,9 +594,21 @@ impl Gpu {
         }))
         .map_err(|e| GpuError::Device(e.to_string()))?;
         log::info!("the GPU's device made in {} ms", made.elapsed().as_millis());
+        // what it holds to, for a report from a GPU that fails within them
+        let l = device.limits();
+        log::info!(
+            "the GPU's limits: textures {} px, a storage binding {} MB, a buffer {} MB, {} storage buffers a \
+             stage, workgroups of {} ({} KB shared)",
+            l.max_texture_dimension_2d,
+            l.max_storage_buffer_binding_size >> 20,
+            l.max_buffer_size >> 20,
+            l.max_storage_buffers_per_shader_stage,
+            l.max_compute_invocations_per_workgroup,
+            l.max_compute_workgroup_storage_size >> 10
+        );
         // new canvases and crops kept to what its textures can be (not by one made as an old GPU's
         // to test with: that would hold every other test's canvases to its size)
-        if !old {
+        if within.is_none() {
             procraft_engine::document::set_gpu_texture_most(device.limits().max_texture_dimension_2d);
         }
         // a validation error must never take the app down: log it instead
@@ -441,6 +636,7 @@ impl Gpu {
             kept: Arc::default(),
             readbacks: Arc::default(),
             old,
+            placed: Arc::default(),
         };
         // what an old GPU can't do, and what the canvas does without it (in the shared log)
         for lack in gpu.lacks() {
@@ -465,6 +661,26 @@ impl Gpu {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
+    }
+
+    /// Makes sure `count` readback buffers of `size` bytes or more are kept (see
+    /// [`Gpu::readback_buffer`]), making those missing now: a reader about to start that many
+    /// copies in a hold of whatever guards what it reads makes them before it, so the memory is
+    /// got (and cleared by the system, a large buffer's slowest part) with nothing waiting on it.
+    pub fn keep_readbacks(&self, size: u64, count: usize) {
+        let have = {
+            let kept = self.readbacks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            kept.iter().filter(|b| b.size() >= size).count()
+        };
+        for _ in have..count {
+            let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("readback"),
+                size,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.readbacks.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(buffer);
+        }
     }
 
     /// Lets go of the readback buffers kept for next time (see [`Gpu::readback_buffer`]).
@@ -571,6 +787,13 @@ impl Gpu {
         WEAK.load(Ordering::Relaxed) || weak_gpu(&info.name, info.device_type)
     }
 
+    /// Whether the GPU's memory is the computer's own: an integrated GPU's (a laptop's Intel or
+    /// AMD graphics, a Mac's) or the system's software one. What it holds, the system and every
+    /// other app go without, and its share of it is smaller than a graphics card's own memory.
+    pub fn shares_memory(&self) -> bool {
+        matches!(self.adapter.get_info().device_type, wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Cpu)
+    }
+
     /// Whether the device is OpenGL (ES)'s.
     pub fn is_gl(&self) -> bool {
         self.adapter.get_info().backend == wgpu::Backend::Gl
@@ -631,13 +854,114 @@ impl Gpu {
 #[cfg(test)]
 mod tests {
     /// A GPU or driver too old for the rest still draws: without OpenGL behind them the app can't
-    /// open at all.
+    /// open at all. (First, on Android, for a GPU whose Vulkan driver is known to crash.)
     #[test]
     #[cfg(any(target_os = "linux", windows, target_os = "android"))]
     fn opengl_is_the_last_backend_tried() {
         if std::env::var_os("WGPU_BACKEND").is_none() {
-            assert_eq!(super::Gpu::backends().last(), Some(&wgpu::Backends::GL));
+            let backends = super::Gpu::backends();
+            let first = cfg!(target_os = "android") && super::vulkan_gpus().iter().any(|n| super::crashes_on_vulkan(n));
+            assert_eq!(if first { backends.first() } else { backends.last() }, Some(&wgpu::Backends::GL));
         }
+    }
+
+    /// Old PowerVR Rogue GPUs start on OpenGL ES: their Vulkan driver crashed the app in the
+    /// queue's submit ("PowerVR Rogue GE8300", Vulkan driver 1.15, five starts in a row). Others,
+    /// newer PowerVRs among them, start on Vulkan.
+    #[test]
+    fn old_powervr_rogue_gpus_start_on_opengl_es() {
+        use super::android_backends;
+        use wgpu::Backends;
+        let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        for rogue in [
+            "PowerVR Rogue GE8300",
+            "PowerVR Rogue GE8320",
+            "PowerVR Rogue GE8322",
+            "PowerVR Rogue GE8100",
+            "PowerVR Rogue GM9446",
+            "PowerVR Rogue G6200",
+        ] {
+            assert_eq!(android_backends(&names(&[rogue])), [Backends::GL, Backends::VULKAN], "{rogue}");
+        }
+        for other in [
+            "PowerVR B-Series BXM-8-256",
+            "Adreno (TM) 750",
+            "Adreno (TM) 610",
+            "Mali-G57 MC2",
+            "Mali-G52 MC2",
+            "Samsung Xclipse 940",
+        ] {
+            assert_eq!(android_backends(&names(&[other])), [Backends::VULKAN, Backends::GL], "{other}");
+        }
+        // Vulkan seeing no GPU at all: Vulkan first still (it fails soft, and OpenGL ES follows)
+        assert_eq!(android_backends(&[]), [Backends::VULKAN, Backends::GL]);
+    }
+
+    /// Where Vulkan's driver crashes, OpenGL ES with some of the canvases' pipelines failing is
+    /// kept, never given up for Vulkan (the tester's GE8300 went back to Vulkan over three smudge
+    /// pipelines and crashed); anywhere else, or lost, or on another backend, it gives way.
+    #[test]
+    fn opengl_es_with_failing_pipelines_is_kept_where_vulkan_crashes() {
+        use super::takes_opengl_with_errors;
+        use wgpu::Backend::{Dx12, Gl, Vulkan};
+        assert!(takes_opengl_with_errors(Gl, false, true));
+        assert!(!takes_opengl_with_errors(Gl, false, false));
+        assert!(!takes_opengl_with_errors(Gl, true, true));
+        assert!(!takes_opengl_with_errors(Vulkan, false, true));
+        assert!(!takes_opengl_with_errors(Dx12, false, true));
+        // the app's record saying so is enough (no GPU on the known list on the PC)
+        super::vulkan_crashed(true);
+        assert!(super::opengl_kept());
+        super::vulkan_crashed(false);
+        assert_eq!(
+            super::opengl_kept(),
+            cfg!(target_os = "android") && super::vulkan_gpus().iter().any(|n| super::crashes_on_vulkan(n))
+        );
+    }
+
+    /// Every wait on the GPU outside the tests goes through [`super::poll`], which fails soft where
+    /// wgpu's own poll panics (a device lost under it, as a phone short of memory can lose it):
+    /// the canvas's looks at how fast the GPU got through paint laid in place, or laid a stroke
+    /// again, and a sample stroke's paced waits, polled it themselves (#358).
+    #[test]
+    fn every_wait_on_the_gpu_outside_the_tests_fails_soft() {
+        let sources = [
+            ("canvas.rs", include_str!("canvas.rs")),
+            ("canvas/fragments.rs", include_str!("canvas/fragments.rs")),
+            ("canvas/plugin_filter.rs", include_str!("canvas/plugin_filter.rs")),
+            ("canvas/plugin_picture.rs", include_str!("canvas/plugin_picture.rs")),
+            ("canvas/rewind.rs", include_str!("canvas/rewind.rs")),
+            ("canvas/smudge.rs", include_str!("canvas/smudge.rs")),
+            ("canvas/store.rs", include_str!("canvas/store.rs")),
+            ("kept.rs", include_str!("kept.rs")),
+            ("lighting.rs", include_str!("lighting.rs")),
+            ("scene.rs", include_str!("scene.rs")),
+            ("sphere.rs", include_str!("sphere.rs")),
+        ];
+        for (name, text) in sources {
+            // (the code before the file's tests)
+            let code = text.split("\nmod tests {").next().unwrap_or(text);
+            let raw = code.lines().filter(|l| l.contains("device.poll(") && !l.trim_start().starts_with("//")).count();
+            assert_eq!(raw, 0, "{name} polls the device itself");
+        }
+    }
+
+    /// A poll panicking, as wgpu's does on a device lost or out of memory, is the device lost; one
+    /// that fails or runs out of time is an error; neither goes on as a panic.
+    #[test]
+    fn a_poll_that_panics_or_fails_is_an_error() {
+        use super::{GpuError, polled};
+        assert!(matches!(polled(|| Ok(wgpu::PollStatus::QueueEmpty)), Ok(wgpu::PollStatus::QueueEmpty)));
+        assert!(matches!(polled(|| panic!("Error in Device::poll: Parent device is lost")), Err(GpuError::Lost)));
+        assert!(matches!(polled(|| Err(wgpu::PollError::Timeout)), Err(GpuError::Failed(_))));
+        assert!(matches!(polled(|| Err(wgpu::PollError::WrongSubmissionIndex(2, 1))), Err(GpuError::Failed(_))));
+        // a device destroyed: waited on, it is lost, then refused at once
+        let Ok(gpu) = super::Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        gpu.device.destroy();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.wait()));
+        assert!(gpu.is_lost());
+        assert!(matches!(gpu.wait(), Err(GpuError::Lost)));
+        gpu.flush();
     }
 
     #[test]
@@ -701,6 +1025,73 @@ mod tests {
     }
 
     use super::*;
+
+    /// A wait goes in slices (see [`WAIT_SLICE`]), each letting OpenGL's one context go, and one
+    /// longer than a slice still waits for everything sent: a picture copied back and forth over
+    /// and over is done, and the device has nothing left to do. Another thread's call into the
+    /// GPU meanwhile is timed (on OpenGL one kept from the context a second panics in wgpu).
+    /// `LONG_WAIT_COPIES` (600) says how much work the GPU is given.
+    #[test]
+    fn a_wait_longer_than_its_slices_still_waits_for_everything_sent() {
+        use std::time::{Duration, Instant};
+        let Ok(gpu) = Gpu::headless() else { return };
+        let copies: usize = std::env::var("LONG_WAIT_COPIES").ok().and_then(|v| v.parse().ok()).unwrap_or(600);
+        let size = wgpu::Extent3d { width: 4096, height: 4096, depth_or_array_layers: 1 };
+        let texture = |label| {
+            gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        };
+        let (a, b) = (texture("a"), texture("b"));
+        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        for _ in 0..copies {
+            encoder.copy_texture_to_texture(a.as_image_copy(), b.as_image_copy(), size);
+            encoder.copy_texture_to_texture(b.as_image_copy(), a.as_image_copy(), size);
+        }
+        let sent = Instant::now();
+        gpu.queue.submit([encoder.finish()]);
+        let submitted = sent.elapsed();
+        let waiting = {
+            let gpu = gpu.clone();
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let done = gpu.wait();
+                (started.elapsed(), done.is_ok())
+            })
+        };
+        let mut longest = Duration::ZERO;
+        while !waiting.is_finished() {
+            let started = Instant::now();
+            let _ = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("meanwhile"),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            longest = longest.max(started.elapsed());
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let (waited, done) = waiting.join().unwrap();
+        println!(
+            "{}: sent in {} ms, waited {} ms; a call meanwhile took {} ms at most",
+            gpu.adapter.get_info().name,
+            submitted.as_millis(),
+            waited.as_millis(),
+            longest.as_millis()
+        );
+        assert!(done);
+        // nothing left: the wait didn't end with a slice
+        let left = gpu.device.poll(wgpu::PollType::Poll).unwrap();
+        assert!(left.is_queue_empty(), "{left:?} after the wait");
+        assert_eq!(gpu.errors(), 0);
+    }
 
     #[test]
     fn work_that_fails_on_the_gpu_is_told() {

@@ -12,14 +12,16 @@ use procraft_engine::curve::Curve;
 use procraft_engine::stroke::LEAST_ROUNDNESS;
 use procraft_engine::textures::{self, TEXTURE_SIZE, grain, shape};
 
-use crate::CanvasSession;
 use crate::brush_library::LibrarySet;
+pub use crate::plugin_brushes::BrushFileBytes;
+use crate::stand_ins::{drawn_grain, drawn_shape};
+use crate::{CanvasSession, MobileError};
 
 /// The set brushes from single brush files go into.
 const IMPORTED: &str = "Imported";
 
-/// The size of the preview a brush file carries.
-const THUMBNAIL: (u32, u32) = (327, 100);
+/// The size of the preview a brush file carries: the sample stroke's canvas, whole.
+const THUMBNAIL: (u32, u32) = (procraft_engine::preview::CANVAS.0 as u32, procraft_engine::preview::CANVAS.1 as u32);
 
 /// The most a brush file's picture may decode to (8192 × 8192 in colour), bytes.
 const MOST_PNG_BYTES: usize = 256 << 20;
@@ -91,7 +93,7 @@ impl CanvasSession {
     fn brush_pictures(&self, brush: &Brush, set: u32, index: u32) -> Made {
         // the preview it came with, else one drawn
         let thumbnail = brush.thumbnail.as_deref().map(<[u8]>::to_vec).unwrap_or_else(|| {
-            self.brush_preview(set, index, THUMBNAIL.0, THUMBNAIL.1)
+            self.brush_preview_for_file(set, index, THUMBNAIL.0, THUMBNAIL.1)
                 .map(|t| crate::project::rgba_png(t.width, t.height, &t.rgba))
                 .unwrap_or_else(|| crate::project::rgba_png(1, 1, &[0, 0, 0, 0]))
         });
@@ -110,7 +112,10 @@ impl CanvasSession {
             secondary: brush.secondary.as_ref().map(|second| {
                 Box::new(Made {
                     shape: self.shape_png(second),
-                    grain: grain_pixels(second).map(|p| gray_png(&p)),
+                    grain: match self.full_grain(second) {
+                        Some((side, pixels)) => Some(sized_gray_png(side, side, &pixels)),
+                        None => grain_pixels(second).map(|p| gray_png(&p)),
+                    },
                     metallic: material_pixels(&second.metallic).map(|p| gray_png(&p)),
                     roughness: material_pixels(&second.roughness).map(|p| gray_png(&p)),
                     thumbnail: Vec::new(),
@@ -147,8 +152,8 @@ pub(crate) fn brush_names<'n>(names: impl Iterator<Item = &'n str>) -> bool {
 pub enum ReadBrushes {
     /// A set of their own at the top of the library (a set file's, or another app's brushes),
     /// called `name` ("Imported" if that is blank); another app's with its file (its name, if
-    /// known, and its bytes), for a plugin's brush engine to make brushes of too.
-    Set { name: String, brushes: Vec<Brush>, file: Option<(String, std::sync::Arc<[u8]>)> },
+    /// known, and where its bytes are), for a plugin's brush engine to make brushes of too.
+    Set { name: String, brushes: Vec<Brush>, file: Option<(String, BrushFileBytes)> },
     /// One brush, at the top of the "Imported" set.
     One(Box<Brush>),
     /// A file of ours from before (a set, or a brush for the set shown), as its text.
@@ -160,20 +165,24 @@ pub enum ReadBrushes {
 
 /// A library file's sets in `bytes`, as a library called `name`; none if it isn't one.
 fn read_library(bytes: &[u8], name: String) -> Option<ReadBrushes> {
-    let file = brushlibrary::read(bytes)?;
+    let zip = procraft_engine::zip::ZipReader::new(bytes)?;
+    Some(library_brushes(brushlibrary::read_with(&zip, |f| Some(brush_from(&f)))?, name))
+}
+
+/// A library file's sets (their brushes made already) as a library called `name`.
+fn library_brushes(file: brushlibrary::LibraryFile<Brush>, name: String) -> ReadBrushes {
     let sets = file
         .sets
-        .iter()
+        .into_iter()
         .map(|set| {
             // its icon as the stock set it names has it
             let icon = crate::brush_library::shipped_icon(set.icon.as_deref().unwrap_or(&set.name));
-            let brushes = procraft_engine::par::side_by_side(&set.brushes, brush_from).into_iter().flatten().collect();
-            (set.name.clone(), icon, brushes)
+            (set.name, icon, set.brushes)
         })
         .collect();
     // the file's tools are paint, smudge and erase
     let [paint, smudge, erase] = file.tools;
-    Some(ReadBrushes::Library { name, sets, tools: [paint, erase, smudge].map(|t| t.unwrap_or((0, 0))) })
+    ReadBrushes::Library { name, sets, tools: [paint, erase, smudge].map(|t| t.unwrap_or((0, 0))) }
 }
 
 /// Our brush file's or set file's brushes in `bytes`.
@@ -189,7 +198,7 @@ fn read_ours(bytes: &[u8]) -> Option<ReadBrushes> {
 /// none if it holds none.
 fn read_other(bytes: &[u8], name: String, file_name: &str) -> Option<ReadBrushes> {
     let (name, brushes) = other_brushes(bytes, name)?;
-    let file = Some((file_name.to_owned(), bytes.into()));
+    let file = Some((file_name.to_owned(), BrushFileBytes::Memory(bytes.into())));
     (!brushes.is_empty()).then_some(ReadBrushes::Set { name, brushes, file })
 }
 
@@ -212,7 +221,7 @@ pub fn read_any_brushes(bytes: &[u8], file_name: Option<String>) -> Option<ReadB
     if other {
         // (one the app reads no brush from still comes, for the brush engines of plugins on: a
         // bundle of brushes only one of them draws)
-        let file = Some((name.clone(), bytes.into()));
+        let file = Some((name.clone(), BrushFileBytes::Memory(bytes.into())));
         return read_other(bytes, stem.clone(), &name).or(Some(ReadBrushes::Set {
             name: stem,
             brushes: Vec::new(),
@@ -238,14 +247,18 @@ impl CanvasSession {
                 // the brush engines of plugins on make brushes of another app's file too
                 let hooks = self.shared.lock().hooks.clone();
                 if let (Some(hooks), Some((file_name, bytes))) = (hooks, file) {
-                    let made = crate::plugin_brushes::make_brushes(&hooks, &file_name, &bytes);
-                    crate::plugin_brushes::join_made(&mut brushes, made);
+                    let (following, limits) = (Default::default(), crate::plugin_run::ImportLimits::now());
+                    let made =
+                        crate::plugin_brushes::make_brushes_following(&hooks, &file_name, &bytes, &following, limits);
+                    crate::plugin_brushes::join_made(&mut brushes, made.map(|m| m.made).unwrap_or_default());
                 }
                 if brushes.is_empty() {
                     return None;
                 }
                 let mut st = self.shared.lock();
                 brushes.iter_mut().for_each(|b| st.grain_store.take(b));
+                // (the big pictures of the stock images a set's brushes name are made as each is
+                // chosen, not all of them now)
                 let name = if name.trim().is_empty() { IMPORTED.to_owned() } else { name.trim().to_owned() };
                 let origins = vec![None; brushes.len()];
                 st.library.insert(0, LibrarySet { name, brushes, origins, icon: crate::brush_library::IMPORTED_ICON });
@@ -255,6 +268,7 @@ impl CanvasSession {
             ReadBrushes::One(mut brush) => {
                 let mut st = self.shared.lock();
                 st.grain_store.take(&mut brush);
+                crate::big_pictures::make_ahead(crate::big_pictures::reached_by(&brush));
                 let at = match st.library.iter().position(|s| s.name == IMPORTED) {
                     Some(at) => at,
                     None => {
@@ -290,18 +304,100 @@ impl CanvasSession {
 pub struct BrushEngines(Option<std::sync::Arc<crate::hooks::Hooks>>);
 
 impl BrushEngines {
+    /// The brush engines of the plugins on `hooks` (none: no plugin's).
+    #[cfg(test)]
+    pub(crate) fn of(hooks: Option<std::sync::Arc<crate::hooks::Hooks>>) -> BrushEngines {
+        BrushEngines(hooks)
+    }
+
     /// `read` with what the brush engines on make of its file joined to its brushes, the file let
     /// go: a long call, not for the interface's thread.
     pub fn make(&self, read: ReadBrushes) -> ReadBrushes {
+        self.make_following(read, &BrushFileReading::default())
+    }
+
+    /// The same, `reading` told how much of the file the engine has read and able to stop it (each
+    /// engine has an import's limits, see [`crate::plugin_run::ImportLimits`]); once made, it says
+    /// what came in, or what went wrong ([`BrushFileReading::notice`]).
+    pub fn make_following(&self, read: ReadBrushes, reading: &BrushFileReading) -> ReadBrushes {
+        self.make_within(read, reading, crate::plugin_run::ImportLimits::now())
+    }
+
+    pub(crate) fn make_within(
+        &self,
+        read: ReadBrushes,
+        reading: &BrushFileReading,
+        limits: crate::plugin_run::ImportLimits,
+    ) -> ReadBrushes {
         match (read, &self.0) {
             (ReadBrushes::Set { name, mut brushes, file: Some((file_name, bytes)) }, Some(hooks)) => {
-                let made = crate::plugin_brushes::make_brushes(hooks, &file_name, &bytes);
-                crate::plugin_brushes::join_made(&mut brushes, made);
+                reading.told(None);
+                reading.engine_starts(&bytes);
+                let made = crate::plugin_brushes::make_brushes_following(
+                    hooks,
+                    &file_name,
+                    &bytes,
+                    &reading.following(),
+                    limits,
+                );
+                drop(bytes);
+                reading.engine_ends();
+                if let Some(made) = made {
+                    let trouble = made.trouble.clone();
+                    crate::plugin_brushes::join_made(&mut brushes, made.made);
+                    let built_in = brushes.iter().filter(|b| b.engine.is_none()).count();
+                    let cancelled = reading.cancelled()
+                        || trouble.as_ref().is_some_and(|(_, t)| *t == crate::plugin_brushes::ImportTrouble::Cancelled);
+                    reading.told(Some(if cancelled {
+                        (None, IMPORT_CANCELLED.to_owned())
+                    } else {
+                        match trouble {
+                            Some((label, why)) => trouble_notice(&label, why, made.pack),
+                            None => (None, brushes_notice(brushes.len(), built_in)),
+                        }
+                    }));
+                }
                 ReadBrushes::Set { name, brushes, file: None }
             }
             (read, _) => read,
         }
     }
+}
+
+/// What an import stopped with Cancel says.
+pub const IMPORT_CANCELLED: &str = "Import cancelled. No brushes were added.";
+
+/// What a plugin's brush engine having made a file's brushes says: how many came in, and how many
+/// of them the app's own reading draws.
+fn brushes_notice(all: usize, built_in: usize) -> String {
+    let brushes = if all == 1 { "brush" } else { "brushes" };
+    match built_in {
+        0 => format!("{all} {brushes} imported."),
+        _ => format!("{all} {brushes} imported, {built_in} drawn by the built-in reader."),
+    }
+}
+
+/// What an engine (`label`) that couldn't make a file's brushes says, as a title and what follows:
+/// why, that they came in as the app read them, and that it is still on.
+fn trouble_notice(label: &str, why: crate::plugin_brushes::ImportTrouble, pack: bool) -> (Option<String>, String) {
+    use crate::plugin_brushes::ImportTrouble;
+    let what = if pack { "pack" } else { "file" };
+    let (title, happened) = match why {
+        ImportTrouble::TooBig => (
+            format!("{} too big for {label}", if pack { "Pack" } else { "File" }),
+            format!("This {what} is too big for {label} on this device."),
+        ),
+        ImportTrouble::TooSlow => {
+            (format!("{label} took too long"), format!("{label} took too long with this {what}."))
+        }
+        ImportTrouble::Failed | ImportTrouble::Cancelled => {
+            (format!("{label} couldn't read this {what}"), format!("{label} couldn't read this {what}."))
+        }
+    };
+    let text = format!(
+        "{happened} Its brushes came in with the built-in reader instead, so they may look a little different. {label} is still on."
+    );
+    (Some(title), text)
 }
 
 impl CanvasSession {
@@ -323,15 +419,223 @@ pub fn read_brushes(bytes: Vec<u8>, file_name: Option<String>) -> Option<std::sy
     read_any_brushes(&bytes, file_name).map(|read| std::sync::Arc::new(BrushesRead(std::sync::Mutex::new(Some(read)))))
 }
 
+/// How far reading a brush file ([`read_brushes_file`]) has come, and whether it is to stop: the
+/// interface shows the one and may ask for the other, from another thread.
+#[derive(uniffi::Object, Default)]
+pub struct BrushFileReading {
+    /// Brushes read so far, of how many there are (none known yet: 0).
+    done: std::sync::atomic::AtomicUsize,
+    of: std::sync::atomic::AtomicUsize,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// While a plugin's brush engine makes its brushes of the file: the file's size (0 while none
+    /// is at it), and how far into it the engine has read.
+    engine_size: std::sync::atomic::AtomicU64,
+    engine_read: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// What to say once an engine has had the file (a title, if it is to be asked to be read, and
+    /// the text): what came in, or what went wrong.
+    notice: std::sync::Mutex<Option<(Option<String>, String)>>,
+}
+
+#[uniffi::export]
+impl BrushFileReading {
+    #[uniffi::constructor]
+    pub fn new() -> std::sync::Arc<BrushFileReading> {
+        std::sync::Arc::new(BrushFileReading::default())
+    }
+
+    /// How far the reading has come, 0..1 (0 while it doesn't know how many brushes there are).
+    pub fn progress(&self) -> f32 {
+        let of = self.of.load(std::sync::atomic::Ordering::Relaxed);
+        let done = self.done.load(std::sync::atomic::Ordering::Relaxed);
+        if of == 0 { 0.0 } else { (done as f32 / of as f32).min(1.0) }
+    }
+
+    /// Stops the reading: it reads no more brushes, and what it read is let go.
+    pub fn cancel(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// While a plugin's brush engine makes its brushes of the file ("Importing brushes"): the
+    /// file's size in bytes; 0 while none is at it.
+    pub fn engine_size(&self) -> u64 {
+        self.engine_size.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How far into the file the engine has read, 0..1, by the bytes it had the app unpack or decode
+    /// (a pack is read through in order, what it doesn't need passed over; it may end short of 1).
+    pub fn engine_progress(&self) -> f32 {
+        let size = self.engine_size();
+        let read = self.engine_read.load(std::sync::atomic::Ordering::Relaxed);
+        if size == 0 { 0.0 } else { (read as f64 / size as f64).min(1.0) as f32 }
+    }
+
+    /// Once a plugin's brush engine has had the file: what to tell ("120 brushes imported.", or that
+    /// the file was too big for it and its brushes came in with the built-in reader); none if no
+    /// engine read it.
+    pub fn notice(&self) -> Option<String> {
+        Some(self.notice.lock().ok()?.as_ref()?.1.clone())
+    }
+
+    /// The title of the notice, when it says what went wrong: shown with an OK, as it is too long
+    /// to pass by; none for a notice that passes ("120 brushes imported.").
+    pub fn notice_title(&self) -> Option<String> {
+        self.notice.lock().ok()?.as_ref()?.0.clone()
+    }
+}
+
+impl BrushFileReading {
+    pub fn cancelled(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What an engine's import is followed by: this reading's Cancel, and how far into the file it
+    /// has read.
+    pub(crate) fn following(&self) -> crate::plugin_run::Following {
+        crate::plugin_run::Following {
+            cancel: Some(std::sync::Arc::clone(&self.stop)),
+            read: Some(std::sync::Arc::clone(&self.engine_read)),
+        }
+    }
+
+    /// An engine starts on `file`.
+    fn engine_starts(&self, file: &BrushFileBytes) {
+        let size = match file {
+            BrushFileBytes::Memory(bytes) => bytes.len() as u64,
+            BrushFileBytes::Disk(path) => std::fs::metadata(path).map_or(1, |m| m.len().max(1)),
+        };
+        self.engine_read.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.engine_size.store(size, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn engine_ends(&self) {
+        self.engine_size.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn told(&self, notice: Option<(Option<String>, String)>) {
+        if let Ok(mut told) = self.notice.lock() {
+            *told = notice;
+        }
+    }
+
+    /// There are `of` brushes to read.
+    fn begin(&self, of: usize) {
+        self.done.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.of.store(of, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `file` made a brush, unless the reading was stopped; counted.
+    fn made(&self, file: Option<BrushFile>) -> Option<Brush> {
+        if self.cancelled() {
+            return None;
+        }
+        let brush = file.map(|f| brush_from(&f));
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        brush
+    }
+}
+
+/// How much memory reading one brush of an archive may take while its pictures are decoded, at
+/// the least (a few are read side by side, as many as fit in the budget for such work).
+const BRUSH_READ_BYTES: usize = 64 << 20;
+
+/// The brushes in the file at `path` the user chose, called `file_name` (if known), as
+/// [`read_any_brushes`] reads them, not yet added. A brush, set or library file (an archive) is
+/// read a brush at a time, each made a brush as it is read and its file's bytes let go, so however
+/// big the archive only a few brushes' files are held at once; `reading` follows it and can stop
+/// it (it then reads as none). Another kind of file is read whole. None if it holds no brushes.
+pub fn read_brushes_from(
+    path: &std::path::Path,
+    file_name: Option<String>,
+    reading: &BrushFileReading,
+) -> Option<ReadBrushes> {
+    let name = file_name.clone().unwrap_or_default();
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name.as_str(), ""));
+    let stem = stem.trim().to_owned();
+    let other = OTHER_BRUSH_EXTENSIONS.iter().any(|o| o.eq_ignore_ascii_case(ext));
+    if !other && let Some(zip) = procraft_engine::zip::ZipReader::open(path) {
+        if ext.eq_ignore_ascii_case(brushlibrary::EXTENSION) || brushlibrary::is_library(zip.names()) {
+            reading.begin(zip.names().filter(|n| n.ends_with(".brush")).count());
+            let file = brushlibrary::read_with(&zip, |f| reading.made(Some(f)));
+            if reading.cancelled() {
+                return None;
+            }
+            if let Some(file) = file {
+                return Some(library_brushes(file, stem));
+            }
+        }
+        if let Some((set_name, folders)) = brushfile::set_folders(&zip) {
+            reading.begin(folders.len());
+            // as many side by side as their pictures fit, by the biggest brush's files
+            let mut sizes: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for f in zip.facts() {
+                if let Some((folder, _)) = f.name.split_once('/') {
+                    let size = sizes.entry(folder).or_default();
+                    *size = size.saturating_add(f.size);
+                }
+            }
+            let each = sizes.values().max().map_or(0, |&s| s.saturating_mul(4)).max(BRUSH_READ_BYTES);
+            let made = procraft_engine::par::side_by_side_within(&folders, each, |folder| {
+                reading.made(brushfile::read_folder(&zip, folder))
+            });
+            if reading.cancelled() {
+                return None;
+            }
+            let brushes: Vec<Brush> = made.into_iter().flatten().flatten().collect();
+            if !brushes.is_empty() {
+                return Some(ReadBrushes::Set { name: set_name, brushes, file: None });
+            }
+        }
+        if let Some(file) = brushfile::read_zip(&zip) {
+            return Some(ReadBrushes::One(Box::new(brush_from(&file))));
+        }
+    }
+    if reading.cancelled() {
+        return None;
+    }
+    // another app's, or one of ours from before (its text): read whole; what a plugin's brush
+    // engine makes of it is read from the file again as it is handed over, so it isn't held twice
+    let bytes = std::fs::read(path).ok()?;
+    let read = read_any_brushes(&bytes, file_name)?;
+    drop(bytes);
+    Some(match read {
+        ReadBrushes::Set { name, brushes, file: Some((file_name, _)) } => {
+            ReadBrushes::Set { name, brushes, file: Some((file_name, BrushFileBytes::Disk(path.to_owned()))) }
+        }
+        read => read,
+    })
+}
+
+/// The brushes in the file at `path` the user chose, called `file_name` (if known), as
+/// [`read_brushes_from`] reads them (a brush, set or library file a brush at a time, never held
+/// whole), not yet added; `reading`, if given, follows it and can stop it. None if it holds none
+/// (or it was stopped).
+#[uniffi::export]
+pub fn read_brushes_file(
+    path: String,
+    file_name: Option<String>,
+    reading: Option<std::sync::Arc<BrushFileReading>>,
+) -> Option<std::sync::Arc<BrushesRead>> {
+    let reading = reading.unwrap_or_default();
+    read_brushes_from(std::path::Path::new(&path), file_name, &reading)
+        .map(|read| std::sync::Arc::new(BrushesRead(std::sync::Mutex::new(Some(read)))))
+}
+
 #[uniffi::export]
 impl CanvasSession {
     /// The brush engines of plugins on make brushes of `read`'s file too (another app's), joined to
-    /// its brushes, so that adding them is quick: a long call, not for the main thread.
-    pub fn make_engine_brushes(&self, read: std::sync::Arc<BrushesRead>) {
+    /// its brushes, so that adding them is quick: a long call, not for the main thread. `reading`,
+    /// if given, follows it and can stop it, and says what came of it (see
+    /// [`BrushEngines::make_following`]).
+    pub fn make_engine_brushes(
+        &self,
+        read: std::sync::Arc<BrushesRead>,
+        reading: Option<std::sync::Arc<BrushFileReading>>,
+    ) {
         let engines = self.brush_engines();
+        let reading = reading.unwrap_or_default();
         let mut held = read.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(brushes) = held.take() {
-            *held = Some(engines.make(brushes));
+            *held = Some(engines.make_following(brushes, &reading));
         }
     }
 }
@@ -380,29 +684,153 @@ impl CanvasSession {
 
     /// Brush `index` of `set` as a brush file.
     pub fn brush_as_file(&self, set: u32, index: u32) -> Option<Vec<u8>> {
+        self.write_brush_into(Vec::new(), set, index)?.ok()
+    }
+
+    /// Brush `index` of `set` written as a brush file at `path` (whole, or not at all).
+    pub fn write_brush_file(&self, set: u32, index: u32, path: String) -> Result<(), MobileError> {
+        write_file(&path, |out| {
+            self.write_brush_into(out, set, index).unwrap_or_else(|| Err(std::io::Error::other("no such brush")))
+        })
+    }
+
+    /// Set `set` as a set file (put together in memory: see [`CanvasSession::write_brush_set_file`]).
+    pub fn brush_set_as_file(&self, set: u32) -> Option<Vec<u8>> {
+        let (name, count) = self.set_name_and_count(set)?;
+        self.brushes_as_set_file(set, 0..count, &name, now_seed())
+    }
+
+    /// Set `set` written as a set file at `path` a brush at a time: each brush's pictures are made,
+    /// written and let go before the next's, so however big the set, only one brush's are held.
+    /// `writing` follows it and can stop it; stopped or failed, nothing is left at `path`.
+    pub fn write_brush_set_file(
+        &self,
+        set: u32,
+        path: String,
+        writing: Option<std::sync::Arc<BrushFileWriting>>,
+    ) -> Result<(), MobileError> {
+        let (name, count) = self.set_name_and_count(set).ok_or_else(|| file_error("no such set"))?;
+        let writing = writing.unwrap_or_default();
+        let seed = now_seed();
+        write_file(&path, |out| {
+            self.write_set_into(out, set, 0..count, &name, seed, &writing)
+                .unwrap_or_else(|| Err(std::io::Error::other("no such set")))
+        })
+    }
+
+    /// The library in use as a library file: its sets and their brushes in order, each tool's
+    /// brush; none if it has no brushes (put together in memory: see
+    /// [`CanvasSession::write_brush_library_file`]).
+    pub fn brush_library_as_file(&self) -> Option<Vec<u8>> {
+        self.write_library_into(Vec::new(), &BrushFileWriting::default())?.ok()
+    }
+
+    /// The library in use written as a library file at `path` a brush at a time, as
+    /// [`CanvasSession::write_brush_set_file`] writes a set; fails if it has no brushes.
+    pub fn write_brush_library_file(
+        &self,
+        path: String,
+        writing: Option<std::sync::Arc<BrushFileWriting>>,
+    ) -> Result<(), MobileError> {
+        let writing = writing.unwrap_or_default();
+        write_file(&path, |out| {
+            self.write_library_into(out, &writing).unwrap_or_else(|| Err(std::io::Error::other("no brushes")))
+        })
+    }
+}
+
+/// How far writing a brush set or library file has come, and whether it is to stop: the interface
+/// shows the one and may ask for the other, from another thread.
+#[derive(uniffi::Object, Default)]
+pub struct BrushFileWriting {
+    /// Brushes written so far, of how many there are (none known yet: 0).
+    done: std::sync::atomic::AtomicUsize,
+    of: std::sync::atomic::AtomicUsize,
+    stop: std::sync::atomic::AtomicBool,
+}
+
+#[uniffi::export]
+impl BrushFileWriting {
+    #[uniffi::constructor]
+    pub fn new() -> std::sync::Arc<BrushFileWriting> {
+        std::sync::Arc::new(BrushFileWriting::default())
+    }
+
+    /// How far the writing has come, 0..1.
+    pub fn progress(&self) -> f32 {
+        let of = self.of.load(std::sync::atomic::Ordering::Relaxed);
+        let done = self.done.load(std::sync::atomic::Ordering::Relaxed);
+        if of == 0 { 0.0 } else { (done as f32 / of as f32).min(1.0) }
+    }
+
+    /// Stops the writing before the next brush: the file isn't made.
+    pub fn cancel(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl BrushFileWriting {
+    fn cancelled(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// There are `of` brushes to write.
+    fn begin(&self, of: usize) {
+        self.done.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.of.store(of, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn wrote_one(&self) {
+        self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Why a file being written stopped part way: it was asked to.
+fn stopped() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "stopped")
+}
+
+/// A number from the clock, to name a file's folders by.
+fn now_seed() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64)
+}
+
+fn file_error(why: impl std::fmt::Display) -> MobileError {
+    crate::project::file_error("writing the brush file", why)
+}
+
+/// The file at `path` written whole through a buffer by `write`, or not at all (what was begun is
+/// removed).
+fn write_file(
+    path: &str,
+    write: impl FnOnce(std::io::BufWriter<std::fs::File>) -> std::io::Result<std::io::BufWriter<std::fs::File>>,
+) -> Result<(), MobileError> {
+    crate::project::write_atomically(std::path::Path::new(path), |p| {
+        let file = std::fs::File::create(p).map_err(file_error)?;
+        let out = write(std::io::BufWriter::with_capacity(1 << 16, file)).map_err(file_error)?;
+        out.into_inner().map_err(|e| file_error(e.error()))?;
+        Ok(())
+    })
+}
+
+impl CanvasSession {
+    fn set_name_and_count(&self, set: u32) -> Option<(String, usize)> {
+        let st = self.shared.lock();
+        let entry = st.library.get(set as usize)?;
+        Some((entry.name.clone(), entry.brushes.len()))
+    }
+
+    /// Brush `index` of `set` as a brush file, written into `out`; none if there is no such brush.
+    fn write_brush_into<W: std::io::Write>(&self, out: W, set: u32, index: u32) -> Option<std::io::Result<W>> {
         let brush = {
             let st = self.shared.lock();
             st.with_sliders(st.library.get(set as usize)?.brushes.get(index as usize)?, set as usize, index as usize)
         };
         let made = self.brush_pictures(&brush, set, index);
         let brush = self.as_written(brush);
-        Some(brushfile::write(&brush, author_name(&brush), &made.pictures()))
+        Some(brushfile::write_to(out, &brush, author_name(&brush), &made.pictures()))
     }
 
-    /// Set `set` as a set file.
-    pub fn brush_set_as_file(&self, set: u32) -> Option<Vec<u8>> {
-        let (name, count) = {
-            let st = self.shared.lock();
-            let entry = st.library.get(set as usize)?;
-            (entry.name.clone(), entry.brushes.len())
-        };
-        let seed =
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64);
-        self.brushes_as_set_file(set, 0..count, &name, seed)
-    }
-}
-
-impl CanvasSession {
     /// Brushes `range` of set `set` as a set file called `name`, their folders named from `seed`.
     pub(crate) fn brushes_as_set_file(
         &self,
@@ -411,62 +839,83 @@ impl CanvasSession {
         name: &str,
         seed: u64,
     ) -> Option<Vec<u8>> {
-        let brushes: Vec<(usize, Brush)> = {
-            let st = self.shared.lock();
-            let entry = st.library.get(set as usize)?;
-            let brushes = entry.brushes.get(range.clone())?;
-            brushes.iter().zip(range).map(|(b, i)| (i, st.with_sliders(b, set as usize, i))).collect()
-        };
-        let made: Vec<Made> = brushes.iter().map(|(i, b)| self.brush_pictures(b, set, *i as u32)).collect();
-        let brushes: Vec<Brush> = brushes.into_iter().map(|(_, b)| self.as_written(b)).collect();
-        let list: Vec<(&Brush, &str, Pictures<'_>)> =
-            brushes.iter().zip(&made).map(|(b, m)| (b, author_name(b), m.pictures())).collect();
-        Some(brushfile::write_set(name, &list, |i| folder_id(seed, i)))
+        self.write_set_into(Vec::new(), set, range, name, seed, &BrushFileWriting::default())?.ok()
     }
-}
 
-#[uniffi::export]
-impl CanvasSession {
-    /// The library in use as a library file: its sets and their brushes in order, each tool's
-    /// brush; none if it has no brushes.
-    pub fn brush_library_as_file(&self) -> Option<Vec<u8>> {
+    /// Brushes `range` of set `set` as a set file called `name` written into `out` a brush at a
+    /// time (see [`CanvasSession::write_brush_set_file`]); none if the set has no such brushes.
+    fn write_set_into<W: std::io::Write>(
+        &self,
+        out: W,
+        set: u32,
+        range: std::ops::Range<usize>,
+        name: &str,
+        seed: u64,
+        writing: &BrushFileWriting,
+    ) -> Option<std::io::Result<W>> {
+        // none if the set hasn't these brushes
+        self.shared.lock().library.get(set as usize)?.brushes.get(range.clone())?;
+        writing.begin(range.len());
+        let mut file = brushfile::SetWriter::begin(out, name, range.len(), |i| folder_id(seed, i));
+        for i in range {
+            if writing.cancelled() {
+                file.fail(stopped());
+                break;
+            }
+            // each brush's settings taken as it is written, its pictures made, written and let go
+            let Some(brush) = self.brush_with_sliders(set as usize, i) else { break };
+            let made = self.brush_pictures(&brush, set, i as u32);
+            let brush = self.as_written(brush);
+            file.add(&brush, author_name(&brush), &made.pictures());
+            writing.wrote_one();
+        }
+        Some(file.finish())
+    }
+
+    /// The library in use as a library file written into `out` a brush at a time (see
+    /// [`CanvasSession::write_brush_library_file`]); none if it has no brushes.
+    fn write_library_into<W: std::io::Write>(&self, out: W, writing: &BrushFileWriting) -> Option<std::io::Result<W>> {
+        // the sets as they are now (each brush is taken as it is written)
         let (sets, tools) = {
             let st = self.shared.lock();
-            let sets: Vec<(String, u32, Vec<Brush>)> = st
-                .library
-                .iter()
-                .enumerate()
-                .map(|(s, set)| {
-                    let brushes = set.brushes.iter().enumerate().map(|(i, b)| st.with_sliders(b, s, i)).collect();
-                    (set.name.clone(), set.icon, brushes)
-                })
-                .collect();
+            let sets: Vec<(String, u32, usize)> =
+                st.library.iter().map(|set| (set.name.clone(), set.icon, set.brushes.len())).collect();
             let tools = [crate::ToolKind::Paint, crate::ToolKind::Smudge, crate::ToolKind::Erase]
                 .map(|tool| Some(st.brush_ref(tool)));
             (sets, tools)
         };
-        if sets.iter().all(|(_, _, brushes)| brushes.is_empty()) {
+        if sets.iter().all(|(_, _, count)| *count == 0) {
             return None;
         }
-        let made: Vec<Vec<Made>> = sets
+        writing.begin(sets.iter().map(|(_, _, count)| count).sum());
+        let heads: Vec<(&str, Option<&str>)> = sets
             .iter()
-            .enumerate()
-            .map(|(s, (_, _, brushes))| {
-                brushes.iter().enumerate().map(|(i, b)| self.brush_pictures(b, s as u32, i as u32)).collect()
-            })
-            .collect();
-        let out: Vec<brushlibrary::SetOut<'_>> = sets
-            .iter()
-            .zip(&made)
-            .map(|((name, icon, brushes), made)| brushlibrary::SetOut {
-                name,
-                icon: crate::brush_library::shipped_icon_name(*icon),
-                brushes: brushes.iter().zip(made).map(|(b, m)| (b, author_name(b), m.pictures())).collect(),
-            })
+            .map(|(name, icon, _)| (name.as_str(), crate::brush_library::shipped_icon_name(*icon)))
             .collect();
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
         let seed = now.as_nanos() as u64;
-        Some(brushlibrary::write(&out, tools, |i| folder_id(seed, i).replace('-', "").to_lowercase(), now.as_secs()))
+        let id = |i| folder_id(seed, i).replace('-', "").to_lowercase();
+        let mut file = brushlibrary::LibraryWriter::begin(out, &heads, tools, id, now.as_secs());
+        'sets: for (s, (_, _, count)) in sets.iter().enumerate() {
+            for i in 0..*count {
+                if writing.cancelled() {
+                    file.fail(stopped());
+                    break 'sets;
+                }
+                // each brush's settings taken as it is written, its pictures made, written and let go
+                let Some(brush) = self.brush_with_sliders(s, i) else { continue 'sets };
+                let made = self.brush_pictures(&brush, s as u32, i as u32);
+                file.add(s, &brush, author_name(&brush), &made.pictures());
+                writing.wrote_one();
+            }
+        }
+        Some(file.finish())
+    }
+
+    /// Brush `index` of set `set` as the library has it now, with its sliders where they stand.
+    fn brush_with_sliders(&self, set: usize, index: usize) -> Option<Brush> {
+        let st = self.shared.lock();
+        Some(st.with_sliders(st.library.get(set)?.brushes.get(index)?, set, index))
     }
 }
 
@@ -1452,7 +1901,8 @@ fn krita_brush(k: &procraft_engine::krita::KritaBrush) -> Brush {
     if let Some(spacing) = k.spacing {
         b.spacing = Brush::spacing_within_reach(spacing);
     }
-    b.shape.rotation = k.angle;
+    // Krita turns its tips counter-clockwise on the canvas, ours clockwise
+    b.shape.rotation = (-k.angle).rem_euclid(std::f32::consts::TAU);
     if k.follows {
         b.shape.follow = 1.0;
     }
@@ -1878,8 +2328,9 @@ pub(crate) fn brush_from(file: &BrushFile) -> Brush {
     }
     b.notches = file.notches.clone();
     b.sliders = file.sliders;
-    // (a second's grain goes on stamp by stamp, so by the grain's own tile)
-    b.secondary = file.secondary.as_deref().map(|second| Box::new(Brush { grain_file: None, ..brush_from(second) }));
+    // (a second's grain goes on stamp by stamp, by the grain's own tile, but from the file's
+    // image at its own size, as the first's does)
+    b.secondary = file.secondary.as_deref().map(|second| Box::new(brush_from(second)));
     let (image, source) = grain_for(&file.grain, file.thumbnail.as_deref());
     b.grain.image = image;
     b.grain_file = grain_file_for(&file.grain, source.as_ref());
@@ -1994,124 +2445,6 @@ pub(crate) fn shape_stand_in(name: &str, inverted: bool) -> StandIn {
     StandIn { pick, key, inverted }
 }
 
-/// The shape a stand-in for a stock one draws (see [`shape_for`]), its image drawn the first time
-/// it is wanted.
-fn drawn_shape(s: &StandIn) -> (Option<u32>, Option<Source>, Option<f32>) {
-    let (key, inverted) = (s.key, s.inverted);
-    let i = match s.pick {
-        Pick::Round(hardness) => return (None, None, Some(hardness)),
-        // a plain image: the stamp's whole square (nothing, inverted)
-        Pick::Blank => {
-            let fill = if inverted { 0 } else { 255 };
-            return (None, Some(drawn(SHAPE, s, move || Some(vec![fill; TEXTURE_SIZE * TEXTURE_SIZE]))), None);
-        }
-        // a tip printed in dots: ours dotted on the same lattice, each dot as big as the stock
-        // tip's ink there
-        Pick::Halftone(lattice) => {
-            let measured = (
-                textures::stock_shape_rows_of(key, inverted),
-                textures::stock_shape_cols_of(key, inverted),
-                textures::stock_shape_tones_of(key, inverted),
-            );
-            let (Some(rows), Some(cols), Some(tones)) = measured else { return (Some(shape::STOCK_DOTS), None, None) };
-            let dots = drawn(SHAPE, s, move || {
-                let cover = tones.iter().map(|&t| f32::from(t)).sum::<f32>() / (tones.len().max(1) as f32 * 255.0);
-                Some(textures::halftone_shape(lattice, &rows, &cols, cover))
-            });
-            return (Some(shape::STOCK_DOTS), Some(dots), None);
-        }
-        Pick::Ours(None) => return (None, None, None),
-        Pick::Ours(Some(i)) => i,
-    };
-    // our shape with the stock one's own lights and darks and its rows' share of the ink, where
-    // they were measured: all of the stock one as its brush shows it (inverted, for one that
-    // inverts it: most stock tips are drawn dark on white), our shape as it is
-    let Some(tones) = textures::stock_shape_tones_of(key, inverted) else { return (Some(i), None, None) };
-    if textures::shape_image(i).is_none() {
-        return (Some(i), None, None);
-    }
-    let retoned = drawn(SHAPE, s, move || {
-        let mut shape = textures::shape_image(i)?;
-        // as wide and tall as the real tip, where it lies in its square (the grainy square,
-        // standing in for a tip we know nothing else of, takes its outline across and down below)
-        if i != shape::STOCK_GRAINY_SQUARE
-            && let (Some(rows), Some(cols)) =
-                (textures::stock_shape_rows_of(key, inverted), textures::stock_shape_cols_of(key, inverted))
-            && let Some(fitted) = textures::fitted_to_box(&shape.pixels, &rows, &cols)
-        {
-            shape.pixels = fitted;
-        }
-        // its marks as fine as the real tip's: standing in for a tip we know nothing else of, the
-        // grainy square (smooth for a solid one); any other shape of ours takes them over itself,
-        // but one drawn to the picture, which has its own
-        let drawn = textures::drawn_to_stock(i);
-        if let Some(feature) = textures::stock_shape_feature_of(key).filter(|_| !drawn) {
-            let cover = tones.iter().map(|&t| f32::from(t)).sum::<f32>() / (tones.len().max(1) as f32 * 255.0);
-            if i == shape::STOCK_GRAINY_SQUARE {
-                shape.pixels = textures::grainy_square_of(feature, cover);
-            } else if let Some(marked) = textures::textured_shape(&shape.pixels, feature, cover) {
-                shape.pixels = marked;
-            }
-        }
-        // its streaks and gaps across the stroke first (and, standing in for a tip we know
-        // nothing else of, its outline across too)
-        let rows = textures::stock_shape_rows_of(key, inverted).filter(|_| !drawn);
-        let cols = textures::stock_shape_cols_of(key, inverted).filter(|_| i == shape::STOCK_GRAINY_SQUARE);
-        let striped = match (rows, cols) {
-            (Some(rows), Some(cols)) => Some(textures::shaped(&shape.pixels, &rows, &cols)),
-            (Some(rows), None) => Some(textures::striped(&shape.pixels, &rows)),
-            _ => None,
-        };
-        let pixels = striped.as_deref().unwrap_or(&shape.pixels);
-        Some(textures::retoned_shape(pixels, &tones, &textures::SHAPE_TONE_SHARES))
-    });
-    (Some(i), Some(retoned), None)
-}
-
-/// What [`drawn`] draws: a shape or a grain.
-const SHAPE: u8 = 0;
-const GRAIN: u8 = 1;
-
-/// A stand-in drawn, as what it is drawn from tells it apart from any other.
-type DrawnKey = (u8, u64, bool, [u32; 4]);
-
-/// The stand-ins made already, while a brush holds them: brushes standing in for the same stock
-/// image share its pixels, drawn once, rather than each drawing and holding its own.
-static DRAWN: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<DrawnKey, procraft_engine::brush::WeakPixels>>,
-> = std::sync::LazyLock::new(Default::default);
-
-/// Stand-in `s` (a shape or a grain, `kind`), its image what `draw` draws (`TEXTURE_SIZE` square)
-/// the first time it is wanted, or another brush's for the same; known by what it is drawn from,
-/// and as standing in for the stock image `s` is for.
-fn drawn(kind: u8, s: &StandIn, draw: impl Fn() -> Option<Vec<u8>> + Send + Sync + 'static) -> Source {
-    let pick = match s.pick {
-        Pick::Round(h) => [1, h.to_bits(), 0, 0],
-        Pick::Blank => [2, 0, 0, 0],
-        Pick::Ours(i) => [3, i.unwrap_or(u32::MAX), 0, 0],
-        Pick::Halftone([(a, b), (c, d)]) => [a.to_bits(), b.to_bits(), c.to_bits(), d.to_bits()],
-    };
-    let key: DrawnKey = (kind, s.key, s.inverted, pick);
-    // its id: FNV-1a of what it is drawn from
-    let words = [u64::from(kind), s.key, u64::from(s.inverted)].into_iter().chain(pick.map(u64::from));
-    let id = words
-        .flat_map(u64::to_le_bytes)
-        .fold(0x6c62_272e_07bb_0142u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
-    let mut map = DRAWN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let pixels = match map.get(&key).and_then(procraft_engine::brush::WeakPixels::upgrade) {
-        Some(pixels) => pixels,
-        None => {
-            if map.len() >= 1024 {
-                map.retain(|_, pixels| pixels.upgrade().is_some());
-            }
-            let pixels = procraft_engine::brush::Pixels::later(draw);
-            map.insert(key, pixels.downgrade());
-            pixels
-        }
-    };
-    Source::drawn_later(id, pixels).standing_in_for(s.key)
-}
-
 /// The lattice a stock tip printed in dots has its dots on, as [`textures::halftone_shape`] takes it
 /// (each set of rows as its cycles across and down the image), as measured; none for any other.
 fn halftone_lattice(name: &str) -> Option<[(f32, f32); 2]> {
@@ -2121,7 +2454,7 @@ fn halftone_lattice(name: &str) -> Option<[(f32, f32); 2]> {
 }
 
 /// Our stand-in for the stock shape `name`: our nearest shape, or the round tip at a hardness, or
-/// (blank) the whole square.
+/// a small soft dot, or (blank) the whole square.
 fn stock_stand_in(name: &str) -> Pick {
     let n = name.to_lowercase();
     let has = |words: &[&str]| words.iter().any(|w| names(&n, w));
@@ -2137,6 +2470,9 @@ fn stock_stand_in(name: &str) -> Pick {
     } else if has(&["oval"]) {
         // a flat oval, not the round tip (as wide as its tones say, where they were measured)
         Pick::Ours(Some(shape::SLIM_OVAL))
+    } else if says(&["point"]) {
+        // a small soft dot in the middle of the square, not a square of grain
+        Pick::Point
     } else if has(&["medium-hard", "medium hard", "mediumhard"]) {
         Pick::Round(0.75)
     } else if says(&["hard", "pen", "solid", "round"]) && !has(&["soft", "ink", "rect", "glow"]) {
@@ -2324,41 +2660,6 @@ pub(crate) fn grain_stand_in(name: &str, inverted: bool, preview: Option<&[u8]>)
     StandIn { pick: Pick::Ours(image), key: textures::stock_key(name), inverted }
 }
 
-/// The grain a stand-in for a stock one draws (see [`grain_for`]), its image drawn the first time
-/// it is wanted: our pattern with the stock grain's own lights and darks, where they were measured;
-/// one drawn to the stock image's proportions as it is drawn (measured smaller, the stock image's
-/// fine lines and dots go grey, which would take the pattern's contrast).
-fn drawn_grain(s: &StandIn) -> (Option<u32>, Option<Source>) {
-    let Pick::Ours(Some(i)) = s.pick else { return (None, None) };
-    let (key, inverted) = (s.key, s.inverted);
-    let invert = move |mut pixels: Vec<u8>| {
-        if inverted {
-            pixels.iter_mut().for_each(|v| *v = 255 - *v);
-        }
-        pixels
-    };
-    let tones = textures::stock_grain_tones_of(key);
-    let source = if textures::drawn_by_octaves(i)
-        && let (Some((_, octaves)), Some(tones)) = (textures::stock_grain_octaves_of(key), tones)
-    {
-        // a paper or a wash: noise as strong at each size as the stock image is, with its tones
-        // (tiled as a share of that image is)
-        Some(drawn(GRAIN, s, move || Some(invert(textures::octave_grain(&octaves, &tones)))))
-    } else if textures::grain_image(i).is_some() && (textures::drawn_to_stock_size(i) || tones.is_some()) {
-        Some(drawn(GRAIN, s, move || {
-            let pattern = textures::grain_image(i)?;
-            let pixels = match tones.filter(|_| !textures::drawn_to_stock_size(i)) {
-                Some(tones) => textures::retoned(&pattern.pixels, &tones, &textures::TONE_SHARES),
-                None => pattern.pixels,
-            };
-            Some(invert(pixels))
-        }))
-    } else {
-        None
-    };
-    (Some(i), source)
-}
-
 /// The source a file's metalness or roughness is painted through: its image, or our nearest grain
 /// to a stock image it names, or none (the amount all over) for one it can't show or names in
 /// words we don't know.
@@ -2412,6 +2713,10 @@ fn named_grain(n: &str) -> Option<u32> {
         (&["hatch"], grain::HATCHING),
         (&["crumple", "crease", "fold"], grain::CRUMPLED),
         (&["stipple"], grain::STIPPLE),
+        // water lit from above: light refracted into a web of bright lines on the dark
+        (&["refract", "caustic"], grain::CAUSTICS),
+        // a sea's face: long bright ripples running across, as our wood's rings do (not its foam)
+        (&["artery-ocean", "ripple"], grain::WOOD),
         (&["wash", "water", "wet"], grain::WASH),
         // ink dried in patches, most of it bare
         (&["dry"], grain::DRY_PATCHES),
@@ -2530,7 +2835,7 @@ fn shape_pixels(b: &Brush) -> Vec<u8> {
     if let Some(s) = &b.shape.source {
         return s.pixels.to_vec();
     }
-    if let Some(img) = b.shape.image.and_then(|i| textures::shapes().into_iter().nth(i as usize)) {
+    if let Some(img) = b.shape.image.and_then(textures::shape_image) {
         return img.pixels;
     }
     // the round tip filling the image, its edge as soft as the brush's hardness says
@@ -2551,7 +2856,7 @@ pub(crate) fn grain_pixels(b: &Brush) -> Option<Vec<u8>> {
     if let Some(s) = &b.grain.source {
         return Some(s.pixels.to_vec());
     }
-    b.grain.image.and_then(|i| textures::grains().into_iter().nth(i as usize)).map(|g| g.pixels)
+    b.grain.image.and_then(textures::grain_image).map(|g| g.pixels)
 }
 
 /// A metalness or roughness source as an image, if it has one.
@@ -2559,7 +2864,7 @@ pub(crate) fn material_pixels(m: &MaterialSource) -> Option<Vec<u8>> {
     if let Some(s) = &m.source {
         return Some(s.pixels.to_vec());
     }
-    m.image.and_then(|i| textures::grains().into_iter().nth(i as usize)).map(|g| g.pixels)
+    m.image.and_then(textures::grain_image).map(|g| g.pixels)
 }
 
 /// A square grey PNG of `pixels`.
@@ -2608,6 +2913,35 @@ mod tests {
         assert_eq!(named_grain("leopard-print.png"), Some(grain::SPOTS));
         assert_eq!(named_grain("brush-preset-hard.png"), Some(grain::DISC));
         assert_eq!(named_grain("brush-preset-floral.png"), Some(grain::SCROLLS));
+    }
+
+    #[test]
+    fn stock_water_grains_stand_in_as_water_not_a_speckle() {
+        // light refracted through water (the stock Water brush's grain, and the water brushes
+        // people make from it): our caustics, a web of bright lines on the dark. Its name said
+        // nothing we knew, so it stood in as the dark speckle a faint preview takes
+        let stock = |name: &str| Texture::Stock { name: name.into(), inverted: false };
+        let (image, source) = grain_for(&stock("Brush-Artery-Refract.png"), None);
+        assert_eq!(image, Some(grain::CAUSTICS));
+        assert!(source.is_some());
+        assert_eq!(named_grain("pool-caustics.png"), Some(grain::CAUSTICS));
+        // the sea's ripples running across (the stock Oceans brush's): our wood's rings, not a speckle
+        assert_eq!(grain_for(&stock("Brush-Artery-Ocean.jpg"), None).0, Some(grain::WOOD));
+        assert_eq!(named_grain("ripples.png"), Some(grain::WOOD));
+        // its foam is no ripple: it goes by its preview as before
+        assert_ne!(named_grain("ocean-foam.jpg"), Some(grain::WOOD));
+        // the stock library's own brushes drawn with it stand in the same
+        let picks = |name: &str| -> Vec<Pick> {
+            let key = textures::stock_key(name);
+            crate::stock_brushes::SETS
+                .iter()
+                .flat_map(|set| set.brushes.iter())
+                .flat_map(|b| std::iter::once(b).chain(b.second))
+                .filter_map(|b| b.grain.filter(|g| g.key == key).map(|g| g.pick))
+                .collect()
+        };
+        assert_eq!(picks("Brush-Artery-Refract.png"), [Pick::Ours(Some(grain::CAUSTICS))]);
+        assert_eq!(picks("Brush-Artery-Ocean.jpg"), [Pick::Ours(Some(grain::WOOD))]);
     }
 
     #[test]
@@ -3200,10 +3534,19 @@ mod tests {
 
     #[test]
     fn stock_names_find_our_nearest() {
+        // a hard tip: our disc as its picture; a medium one, the round tip by its hardness
+        let (image, source, hardness) = shape_for(&Texture::Stock { name: "Brush-Hard.png".into(), inverted: false });
+        assert_eq!((image, hardness), (None, Some(0.95)));
+        assert!(*source.unwrap().pixels == textures::hard_round_at(TEXTURE_SIZE));
         assert_eq!(
-            shape_for(&Texture::Stock { name: "Brush-Hard.png".into(), inverted: false }),
-            (None, None, Some(0.95))
+            shape_for(&Texture::Stock { name: "Brush-Medium.png".into(), inverted: false }),
+            (None, None, Some(0.5))
         );
+        // the small point: our soft dot, not a square of grain
+        let (image, source, hardness) =
+            shape_for(&Texture::Stock { name: "Brush-Small-Point.png".into(), inverted: false });
+        assert_eq!((image, hardness), (None, None));
+        assert!(*source.unwrap().pixels == textures::point_at(TEXTURE_SIZE));
         assert_eq!(shape_for(&Texture::Stock { name: "Soft.png".into(), inverted: false }).0, Some(shape::SOFT_ROUND));
         let ultra = Texture::Stock { name: "Ultra-Soft.jpg".into(), inverted: false };
         assert_eq!(shape_for(&ultra).0, Some(shape::ULTRA_SOFT_ROUND));
@@ -4012,5 +4355,138 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.matches('-').count(), 4);
         assert_ne!(id, folder_id(42, 4));
+    }
+
+    /// Sharing the library as it ships on this machine's GPU (each brush's preview drawn): how long
+    /// it takes, and how much of that is the previews (drawn a piece at a time, each waited for, so
+    /// a weak GPU's driver never stops one), the other pictures and the file: writing the file adds
+    /// little to making the pictures. Absolute numbers:
+    /// `cargo test -p procraft-core --lib brush_library_export_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn brush_library_export_time() {
+        let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+        let s = crate::CanvasSession::new(200, 200);
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (200, 200);
+            st.view = Some(procraft_engine::view::View::fit((200, 200), (200, 200)));
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+        }
+        let brushes: Vec<(u32, u32, Brush)> = {
+            let st = s.shared.lock();
+            st.library
+                .iter()
+                .enumerate()
+                .flat_map(|(set, entry)| {
+                    entry.brushes.iter().enumerate().map(move |(i, b)| (set as u32, i as u32, b.clone()))
+                })
+                .collect()
+        };
+        // each part alone
+        let started = std::time::Instant::now();
+        let mut previews = std::time::Duration::ZERO;
+        for (set, i, brush) in &brushes {
+            if brush.thumbnail.is_none() {
+                let t = std::time::Instant::now();
+                std::hint::black_box(s.brush_preview(*set, *i, THUMBNAIL.0, THUMBNAIL.1));
+                previews += t.elapsed();
+            }
+        }
+        let mut pictures = std::time::Duration::ZERO;
+        for (set, i, brush) in &brushes {
+            let t = std::time::Instant::now();
+            std::hint::black_box(s.brush_pictures(brush, *set, *i));
+            pictures += t.elapsed();
+        }
+        let parts = started.elapsed();
+        let dir = std::env::temp_dir().join(format!("procraft-library-time-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Library.brushlibrary").to_string_lossy().into_owned();
+        let t = std::time::Instant::now();
+        s.write_brush_library_file(path.clone(), None).unwrap();
+        let written = t.elapsed();
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_dir_all(&dir);
+        let drawn = brushes.iter().filter(|(_, _, b)| b.thumbnail.is_none()).count();
+        println!(
+            "{} brushes ({drawn} previews drawn): previews {} ms ({:.1} ms each), all pictures {} ms \
+             (parts {} ms); the library file written in {} ms, {} KB",
+            brushes.len(),
+            previews.as_millis(),
+            previews.as_secs_f64() * 1000.0 / drawn.max(1) as f64,
+            pictures.as_millis(),
+            parts.as_millis(),
+            written.as_millis(),
+            bytes >> 10
+        );
+        assert!(written <= pictures * 3 / 2, "written in {written:?}, its pictures made in {pictures:?}");
+    }
+
+    /// Sharing the library as it ships after the library has shown every brush (each row's sample
+    /// stroke drawn at the size the Android library draws it): the file takes the strokes the
+    /// library drew and keeps (all but the oldest, past what may be kept), drawing only the rest,
+    /// so it is written quicker than with none shown (its other pictures take the rest of the
+    /// time). Prints both times and what the kept strokes hold. Bounds: nine in ten of the kept
+    /// strokes taken, and quicker than with none shown.
+    /// `cargo test -p procraft-core --lib brush_library_export_after_its_previews_were_shown -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn brush_library_export_after_its_previews_were_shown() {
+        let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+        let s = crate::CanvasSession::new(200, 200);
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (200, 200);
+            st.view = Some(procraft_engine::view::View::fit((200, 200), (200, 200)));
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+        }
+        let dir = std::env::temp_dir().join(format!("procraft-library-shown-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Library.brushlibrary").to_string_lossy().into_owned();
+        let write = || {
+            let t = std::time::Instant::now();
+            s.write_brush_library_file(path.clone(), None).unwrap();
+            (t.elapsed(), std::fs::read(&path).unwrap())
+        };
+        // none shown: every stroke drawn for the file (none kept), and nothing left kept
+        let (cold, cold_file) = write();
+        let drawn = s.shared.lock().drawn_previews.missed;
+        s.shared.lock().drawn_previews = Default::default();
+        // the library shows every brush, as its rows ask
+        let brushes: Vec<(u32, u32)> = s
+            .brush_library()
+            .iter()
+            .enumerate()
+            .flat_map(|(set, entry)| (0..entry.brushes.len()).map(move |i| (set as u32, i as u32)))
+            .collect();
+        let t = std::time::Instant::now();
+        for &(set, i) in &brushes {
+            std::hint::black_box(s.brush_preview(set, i, 530, 162));
+        }
+        let shown = t.elapsed();
+        let (kept, bytes) = s.shared.lock().drawn_previews.held();
+        let (warm, warm_file) = write();
+        let found = s.shared.lock().drawn_previews.found;
+        let _ = std::fs::remove_dir_all(&dir);
+        println!(
+            "{} brushes, {drawn} strokes drawn for the file: written in {} ms with none shown; the library shown in {} ms              ({kept} strokes kept, {} KB); then written in {} ms ({found} strokes taken from those kept)",
+            brushes.len(),
+            cold.as_millis(),
+            shown.as_millis(),
+            bytes >> 10,
+            warm.as_millis()
+        );
+        // the same file either way, but for the folders' names (made from the clock)
+        assert!(
+            cold_file.len().abs_diff(warm_file.len()) < cold_file.len() / 100,
+            "{} against {}",
+            cold_file.len(),
+            warm_file.len()
+        );
+        assert!(found >= kept as u64 * 9 / 10, "{found} strokes taken of {kept} kept");
+        assert!(warm < cold, "written in {warm:?} after the library was shown, {cold:?} before");
     }
 }

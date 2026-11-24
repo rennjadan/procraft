@@ -188,10 +188,12 @@ impl State {
         };
         self.strokes = self.strokes.wrapping_add(1);
         let seed = self.strokes.wrapping_mul(0x9e37_79b9);
-        let mut builder = StrokeBuilder::with_seed(brush.clone(), brush.diameter(sliders.size), pointer.into(), seed)
+        let builder = StrokeBuilder::with_seed(brush.clone(), brush.diameter(sliders.size), pointer.into(), seed)
             .with_input(self.input.clone())
             .on_view_turned(self.view.map_or(0.0, |v| v.rotation()))
+            .on_canvas_made_turned(self.doc.made_turns)
             .seen_at(self.view.map_or(1.0, |v| v.zoom()) / self.display_scale);
+        let mut builder = self.pressing.applied(builder, self.canvas_per_point());
         if let Some(zoom) = self.whole_pixels(samples) {
             builder = builder.read_in_whole_pixels(zoom);
         }
@@ -331,9 +333,11 @@ impl Shared {
         if steps.is_empty() {
             return;
         }
+        // with Drawing Assist on the layer, the symmetry's copies too, as a stroke's
+        let guide = st.doc.stroke_guide();
         if let Some(canvas) = st.canvas.as_mut() {
             for step in &steps {
-                canvas.liquify_stamps(step);
+                canvas.liquify_stamps(&crate::guide::mirrored_liquify(&guide, step));
             }
             if let Some(f) = st.last_filter {
                 canvas.set_filter(f);
@@ -625,6 +629,22 @@ impl CanvasSession {
         true
     }
 
+    /// The pen's barrel rolled `turn` radians with the liquify brush at window point (`x`, `y`): a
+    /// twirl turns as far with it, right or left as the barrel went. False if `brush` isn't a twirl.
+    pub fn liquify_rolled(&self, x: f32, y: f32, turn: f32, mut brush: LiquifyBrush) -> bool {
+        if !matches!(brush.kind, LiquifyKind::TwirlRight | LiquifyKind::TwirlLeft) {
+            return false;
+        }
+        brush.kind = if turn > 0.0 { LiquifyKind::TwirlRight } else { LiquifyKind::TwirlLeft };
+        let mut guard = self.shared.lock();
+        let st = &mut *guard;
+        let Some(view) = st.view else { return true };
+        let Some(at) = view.screen_to_canvas(Vec2::new(x, y)).filter(|p| p.is_finite()) else { return true };
+        let steps = st.liquify.rolled(at, turn.abs(), brush);
+        self.shared.lay_liquify(st, steps);
+        true
+    }
+
     /// The liquify brush lifts: it carries on as it was going, for as long as `momentum` (0..1)
     /// lets it. True if something goes on, which needs [`CanvasSession::liquify_tick`].
     pub fn liquify_lift(&self, momentum: f32, brush: LiquifyBrush) -> bool {
@@ -672,6 +692,19 @@ impl CanvasSession {
     pub fn adjust_end(&self, commit: bool) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        // a filter layer's settings: kept as a step, or put back
+        if let Some(edit) = st.filters.layer.as_ref() {
+            let (layer, added) = (edit.layer, edit.added);
+            st.end_layer_edit(commit);
+            self.shared.frame(st);
+            drop(guard);
+            // Cancel in the settings a filter layer opened with as it was added: it goes again,
+            // its adding undone and nothing left to redo, as if it was never added
+            if added && !commit {
+                self.take_back_added(layer);
+            }
+            return;
+        }
         if st.adjusting {
             st.end_adjustment(commit);
             st.flush();

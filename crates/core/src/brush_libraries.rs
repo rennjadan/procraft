@@ -278,11 +278,10 @@ fn libraries_in(dir: &Path) -> (Vec<Entry>, String) {
     (list, FIRST.to_owned())
 }
 
-/// The file of the library in use in `dir`, and whether it is the first library's (whose file an
-/// empty library never is).
-pub(crate) fn file_in_use(dir: &Path) -> (PathBuf, bool) {
+/// The file of the library in use in `dir`.
+pub(crate) fn file_in_use(dir: &Path) -> PathBuf {
     let (_, current) = libraries_in(dir);
-    (files(dir, &current).0, current == FIRST)
+    files(dir, &current).0
 }
 
 /// `text` kept in the file at `path`, replaced whole; false if it couldn't be.
@@ -291,7 +290,7 @@ fn write(path: &Path, text: &str) -> bool {
         let _ = std::fs::create_dir_all(dir);
     }
     let written = crate::project::write_atomically(path, |p| {
-        std::fs::write(p, text.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
+        crate::storage::write(p, text.as_bytes()).map_err(|e| crate::project::file_error("keeping the brushes", e))
     });
     if let Err(e) = &written {
         log::error!("{e}");
@@ -607,8 +606,8 @@ impl CanvasSession {
             st.libraries.read.iter().find(|r| r.is(target, now)).map(|r| (Arc::clone(&r.sets), r.told))
         };
         match read {
-            Some((sets, told)) => (target != FIRST || !sets.is_empty()).then(|| (Arc::unwrap_or_clone(sets), told)),
-            None => self.library_at(path, target != FIRST),
+            Some((sets, told)) => Some((Arc::unwrap_or_clone(sets), told)),
+            None => self.library_at(path, true),
         }
     }
 
@@ -706,7 +705,7 @@ impl CanvasSession {
             };
         }
         let (sets, choices) = files(dir, &current);
-        if self.load_library_file(&sets, current != FIRST) {
+        if self.load_library_file(&sets, true) {
             return (sets, choices, true);
         }
         if current == first {
@@ -716,7 +715,7 @@ impl CanvasSession {
         log::warn!("the brush library in use can't be read: the first one is used");
         self.shared.lock().libraries.held.clone_from(&first);
         let (sets, choices) = files(dir, &first);
-        let loaded = self.load_library_file(&sets, first != FIRST);
+        let loaded = self.load_library_file(&sets, true);
         (sets, choices, loaded)
     }
 

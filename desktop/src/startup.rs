@@ -23,6 +23,11 @@
 //! A crash (or a panic on the window's thread) while a backend starts, or as a canvas first draws
 //! on it, starts the app again at once on the next backend, until each has been tried; then, or
 //! where it can't start again, it says why it stopped (see [`stopped`]).
+//!
+//! A tablet's driver can take the app down too, in its WinTab (Windows): a record of it says
+//! "trying" while the app starts it, "made" once it has, "crashed" after a crash in its file, then
+//! the app's version. A start after "trying" or "crashed" leaves WinTab off, the pen coming through
+//! Windows Ink alone, until another version tries it again (see [`wintab_trying`]).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -44,6 +49,9 @@ const GPU_START: &str = "gpu-start.txt";
 const GPU_ASKING: &str = "gpu-asking.txt";
 /// A note that the next start chooses the graphics backend again (see [`retry_best_graphics`]).
 const GPU_RETRY: &str = "gpu-retry.txt";
+/// How far the app last got with a tablet driver's WinTab, and the version that got there.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINTAB: &str = "wintab.txt";
 
 /// This run's part in the record.
 static RUN: Mutex<Run> = Mutex::new(Run::NEW);
@@ -64,6 +72,14 @@ const START_WATCH: Duration = Duration::from_secs(5);
 const START_WATCH_MOST: Duration = Duration::from_secs(10 * 60);
 /// When the app was started.
 static LAUNCHED: OnceLock<Instant> = OnceLock::new();
+
+/// The log of the run before this one (the one a crash ended, after one), else this run's: what to
+/// send on when asked for it.
+pub fn last_run_log() -> std::path::PathBuf {
+    let dir = files::app_dir();
+    let before = dir.join(PREVIOUS_LOG);
+    if before.is_file() { before } else { dir.join(LOG) }
+}
 
 /// The log to the terminal and to the app folder's log file, and a crash's message into it. A
 /// start the app made itself on another graphics backend goes on in the same log, so it holds
@@ -205,29 +221,11 @@ pub fn backend_order() -> &'static [usize] {
         if keeps_backend(&saved, backends.len(), ENDS_TOLD) {
             return listed;
         }
-        let asking = files::app_dir().join(GPU_ASKING);
-        if recorded() {
-            if asking.exists() {
-                log::warn!("the last start stopped as Direct3D 12 listed the GPUs: the backends in their order");
-                return listed;
-            }
-            if let Err(e) = files::write_whole(&asking, b"asking") {
-                log::warn!("keeping that the GPUs are being listed: {e}");
-            }
-        }
-        // as Direct3D 12 sees them: Vulkan's driver is what may crash, so it isn't asked
-        let started = Instant::now();
-        let seen = std::panic::catch_unwind(|| Gpu::adapters(wgpu::Backends::DX12)).unwrap_or_else(|panic| {
-            log::warn!("the GPUs couldn't be listed: {}", procraft_gpu::panic_message(panic.as_ref()));
-            Vec::new()
-        });
-        if recorded() {
-            let _ = std::fs::remove_file(&asking);
-        }
-        let gpus: Vec<(u32, wgpu::DeviceType)> = seen.iter().map(|a| (a.vendor, a.device_type)).collect();
-        let picked = drawn_with(&gpus).and_then(|i| seen.get(i));
-        let order = order_for(&backends, picked.map(|a| (a.vendor, a.device_type)));
-        let took = started.elapsed().as_millis();
+        let Some((picked, took)) = d3d12_choice() else {
+            log::warn!("the last start stopped as Direct3D 12 listed the GPUs: the backends in their order");
+            return listed;
+        };
+        let order = order_for(&backends, picked.as_ref().map(|a| (a.vendor, a.device_type)));
         match picked {
             Some(gpu) if order != listed => log::info!(
                 "the GPU to draw with is {} ({:?}, vendor {:#06x}; listed by Direct3D 12 in {took} ms): {} first",
@@ -246,6 +244,72 @@ pub fn backend_order() -> &'static [usize] {
         }
         order
     })
+}
+
+/// The GPU Direct3D 12 would draw with (see [`drawn_with`]), as it lists them, once a run, and how
+/// long that took (ms); none where they can't be listed: the last start stopped as they were (a
+/// driver that crashes as it is asked mustn't do so at every start).
+fn d3d12_choice() -> Option<&'static (Option<wgpu::AdapterInfo>, u128)> {
+    static CHOICE: OnceLock<Option<(Option<wgpu::AdapterInfo>, u128)>> = OnceLock::new();
+    CHOICE
+        .get_or_init(|| {
+            let asking = files::app_dir().join(GPU_ASKING);
+            if recorded() {
+                if asking.exists() {
+                    return None;
+                }
+                if let Err(e) = files::write_whole(&asking, b"asking") {
+                    log::warn!("keeping that the GPUs are being listed: {e}");
+                }
+            }
+            // as Direct3D 12 sees them: Vulkan's driver is what may crash, so it isn't asked
+            let started = Instant::now();
+            let seen = std::panic::catch_unwind(|| Gpu::adapters(wgpu::Backends::DX12)).unwrap_or_else(|panic| {
+                log::warn!("the GPUs couldn't be listed: {}", procraft_gpu::panic_message(panic.as_ref()));
+                Vec::new()
+            });
+            if recorded() {
+                let _ = std::fs::remove_file(&asking);
+            }
+            let gpus: Vec<(u32, wgpu::DeviceType)> = seen.iter().map(|a| (a.vendor, a.device_type)).collect();
+            let picked = drawn_with(&gpus).and_then(|i| seen.get(i)).cloned();
+            Some((picked, started.elapsed().as_millis()))
+        })
+        .as_ref()
+}
+
+/// The window's device is made on `gpu`: on OpenGL under Windows, which GPU that is is logged
+/// beside the one Direct3D 12 would draw with, and a mismatch warned of. OpenGL draws on the GPU
+/// the drivers give the app, not the one wgpu picks: on a laptop of two GPUs it was the integrated
+/// one, its frames slow, before the app asked the drivers for the faster (see `main.rs`).
+pub fn gpu_drawing(gpu: &wgpu::AdapterInfo) {
+    if !cfg!(windows) || gpu.backend != wgpu::Backend::Gl {
+        return;
+    }
+    match d3d12_choice() {
+        None => log::info!("OpenGL draws on {} (Direct3D 12 isn't asked which GPU it would draw with)", gpu.name),
+        Some((None, _)) => log::info!("OpenGL draws on {} (Direct3D 12 lists no GPU)", gpu.name),
+        Some((Some(d3d12), _)) if same_gpu(gpu, d3d12) => {
+            log::info!("OpenGL draws on {}, the GPU Direct3D 12 would draw with", gpu.name);
+        }
+        Some((Some(d3d12), _)) => log::warn!(
+            "OpenGL draws on {} (vendor {:#06x}), not on {} (vendor {:#06x}) as Direct3D 12 would: the GPU the              drivers give the app",
+            gpu.name,
+            gpu.vendor,
+            d3d12.name,
+            d3d12.vendor
+        ),
+    }
+}
+
+/// Whether OpenGL's `gl` is the GPU `other` (another backend's): by vendor where OpenGL's says
+/// which (it goes by the driver's name), else by name (OpenGL's may add to it, as "/PCIe/SSE2").
+fn same_gpu(gl: &wgpu::AdapterInfo, other: &wgpu::AdapterInfo) -> bool {
+    if gl.vendor != 0 && other.vendor != 0 {
+        return gl.vendor == other.vendor;
+    }
+    let (gl, other) = (gl.name.to_lowercase(), other.name.to_lowercase());
+    !other.is_empty() && (gl.starts_with(&other) || other.starts_with(&gl))
 }
 
 /// Whether the record `saved` keeps its backend for the next start, of `count`.
@@ -482,6 +546,87 @@ pub fn gpu_ended() {
     let mut run = run_now();
     run.end();
     keep(&mut run);
+}
+
+/// Whether this run starts a tablet driver's WinTab, decided as it first would, from the record
+/// the run before left.
+#[cfg(windows)]
+static WINTAB_ON: OnceLock<bool> = OnceLock::new();
+/// WinTab is being started now: a crash anywhere meanwhile is taken for its driver's.
+#[cfg(windows)]
+static WINTAB_STARTING: AtomicBool = AtomicBool::new(false);
+
+/// A tablet driver's WinTab is about to be started: whether it is to be. Not if the run before
+/// died in it with this version (the record saying "trying" or "crashed"): it stays off then, with
+/// a line in the log, and the record is left for the runs after. Else the record says "trying"
+/// until [`wintab_made`].
+#[cfg(windows)]
+pub fn wintab_trying() -> bool {
+    let on = *WINTAB_ON.get_or_init(|| {
+        let path = files::app_dir().join(WINTAB);
+        // (the unit tests leave the app's own record alone)
+        let saved = if cfg!(test) { String::new() } else { std::fs::read_to_string(&path).unwrap_or_default() };
+        let off = wintab_off(&saved, env!("PROCRAFT_VERSION"));
+        if off {
+            log::warn!(
+                "WinTab off: the tablet's driver crashed as this version last started it, so the pen comes through Windows Ink alone (deleting {} tries WinTab again)",
+                path.display()
+            );
+        }
+        !off
+    });
+    if on {
+        WINTAB_STARTING.store(true, Ordering::SeqCst);
+        keep_wintab("trying");
+    }
+    on
+}
+
+/// WinTab is started (or there is none to start): the record says "made".
+#[cfg(windows)]
+pub fn wintab_made() {
+    WINTAB_STARTING.store(false, Ordering::SeqCst);
+    keep_wintab("made");
+}
+
+/// A crash in `file`: true if it was the tablet driver's (in its file while this run uses WinTab,
+/// or anywhere as WinTab starts), the record then saying "crashed".
+#[cfg(windows)]
+fn wintab_crashed(file: &str) -> bool {
+    let theirs = WINTAB_STARTING.load(Ordering::SeqCst)
+        || (file.eq_ignore_ascii_case("wintab32.dll") && WINTAB_ON.get() == Some(&true));
+    if theirs {
+        keep_wintab("crashed");
+    }
+    theirs
+}
+
+/// Writes the WinTab record as at `stage` with this version, whole or not at all: not for a
+/// test's window (see [`kept`]), nor in the unit tests.
+#[cfg(windows)]
+fn keep_wintab(stage: &str) {
+    if cfg!(test) || !kept() {
+        return;
+    }
+    let record = wintab_record(stage, env!("PROCRAFT_VERSION"));
+    if let Err(e) = files::write_whole(&files::app_dir().join(WINTAB), record.as_bytes()) {
+        log::warn!("keeping how far WinTab got: {e}");
+    }
+}
+
+/// The WinTab record for `stage` and `version`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wintab_record(stage: &str, version: &str) -> String {
+    format!("{stage} {version}")
+}
+
+/// Whether WinTab stays off after the record `saved`, for `version`: the run before died in it
+/// ("trying" or "crashed") with the same version. Another version tries it again; no record, or
+/// one that can't be read, leaves it on.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wintab_off(saved: &str, version: &str) -> bool {
+    let mut words = saved.split_whitespace();
+    matches!(words.next(), Some("trying" | "crashed")) && words.next() == Some(version) && words.next().is_none()
 }
 
 /// This run's part in the record, held.
@@ -772,18 +917,30 @@ enum Stop {
     SayAllTried,
     /// Says why it stopped.
     Say,
+    /// Says why it stopped: the tablet's driver crashed, and the next start leaves its WinTab off.
+    Tablet,
 }
 
 /// The app stopped on `what` (a crash, a panic's message on the window's thread), and is to end:
 /// started again on the next backend, if it can be (see [`Run::stop`]), else said, with where its
 /// log is (only logged for a test's window). The backend record stays as it is now.
 pub fn stopped(what: &str) {
+    stop_with(what, false);
+}
+
+/// [`stopped`], on a crash in the tablet's driver (`tablet`): said, the next start leaving its
+/// WinTab off, rather than the app started again on another graphics backend.
+fn stop_with(what: &str, tablet: bool) {
     log::error!("stopped: {what}");
     STOPPED.store(true, Ordering::SeqCst);
     if !kept() {
         return;
     }
-    let stop = run_if_free().map_or(Stop::Say, |run| run.stop(Gpu::backend_count(), ENDS_TOLD));
+    let stop = if tablet {
+        Stop::Tablet
+    } else {
+        run_if_free().map_or(Stop::Say, |run| run.stop(Gpu::backend_count(), ENDS_TOLD))
+    };
     let stop = match stop {
         // without the files it was opened with: they may have been taken in already
         Stop::Again(tried) if apart("procraft-again", move || start_on_next(tried)) == Some(true) => {
@@ -833,6 +990,9 @@ fn stopped_text(what: &str, stop: Stop) -> String {
     let after = match stop {
         Stop::SayAnother | Stop::Again(_) => "\n\nStart it again to try another graphics backend.",
         Stop::SayAllTried => "\n\nEach graphics backend has been tried. Updating the graphics driver may help.",
+        Stop::Tablet => {
+            "\n\nIt was the tablet's driver. Next time ProCraft starts without the driver's WinTab: the pen's pressure comes through Windows Ink, if the tablet's settings have it on."
+        }
         Stop::Say => "",
     };
     format!("ProCraft stopped: {what}.{after}\n\nIts log is {}", files::app_dir().join(LOG).display())
@@ -935,11 +1095,13 @@ mod native {
         EXCEPTION_EXECUTE_HANDLER
     }
 
-    /// The crash logged, and the app started again or the crash said.
+    /// The crash logged, and the app started again or the crash said: the tablet driver's (see
+    /// [`super::wintab_crashed`]) said as such, its WinTab left off from the next start.
     fn said(code: u32, address: usize) {
         let file = module_of(address as *mut core::ffi::c_void).unwrap_or_else(|| "the app's code".to_owned());
         log::error!("crashed in {file} (exception {code:#010X} at {address:#x})");
-        super::stopped(&format!("it crashed in {file} (exception {code:#010X})"));
+        let tablet = super::wintab_crashed(&file);
+        super::stop_with(&format!("it crashed in {file} (exception {code:#010X})"), tablet);
     }
 
     /// The name of the file (a DLL, the app) whose code is at `address`.
@@ -958,7 +1120,7 @@ mod native {
 
 #[cfg(test)]
 mod tests {
-    use super::{Record, Run, Stage, next_start};
+    use super::{Record, Run, Stage, next_start, stopped_text, wintab_off, wintab_record};
 
     /// The record a run leaves if it stops now with nothing more written (a crash, a log-out, the
     /// app killed): the record is written each time what it says changes.
@@ -1019,6 +1181,25 @@ mod tests {
     /// The order for a machine whose GPUs (vendor, type) are `gpus`, as Direct3D 12 lists them.
     fn order_with(backends: &[Backends], gpus: &[(u32, procraft_gpu::wgpu::DeviceType)]) -> Vec<usize> {
         order_for(backends, drawn_with(gpus).and_then(|i| gpus.get(i).copied()))
+    }
+
+    #[test]
+    fn opengl_s_gpu_is_told_apart_from_direct3d_12_s_by_vendor_or_name() {
+        use super::same_gpu;
+        use procraft_gpu::wgpu;
+        let gpu = |name: &str, vendor: u32, backend| wgpu::AdapterInfo {
+            name: name.to_owned(),
+            vendor,
+            ..wgpu::AdapterInfo::new(wgpu::DeviceType::Other, backend)
+        };
+        let rtx = gpu("NVIDIA GeForce RTX 2050", 0x10de, wgpu::Backend::Dx12);
+        // a laptop's OpenGL on the integrated GPU, Direct3D 12 on the discrete one
+        assert!(!same_gpu(&gpu("Intel(R) Iris(R) Xe Graphics", 0x8086, wgpu::Backend::Gl), &rtx));
+        assert!(same_gpu(&gpu("NVIDIA GeForce RTX 2050/PCIe/SSE2", 0x10de, wgpu::Backend::Gl), &rtx));
+        // a driver OpenGL can't name the vendor of: by name
+        let radeon = gpu("AMD Radeon RX 6600", 0x1002, wgpu::Backend::Dx12);
+        assert!(same_gpu(&gpu("AMD Radeon RX 6600", 0, wgpu::Backend::Gl), &radeon));
+        assert!(!same_gpu(&gpu("Radeon Graphics", 0, wgpu::Backend::Gl), &radeon));
     }
 
     #[test]
@@ -1438,5 +1619,31 @@ mod tests {
         let mut run = trying(2, 0);
         run.end();
         assert_eq!(run.awaited(), None);
+    }
+
+    #[test]
+    fn a_run_that_died_in_the_tablet_drivers_wintab_leaves_it_off_until_another_version() {
+        let version = "0.0.7-beta";
+        // the run before died as WinTab started, or in the driver's file: off
+        assert!(wintab_off(&wintab_record("trying", version), version));
+        assert!(wintab_off(&wintab_record("crashed", version), version));
+        assert!(wintab_off("crashed 0.0.7-beta\r\n", version), "as another editor saves it");
+        // started, and the run went on: on
+        assert!(!wintab_off(&wintab_record("made", version), version));
+        // a later version tries it again
+        assert!(!wintab_off("crashed 0.0.7-beta", "0.0.8-beta"));
+        assert!(!wintab_off("trying 0.0.7-beta", "0.0.7"));
+        // no record, or one that can't be read: on
+        for saved in ["", "crashed", "trying 0.0.7-beta drew", "off 0.0.7-beta", "0 trying"] {
+            assert!(!wintab_off(saved, version), "{saved:?}");
+        }
+    }
+
+    #[test]
+    fn a_crash_in_the_tablets_driver_says_so_and_what_the_next_start_does() {
+        let text = stopped_text("it crashed in wintab32.dll (exception 0xC0000005)", Stop::Tablet);
+        assert!(text.starts_with("ProCraft stopped: it crashed in wintab32.dll (exception 0xC0000005).\n\n"), "{text}");
+        assert!(text.contains("tablet's driver") && text.contains("Windows Ink"), "{text}");
+        assert!(!text.contains("graphics backend"), "{text}");
     }
 }

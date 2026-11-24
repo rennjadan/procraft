@@ -52,6 +52,9 @@ pub(crate) struct Filters {
     open: Option<OpenFilter>,
     /// The last one open, for Reset and Undo to open it again.
     last: Option<OpenFilter>,
+    /// A filter layer's settings open in the panel (interface 17), and the last open.
+    pub(crate) layer: Option<crate::filter_layers::LayerEdit>,
+    last_layer: Option<crate::filter_layers::LayerEdit>,
     /// What stopped one, for the app to tell, once.
     said: Option<String>,
     /// The artwork was saved ahead of a first filter.
@@ -60,7 +63,36 @@ pub(crate) struct Filters {
 
 impl Filters {
     pub(crate) fn shown(&self) -> Option<PluginFilterShown> {
-        self.open.as_ref().map(|open| PluginFilterShown { name: open.name.clone(), controls: open.controls.clone() })
+        // (a filter layer's settings open in the app's own editor show that, not this panel)
+        let layer = || {
+            let edit = self.layer.as_ref().filter(|e| !e.controls.is_empty())?;
+            Some(PluginFilterShown { name: edit.name.clone(), controls: edit.controls.clone() })
+        };
+        self.open
+            .as_ref()
+            .map(|open| PluginFilterShown { name: open.name.clone(), controls: open.controls.clone() })
+            .or_else(layer)
+    }
+
+    /// A filter layer's settings open, any other filter closed.
+    pub(crate) fn open_layer_edit(&mut self, edit: crate::filter_layers::LayerEdit) {
+        self.open = None;
+        self.last = None;
+        self.layer = Some(edit);
+    }
+
+    /// The filter layer's settings last open, if they were `layer`'s, to open again.
+    pub(crate) fn take_last_layer(
+        &mut self,
+        layer: procraft_engine::document::LayerId,
+    ) -> Option<crate::filter_layers::LayerEdit> {
+        self.last_layer.take().filter(|e| e.layer == layer)
+    }
+
+    /// The filter layer's settings closed, kept to open again.
+    pub(crate) fn keep_layer_edit(&mut self, edit: crate::filter_layers::LayerEdit) {
+        self.last = None;
+        self.last_layer = Some(edit);
     }
 
     pub(crate) fn take_said(&mut self) -> Option<String> {
@@ -71,6 +103,7 @@ impl Filters {
     pub(crate) fn close(&mut self) -> Option<String> {
         let closed = self.open.take()?;
         let name = closed.name.clone();
+        self.last_layer = None;
         self.last = Some(closed);
         Some(name)
     }
@@ -144,6 +177,20 @@ impl CanvasSession {
 
     /// The filter last open, again, its values as they start: its Reset, and its Undo.
     pub(crate) fn plugin_filter_again(&self) -> bool {
+        // a filter layer's settings, as they were when they opened
+        {
+            let mut guard = self.shared.lock();
+            let st = &mut *guard;
+            let layer = st.filters.last_layer.take().filter(|e| e.layer == st.doc.current());
+            if let Some(edit) = layer {
+                let edit = edit.again(&st.doc);
+                st.adjust.open_plugin();
+                st.filters.open_layer_edit(edit);
+                st.draw_layer_edit();
+                self.shared.frame(st);
+                return true;
+            }
+        }
         let last = self.shared.lock().filters.last.take();
         let Some(mut filter) = last else { return false };
         for control in &mut filter.controls {
@@ -202,6 +249,19 @@ impl CanvasSession {
     pub fn plugin_filter_slider(&self, key: String, value: f32, done: bool) -> Option<f32> {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        // a filter layer's value, shown at once
+        if let Some(edit) = st.filters.layer.as_mut() {
+            let slider = edit.controls.iter_mut().find_map(|control| match control {
+                PluginControl::Slider { control } if control.key == key => Some(control),
+                _ => None,
+            })?;
+            let landed = PluginSlider::stepped(slider, value);
+            slider.value = landed;
+            st.adjust.touch();
+            st.draw_layer_edit();
+            self.shared.frame(st);
+            return Some(landed);
+        }
         st.heed_filter_run();
         let open = st.filters.open.as_mut()?;
         let slider = open.controls.iter_mut().find_map(|control| match control {
@@ -222,6 +282,18 @@ impl CanvasSession {
     pub fn plugin_filter_switch(&self, key: String, on: bool) {
         let mut guard = self.shared.lock();
         let st = &mut *guard;
+        if let Some(edit) = st.filters.layer.as_mut() {
+            let switch = edit.controls.iter_mut().find_map(|control| match control {
+                PluginControl::Switch { control } if control.key == key => Some(control),
+                _ => None,
+            });
+            let Some(switch) = switch else { return };
+            switch.on = on;
+            st.adjust.touch();
+            st.draw_layer_edit();
+            self.shared.frame(st);
+            return;
+        }
         st.heed_filter_run();
         let Some(open) = st.filters.open.as_mut() else { return };
         let switch = open.controls.iter_mut().find_map(|control| match control {
@@ -431,7 +503,7 @@ mod tests {
         assert_eq!(layer(&s), starts);
         let cut = s.adjustment_shown().plugin.unwrap().controls.into_iter().find_map(|control| match control {
             PluginControl::Slider { control } => Some(control.value),
-            PluginControl::Switch { .. } | PluginControl::File { .. } => None,
+            PluginControl::Switch { .. } | PluginControl::File { .. } | PluginControl::Texture { .. } => None,
         });
         assert_eq!(cut, Some(0.5));
         // Undo the same, and it stays open
@@ -569,8 +641,14 @@ mod tests {
             let folder = sample.unwrap().path();
             let Ok(manifest) = std::fs::read(folder.join("craft-extension.json")) else { continue };
             let mut manifest: Value = serde_json::from_slice(&manifest).unwrap();
-            // its one filter, or each it lists
-            let listed = manifest["filters"].as_array().cloned().unwrap_or_default();
+            // its one filter, or each it lists (a filter layer's are tried as the canvas runs them, in
+            // plugins.rs)
+            let all = manifest["filters"].as_array().cloned().unwrap_or_default();
+            let layers = all.iter().any(|f| f["layer"] == true);
+            let listed: Vec<Value> = all.into_iter().filter(|f| f["layer"] != true).collect();
+            if layers && listed.is_empty() {
+                continue;
+            }
             let paths: Vec<String> = if listed.is_empty() {
                 vec!["filter.wgsl".to_owned()]
             } else {
@@ -586,10 +664,41 @@ mod tests {
                 .map(|(path, code)| json!({ "path": path, "sha256": sha256(code), "size": code.len() }))
                 .collect();
             manifest["files"] = json!(files);
-            // the code beside a filter is looked at by its own crate: here it holds the filters alone
+            // the code beside a filter is looked at by its own crate: here it holds the filters alone,
+            // and of a plugin of features, the controls they read, under nothing
+            let featured = manifest["controls"].as_array().is_some_and(|c| c.iter().any(|c| c["type"] == "feature"));
+            if featured {
+                let read: Vec<String> = listed
+                    .iter()
+                    .flat_map(|f| f["controls"].as_array().cloned().unwrap_or_default())
+                    .filter_map(|key| key.as_str().map(str::to_owned))
+                    .collect();
+                let controls: Vec<Value> = manifest["controls"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|c| c["key"].as_str().is_some_and(|key| read.iter().any(|r| r == key)))
+                    .map(|mut c| {
+                        c.as_object_mut().map(|c| c.remove("under"));
+                        c
+                    })
+                    .collect();
+                manifest["controls"] = json!(controls);
+                let filters: Vec<Value> = listed
+                    .iter()
+                    .cloned()
+                    .map(|mut f| {
+                        f.as_object_mut().map(|f| f.remove("under"));
+                        f
+                    })
+                    .collect();
+                manifest["filters"] = json!(filters);
+                manifest["compat"]["procraft"]["interface"] = json!(5);
+            }
             if let Some(object) = manifest.as_object_mut() {
                 object.insert("holds".to_owned(), json!(["filter"]));
-                for field in ["hooks", "actions", "brush_controls", "kinds", "layer_kinds"] {
+                for field in ["hooks", "actions", "brush_controls", "kinds", "layer_kinds", "replaces", "menu"] {
                     object.remove(field);
                 }
                 object.insert("permissions".to_owned(), json!([]));
@@ -600,8 +709,8 @@ mod tests {
             let packed: Vec<(&str, &[u8])> =
                 paths.iter().map(String::as_str).zip(codes.iter().map(Vec::as_slice)).collect();
             assert_eq!(plugins.install(pack(&manifest, &packed)), None, "{}", folder.display());
-            // each listed under its switch, on
-            for filter in &listed {
+            // each listed under its switch, on (of a plugin of features, under none here)
+            for filter in listed.iter().filter(|_| !featured) {
                 if let Some(under) = filter["under"].as_str() {
                     assert!(plugins.set_switch(format!("{plugin}.{under}"), true), "{plugin}.{under}");
                 }
@@ -627,7 +736,7 @@ mod tests {
                             s.plugin_filter_switch(control.key, !control.starts);
                             layer(&s);
                         }
-                        PluginControl::File { .. } => {}
+                        PluginControl::File { .. } | PluginControl::Texture { .. } => {}
                     }
                 }
                 assert_eq!(s.adjustment_shown().adjustment, Some(Adjustment::Plugin), "{id} stopped");

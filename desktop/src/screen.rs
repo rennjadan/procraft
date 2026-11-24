@@ -38,6 +38,10 @@ pub struct Screen {
     /// Whether the interface was told it is on a touch screen, for a tablet's pen that moves the
     /// mouse pointer.
     pen_touch_screen: crate::input::PenTouchScreen,
+    /// The interface's frames missed in a row, and what the app is to do after the last one (see
+    /// `interface_pass`).
+    misses: crate::interface_pass::Misses,
+    after_frame: crate::interface_pass::AfterFrame,
 }
 
 /// A canvas drawn into a picture of its own (the surface's format), its size, and the
@@ -89,6 +93,10 @@ const INTERFACE_WIDE: bool = false;
 
 /// How soon a window left without its surface asks for it again.
 const SURFACE_RETRY: Duration = Duration::from_millis(100);
+
+/// How soon a frame whose interface couldn't go up to the GPU is drawn again, once the app has let
+/// go of what it keeps.
+const MISSED_RETRY: Duration = Duration::from_millis(50);
 
 /// A window of no size is minimised: nothing shows until it has one.
 fn is_minimised(size: winit::dpi::PhysicalSize<u32>) -> bool {
@@ -201,7 +209,14 @@ impl Screen {
             last,
             touch_keyboard: crate::touch_keyboard::TouchKeyboard::default(),
             pen_touch_screen: crate::input::PenTouchScreen::default(),
+            misses: crate::interface_pass::Misses::default(),
+            after_frame: crate::interface_pass::AfterFrame::Fine,
         })
+    }
+
+    /// What the app is to do after the last frame drawn: whether its interface missed (told once).
+    pub fn take_after_frame(&mut self) -> crate::interface_pass::AfterFrame {
+        std::mem::replace(&mut self.after_frame, crate::interface_pass::AfterFrame::Fine)
     }
 
     /// What the window's events gave the interface since its last frame; once a tablet's pen moves
@@ -233,11 +248,15 @@ impl Screen {
         self.canvases_later.is_some()
     }
 
-    /// Whether nothing may be drawn now: on OpenGL while the canvases' pipelines are made. Its one
-    /// context is held by one thread at a time, and one that waits for it more than a second
-    /// panics (wgpu's lock), while a pipeline can take longer than that to compile.
+    /// Whether nothing may be drawn now: on OpenGL while the canvases' pipelines are made, or the
+    /// artwork open is exported or saved on a thread of its own. Its one context is held by one
+    /// thread at a time, and one that waits for it more than a second panics (wgpu's lock), while
+    /// a pipeline can take longer than that to compile, and an export's work on a big canvas (its
+    /// picture made and read back) longer than that to send and wait for.
     pub fn gl_busy(&self) -> bool {
-        self.gpu.is_gl() && self.canvases.as_ref().is_some_and(|made| !made.is_finished())
+        self.gpu.is_gl()
+            && (self.canvases.as_ref().is_some_and(|made| !made.is_finished())
+                || crate::files::exporting_since().is_some())
     }
 
     /// Whether nothing can show: its next size brings it back.
@@ -378,8 +397,10 @@ impl Screen {
         let textures_done = began.elapsed();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            // made again at the window's size as it now is: the window changing is what put the
+            // surface out of date, and made at its old size it would stay so
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.resize(size.0, size.1);
+                self.resize(window.width, window.height);
                 return Some(Duration::ZERO);
             }
             wgpu::CurrentSurfaceTexture::Timeout
@@ -391,36 +412,22 @@ impl Screen {
         let canvas_after = session.and_then(|s| s.draw(&view, format, size, screen, started));
         let canvas_done = began.elapsed();
 
-        let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         let jobs = self.egui.egui_ctx().tessellate(shapes, pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [size.0, size.1], pixels_per_point };
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("interface") });
-        let uploads = self.renderer.update_buffers(device, queue, &mut encoder, &jobs, &screen);
-        {
-            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("interface"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    // over the canvas just drawn (the gallery covers the whole window)
-                    ops: wgpu::Operations {
-                        load: if session.is_some() {
-                            wgpu::LoadOp::Load
-                        } else {
-                            wgpu::LoadOp::Clear(wgpu::Color::BLACK)
-                        },
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
-        }
-        queue.submit(uploads.into_iter().chain([encoder.finish()]));
+        let mut encoder =
+            self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("interface") });
+        // over the canvas just drawn (the gallery covers the whole window)
+        let load = if session.is_some() { wgpu::LoadOp::Load } else { wgpu::LoadOp::Clear(wgpu::Color::BLACK) };
+        let recorded =
+            crate::interface_pass::record(&mut self.renderer, &self.gpu, &mut encoder, &view, load, &jobs, &screen);
+        let Some(uploads) = recorded else {
+            // the interface couldn't go up to the GPU: the frame goes unshown (the window keeps the
+            // last), and the app lets go of what it keeps and draws again (see `interface_pass`)
+            self.after_frame = self.misses.frame(false);
+            return Some(MISSED_RETRY);
+        };
+        self.after_frame = self.misses.frame(true);
+        self.gpu.queue.submit(uploads.into_iter().chain([encoder.finish()]));
         let interface_done = began.elapsed();
         self.window.pre_present_notify();
         if began.elapsed() > Duration::from_millis(100) {
@@ -434,7 +441,7 @@ impl Screen {
                 interface_done.saturating_sub(canvas_done).as_millis()
             );
         }
-        queue.present(frame);
+        self.gpu.queue.present(frame);
         // the backend shows: a crash from now on isn't its start's
         crate::startup::gpu_shown();
         // on OpenGL the canvases' pipelines once there is a window to see

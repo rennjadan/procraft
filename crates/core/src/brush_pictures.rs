@@ -90,7 +90,7 @@ pub(crate) fn keep(folder: &Path, pictures: &[(String, Held)]) -> bool {
         }
         let written = written.and_then(|()| {
             crate::project::write_atomically(&path, |p| {
-                fs::write(p, bytes).map_err(|e| crate::project::file_error(what, e))
+                crate::storage::write(p, bytes).map_err(|e| crate::project::file_error(what, e))
             })
         });
         if let Err(e) = written {

@@ -10,7 +10,7 @@ use procraft_engine::geom::Vec2;
 use procraft_engine::input::Sample;
 use procraft_engine::quickshape::{Anchor, Shape, ShapeKind, end_hook_reach, fit_ellipse, recognise, without_end_hook};
 use procraft_engine::stroke::StrokeBuilder;
-use procraft_gpu::{Canvas, StrokeStyle};
+use procraft_gpu::{Canvas, SecondStroke, StrokeStyle};
 
 use crate::{CanvasSession, PointerKind, State};
 
@@ -104,6 +104,9 @@ pub(crate) struct ShapeEdit {
     held: Option<Held>,
     /// The stroke it was made of, for undo to go back to.
     stroke: Option<DrawnStroke>,
+    /// Moved since its stroke was last drawn: drawn again as the next frame is, or as it is kept.
+    /// A drag's moves come faster than frames, and each would lay the whole stroke again.
+    stale: bool,
 }
 
 impl ShapeEdit {
@@ -116,18 +119,9 @@ impl ShapeEdit {
         stroke: Option<DrawnStroke>,
     ) -> ShapeEdit {
         let first = shape.clone();
-        ShapeEdit {
-            shape,
-            first,
-            earlier: Vec::new(),
-            later: Vec::new(),
-            choices,
-            drawn,
-            along,
-            modes: Vec::new(),
-            held,
-            stroke,
-        }
+        let modes = initial_curve_modes(&shape);
+        let (earlier, later) = (Vec::new(), Vec::new());
+        ShapeEdit { shape, first, earlier, later, choices, drawn, along, modes, held, stroke, stale: false }
     }
 
     /// A drag undone can be done again.
@@ -154,8 +148,8 @@ impl ShapeEdit {
     }
 }
 
-/// A stroke made a shape, as it can be laid again: where, its builder as it began and its input.
-/// (A dual brush's isn't kept: its shape is its first alone.)
+/// A stroke made a shape, as it can be laid again: where, its builder as it began and its input,
+/// and a dual brush's second, which its shape is drawn with too.
 pub(crate) struct DrawnStroke {
     layer: LayerId,
     style: StrokeStyle,
@@ -163,6 +157,15 @@ pub(crate) struct DrawnStroke {
     samples: Vec<Sample>,
     /// What its randomness was seeded with: a brush engine draws it again the same.
     seed: u32,
+    second: Option<SecondAgain>,
+}
+
+/// A dual brush's second as its stroke began, to draw it again (along a shape, or the stroke a
+/// shape gave way to): how it is laid and combines, and its builder before any input.
+#[derive(Clone)]
+pub(crate) struct SecondAgain {
+    pub(crate) stroke: SecondStroke,
+    pub(crate) fresh: StrokeBuilder,
 }
 
 /// A shape kept, as it first snapped, or the stroke it gave way to: the canvas's undo steps once
@@ -199,10 +202,13 @@ pub(crate) struct LastStroke {
     /// What it drew (canvas points) and how fast it went.
     pub(crate) drawn: Vec<Vec2>,
     pub(crate) pace: f32,
-    /// The canvas's undo steps once it was kept: anything done since changes them.
-    pub(crate) steps: u64,
-    /// Its builder as it began (none for a dual brush), and its input.
+    /// Which stroke the canvas counts it as (see `Canvas::step_of_stroke`): once it is laid, its
+    /// step is the last made unless something has been done since.
+    pub(crate) stroke: u64,
+    /// Its builder as it began (none for a brush engine's dual brush), and its input.
     pub(crate) fresh: Option<StrokeBuilder>,
+    /// A dual brush's second as it began.
+    pub(crate) second: Option<SecondAgain>,
     pub(crate) samples: Vec<Sample>,
     /// Its builder as it began (a dual brush's first), for the line a shape is fitted to.
     pub(crate) line: StrokeBuilder,
@@ -222,12 +228,22 @@ impl LastStroke {
     /// The stroke as it can be laid again, given its input.
     fn laid_again(&self, samples: Vec<Sample>) -> Option<DrawnStroke> {
         let builder = self.fresh.clone()?;
-        Some(DrawnStroke { layer: self.layer, style: self.style, builder, samples, seed: self.seed })
+        let second = self.second.clone();
+        Some(DrawnStroke { layer: self.layer, style: self.style, builder, samples, seed: self.seed, second })
     }
 }
 
-/// What a shape's stroke's randomness is seeded with.
+/// What a shape's stroke's randomness is seeded with, and its second's (a dual brush's).
 pub(crate) const SHAPE_SEED: u32 = 0x5eed_1234;
+const SECOND_SHAPE_SEED: u32 = SHAPE_SEED ^ 0x5eed_0002;
+
+/// Begins the canvas's stroke for `stroke` again, as it began: a dual brush's with its second.
+fn begin_again(canvas: &mut Canvas, stroke: &DrawnStroke) {
+    match &stroke.second {
+        Some(second) => canvas.begin_dual_stroke(stroke.layer, stroke.style, second.stroke),
+        None => canvas.begin_stroke(stroke.layer, stroke.style),
+    }
+}
 
 /// The outline is redrawn with samples this far apart (canvas pixels), at the pace its stroke was
 /// drawn: this if that isn't known (canvas pixels a millisecond).
@@ -295,13 +311,14 @@ impl State {
         let Some(mut kept) = self.kept_shape.take().filter(|kept| self.still_stands(kept)) else { return false };
         let Some(canvas) = self.canvas.as_mut() else { return false };
         canvas.undo();
-        canvas.begin_stroke(kept.stroke.layer, kept.stroke.style);
+        begin_again(canvas, &kept.stroke);
         // a brush engine's stroke drawn by it again, as it was
         let mut builder = self.engine_again(kept.stroke.builder.clone(), kept.stroke.layer, kept.stroke.seed);
+        let mut second = kept.stroke.second.as_ref().map(|s| s.fresh.clone());
         let guide = self.doc.stroke_guide();
         let Some(canvas) = self.canvas.as_mut() else { return false };
-        crate::draw_samples(canvas, &mut builder, None, &kept.stroke.samples, &guide);
-        crate::close_stroke(canvas, builder, None, &guide);
+        crate::draw_samples(canvas, &mut builder, second.as_mut(), &kept.stroke.samples, &guide, false);
+        crate::close_stroke(canvas, builder, second, &guide);
         self.flush();
         kept.steps = self.canvas.as_ref().map_or(0, Canvas::steps_made);
         self.unkept_shape = Some(kept);
@@ -317,7 +334,7 @@ impl State {
         }
         let (Some(kept), Some(canvas)) = (self.unkept_shape.take(), self.canvas.as_mut()) else { return false };
         canvas.undo();
-        canvas.begin_stroke(kept.stroke.layer, kept.stroke.style);
+        begin_again(canvas, &kept.stroke);
         self.stroke = Some(kept.stroke.builder.clone());
         self.second = None;
         self.shape = Some(ShapeEdit::new(kept.first, kept.choices, kept.drawn, kept.along, None, Some(kept.stroke)));
@@ -328,12 +345,32 @@ impl State {
 
     /// Redraws the open stroke along the shape's outline.
     fn draw_shape(&mut self) {
+        if let Some(edit) = self.shape.as_mut() {
+            edit.stale = false;
+        }
         let (Some(edit), Some(old)) = (self.shape.as_ref(), self.stroke.as_ref()) else { return };
         // the outline is the path: nothing smooths it, or round its corners
         let builder = StrokeBuilder::with_seed(old.brush().clone(), old.diameter(), old.pointer(), SHAPE_SEED)
             .scaled(self.brush_scale())
-            .exact_path();
+            .exact_path()
+            .drawn_like(old);
+        let builder = crate::pressure::pressed_like(builder, old);
         let samples = edit.samples();
+        // a dual brush's second drawn along it too, as the stroke drew it
+        let scale = self.brush_scale();
+        let mut second = edit.stroke.as_ref().and_then(|s| s.second.as_ref()).map(|s| {
+            let fresh = &s.fresh;
+            let builder =
+                StrokeBuilder::with_seed(fresh.brush().clone(), fresh.diameter(), fresh.pointer(), SECOND_SHAPE_SEED)
+                    .scaled(scale)
+                    .exact_path()
+                    .drawn_like(fresh);
+            crate::pressure::pressed_like(builder, fresh)
+        });
+        let second_stamps = second.as_mut().map(|b| {
+            b.add(&samples);
+            b.finish()
+        });
         // a brush engine's stroke drawn by it along the shape
         let mut builder = self.engine_again(builder, self.doc.current(), SHAPE_SEED);
         builder.add(&samples);
@@ -344,12 +381,23 @@ impl State {
             // nothing drawn ahead of the pen before it snapped stays over the shape
             canvas.set_prediction(&[]);
             canvas.set_tip(&[]);
-            // made a shape, a dual brush's stroke goes on as its first alone
-            canvas.drop_second();
+            match &second_stamps {
+                Some(second) => canvas.replace_second_stamps(&crate::guide::mirrored(&guide, second)),
+                // (a brush engine's dual brush goes on as its first alone)
+                None => canvas.drop_second(),
+            }
             canvas.replace_stamps(&crate::guide::mirrored(&guide, &stamps));
         }
         self.stroke = Some(builder);
-        self.second = None;
+        self.second = second;
+    }
+
+    /// Redraws the open stroke along the shape if it moved since it was last drawn: as a frame is
+    /// drawn, and before it is kept (see [`ShapeEdit::stale`]).
+    pub(crate) fn draw_moved_shape(&mut self) {
+        if self.shape.as_ref().is_some_and(|edit| edit.stale) {
+            self.draw_shape();
+        }
     }
 
     /// The pen still down after a snap moved to `to` (canvas point): the shape turns and grows
@@ -373,7 +421,7 @@ impl State {
             return false;
         }
         edit.shape = shape;
-        self.draw_shape();
+        edit.stale = true;
         true
     }
 
@@ -384,15 +432,15 @@ impl State {
         }
     }
 
-    /// The stroke just kept is remembered, for QuickShape on the last stroke.
+    /// The stroke just kept is remembered, for QuickShape on the last stroke. It is laid by the next
+    /// render, not here: laying it at once held the pen's lift (and the next stroke) up for as long
+    /// as the canvas took to lay it.
     pub(crate) fn remember_last_stroke(&mut self) {
         let Some(mut last) = self.began.take() else { return };
-        // its step is made now, so that a later change shows against it
-        self.flush();
         let Some(canvas) = self.canvas.as_ref() else { return };
         last.drawn = self.drawn.clone();
         last.pace = self.pace();
-        last.steps = canvas.steps_made();
+        last.stroke = canvas.strokes_ended();
         last.samples = std::mem::take(&mut self.drawn_samples);
         self.last_stroke = Some(last);
     }
@@ -462,6 +510,32 @@ fn shape_number(kind: ShapeKind) -> i32 {
 /// The place in a curve's anchors' modes of its `k`th anchor: a closed curve's last is its first.
 fn mode_of(shape: &Shape, k: usize) -> usize {
     if shape.closed_curve() && k == shape.nodes.len().saturating_sub(1) / 3 { 0 } else { k }
+}
+
+/// How a curve's anchors start, as it is fitted: broken where the controls either side turn (by
+/// some 16 degrees or more), so a drag of one leaves the other and the turn stays; smooth elsewhere.
+/// The ends and a closed curve's join start smooth.
+fn initial_curve_modes(shape: &Shape) -> Vec<Anchor> {
+    if shape.kind != ShapeKind::Curve {
+        return Vec::new();
+    }
+    let n = shape.nodes.len().saturating_sub(1) / 3 + 1;
+    (0..n)
+        .map(|k| {
+            let i = k * 3;
+            if i == 0 || i + 1 >= shape.nodes.len() {
+                return Anchor::Smooth;
+            }
+            let (Some(&point), Some(&prior), Some(&next)) =
+                (shape.nodes.get(i), shape.nodes.get(i - 1), shape.nodes.get(i + 1))
+            else {
+                return Anchor::Smooth;
+            };
+            let (incoming, outgoing) = (point - prior, next - point);
+            let lengths = incoming.length() * outgoing.length();
+            if lengths > 1e-5 && incoming.dot(outgoing) < 0.96 * lengths { Anchor::Broken } else { Anchor::Smooth }
+        })
+        .collect()
 }
 
 /// How each of a curve's anchors sits, for its handles to be drawn as.
@@ -639,15 +713,6 @@ fn resample(outline: &[Vec2], along: &StrokeAlong) -> Vec<Sample> {
     out
 }
 
-/// The outline (x and y in turn) of the shape a path of points (x and y in turn) looks like, if
-/// any: a freehand selection held still snaps to it.
-#[uniffi::export]
-pub fn quickshape_outline(points: Vec<f32>) -> Option<Vec<f32>> {
-    let path: Vec<Vec2> = points.as_chunks::<2>().0.iter().map(|&[x, y]| Vec2::new(x, y)).collect();
-    let shape = recognise(&path).into_iter().next()?;
-    Some(shape.outline().into_iter().flat_map(|p| [p.x, p.y]).collect())
-}
-
 #[uniffi::export]
 impl CanvasSession {
     /// The stroke being drawn has been held still: it snaps to the shape it looks like, if any.
@@ -688,7 +753,7 @@ impl CanvasSession {
         }
         let line = st.without_end_hook(last.shape_line(&last.samples, &last.drawn));
         let canvas = st.canvas.as_mut()?;
-        if canvas.steps_made() != last.steps || canvas.can_redo() {
+        if canvas.step_of_stroke(last.stroke) != Some(canvas.steps_made()) || canvas.can_redo() {
             return None;
         }
         let found = st.recognised(&line);
@@ -696,12 +761,17 @@ impl CanvasSession {
         let choices = found.iter().map(|s| s.kind).collect();
         let canvas = st.canvas.as_mut()?;
         canvas.undo();
-        canvas.begin_stroke(last.layer, last.style);
+        match &last.second {
+            Some(second) => canvas.begin_dual_stroke(last.layer, last.style, second.stroke),
+            None => canvas.begin_stroke(last.layer, last.style),
+        }
         let scale = st.brush_scale();
         let stroke = last.laid_again(last.samples.clone());
         let along = StrokeAlong::of(&last.samples, last.pace);
-        st.stroke =
-            Some(StrokeBuilder::with_seed(last.brush, last.diameter, last.pointer.into(), SHAPE_SEED).scaled(scale));
+        let builder = StrokeBuilder::with_seed(last.brush, last.diameter, last.pointer.into(), SHAPE_SEED)
+            .scaled(scale)
+            .drawn_like(&last.line);
+        st.stroke = Some(crate::pressure::pressed_like(builder, &last.line));
         st.second = None;
         st.shape = Some(ShapeEdit::new(first, choices, line, along, None, stroke));
         st.draw_shape();
@@ -747,7 +817,7 @@ impl CanvasSession {
         edit.earlier.push(before);
         edit.later.clear();
         // fitted afresh: the anchors it had are no guide
-        edit.modes.clear();
+        edit.modes = initial_curve_modes(&edit.shape);
         st.draw_shape();
         self.shared.frame(st);
         st.shape_info()
@@ -832,7 +902,7 @@ impl CanvasSession {
             edit.shape.move_handle(index, to);
         }
         refresh_corners(&mut edit.shape, &edit.modes);
-        st.draw_shape();
+        edit.stale = true;
         self.shared.frame(st);
         st.shape_info()
     }
@@ -931,7 +1001,7 @@ impl CanvasSession {
         let edit = st.shape.as_mut()?;
         edit.held = None;
         edit.shape = edit.shape.translated(by);
-        st.draw_shape();
+        edit.stale = true;
         self.shared.frame(st);
         st.shape_info()
     }

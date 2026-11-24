@@ -571,7 +571,9 @@ const SHORTCUTS: &[(&str, &[Entry])] = &[
             desktop(&[alone("r"), (false, true, false, "r")], "Turn the canvas 15° (with Shift, back)").fixed(),
             drag("R and drag", &[alone("r")], "Turn the canvas (with Shift, in 15° steps)"),
             desktop(&[alone("escape")], "Close what is open, or set the canvas upright").fixed(),
-            desktop(&[alone("f11")], "Full screen, or back to a window").fixed(),
+            desktop(&[alone("f11")], "Full screen, or back to a window")
+                .not_mac(&[(false, false, true, "enter")])
+                .fixed(),
             // the view's own moves, with keys only as a plugin gives them (off the desktop, its
             // zooming and fitting too)
             view(&[alone("view:zoom-in"), alone("view:zoom-out")], "Zoom in or out")
@@ -618,6 +620,7 @@ fn key_label(key: &str, mac: bool) -> String {
         ("up", _) => "↑".into(),
         ("down", _) => "↓".into(),
         ("space", _) => "Space".into(),
+        ("enter", _) => "Enter".into(),
         ("=", _) => "+".into(),
         ("-", _) => "−".into(),
         ("plus", _) => "+".into(),
@@ -908,7 +911,9 @@ mod tests {
         assert!(desktop.contains("View\tZoom in\tcommand+=\t0\n"), "{desktop}");
         assert!(desktop.contains("View\tTurn the canvas 15° (with Shift, back)\tr shift+r\t1\n"), "{desktop}");
         assert!(desktop.contains("View\tZoom\tcommand+space\t1\n"), "{desktop}");
-        assert!(desktop.contains("View\tFull screen, or back to a window\tf11\t1\n"), "{desktop}");
+        assert!(desktop.contains("View\tFull screen, or back to a window\tf11 alt+enter\t1\n"), "{desktop}");
+        let mac = shortcuts_told(true, true);
+        assert!(mac.contains("View\tFull screen, or back to a window\tf11\t1\n"), "{mac}");
         // each press told reads back as one
         for fields in desktop.lines().map(|l| l.split('\t').collect::<Vec<_>>()) {
             assert!(KeyCombo::read_all(fields[2]).is_some_and(|p| !p.is_empty()), "{fields:?}");
