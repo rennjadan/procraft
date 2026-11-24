@@ -811,6 +811,7 @@ impl App {
         if self.screen.is_none() {
             return;
         }
+        let began = Instant::now();
         // on OpenGL nothing is drawn while the canvases' pipelines are made (see
         // `Screen::gl_busy`), and nothing that would draw is taken in: looked at again soon (the
         // window answers meanwhile)
@@ -868,6 +869,7 @@ impl App {
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
         let raw = screen.take_input();
+        let before_ui = began.elapsed();
         // an artwork showing: ready to be seen
         self.full.ready(true);
         let full = &mut self.full;
@@ -887,9 +889,22 @@ impl App {
                 veil(ui.ctx(), "Finishing the fill…");
             }
         });
+        let built = began.elapsed();
         let pad_soon = self.studio_pad(&session);
         let Some(screen) = self.screen.as_mut() else { return };
         self.again = screen.draw(Some(&session), self.started, output).map(|after| Instant::now() + after);
+        // a slow frame: what it spent its time on, to find what holds the window up
+        let total = began.elapsed();
+        if total > SLOW_EVENT {
+            log::warn!(
+                "slow canvas frame {} ms: before the interface {} ms (reading, opening), the interface {} ms, \
+                 drawing and showing {} ms",
+                total.as_millis(),
+                before_ui.as_millis(),
+                built.saturating_sub(before_ui).as_millis(),
+                total.saturating_sub(built).as_millis()
+            );
+        }
         if pad_soon {
             self.again = Some(Instant::now());
         }

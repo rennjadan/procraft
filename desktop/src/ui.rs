@@ -2697,6 +2697,9 @@ impl Interface {
                     Some(Act::Cut) => self.cut_layer(session),
                     Some(Act::Copy) => self.copy_layer(session),
                     Some(Act::CopyCanvas) => self.copy_canvas(session),
+                    Some(Act::RetryGraphics) => self
+                        .overlays
+                        .notice("Graphics reset: restart ProCraft to try the best graphics for this device", false),
                     Some(Act::Paste) => self.paste(ctx, false),
                     Some(Act::PastePrivate) => self.paste(ctx, true),
                     // the panel does these itself

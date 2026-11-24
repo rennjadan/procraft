@@ -45,7 +45,7 @@ const NEW_HEADER: f32 = 21.0 + 31.0 + 20.0;
 const PRESETS_MOST: f32 = 376.0;
 /// Above the New canvas list, apart from it: the app's own rows (updates and the artworks'
 /// folder), each this tall, and all they take with the gap under them.
-const APP_ROWS: usize = 4;
+const APP_ROWS: usize = 5;
 const APP_ROW: f32 = 44.0;
 const APP_SECTION: f32 = 14.0 + APP_ROWS as f32 * APP_ROW + 4.0;
 /// A preset row swiped left: how far it slides, and the Edit and Delete it shows.
@@ -1937,6 +1937,7 @@ impl Gallery {
                 ("Updates", crate::update::mode_name(crate::update::mode()).to_owned()),
                 ("Artwork folder", folder_name),
                 ("Open artwork folder", String::new()),
+                ("Open app folder (log)", String::new()),
             ];
             for (k, (label, value)) in rows.iter().enumerate() {
                 let line = Rect::from_min_size(
@@ -1965,7 +1966,8 @@ impl Gallery {
                                 crate::update::restart();
                             }
                         }
-                        _ => crate::files::open_artworks_dir(),
+                        3 => crate::files::open_artworks_dir(),
+                        _ => crate::files::open_app_dir(),
                     }
                 }
             }

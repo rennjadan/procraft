@@ -312,6 +312,27 @@ pub fn gpu_start(order: &[usize]) -> usize {
     start
 }
 
+/// The graphics backend this run draws with, by name ("Starting" before it is made).
+pub fn backend_now() -> &'static str {
+    let Some(index) = run_now().backend else { return "Starting" };
+    match Gpu::backend_name(index).as_str() {
+        "Direct3D 12" => "Direct3D 12",
+        "Vulkan" => "Vulkan",
+        "OpenGL" => "OpenGL",
+        "Metal" => "Metal",
+        _ => "Other",
+    }
+}
+
+/// Forgets which graphics backend to start with: the next start asks again, trying the best for
+/// this GPU first (Direct3D 12 on Intel) and falling back from a failing one as ever.
+pub fn retry_best_graphics() {
+    for name in [GPU_START, GPU_ASKING] {
+        let _ = std::fs::remove_file(files::app_dir().join(name));
+    }
+    log::info!("the graphics backend to start with forgotten: the next start chooses again");
+}
+
 /// Backend `index` is about to be tried for the window: kept as trying until the window's first
 /// frame shows and the canvases' pipelines are made.
 pub fn gpu_trying(index: usize) {

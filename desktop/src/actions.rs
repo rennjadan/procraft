@@ -123,6 +123,9 @@ pub enum Act {
     PenCross,
     /// The edge the taskbar is swiped in from in full screen: the top or the bottom.
     TaskbarEdge,
+    /// The graphics choice forgotten: the next start tries the best one for this GPU again
+    /// (Direct3D 12 on Intel), falling back as ever if it fails.
+    RetryGraphics,
     /// The taskbar swipe in full screen on or off.
     TaskbarSwipe,
     ProjectCanvas,
@@ -391,6 +394,7 @@ fn groups(tab: usize, showing: &Showing, prefs: &Prefs) -> Vec<Vec<Row>> {
                         prefs.taskbar_swipe.then_some(Act::TaskbarEdge),
                     ),
                 ],
+                vec![Button("Graphics", Some(crate::startup::backend_now()), Some(Act::RetryGraphics))],
                 vec![
                     Switch("Light interface", prefs.light_interface, Some(Act::LightInterface)),
                     Switch("Right-hand interface", prefs.right_handed, Some(Act::RightHanded)),
@@ -702,6 +706,11 @@ impl Actions {
                 prefs.taskbar_swipe = !prefs.taskbar_swipe;
                 Some(Act::Prefs)
             }
+            Some(Tapped::Act(Act::RetryGraphics)) => {
+                crate::startup::retry_best_graphics();
+                Some(Act::RetryGraphics)
+            }
+
             Some(Tapped::Act(Act::TaskbarEdge)) => {
                 prefs.taskbar_from_top = !prefs.taskbar_from_top;
                 Some(Act::Prefs)

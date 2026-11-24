@@ -341,6 +341,7 @@ impl Screen {
         started: Instant,
         output: egui::FullOutput,
     ) -> Option<Duration> {
+        let began = Instant::now();
         let egui::FullOutput { platform_output, mut textures_delta, shapes, pixels_per_point, viewport_output } =
             output;
         // a pen read by the app itself (on Wayland) has its cursor set apart from the mouse's
@@ -374,6 +375,7 @@ impl Screen {
         };
         let size = (config.width, config.height);
         let (format, screen) = (config.format, screen_profile(config));
+        let textures_done = began.elapsed();
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f) | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
@@ -384,8 +386,10 @@ impl Screen {
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => return None,
         };
+        let got_frame = began.elapsed();
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
         let canvas_after = session.and_then(|s| s.draw(&view, format, size, screen, started));
+        let canvas_done = began.elapsed();
 
         let (device, queue) = (&self.gpu.device, &self.gpu.queue);
         let jobs = self.egui.egui_ctx().tessellate(shapes, pixels_per_point);
@@ -417,7 +421,19 @@ impl Screen {
             self.renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
         }
         queue.submit(uploads.into_iter().chain([encoder.finish()]));
+        let interface_done = began.elapsed();
         self.window.pre_present_notify();
+        if began.elapsed() > Duration::from_millis(100) {
+            log::warn!(
+                "slow draw {} ms: the interface's pictures {} ms, waiting for the screen {} ms, the canvas {} ms, \
+                 the interface {} ms",
+                began.elapsed().as_millis(),
+                textures_done.as_millis(),
+                got_frame.saturating_sub(textures_done).as_millis(),
+                canvas_done.saturating_sub(got_frame).as_millis(),
+                interface_done.saturating_sub(canvas_done).as_millis()
+            );
+        }
         queue.present(frame);
         // the backend shows: a crash from now on isn't its start's
         crate::startup::gpu_shown();

@@ -195,9 +195,18 @@ pub fn choose_artworks_dir() -> bool {
     true
 }
 
+/// Opens the app's own folder (its log, settings) in the system's file browser.
+pub fn open_app_dir() {
+    open_in_browser(&app_dir());
+}
+
 /// Shows the artworks' folder in the system's file manager.
 pub fn open_artworks_dir() {
-    let dir = artworks_dir();
+    open_in_browser(&artworks_dir());
+}
+
+/// Opens folder `dir` in the system's file browser.
+fn open_in_browser(dir: &std::path::Path) {
     let opener = if cfg!(windows) {
         "explorer"
     } else if cfg!(target_os = "macos") {
@@ -205,7 +214,7 @@ pub fn open_artworks_dir() {
     } else {
         "xdg-open"
     };
-    if let Err(e) = std::process::Command::new(opener).arg(&dir).spawn() {
+    if let Err(e) = std::process::Command::new(opener).arg(dir).spawn() {
         log::warn!("opening {}: {e}", dir.display());
     }
 }
