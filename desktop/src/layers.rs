@@ -115,6 +115,8 @@ const SLOP: f32 = 8.0;
 /// A row slid and let go this fast (points a second) opens or closes by the way it went, however
 /// far it got, as Procreate's do; slower, by how far it got.
 const SWIPE_FLICK: f32 = 280.0;
+/// An open row moving right this fast (points a second) as it's let go closes.
+const SWIPE_CLOSE_FLICK: f32 = 90.0;
 /// Pulled past where it stops, a row goes on this much of the way (it stretches).
 const SWIPE_STRETCH: f32 = 0.3;
 /// How long back a slide's moves tell its speed (seconds).
@@ -279,6 +281,9 @@ pub struct Layers {
     /// speed it was let go at (points a second), which its settling carries on from.
     swipe_track: Vec<(f64, f32)>,
     swipe_speed: HashMap<u64, f32>,
+    /// A row pressed while another was open: the press went to the open one (to close it), so
+    /// its tap doesn't choose this row.
+    closing_from: Option<u64>,
     /// A press on a row's visibility box: whose, since when, and whether holding it has acted.
     box_press: Option<(u64, Instant, bool)>,
     /// The fingers on a touch screen, two put on two rows being pinched, and two put on one row.
@@ -662,16 +667,24 @@ impl Layers {
                                     let way = Way::Undecided;
                                     // a tablet's pen moving the mouse pointer goes as a finger
                                     let mouse = !ui.input(|i| i.any_touches()) && crate::pen::mouse_pen().is_none();
-                                    self.press =
-                                        Some(RowPress { id: l.id, origin, since, way, start: slide, dy: 0.0, mouse });
+                                    // with a row open, a press anywhere in the list is that row's
+                                    // (as in Procreate): slid right it closes it, a tap or a
+                                    // scroll closes it too, and the row under the finger isn't
+                                    // slid, picked or chosen
+                                    let (id, start) = match self.swiped.filter(|&open| open != l.id) {
+                                        Some(open) => {
+                                            self.closing_from = Some(l.id);
+                                            (open, self.slid.get(&open).copied().unwrap_or(0.0))
+                                        }
+                                        None => {
+                                            self.closing_from = None;
+                                            (l.id, slide)
+                                        }
+                                    };
+                                    self.press = Some(RowPress { id, origin, since, way, start, dy: 0.0, mouse });
                                     // a press catches the list gliding
                                     self.fling = 0.0;
                                     self.swipe_track.clear();
-                                    // a press on another row closes the one open (as on the
-                                    // tablet)
-                                    if self.swiped.is_some_and(|open| open != l.id) {
-                                        self.swiped = None;
-                                    }
                                 }
                                 let mut row_ui = ui.new_child(UiBuilder::new().max_rect(row));
                                 row_ui.set_clip_rect(row.intersect(ui.clip_rect()));
@@ -680,7 +693,10 @@ impl Layers {
                                 }
                                 // a tap, not a slide or a hold
                                 if response.clicked() && self.press.is_none_or(|p| p.way == Way::Undecided) {
-                                    tapped = Some(l);
+                                    // a tap that only closed another row's buttons chooses nothing
+                                    if self.closing_from.take() != Some(l.id) {
+                                        tapped = Some(l);
+                                    }
                                     self.swiped = None;
                                 }
                             }
@@ -1470,7 +1486,7 @@ impl Layers {
             match p.way {
                 Way::Undecided => {
                     // an open row takes a nudge right as closing it (a slanting one too)
-                    let closing = open && d.x > SLOP * 0.5 && d.x > d.y.abs() * 0.6;
+                    let closing = open && d.x > SLOP * 0.4 && d.x > d.y.abs() * 0.4;
                     let sideways = closing || d.x.abs() > d.y.abs();
                     if (d.length() > SLOP || closing) && (sideways || !p.mouse) {
                         p.way = if sideways { Way::Swipe } else { Way::Ignored };
@@ -1585,6 +1601,10 @@ impl Layers {
             ctx.request_repaint();
         }
         self.drop_at = None;
+        // an open row's press that was a tap or a scroll closes it
+        if open && matches!(p.way, Way::Undecided | Way::Ignored) {
+            self.swiped = None;
+        }
         match p.way {
             Way::Swipe => {
                 let slide = self.slid.get(&p.id).copied().unwrap_or(0.0);
@@ -1603,10 +1623,12 @@ impl Layers {
                 } else {
                     // flicked, the way it went decides; otherwise how far: open, a fifth of the
                     // way back closes it, closed, half the way opens it
-                    let opened = if speed.abs() >= SWIPE_FLICK {
+                    let opened = if open {
+                        // open, any flick right or a small push back closes it
+                        speed > -SWIPE_FLICK && slide < -reach * 0.9 && speed <= SWIPE_CLOSE_FLICK
+                            || speed <= -SWIPE_FLICK
+                    } else if speed.abs() >= SWIPE_FLICK {
                         speed < 0.0 && slide < 0.0
-                    } else if open {
-                        slide < -reach * 0.8
                     } else {
                         slide < -reach / 2.0
                     };
