@@ -115,8 +115,6 @@ const SLOP: f32 = 8.0;
 /// A row slid and let go this fast (points a second) opens or closes by the way it went, however
 /// far it got, as Procreate's do; slower, by how far it got.
 const SWIPE_FLICK: f32 = 280.0;
-/// An open row moving right this fast (points a second) as it's let go closes.
-const SWIPE_CLOSE_FLICK: f32 = 90.0;
 /// Pulled past where it stops, a row goes on this much of the way (it stretches).
 const SWIPE_STRETCH: f32 = 0.3;
 /// How long back a slide's moves tell its speed (seconds).
@@ -154,6 +152,9 @@ struct RowPress {
     start: f32,
     dy: f32,
     mouse: bool,
+    /// The farthest right it has gone (points): on an open row, any real move right closes it
+    /// however it's let go (a finger lifting off rolls back a little).
+    most_right: f32,
 }
 
 /// The blend editor open under a layer's row: how far its modes are scrolled (points, the first
@@ -681,7 +682,16 @@ impl Layers {
                                             (l.id, slide)
                                         }
                                     };
-                                    self.press = Some(RowPress { id, origin, since, way, start, dy: 0.0, mouse });
+                                    self.press = Some(RowPress {
+                                        id,
+                                        origin,
+                                        since,
+                                        way,
+                                        start,
+                                        dy: 0.0,
+                                        mouse,
+                                        most_right: 0.0,
+                                    });
                                     // a press catches the list gliding
                                     self.fling = 0.0;
                                     self.swipe_track.clear();
@@ -1482,6 +1492,7 @@ impl Layers {
         let l = layers.iter().find(|l| l.id == p.id);
         let reach = l.map_or(0.0, swipe_reach);
         let open = self.swiped == Some(p.id);
+        p.most_right = p.most_right.max(d.x);
         if down {
             match p.way {
                 Way::Undecided => {
@@ -1601,9 +1612,15 @@ impl Layers {
             ctx.request_repaint();
         }
         self.drop_at = None;
-        // an open row's press that was a tap or a scroll closes it
-        if open && matches!(p.way, Way::Undecided | Way::Ignored) {
+        // an open row's press closes it: a tap, a scroll, or any real move right, whatever way it
+        // was let go; only one slid on left (or not at all) keeps it open
+        if open && (matches!(p.way, Way::Undecided | Way::Ignored) || p.most_right > SLOP * 0.75) {
             self.swiped = None;
+            if p.way == Way::Swipe {
+                self.swipe_track.clear();
+                self.swipe_speed.remove(&p.id);
+                return;
+            }
         }
         match p.way {
             Way::Swipe => {
@@ -1624,9 +1641,8 @@ impl Layers {
                     // flicked, the way it went decides; otherwise how far: open, a fifth of the
                     // way back closes it, closed, half the way opens it
                     let opened = if open {
-                        // open, any flick right or a small push back closes it
-                        speed > -SWIPE_FLICK && slide < -reach * 0.9 && speed <= SWIPE_CLOSE_FLICK
-                            || speed <= -SWIPE_FLICK
+                        // open and not moved right: it stays open unless pushed back a tenth
+                        slide < -reach * 0.9
                     } else if speed.abs() >= SWIPE_FLICK {
                         speed < 0.0 && slide < 0.0
                     } else {
