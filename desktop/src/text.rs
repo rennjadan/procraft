@@ -242,6 +242,9 @@ pub struct TextEditor {
 }
 
 /// The view as [`CanvasSession::view_matrix`] gives it.
+/// How far round a text's box a tap on it may land (points).
+const TAP_REACH: f32 = 20.0;
+
 fn matrix(session: &CanvasSession) -> [f32; 6] {
     let v = session.view_matrix();
     v.get(..6).and_then(|m| <[f32; 6]>::try_from(m).ok()).unwrap_or([1.0, 0.0, 0.0, 1.0, 0.0, 0.0])
@@ -418,6 +421,23 @@ impl TextEditor {
             }
             None => _ = session.draw_text_into_layer(),
         }
+    }
+
+    /// Whether the press just now landed on text layer `id`'s text (its box, or a finger's width
+    /// round it), as a tap on the text edits it in Procreate (one elsewhere doesn't).
+    pub fn pressed_on(&self, ctx: &egui::Context, session: &CanvasSession, id: u64) -> bool {
+        let Some(at) = ctx.input(|i| i.pointer.press_origin().or(i.pointer.interact_pos())) else { return false };
+        let Some(info) = session.layer_text(id) else { return false };
+        let m = matrix(session);
+        let ppp = ctx.pixels_per_point();
+        let Some((x, y)) = to_canvas(m, ppp, at) else { return false };
+        let b = procraft_core::text_box(info);
+        let [l, t, w, h] = [0, 1, 2, 3].map(|i| b.get(i).copied().unwrap_or(0.0));
+        // a finger's width round it, in canvas pixels at this zoom
+        let [a, bb, c, d, _, _] = m;
+        let scale = (a * d - bb * c).abs().sqrt().max(1e-3);
+        let reach = TAP_REACH * ppp / scale;
+        x >= l - reach && x <= l + w + reach && y >= t - reach && y <= t + h + reach
     }
 
     /// Ends editing text: `keep` makes it one undo step, otherwise it goes back.

@@ -1064,9 +1064,46 @@ pub struct Pickers {
     /// made: kept while that is the colour, not worked out again from it (a dark or greyish
     /// colour's would wander, and black's be lost).
     harmony_held: Option<(u32, [f32; 3])>,
+    /// A double-tap, as Procreate's: when and where the last tap on a picker lifted, and whether
+    /// the press now down snapped (held there, its finger's moves ignored, until it lifts).
+    last_tap: Option<(f64, Pos2)>,
+    snap_held: bool,
 }
 
+/// A double-tap's second tap lands within this long of the first lifting, and this near it.
+const DOUBLE_TAP_S: f64 = 0.4;
+const DOUBLE_TAP_REACH: f32 = 36.0;
+
 impl Pickers {
+    /// Whether a press on `response` just now is the second tap of a double-tap (a snap: held
+    /// until it lifts), or the press of one is still down. Taps that lift are kept for the next.
+    fn double_tap(&mut self, ui: &Ui, response: &egui::Response) -> bool {
+        let (now, pressed, origin) = ui.input(|i| (i.time, i.pointer.any_pressed(), i.pointer.press_origin()));
+        if pressed
+            && let Some(at) = origin
+            && response.rect.contains(at)
+        {
+            let second = self
+                .last_tap
+                .is_some_and(|(when, was)| now - when <= DOUBLE_TAP_S && was.distance(at) <= DOUBLE_TAP_REACH);
+            self.snap_held = second;
+            if second {
+                self.last_tap = None;
+                return true;
+            }
+        }
+        if response.clicked() {
+            if !self.snap_held {
+                self.last_tap = response.interact_pointer_pos().or(origin).map(|at| (now, at));
+            }
+            self.snap_held = false;
+        } else if response.drag_stopped() {
+            self.snap_held = false;
+            self.last_tap = None;
+        }
+        false
+    }
+
     /// The disc picker in `rect` (364 square, or smaller and scaled alike): a hue ring (radii 124
     /// to 182, its hues running anticlockwise from the right) round the saturation/brightness disc
     /// (radius 105). Returns whether it changed `hsv`.
@@ -1078,35 +1115,36 @@ impl Pickers {
         let centre = rect.center();
         let before = *hsv;
         let response = ui.interact(rect, ui.scope_id().with("disc"), Sense::click_and_drag());
-        if let Some(p) = response.interact_pointer_pos() {
+        // double-tapped, as Procreate's: the ring snaps to the nearest primary or secondary hue
+        // (red, yellow, green, cyan, blue, magenta), the disc to the nearest of white, black and
+        // the pure hue; the second tap held there till it lifts
+        let snap = self.double_tap(ui, &response);
+        if let Some(p) = response.interact_pointer_pos().filter(|_| !self.snap_held || snap) {
             let d = p - centre;
             let ring = *self.on_ring.get_or_insert(d.length() > (disc_radius + ring_inner) / 2.0);
             if ring {
                 let turn = ((-d.y).atan2(d.x) / std::f32::consts::TAU + 1.0) % 1.0;
                 hsv[0] = self.model.ring_hue(turn);
+                if snap {
+                    hsv[0] = self.model.ring_hue(nearest_primary_turn(self.model, hsv[0]));
+                }
+            } else if snap {
+                let at = d / disc_radius;
+                let model = self.model;
+                let nearest = snap_points(hsv[0])
+                    .into_iter()
+                    .map(|c| {
+                        let [x, y] = model.disc_point(c);
+                        (c, (vec2(x, y) - at).length())
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1));
+                if let Some((c, _)) = nearest {
+                    *hsv = c;
+                }
             } else {
                 // (HSY′'s disc is Krita's wheel: hue round it and saturation out, worked out on
                 // linear light at the colour's luma; the ring and sliders on the encoded values)
                 *hsv = self.model.disc_pick(*hsv, [d.x / disc_radius, d.y / disc_radius]);
-            }
-        }
-        // double-tapped inside the disc, the colour snaps to the nearest of its nine points (white,
-        // black, the pure hue, the greys and tints between), as Procreate's does
-        if response.double_clicked()
-            && let Some(p) = response.interact_pointer_pos()
-            && (p - centre).length() <= disc_radius * 1.08
-        {
-            let at = (p - centre) / disc_radius;
-            let model = self.model;
-            let nearest = snap_points(hsv[0])
-                .into_iter()
-                .map(|c| {
-                    let [x, y] = model.disc_point(c);
-                    (c, (vec2(x, y) - at).length())
-                })
-                .min_by(|a, b| a.1.total_cmp(&b.1));
-            if let Some((c, _)) = nearest {
-                *hsv = c;
             }
         }
         if !response.is_pointer_button_down_on() {
@@ -1161,15 +1199,15 @@ impl Pickers {
         let ppp = ctx.pixels_per_point();
         let before = *hsv;
         let response = ui.interact(square, ui.scope_id().with("classic square"), Sense::click_and_drag());
-        if let Some(p) = response.interact_pointer_pos() {
+        let snap = self.double_tap(ui, &response);
+        if let Some(p) = response.interact_pointer_pos().filter(|_| !self.snap_held || snap) {
             hsv[1] = ((p.x - square.left()) / square.width()).clamp(0.0, 1.0);
             hsv[2] = 1.0 - ((p.y - square.top()) / square.height()).clamp(0.0, 1.0);
-        }
-        // double-tapped, the nearest of its corners, edges' middles and middle (pure white, black,
-        // the pure hue...)
-        if response.double_clicked() {
-            hsv[1] = (hsv[1] * 2.0).round() / 2.0;
-            hsv[2] = (hsv[2] * 2.0).round() / 2.0;
+            // double-tapped, the nearest corner: white, the pure hue, or black (either lower one)
+            if snap {
+                hsv[1] = hsv[1].round();
+                hsv[2] = hsv[2].round();
+            }
         }
         let hue_key = (hsv[0] * 10_000.0).round() as u32;
         let side = (square.width() * ppp).round() as usize;
@@ -2351,21 +2389,55 @@ pub fn rgb_to_hsv([r, g, b]: [f32; 3]) -> [f32; 3] {
     [h / 6.0, if max > 0.0 { d / max } else { 0.0 }, max]
 }
 
-/// The nine points a double-tap on the disc snaps to, for hue `h`: every saturation and
-/// brightness of none, half and all (all of them black at no brightness).
+/// The points a double-tap on the disc snaps to, for hue `h`: white, black and the pure hue.
 fn snap_points(h: f32) -> Vec<[f32; 3]> {
-    let mut points = Vec::with_capacity(9);
-    for s in [0.0, 0.5, 1.0] {
-        for v in [0.0, 0.5, 1.0] {
-            points.push([h, s, v]);
-        }
-    }
-    points
+    // (black is every saturation at no brightness: each place it shows on the disc)
+    vec![[h, 0.0, 1.0], [h, 1.0, 1.0], [h, 0.0, 0.0], [h, 0.5, 0.0], [h, 1.0, 0.0]]
+}
+
+/// Where on `model`'s ring the primary or secondary hue nearest `hue` is (red, yellow, green,
+/// cyan, blue, magenta): the ring's turn of the one whose pure colour is nearest it in sRGB.
+fn nearest_primary_turn(model: ColourModel, hue: f32) -> f32 {
+    const PRIMARIES: [[f32; 3]; 6] =
+        [[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 1.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 1.0]];
+    // each primary's place on the ring, found by stepping round it
+    let place = |target: [f32; 3]| {
+        (0..720)
+            .map(|i| i as f32 / 720.0)
+            .min_by(|a, b| {
+                let far = |t: f32| {
+                    let c = model.pure(model.ring_hue(t));
+                    c.iter().zip(target).map(|(a, b)| (a - b).powi(2)).sum::<f32>()
+                };
+                far(*a).total_cmp(&far(*b))
+            })
+            .unwrap_or(0.0)
+    };
+    let at = model.ring_turn(hue);
+    let round = |a: f32, b: f32| {
+        let d = (a - b).abs() % 1.0;
+        d.min(1.0 - d)
+    };
+    PRIMARIES.into_iter().map(place).min_by(|a, b| round(*a, at).total_cmp(&round(*b, at))).unwrap_or(at)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_double_tap_on_the_ring_finds_the_nearest_primary_or_secondary() {
+        let m = ColourModel::Hsb;
+        let near = |hue: f32| m.ring_hue(nearest_primary_turn(m, hue));
+        assert!((near(0.04) - 0.0).abs() < 0.01 || (near(0.04) - 1.0).abs() < 0.01, "orange-red to red");
+        assert!((near(0.62) - 4.0 / 6.0).abs() < 0.01, "a blue to blue: {}", near(0.62));
+        assert!((near(0.97) - 0.0).abs() < 0.01 || (near(0.97) - 1.0).abs() < 0.01, "round past magenta to red");
+        assert!((near(0.15) - 1.0 / 6.0).abs() < 0.01, "to yellow");
+        // the disc's points: white, the pure hue and black
+        let points = snap_points(0.3);
+        assert!(points.contains(&[0.3, 0.0, 1.0]) && points.contains(&[0.3, 1.0, 1.0]));
+        assert!(points.iter().filter(|p| p[2] == 0.0).count() >= 1 && points.len() == 5);
+    }
 
     #[test]
     fn harmony_keeps_its_hue_and_saturation_through_black() {

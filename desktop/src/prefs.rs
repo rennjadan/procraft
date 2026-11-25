@@ -430,15 +430,27 @@ fn pick<T: Copy>(list: &[T], value: &str) -> Option<T> {
 /// artwork's are made pixels as it opens).
 pub const VECTOR_PLUGIN: &str = "io.github.artcraftandroid.vector-layers";
 
-/// `plugins` with the vector layers plugin switched off.
+/// `plugins` without the vector layers plugin: switched off and taken off the list, so it is
+/// offered nowhere (no Vector layer to add, no switch for it in Plugins).
 pub fn no_vector(plugins: std::sync::Arc<Plugins>) -> std::sync::Arc<Plugins> {
     plugins.set_on(VECTOR_PLUGIN.to_owned(), false);
+    plugins.remove_listed(VECTOR_PLUGIN.to_owned());
     plugins
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_layers_are_offered_nowhere() {
+        let dir = std::env::temp_dir().join(format!("procraft-prefs-no-vector-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugins = super::no_vector(Plugins::with_bundled(dir.to_string_lossy().into_owned()));
+        assert!(!plugins.plugins().iter().any(|p| p.id == super::VECTOR_PLUGIN), "not listed at all");
+        assert!(plugins.plugins().len() > 3, "the others stay");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_pen_button_runs_a_plugin_s_action_while_its_plugin_is_on_else_as_pen_buttons_say() {

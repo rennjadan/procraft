@@ -2339,6 +2339,20 @@ impl Plugins {
     /// Turns a plugin on or off; false if no file is `id`. It goes on its hooks or off them at once,
     /// no restart: off them the app is as it was, and its values wait for it. One that can't start
     /// stays off, and says why.
+    /// Takes the plugin `id` off the list altogether (stopped, and not offered anywhere): whether
+    /// it was there.
+    pub fn remove_listed(&self, id: String) -> bool {
+        let mut list = self.listed();
+        let before = list.files.len();
+        list.files.retain(|p| p.id != id);
+        let removed = list.files.len() != before;
+        drop(list);
+        if removed {
+            self.take_off(&id);
+        }
+        removed
+    }
+
     pub fn set_on(&self, id: String, on: bool) -> bool {
         let mut list = self.listed();
         let Listed { files, shapes, .. } = &mut *list;

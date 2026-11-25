@@ -1712,11 +1712,13 @@ impl Interface {
                 // a press on the canvas with a panel open: dragged or held, it goes on; a tap only
                 // closes the panel
                 TouchCommand::PanelFades | TouchCommand::PanelTapped => self.open = None,
-                // a touch on the canvas with a text layer chosen edits its text (as on the tablet);
-                // rasterizing stays the layer's own option
+                // a tap on the chosen text layer's text edits it, as in Procreate; a touch elsewhere
+                // does nothing (one that just ended an edit doesn't open it again). Rasterizing
+                // stays the layer's own option
                 TouchCommand::TextLayer => {
                     let current = session.layers().into_iter().find(|l| l.current);
                     match current {
+                        Some(l) if !self.text.pressed_on(ctx, session, l.id) => {}
                         Some(l) if l.locked => self.overlays.notice("This text layer is locked", false),
                         Some(l) if !self.text.editing() && self.text.edit(session, l.id) => {}
                         _ => {}
