@@ -1669,8 +1669,11 @@ impl Layers {
     /// alone, every layer shows again); held, it shows alone (or, alone already, every layer shows
     /// again), a notice saying which.
     fn visibility_touch(&mut self, ui: &Ui, session: &CanvasSession, l: &LayerInfo, rect: Rect) {
-        let response = ui.interact(rect, ui.scope_id().with(("visible", l.id)), Sense::click_and_drag());
-        if response.is_pointer_button_down_on() {
+        // taps (and a hold) only: a drag that starts on it slides or scrolls the row's list, and
+        // isn't a hold
+        let response = ui.interact(rect, ui.scope_id().with(("visible", l.id)), Sense::click());
+        let still = self.press.is_none_or(|p| p.way == Way::Undecided);
+        if response.is_pointer_button_down_on() && still {
             let (id, since, done) = self.box_press.get_or_insert((l.id, Instant::now(), false));
             if *id == l.id && !*done {
                 let held = since.elapsed();
@@ -2037,8 +2040,8 @@ impl Layers {
                 Weight::SemiBold,
                 letter,
             );
-            // it takes drags too, so a press on it is never the row's
-            blend_tapped = ui.interact(blend, ui.scope_id().with(("blend", l.id)), Sense::click_and_drag()).clicked();
+            // taps only: a drag that starts on it slides the row (a tap is still its own)
+            blend_tapped = ui.interact(blend, ui.scope_id().with(("blend", l.id)), Sense::click()).clicked();
         }
         check_box(ui, look, visibility.center(), l.visible && !l.soloed_out, box_fill);
         self.visibility_touch(ui, session, l, visibility);
