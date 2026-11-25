@@ -835,10 +835,7 @@ impl Actions {
                 prefs.taskbar_swipe = !prefs.taskbar_swipe;
                 Some(Act::Prefs)
             }
-            Some(Tapped::Act(Act::RetryGraphics)) => {
-                crate::startup::retry_best_graphics();
-                Some(Act::RetryGraphics)
-            }
+            Some(Tapped::Act(Act::RetryGraphics)) => Some(Act::RetryGraphics),
 
             Some(Tapped::Act(Act::TaskbarEdge)) => {
                 prefs.taskbar_from_top = !prefs.taskbar_from_top;

@@ -126,11 +126,13 @@ pub fn take_ready() -> Option<&'static str> {
     if !READY.swap(false, Ordering::Relaxed) {
         return None;
     }
-    Some(if MOVING.load(Ordering::Relaxed) { "Moving your artworks\u{2026}" } else { "Updating ProCraft\u{2026}" })
+    let said = *SAYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Some(said.unwrap_or("Updating ProCraft\u{2026}"))
 }
 
-/// The app closes to move the artworks' folder, not for an update.
-static MOVING: AtomicBool = AtomicBool::new(false);
+/// What the app closes for when it isn't an update (the artworks' folder moving, the graphics
+/// changing), said on its curtain.
+static SAYING: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
 
 /// Whether this copy can update itself at all.
 pub fn available() -> bool {
@@ -182,6 +184,11 @@ pub fn tap() {
 
 /// Closes the app as its close button would and opens it again (the artworks' folder moved).
 pub fn restart() {
+    restart_saying("Moving your artworks\u{2026}");
+}
+
+/// Closes the app as its close button would and opens it again, `said` on its curtain.
+pub fn restart_saying(said: &'static str) {
     let reopened = std::env::current_exe()
         .map_err(|e| e.to_string())
         .and_then(|exe| {
@@ -193,7 +200,7 @@ pub fn restart() {
         });
     match (reopened, APP.get()) {
         (Ok(()), Some((_, wake))) if cfg!(windows) => {
-            MOVING.store(true, Ordering::Relaxed);
+            *SAYING.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(said);
             READY.store(true, Ordering::Relaxed);
             let _ = wake.send_event(());
         }

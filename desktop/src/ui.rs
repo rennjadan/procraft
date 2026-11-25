@@ -220,6 +220,8 @@ pub struct Interface {
     blocked: Option<(Blocked, u64)>,
     blocked_alert: Alert,
     model_warning_alert: Alert,
+    /// Which graphics to draw with, from Settings' Graphics row.
+    graphics_alert: Alert,
     /// Share's PDF asks how well it keeps its pictures first (for this format).
     pdf_alert: Alert,
     pdf_for: Option<Format>,
@@ -352,6 +354,7 @@ impl Interface {
             blocked: None,
             blocked_alert: Alert::default(),
             model_warning_alert: Alert::default(),
+            graphics_alert: Alert::default(),
             pdf_alert: Alert::default(),
             pdf_for: None,
             plugin_alert: Alert::default(),
@@ -1258,6 +1261,18 @@ impl Interface {
         self.quick_menu(&ctx, session);
         self.blocked_alert(&ctx, session);
         _ = self.model_warning_alert.show(&ctx, &mut self.look);
+        if let Some(answer) = self.graphics_alert.show(&ctx, &mut self.look) {
+            let chosen = match answer {
+                Answer::Action => Some("Direct3D 12"),
+                Answer::First => Some("Vulkan"),
+                Answer::Extra => Some("OpenGL"),
+                Answer::Cancel => None,
+            };
+            if let Some(name) = chosen {
+                crate::startup::choose_graphics(name);
+                crate::update::restart_saying("Changing the graphics\u{2026}");
+            }
+        }
         self.pdf_quality_alert(&ctx);
         self.plugin_alert(&ctx);
         self.export_card.show(&ctx, &mut self.look);
@@ -3389,9 +3404,20 @@ impl Interface {
             Some(Act::Cut) => self.cut_layer(session),
             Some(Act::Copy) => self.copy_layer(session),
             Some(Act::CopyCanvas) => self.copy_canvas(session),
-            Some(Act::RetryGraphics) => {
-                self.overlays.notice("Graphics reset: restart ProCraft to try the best graphics for this device", false)
-            }
+            Some(Act::RetryGraphics) => self.graphics_alert.ask(Asking {
+                title: "Graphics".into(),
+                message: format!(
+                    "ProCraft draws with {} now. Choose one: your artwork is saved and ProCraft restarts on it. \
+                     Direct3D 12 suits Surface and other Intel graphics best.",
+                    crate::startup::backend_now()
+                ),
+                action: "Direct3D 12".into(),
+                icon: None,
+                destructive: false,
+                extra: Some("OpenGL".into()),
+                first: Some("Vulkan".into()),
+                alone: false,
+            }),
             Some(Act::Paste) => self.paste(ctx, false),
             Some(Act::PastePrivate) => self.paste(ctx, true),
             // the panel does these itself

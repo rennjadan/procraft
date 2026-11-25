@@ -49,6 +49,8 @@ const GPU_START: &str = "gpu-start.txt";
 const GPU_ASKING: &str = "gpu-asking.txt";
 /// A note that the next start chooses the graphics backend again (see [`retry_best_graphics`]).
 const GPU_RETRY: &str = "gpu-retry.txt";
+/// The graphics backend chosen in Settings ("Direct3D 12", "Vulkan", "OpenGL"): tried first.
+const GPU_CHOICE: &str = "gpu-choice.txt";
 /// How far the app last got with a tablet driver's WinTab, and the version that got there.
 #[cfg_attr(not(windows), allow(dead_code))]
 const WINTAB: &str = "wintab.txt";
@@ -200,6 +202,42 @@ pub fn backend_order() -> &'static [usize] {
     static ORDER: OnceLock<Vec<usize>> = OnceLock::new();
     ORDER.get_or_init(|| {
         forget_graphics_if_asked();
+        let order = usual_order();
+        // the one chosen in Settings first, the rest after it as they were (to fall back to)
+        let chosen = if Gpu::backends_named() { None } else { graphics_choice() };
+        let Some(at) = chosen.and_then(|name| order.iter().position(|&i| Gpu::backend_name(i) == name)) else {
+            return order;
+        };
+        let mut order = order;
+        let first = order.remove(at);
+        order.insert(0, first);
+        log::info!("graphics backend {first} ({}) first, as chosen in Settings", Gpu::backend_name(first));
+        order
+    })
+}
+
+/// The graphics backend chosen in Settings, if one is.
+pub fn graphics_choice() -> Option<&'static str> {
+    let saved = std::fs::read_to_string(files::app_dir().join(GPU_CHOICE)).unwrap_or_default();
+    GRAPHICS.iter().copied().find(|name| *name == saved.trim())
+}
+
+/// The graphics backends that can be chosen in Settings.
+pub const GRAPHICS: [&str; 3] = ["Direct3D 12", "Vulkan", "OpenGL"];
+
+/// Chooses graphics backend `name` (of [`GRAPHICS`]) for the next start: tried first, and the
+/// record of the one used forgotten so it isn't kept instead.
+pub fn choose_graphics(name: &str) {
+    if let Err(e) = files::write_whole(&files::app_dir().join(GPU_CHOICE), name.as_bytes()) {
+        log::warn!("keeping the graphics chosen: {e}");
+    }
+    retry_best_graphics();
+    log::info!("graphics chosen in Settings: {name}");
+}
+
+/// The order of the backends without a choice in Settings (see [`backend_order`]).
+fn usual_order() -> Vec<usize> {
+    {
         let backends = Gpu::backends();
         let listed: Vec<usize> = (0..backends.len()).collect();
         // asked only where it changes anything: not with a backend named by hand, and not where
@@ -243,7 +281,7 @@ pub fn backend_order() -> &'static [usize] {
             None => log::info!("Direct3D 12 lists no GPU to draw with ({took} ms): the backends in their order"),
         }
         order
-    })
+    }
 }
 
 /// The GPU Direct3D 12 would draw with (see [`drawn_with`]), as it lists them, once a run, and how
