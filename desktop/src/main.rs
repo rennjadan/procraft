@@ -472,6 +472,17 @@ fn set_app_identity() {
 fn set_app_identity() {}
 
 /// The app's icon, for the window's title bar and the task bar.
+/// On Windows, the app's icon at `size` pixels from its .exe (the .ico built in as resource 1,
+/// drawn at each size Windows shows), so the title bar and task bar show it crisp rather than the
+/// 256-pixel picture squeezed down by the system.
+#[cfg(windows)]
+fn exe_icon(size: u32) -> Option<winit::window::Icon> {
+    use winit::platform::windows::IconExtWindows;
+    winit::window::Icon::from_resource(1, Some(winit::dpi::PhysicalSize::new(size, size)))
+        .inspect_err(|e| log::warn!("the app's icon from its .exe at {size} pixels: {e}"))
+        .ok()
+}
+
 fn window_icon() -> Option<winit::window::Icon> {
     let picture = image::load_from_memory(include_bytes!("../../assets/app-icon/procraft-256.png")).ok()?;
     let rgba = picture.into_rgba8();
@@ -522,9 +533,16 @@ impl ApplicationHandler for App {
         if self.screen.is_some() {
             return;
         }
+        // the title bar's icon is 16 points, the task bar's 32, at the screen's scale
+        #[cfg(windows)]
+        let scale = event_loop.primary_monitor().map_or(1.0, |m| m.scale_factor());
+        #[cfg(windows)]
+        let small = exe_icon((16.0 * scale).round() as u32).or_else(window_icon);
+        #[cfg(not(windows))]
+        let small = window_icon();
         let attributes = Window::default_attributes()
             .with_title("ProCraft")
-            .with_window_icon(window_icon())
+            .with_window_icon(small)
             .with_inner_size(LogicalSize::new(1440.0, 900.0))
             .with_min_inner_size(LogicalSize::new(640.0, 480.0))
             // opened for a test (PROCRAFT_BACKGROUND set), it leaves the keyboard where it was
@@ -535,6 +553,11 @@ impl ApplicationHandler for App {
             // filling the screen, not where the system happens to put it
             .with_maximized(true)
             .with_fullscreen(self.full.wanted.then_some(winit::window::Fullscreen::Borderless(None)));
+        #[cfg(windows)]
+        let attributes = {
+            use winit::platform::windows::WindowAttributesExtWindows;
+            attributes.with_taskbar_icon(exe_icon((32.0 * scale).round() as u32).or_else(window_icon))
+        };
         // on Linux the desktop's menus match the window to the app's entry (procraft.desktop)
         #[cfg(target_os = "linux")]
         let attributes = {
