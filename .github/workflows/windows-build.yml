@@ -163,6 +163,16 @@ jobs:
             *) upstream="UPSTREAM-CONFLICT: the developer's newest changes clash with Renn's (${THEIRS:0:7})" ;;
           esac
           printf '%s\n\nRenn'"'"'s version %s.\n\nKEY: %s\n' "$upstream" "${OURS:0:7}" "$KEY" >notes.md
-          gh release create "build-$BUILD" dist/*.msi dist/*.zip \
-            --repo "$GITHUB_REPOSITORY" --target "$OURS" --latest \
-            --title "ProCraft (Renn) build $BUILD" --notes-file notes.md
+          # GitHub's releases sometimes answer 502 for a while: try again, clearing what a failed
+          # try left behind
+          for try in 1 2 3 4 5; do
+            if gh release create "build-$BUILD" dist/*.msi dist/*.zip \
+              --repo "$GITHUB_REPOSITORY" --target "$OURS" --latest \
+              --title "ProCraft (Renn) build $BUILD" --notes-file notes.md; then
+              exit 0
+            fi
+            echo "publishing failed (try $try): trying again in $((try * 30)) s"
+            gh release delete "build-$BUILD" --repo "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+            sleep $((try * 30))
+          done
+          exit 1
