@@ -112,6 +112,15 @@ const SWIPE_DELETE: u32 = 0xFFFF473D;
 const PICK_REACH: f32 = 72.0;
 /// A press moved this far (points) slides its row; held still this long, it is a hold.
 const SLOP: f32 = 8.0;
+/// A row slid and let go this fast (points a second) opens or closes by the way it went, however
+/// far it got, as Procreate's do; slower, by how far it got.
+const SWIPE_FLICK: f32 = 280.0;
+/// Pulled past where it stops, a row goes on this much of the way (it stretches).
+const SWIPE_STRETCH: f32 = 0.3;
+/// How long back a slide's moves tell its speed (seconds).
+const SWIPE_WINDOW: f64 = 0.08;
+/// The settling spring's stiffness (a second², about a fifth of a second to settle).
+const SETTLE_STIFFNESS: f32 = 400.0;
 const HOLD: std::time::Duration = std::time::Duration::from_millis(400);
 /// A dragged row this near an end of the list scrolls it, at most this far a second.
 const DRAG_EDGE: f32 = 56.0;
@@ -266,6 +275,10 @@ pub struct Layers {
     /// to a stop; and the finger's recent moves (when, how far down) to tell a flick's speed.
     fling: f32,
     moves: Vec<(f64, f32)>,
+    /// A row being slid: its recent places (when, how far), to tell a flick's speed; and the
+    /// speed it was let go at (points a second), which its settling carries on from.
+    swipe_track: Vec<(f64, f32)>,
+    swipe_speed: HashMap<u64, f32>,
     /// A press on a row's visibility box: whose, since when, and whether holding it has acted.
     box_press: Option<(u64, Instant, bool)>,
     /// The fingers on a touch screen, two put on two rows being pinched, and two put on one row.
@@ -653,6 +666,7 @@ impl Layers {
                                         Some(RowPress { id: l.id, origin, since, way, start: slide, dy: 0.0, mouse });
                                     // a press catches the list gliding
                                     self.fling = 0.0;
+                                    self.swipe_track.clear();
                                     // a press on another row closes the one open (as on the
                                     // tablet)
                                     if self.swiped.is_some_and(|open| open != l.id) {
@@ -1340,9 +1354,20 @@ impl Layers {
                 }
                 continue;
             };
-            *v += (to - *v) * (dt * 14.0).min(1.0);
-            if (to - *v).abs() < 0.5 {
+            // a spring, critically damped, carrying on from the speed it was let go at: it eases in
+            // without a bounce, a flick arriving quicker (in small steps, steady on a slow frame)
+            let k = SETTLE_STIFFNESS;
+            let speed = self.swipe_speed.entry(l.id).or_insert(0.0);
+            let steps = (dt * 240.0).ceil().max(1.0);
+            let step = dt / steps;
+            for _ in 0..steps as u32 {
+                let accel = k * (to - *v) - 2.0 * k.sqrt() * *speed;
+                *speed += accel * step;
+                *v += *speed * step;
+            }
+            if (to - *v).abs() < 0.5 && speed.abs() < 20.0 {
                 *v = to;
+                self.swipe_speed.remove(&l.id);
             } else {
                 ctx.request_repaint();
             }
@@ -1455,6 +1480,12 @@ impl Layers {
                             self.moves = vec![(ctx.input(|i| i.time), d.y)];
                             ctx.request_repaint();
                         }
+                    } else if open {
+                        // an open row is only ever slid back (or tapped): a pen resting on it as it
+                        // backs out slowly isn't a hold that lifts the row
+                        if d.length() > SLOP {
+                            p.way = Way::Ignored;
+                        }
                     } else if p.since.elapsed() >= HOLD || d.length() > SLOP {
                         // a mask stays with its layer
                         if l.is_some_and(|l| l.kind != LayerType::Mask) {
@@ -1472,9 +1503,20 @@ impl Layers {
                     }
                 }
                 Way::Swipe => {
-                    // closed, it goes right as far as picking takes
+                    // closed, it goes right as far as picking takes; past either end it stretches
                     let most = if open { 0.0 } else { PICK_REACH };
-                    self.slid.insert(p.id, (p.start + d.x).clamp(-reach, most));
+                    let x = p.start + d.x;
+                    let slide = if x < -reach {
+                        -reach + (x + reach) * SWIPE_STRETCH
+                    } else if x > most {
+                        most + (x - most) * SWIPE_STRETCH
+                    } else {
+                        x
+                    };
+                    self.slid.insert(p.id, slide);
+                    let now = ctx.input(|i| i.time);
+                    self.swipe_track.push((now, x));
+                    self.swipe_track.retain(|(t, _)| now - t <= SWIPE_WINDOW);
                     ctx.request_repaint();
                 }
                 Way::Reorder => {
@@ -1546,11 +1588,28 @@ impl Layers {
         match p.way {
             Way::Swipe => {
                 let slide = self.slid.get(&p.id).copied().unwrap_or(0.0);
-                if slide > PICK_REACH / 2.0 {
+                // its speed as it was let go (points a second, right positive)
+                let now = ctx.input(|i| i.time);
+                let speed = match (self.swipe_track.first(), self.swipe_track.last()) {
+                    (Some((t0, x0)), Some((_, x1))) if now - t0 <= SWIPE_WINDOW * 2.0 => {
+                        (x1 - x0) / ((now - t0) as f32).max(1.0 / 60.0)
+                    }
+                    _ => 0.0,
+                };
+                self.swipe_track.clear();
+                self.swipe_speed.insert(p.id, speed);
+                if slide > PICK_REACH / 2.0 && speed > -SWIPE_FLICK {
                     session.pick_layer(p.id);
                 } else {
-                    // open, a fifth of the way back closes it; closed, half the way opens it
-                    let opened = if open { slide < -reach * 0.8 } else { slide < -reach / 2.0 };
+                    // flicked, the way it went decides; otherwise how far: open, a fifth of the
+                    // way back closes it, closed, half the way opens it
+                    let opened = if speed.abs() >= SWIPE_FLICK {
+                        speed < 0.0 && slide < 0.0
+                    } else if open {
+                        slide < -reach * 0.8
+                    } else {
+                        slide < -reach / 2.0
+                    };
                     if opened != open {
                         self.swiped = opened.then_some(p.id);
                     }
