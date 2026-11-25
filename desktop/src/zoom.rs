@@ -17,6 +17,11 @@ const OPEN: Duration = Duration::from_millis(400);
 /// The most a frame moves a zoom on (a 30th of a second): a slower frame doesn't skip it.
 const MOST_STEP: Duration = Duration::from_millis(33);
 const CLOSE: Duration = Duration::from_millis(500);
+/// Opening, a frame this quick counts as settled: the canvas's layers are on the GPU.
+const SETTLED_FRAME: Duration = Duration::from_millis(40);
+/// Opening, how many settled frames in a row it waits for before it plays, and the most it waits.
+const SETTLED_FRAMES: u8 = 3;
+const MOST_WAIT: Duration = Duration::from_millis(1200);
 /// How much of the opening's end the gallery fades over, and how much of the closing's start the
 /// canvas does.
 const OPEN_FADE: f32 = 0.35;
@@ -38,6 +43,11 @@ pub struct Zoom {
     last: Instant,
     /// The canvas as it closed.
     picture: Option<TextureHandle>,
+    /// Opening: how many quick frames in a row there have been, whether it plays (the canvas
+    /// settled, so it plays through smoothly rather than in hitches), and since when it waits.
+    settled: u8,
+    playing: bool,
+    waiting: Instant,
 }
 
 impl Zoom {
@@ -53,6 +63,9 @@ impl Zoom {
             shown: Duration::ZERO,
             last: Instant::now(),
             picture: None,
+            settled: 0,
+            playing: false,
+            waiting: Instant::now(),
         }
     }
 
@@ -63,20 +76,43 @@ impl Zoom {
             ctx.load_texture("closing canvas", image, egui::TextureOptions::LINEAR)
         });
         let canvas = canvas_place(session, &session.view_matrix(), ctx.pixels_per_point());
-        Zoom { cell, canvas, turns, opening: false, shown: Duration::ZERO, last: Instant::now(), picture }
+        Zoom {
+            cell,
+            canvas,
+            turns,
+            opening: false,
+            shown: Duration::ZERO,
+            last: Instant::now(),
+            picture,
+            settled: 0,
+            playing: true,
+            waiting: Instant::now(),
+        }
     }
 
     /// Not under way yet (the canvas is still being made): it starts from the gallery again.
     pub fn hold(&mut self) {
         self.shown = Duration::ZERO;
         self.last = Instant::now();
+        self.settled = 0;
+        self.playing = false;
+        self.waiting = self.last;
     }
 
-    /// Moves it on by the time since the last frame, at most [`MOST_STEP`].
+    /// Moves it on by the time since the last frame, at most [`MOST_STEP`]. Opening, it waits
+    /// at the start until frames come quickly (the canvas's first, slow frames done), at most
+    /// [`MOST_WAIT`].
     pub fn tick(&mut self) {
         let now = Instant::now();
-        self.shown += now.duration_since(self.last).min(MOST_STEP);
+        let step = now.duration_since(self.last);
         self.last = now;
+        if !self.playing {
+            self.settled = if step <= SETTLED_FRAME { self.settled.saturating_add(1) } else { 0 };
+            self.playing = self.settled >= SETTLED_FRAMES || now.duration_since(self.waiting) >= MOST_WAIT;
+            // it plays from its start next frame: the waiting isn't counted
+            return;
+        }
+        self.shown += step.min(MOST_STEP);
     }
 
     fn length(&self) -> Duration {
