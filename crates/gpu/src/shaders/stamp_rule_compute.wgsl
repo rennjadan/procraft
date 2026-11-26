@@ -2,7 +2,8 @@
 // once into a buffer copied into the stroke after.
 
 // The part of the canvas worked on: its corner, its tiles across, and the rule (1: gradual,
-// 2: towards the transfer); then each tile's (first, count) into the stamp list after them.
+// 2: towards the transfer, which the pass takes as its constant instead); then each tile's
+// (first, count) into the stamp list after them.
 @group(0) @binding(1) var<storage, read> rule_stamps: array<f32>;
 @group(0) @binding(2) var<storage, read> rule_tiles: array<u32>;
 // the stroke as it stands before these stamps, and where the part goes, a row of RULE_ROW
@@ -18,6 +19,9 @@ fn rule_word(i: u32) -> u32 {
     return rule_tiles[i];
 }
 
+// The rule the pass lays by (see rule_laid), set as its pipeline is made: a pass for each.
+override RULE: u32 = 1u;
+
 @compute @workgroup_size(16, 16)
 fn cs_stamp_rule(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invocation_id) local: vec3<u32>) {
     let corner = vec2<i32>(bitcast<i32>(rule_tiles[0]), bitcast<i32>(rule_tiles[1]));
@@ -30,7 +34,7 @@ fn cs_stamp_rule(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_invocati
     // rounded to half floats here, as they are kept: packing leaves the rounding to the GPU's API,
     // and Direct3D rounds otherwise than Vulkan, which a stroke built up frame by frame carried on
     // until a sharp edge or a grain cut it into specks
-    let paint = halves(rule_laid(textureLoad(rule_before, px, 0), px, at));
+    let paint = halves(rule_laid(textureLoad(rule_before, px, 0), px, at, RULE));
     let o = at.y * RULE_ROW + at.x;
     rule_out[o] = vec2<u32>(pack2x16float(paint.rg), pack2x16float(paint.ba));
 }
@@ -71,7 +75,7 @@ fn cs_stamp_rule_carried(@builtin(workgroup_id) tile: vec3<u32>, @builtin(local_
     let halved_kept = halves(kept);
     let flushed = (abs(halved_kept) < vec4<f32>(6.1035156e-5)) & (shown == vec4<f32>(0.0));
     let start = select(shown, kept, !fresh && all((halved_kept == shown) | flushed));
-    let paint = rule_laid(start, px, at);
+    let paint = rule_laid(start, px, at, RULE);
     let halved = halves(paint);
     let o = at.y * RULE_ROW + at.x;
     rule_out[o] = vec2<u32>(pack2x16float(halved.rg), pack2x16float(halved.ba));

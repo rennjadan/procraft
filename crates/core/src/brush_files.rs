@@ -261,7 +261,8 @@ impl CanvasSession {
                 // chosen, not all of them now)
                 let name = if name.trim().is_empty() { IMPORTED.to_owned() } else { name.trim().to_owned() };
                 let origins = vec![None; brushes.len()];
-                st.library.insert(0, LibrarySet { name, brushes, origins, icon: crate::brush_library::IMPORTED_ICON });
+                let icon = crate::brush_library::IMPORTED_ICON;
+                st.library.insert(0, LibrarySet { name, brushes, origins, icon, plugin: None });
                 st.move_brush_refs(|(rs, ri)| Some((rs + 1, ri)));
                 Some(0)
             }
@@ -279,6 +280,7 @@ impl CanvasSession {
                                 brushes: Vec::new(),
                                 origins: Vec::new(),
                                 icon: crate::brush_library::IMPORTED_ICON,
+                                plugin: None,
                             },
                         );
                         st.move_brush_refs(|(rs, ri)| Some((rs + 1, ri)));
@@ -2838,13 +2840,16 @@ fn shape_pixels(b: &Brush) -> Vec<u8> {
     if let Some(img) = b.shape.image.and_then(textures::shape_image) {
         return img.pixels;
     }
-    // the round tip filling the image, its edge as soft as the brush's hardness says
+    // the round tip as a stock tip is drawn, across the share of the image that the sizes in files
+    // go by (the file keeps the stamp's square, of which our round tip covers that share), its
+    // edge as soft as the brush's hardness says
     let n = TEXTURE_SIZE;
     let soft = (1.0 - b.hardness.clamp(0.0, 1.0)).max(0.02);
+    let across = brushfile::ROUND_TIP_SHARE;
     (0..n * n)
         .map(|i| {
             let (x, y) = ((i % n) as f32 + 0.5, (i / n) as f32 + 0.5);
-            let r = ((x / n as f32 - 0.5).powi(2) + (y / n as f32 - 0.5).powi(2)).sqrt() * 2.0;
+            let r = ((x / n as f32 - 0.5).powi(2) + (y / n as f32 - 0.5).powi(2)).sqrt() * 2.0 / across;
             let v = ((1.0 - r) / soft).clamp(0.0, 1.0);
             (v * v * (3.0 - 2.0 * v) * 255.0).round() as u8
         })
@@ -4488,5 +4493,235 @@ mod tests {
         );
         assert!(found >= kept as u64 * 9 / 10, "{found} strokes taken of {kept} kept");
         assert!(warm < cold, "written in {warm:?} after the library was shown, {cold:?} before");
+    }
+
+    /// A soft blending brush as another app's file keeps it: every key that softens a stroke set
+    /// away from where it starts (the opacity and the flow following the pressure on curves of
+    /// their own, a soft tip, a low flow in a glaze that builds up, tapers that fade, wet mix and
+    /// opacity jitter).
+    fn soft_brush_file() -> Vec<u8> {
+        use procraft_engine::keyed::Builder;
+        use procraft_engine::plist::Value;
+        let mut b = Builder::new();
+        let root = b.reserve();
+        let curve = |b: &mut Builder, points: &[(f32, f32)]| {
+            let points: Vec<Value> = points.iter().map(|(x, y)| b.string(&format!("{{{x}, {y}}}"))).collect();
+            let list = b.array(points, true);
+            b.object(&["ValkyrieMagnitudinalCurve", "NSObject"], vec![("points", list)])
+        };
+        let mut fields = vec![
+            ("name", b.string("Soft Blend")),
+            ("bundledShapePath", b.string("Brush-Preset-Soft.png")),
+            ("dynamicsPressureOpacityCurve", curve(&mut b, &[(0.0, 0.0), (0.5, 0.25), (1.0, 1.0)])),
+            ("dynamicsPressureTransferModulationCurve", curve(&mut b, &[(0.0, 0.2), (1.0, 1.0)])),
+            ("dynamicsPressureOpacityJitterCurve", curve(&mut b, &[(0.0, 1.0), (1.0, 0.0)])),
+        ];
+        let reals = [
+            ("maxSize", 1.0),
+            ("minSize", 0.0),
+            ("plotSpacing", 0.04),
+            ("dynamicsPressureOpacity", 1.0),
+            ("dynamicsPressureSize", 0.0),
+            ("dynamicsPressureOpacitySpeed", 0.0),
+            ("dynamicsPressureResponse", 0.0),
+            ("dynamicsPressureOpacityTransfer", 0.6),
+            ("dynamicsGlazedFlow", 0.45),
+            ("pencilTaperStartLength", 0.3),
+            ("pencilTaperEndLength", 0.6),
+            ("pencilTaperOpacity", 0.7),
+            ("pencilTaperSize", 0.0),
+            ("pencilTaperShape", 0.0),
+            ("taperPressure", 0.0),
+            ("taperStartLength", 0.1),
+            ("taperEndLength", 0.2),
+            ("taperOpacity", 0.4),
+            ("taperSize", 0.0),
+            ("dynamicsJitterOpacity", 0.25),
+            ("dynamicsMix", 0.6),
+            ("dynamicsLoad", 0.4),
+            ("dynamicsPressureMix", 0.5),
+            ("dynamicsWetAccumulation", 0.3),
+            ("dynamicsMixSoftening", -0.2),
+            ("minOpacity", 0.05),
+            ("maxOpacity", 0.8),
+        ];
+        fields.extend(reals.map(|(k, v)| (k, Value::Real(v))));
+        fields.extend([
+            ("renderingRecursiveMixing", Value::Bool(false)),
+            ("renderingMaxTransfer", Value::Bool(false)),
+            ("renderingModulatedTransfer", Value::Bool(true)),
+            ("taperVersion", Value::Int(1)),
+        ]);
+        b.fill(&root, &["SilicaBrush", "ValkyrieBrush", "NSObject"], fields);
+        let mut zip = procraft_engine::zip::ZipWriter::new();
+        zip.add("Brush.archive", &b.finish(root));
+        zip.finish()
+    }
+
+    #[test]
+    fn a_soft_brush_file_s_softening_keys_read_as_what_they_say() {
+        use procraft_engine::brush::{PressureCurve, Rendering};
+        let b = brush_from(&brushfile::read(&soft_brush_file()).unwrap());
+        for (key, want) in [
+            ("pressure_opacity", 1.0),
+            ("pressure_size", 0.0),
+            ("pressure_opacity_response", 0.0),
+            ("pressure_flow", 0.6),
+            ("flow", 0.45),
+            ("rendering_mode", 3.0),
+            ("pen_taper_start", 0.3),
+            ("pen_taper_end", 0.6),
+            ("pen_taper_opacity", 0.7),
+            ("pen_taper_size", 0.0),
+            ("touch_taper_start", 0.1),
+            ("touch_taper_end", 0.2),
+            ("touch_taper_opacity", 0.4),
+            ("classic_taper", 0.0),
+            ("jitter_opacity", 0.25),
+            ("wet_dilution", 0.6),
+            ("wet_charge", 0.4),
+            ("wet_attack", 0.5),
+            ("wet_pull", 0.3),
+            ("wet_grade", -0.2),
+            ("min_opacity", 0.05),
+            ("max_opacity", 0.8),
+        ] {
+            let got = b.setting(key);
+            assert!((got - want).abs() < 1e-4, "{key}: {got}, the file's {want}");
+        }
+        // a glaze that builds up by what is left (the file's modulated transfer alone)
+        assert_eq!(b.rendering, Rendering::Gradual);
+        // the curves: the opacity's own, the flow's (the transfer's) and the opacity jitter's
+        assert!((b.opacity_curve.eval(0.5) - 0.25).abs() < 0.01, "{}", b.opacity_curve.eval(0.5));
+        let curves = &b.pressure_curves;
+        assert!((curves.through(PressureCurve::Flow, 0.0) - 0.2).abs() < 0.01);
+        assert!((curves.at(PressureCurve::OpacityJitter, 0.0) - 1.0).abs() < 0.01);
+        assert!(curves.at(PressureCurve::OpacityJitter, 1.0) < 0.01);
+        // the soft tip: our soft round, not a hard one
+        assert_eq!(b.shape.image, Some(shape::SOFT_ROUND));
+    }
+
+    /// A stamp's opacity under a pen pressing `p` (upright, slow, nothing fallen off) as the
+    /// reference works it out for brush `b`: the flow times the pressure's share (its amount
+    /// taking away along its opacity curve) through the opacity range, held to 0.01..1, to the
+    /// power 2.5, times what the transfer lets through (its amount taking away along its curve).
+    fn reference_stamp_alpha(b: &Brush, p: f32) -> f32 {
+        use procraft_engine::brush::PressureCurve;
+        let amount = b.setting("pressure_opacity");
+        let c = b.opacity_curve.eval(p);
+        let pressed = if amount >= 0.0 { 1.0 - amount * (1.0 - c) } else { 1.0 + amount * c };
+        let (least, most) = (b.setting("min_opacity"), b.setting("max_opacity"));
+        let opacity = (least + (most - least) * b.setting("flow") * pressed).clamp(0.01, 1.0).powf(2.5);
+        let transfer = 1.0 - b.setting("pressure_flow") * (1.0 - b.pressure_curves.through(PressureCurve::Flow, p));
+        opacity * transfer.clamp(0.0, 1.0)
+    }
+
+    /// `brush`'s stamps along a line from x 50 to 450, the pen pressing as `pressure` says at each
+    /// share of the way, taken as it comes (no lag, no speed).
+    fn pressed_line(brush: &Brush, pressure: impl Fn(f32) -> f32) -> Vec<procraft_engine::stroke::Stamp> {
+        use procraft_engine::geom::Vec2;
+        use procraft_engine::input::{Pointer, Sample};
+        let samples: Vec<Sample> = (0..=200)
+            .map(|i| {
+                let t = i as f32 / 200.0;
+                Sample::at(Vec2::new(50.0 + 400.0 * t, 100.0), pressure(t), f64::from(i) * 4.0)
+            })
+            .collect();
+        let mut s = procraft_engine::stroke::StrokeBuilder::new(brush.clone(), 40.0, Pointer::Stylus).steady();
+        s.add(&samples);
+        s.finish()
+    }
+
+    #[test]
+    fn a_soft_brush_s_stroke_fades_with_the_pen_as_its_file_says() {
+        // pressing from nothing to fully and back: each stamp as faint as the reference's rule
+        // makes it at its pressure (its random opacity jitter and wet paint aside, and no taper)
+        let mut b = brush_from(&brushfile::read(&soft_brush_file()).unwrap());
+        for key in ["jitter_opacity", "wet_dilution", "pen_taper_opacity"] {
+            b.set_setting(key, 0.0);
+        }
+        let ramp = |t: f32| 1.0 - (2.0 * t - 1.0).abs();
+        let stamps = pressed_line(&b, ramp);
+        assert!(stamps.len() > 100, "{} stamps", stamps.len());
+        let (mut worst, mut fullest) = (0.0f32, 0.0f32);
+        for s in &stamps {
+            let p = ramp(((s.center.x - 50.0) / 400.0).clamp(0.0, 1.0));
+            let want = reference_stamp_alpha(&b, p);
+            // relative to what it should be, but no finer than a ten-thousandth
+            worst = worst.max((s.alpha - want).abs() / want.max(1e-4));
+            fullest = fullest.max(s.alpha);
+        }
+        let light = reference_stamp_alpha(&b, 0.3) / reference_stamp_alpha(&b, 1.0);
+        println!(
+            "{} stamps: worst {:.2}% off the reference's rule; fullest {fullest:.4} (the rule's {:.4}); at a \
+             third of the pressure {:.1}% of the full press's",
+            stamps.len(),
+            worst * 100.0,
+            reference_stamp_alpha(&b, 1.0),
+            light * 100.0
+        );
+        assert!(worst < 0.02, "{:.2}% off", worst * 100.0);
+        // (the stamps lie a few pixels apart, so the fullest is a press a little short of full)
+        assert!((fullest / reference_stamp_alpha(&b, 1.0) - 1.0).abs() < 0.05, "{fullest}");
+        // a light press is a faint fraction of a full one: the soft brush doesn't draw like an ink pen
+        assert!(light < 0.1, "{light}");
+    }
+
+    #[test]
+    fn a_soft_brush_s_stroke_fades_in_and_out_by_its_taper_s_opacity() {
+        // pressing fully throughout: its ends as faint as the taper's opacity says at their tips
+        // (an opacity o leaves 1 - o^2.5 of the stamp where the taper hasn't grown at all)
+        for o in [0.4f32, 0.7, 1.0] {
+            let mut b = brush_from(&brushfile::read(&soft_brush_file()).unwrap());
+            for key in ["jitter_opacity", "wet_dilution"] {
+                b.set_setting(key, 0.0);
+            }
+            b.set_setting("pen_taper_opacity", o);
+            let stamps = pressed_line(&b, |_| 1.0);
+            let mid = stamps[stamps.len() / 2].alpha;
+            let (first, last) = (stamps[0].alpha / mid, stamps[stamps.len() - 1].alpha / mid);
+            let want = 1.0 - o.powf(2.5);
+            println!(
+                "taper opacity {o}: the stroke starts at {first:.3} and ends at {last:.3} of its middle (rule {want:.3})"
+            );
+            assert!((first - want).abs() < 0.05 && (last - want).abs() < 0.05, "{o}: {first} {last}, {want}");
+            assert!((mid - reference_stamp_alpha(&b, 1.0)).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn a_soft_round_brush_shared_and_brought_back_is_as_wide_and_as_soft() {
+        // a stock brush drawn with our round tip at a medium hardness: its file's shape is that
+        // tip drawn as a stock tip is, as big a share of the stamp's square as the sizes in files
+        // go by, so that brought back (here, or in the other app) its stamp is as wide
+        let s = CanvasSession::new(32, 32);
+        let (set, index, was) = {
+            let st = s.shared.lock();
+            st.library
+                .iter()
+                .enumerate()
+                .find_map(|(set, l)| {
+                    let i =
+                        l.brushes.iter().position(|b| b.round_tip() && b.hardness < 0.8 && b.secondary.is_none())?;
+                    Some((set, i, l.brushes[i].clone()))
+                })
+                .expect("a stock brush with a soft round tip")
+        };
+        let file = s.brush_as_file(set as u32, index as u32).unwrap();
+        let back_set = s.import_any_brushes(file, Some("Round.brush".into()), 0).unwrap();
+        let back = s.shared.lock().library[back_set as usize].brushes[0].clone();
+        // the width at which its stamp is half covered, at its most size: the round tip's edge fades
+        // from its hardness's share of its radius out
+        let was_half = was.biggest() * (1.0 + was.hardness) / 2.0;
+        let pixels = back.shape.source.as_ref().expect("the tip as a picture").pixels.to_vec();
+        let n = TEXTURE_SIZE;
+        let covered = pixels[n * (n / 2)..n * (n / 2 + 1)].iter().filter(|&&v| v >= 128).count() as f32 / n as f32;
+        let back_half = back.biggest() * covered;
+        println!(
+            "{}: half covered across {was_half:.1} px, brought back {back_half:.1} px ({:.3} times)",
+            was.name,
+            back_half / was_half
+        );
+        assert!((back_half / was_half - 1.0).abs() < 0.02, "{back_half} against {was_half}");
     }
 }

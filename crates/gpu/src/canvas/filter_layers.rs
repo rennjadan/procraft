@@ -189,7 +189,7 @@ impl Canvas {
             if self.filter_tables.get(&layer.id).is_some_and(|t| t.made_of == bytes) {
                 continue;
             }
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = gpu.texture(&wgpu::TextureDescriptor {
                 label: Some("filter layer table"),
                 size: extent(256, rows),
                 mip_level_count: 1,
@@ -199,7 +199,7 @@ impl Canvas {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats: &[],
             });
-            gpu.queue.write_texture(
+            gpu.write_texture(
                 copy_at(&texture, 0, 0),
                 &bytes,
                 wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(1024), rows_per_image: Some(rows) },
@@ -321,16 +321,11 @@ impl Canvas {
 
     /// Keeps what the composite holds in `work` about `rect`, before what is round `rect` is made
     /// again for what is in it, wrong at the edges.
-    pub(super) fn keep_around(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        work: IRect,
-        rect: IRect,
-    ) {
-        let (keep, _) = self.filter_keep.get(device);
+    pub(super) fn keep_around(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, work: IRect, rect: IRect) {
+        let (keep, _) = self.filter_keep.get(gpu);
         for band in around(work, rect) {
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(&self.composite, band.x0, band.y0),
                 copy_at(keep, band.x0, band.y0),
                 extent(band.width(), band.height()),
@@ -339,16 +334,11 @@ impl Canvas {
     }
 
     /// Puts back what [`Canvas::keep_around`] kept.
-    pub(super) fn put_back_around(
-        &self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        work: IRect,
-        rect: IRect,
-    ) {
-        let (keep, _) = self.filter_keep.get(device);
+    pub(super) fn put_back_around(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, work: IRect, rect: IRect) {
+        let (keep, _) = self.filter_keep.get(gpu);
         for band in around(work, rect) {
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(keep, band.x0, band.y0),
                 copy_at(&self.composite, band.x0, band.y0),
                 extent(band.width(), band.height()),
@@ -390,7 +380,7 @@ impl Canvas {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn composite_filter_layer(
         &self,
-        device: &wgpu::Device,
+        gpu: &Gpu,
         doc: &Document,
         encoder: &mut wgpu::CommandEncoder,
         uniforms: &mut UniformData,
@@ -401,6 +391,7 @@ impl Canvas {
         stack: &Stack<'_>,
         current: &mut usize,
     ) {
+        let device = &gpu.device;
         let Some(filter) = layer.filter.as_ref() else { return };
         let Some(program) = self.layer_filters.get(&filter.filter) else { return };
         let clip = doc.clip_base(layer.id).filter(|_| role == CLIP_NONE);
@@ -411,7 +402,7 @@ impl Canvas {
         }
         // what the stack holds through the filter, in a draw no bigger than a filter's piece
         let below = if *current == 0 { stack.first.1 } else { stack.second().1 };
-        let (_, out) = self.filter_out.get(device);
+        let (_, out) = self.filter_out.get(gpu);
         let values = program.values_of(filter);
         let [a @ .., _, _, _, _] = values;
         let [_, _, _, _, b @ ..] = values;
@@ -459,7 +450,7 @@ impl Canvas {
         let first = stack.first.1;
         let (backdrop, target) = if *current == 0 { (first, second) } else { (second, first) };
         let bind = self.quad_masked(
-            device,
+            gpu,
             [out, &self.stroke_view, clip_view, backdrop],
             mask_view.unwrap_or(&self.stroke_view),
             clip_mask_view.unwrap_or(&self.stroke_view),
@@ -482,7 +473,7 @@ impl Canvas {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn filter_into(
         &self,
-        device: &wgpu::Device,
+        gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         uniforms: &mut UniformData,
         doc: &Document,
@@ -490,11 +481,12 @@ impl Canvas {
         lower: LayerId,
         clipped: u32,
     ) -> Option<()> {
+        let device = &gpu.device;
         let filter = upper.filter.as_ref()?;
         let program = self.layer_filters.get(&filter.filter)?;
         let low = self.layers.get(&lower)?;
         let full = self.full();
-        let (_, out) = self.filter_out.get(device);
+        let (_, out) = self.filter_out.get(gpu);
         let values = program.values_of(filter);
         let [a @ .., _, _, _, _] = values;
         let [_, _, _, _, b @ ..] = values;
@@ -530,12 +522,12 @@ impl Canvas {
         };
         let offset = uniforms.push(&uniform);
         let bind = self.quad_masked(
-            device,
+            gpu,
             [out, &self.stroke_view, &self.stroke_view, &low.view],
             mask_view.unwrap_or(&self.stroke_view),
             &self.stroke_view,
         );
-        let (scratch, scratch_view) = self.scratch.get(device);
+        let (scratch, scratch_view) = self.scratch.get(gpu);
         {
             let mut pass = render_pass(encoder, "filter merged blend", scratch_view, wgpu::LoadOp::Load);
             pass.set_pipeline(&self.pipelines.filter_layer);
@@ -543,7 +535,8 @@ impl Canvas {
             pass.set_bind_group(1, &self.uniform_bind, &[offset]);
             pass.draw(0..3, 0..1);
         }
-        encoder.copy_texture_to_texture(
+        gpu.copy_texture_to_texture(
+            encoder,
             copy_at(scratch, 0, 0),
             copy_at(&low.texture, 0, 0),
             extent(self.width, self.height),

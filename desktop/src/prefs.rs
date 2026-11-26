@@ -201,6 +201,10 @@ impl Prefs {
     pub fn kept() -> Prefs {
         let store = crate::files::app_dir().join("plugins").to_string_lossy().into_owned();
         let mut p = Prefs { plugins: no_vector(Plugins::with_bundled(store)), ..Prefs::default() };
+        // the folders picked for plugins are plain folders here; files made for them first in a
+        // folder of the app's own
+        let work = crate::files::app_dir().join("folder-work").to_string_lossy().into_owned();
+        p.plugins.use_folder_access(Arc::new(procraft_core::PlainFolderAccess), work);
         let text = std::fs::read_to_string(crate::files::app_dir().join("interface")).unwrap_or_default();
         for line in text.lines() {
             let Some((name, value)) = line.split_once(' ') else { continue };

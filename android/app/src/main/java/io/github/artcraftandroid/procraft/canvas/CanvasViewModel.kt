@@ -228,10 +228,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * An artwork picked whose opening ended the app last time, and what was to follow its opening:
-     * asked about before it opens again; with whether the system ended that run short of memory
-     * ([lowMemory]), which the question then says rather than ask for the log.
+     * asked about before it opens again; with how that run ended as far as Android kept it ([end]):
+     * short of memory the question says so rather than ask for the log, crashed it says it crashed.
      */
-    data class OpeningEndedApp(val artwork: Artwork, val then: (() -> Unit)?, val lowMemory: Boolean = false)
+    data class OpeningEndedApp(
+        val artwork: Artwork,
+        val then: (() -> Unit)?,
+        val end: io.github.artcraftandroid.procraft.core.RunEnd = io.github.artcraftandroid.procraft.core.RunEnd.UNKNOWN,
+    )
 
     /** The artwork picked whose opening ended the app last time, while the gallery asks whether to open it anyway. */
     var openingEndedApp by mutableStateOf<OpeningEndedApp?>(null)
@@ -292,13 +296,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * The second colour (0xRRGGBB), beside the current one in the colour panel: swapped with it,
-     * and mixed in by brushes whose colour dynamics say so.
+     * and mixed in by brushes whose colour dynamics say so. Kept for the next start with the others.
      */
     var secondaryRgb: Int
         get() = secondaryState
         private set(v) {
             secondaryState = v
             pushSecondary()
+            keptColours.keepSecond(keptOfSecond(v))
         }
 
     private fun pushSecondary() {
@@ -330,22 +335,34 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
      */
     private var otherColour = floatArrayOf(0f, 0f, 0f)
 
+    /**
+     * The brush colour, the masks' and the second colour, kept by the shared core in their file as
+     * each changes, so the next start finds them however this run ends (a force-stop or a kill runs
+     * no onStop).
+     */
+    private val keptColours = io.github.artcraftandroid.procraft.core.KeptColours.open(File(app.filesDir, "colour").path)
+
     init {
+        // the colours earlier versions kept in the preferences (as the app went into the background), once
+        if (!keptColours.wasKept() && interfacePrefs.contains(KEPT_HUE)) {
+            val brush = listOf(KEPT_HUE, KEPT_SATURATION, KEPT_BRIGHTNESS).zip(listOf(DEFAULT_HUE, 1f, 1f)).map { (key, first) -> interfacePrefs.getFloat(key, first) }
+            val mask = listOf(KEPT_MASK_HUE, KEPT_MASK_SATURATION, KEPT_MASK_BRIGHTNESS).map { interfacePrefs.getFloat(it, 0f) }
+            keptColours.keep(brush, mask)
+        }
         // the colours as they were last left
-        hue = interfacePrefs.getFloat(KEPT_HUE, DEFAULT_HUE).coerceIn(0f, 1f)
-        saturation = interfacePrefs.getFloat(KEPT_SATURATION, 1f).coerceIn(0f, 1f)
-        brightness = interfacePrefs.getFloat(KEPT_BRIGHTNESS, 1f).coerceIn(0f, 1f)
-        otherColour = listOf(KEPT_MASK_HUE, KEPT_MASK_SATURATION, KEPT_MASK_BRIGHTNESS).map { interfacePrefs.getFloat(it, 0f).coerceIn(0f, 1f) }.toFloatArray()
+        val (h, s, v) = keptColours.brush()
+        hue = h
+        saturation = s
+        brightness = v
+        otherColour = keptColours.mask().toFloatArray()
+        secondaryState = secondRgbOf(keptColours.second())
     }
 
-    /** Keeps the brush colour and the masks' for the next session. */
+    /** Keeps the brush colour and the masks' for the next start (the core writes them soon, off this thread). */
     private fun keepColour() {
-        val now = floatArrayOf(hue, saturation, brightness)
-        val (brush, mask) = if (onMask) otherColour to now else now to otherColour
-        interfacePrefs.edit()
-            .putFloat(KEPT_HUE, brush[0]).putFloat(KEPT_SATURATION, brush[1]).putFloat(KEPT_BRIGHTNESS, brush[2])
-            .putFloat(KEPT_MASK_HUE, mask[0]).putFloat(KEPT_MASK_SATURATION, mask[1]).putFloat(KEPT_MASK_BRIGHTNESS, mask[2])
-            .apply()
+        val now = listOf(hue, saturation, brightness)
+        val other = otherColour.toList()
+        if (onMask) keptColours.keep(other, now) else keptColours.keep(now, other)
     }
 
     /**
@@ -357,8 +374,10 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (mask == onMask) return
         onMask = mask
         val now = floatArrayOf(hue, saturation, brightness)
-        setColor(otherColour[0], otherColour[1], otherColour[2])
+        val next = otherColour
+        // set aside first: the colour kept as it changes pairs the right two
         otherColour = now
+        setColor(next[0], next[1], next[2])
     }
 
     /** The colour panel's mode, kept from one session to the next. */
@@ -602,8 +621,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         interfacePrefs.edit().putBoolean(LIGHT_INTERFACE, on).apply()
     }
 
-    /** The plugins, their values kept with the interface settings, and what their page draws. */
-    val plugins = keptPlugins(app, interfacePrefs)
+    /** The plugins, their values kept with the interface settings, and what their page draws; the folders picked for them reached through the system's document trees, files made for them in the cache first. */
+    val plugins = keptPlugins(app, interfacePrefs).also { it.useFolderAccess(SystemFolders(app), File(app.cacheDir, "folders").path) }
     var pluginList by mutableStateOf(plugins.plugins())
         private set
 
@@ -680,8 +699,24 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private val failureWatch = WhileNeeded(viewModelScope, SAVE_FAILURE_POLL_MS, Dispatchers.IO) {
         val s = session ?: return@WhileNeeded false
         s.takeSaveFailure()?.let { told(Result.failure(Exception(it))) }
+        // opened again from its folder after the graphics stopped: its layers read again
+        val reopened = s.reopenedAfterLoss()
+        if (reopened != reopenedSeen) withContext(Dispatchers.Main) { if (session === s) reopenedAgain(reopened) }
         s.takeFailure()?.let { withContext(Dispatchers.Main) { showNotice(it, warning = true) } }
         session === s && s.editsSaved() != s.edits()
+    }
+
+    /** How many times the open artwork was opened again after the graphics stopped, as last read. */
+    private var reopenedSeen = 0uL
+
+    /** The open artwork was opened again from its folder after the graphics stopped ([count] times): its layers, thumbnails and undo state read again. */
+    private fun reopenedAgain(count: ULong) {
+        reopenedSeen = count
+        thumbnails.clear()
+        thumbnailVersions.clear()
+        refresh()
+        refreshView()
+        if (layersShown) refreshThumbnails()
     }
 
     /**
@@ -939,6 +974,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 is io.github.artcraftandroid.procraft.core.PluginControl.Slider ->
                     if (io.github.artcraftandroid.procraft.core.pluginSliderWhole(c.control)) edit.putInt(c.control.key, c.control.value.roundToInt()) else edit.putFloat(c.control.key, c.control.value)
                 is io.github.artcraftandroid.procraft.core.PluginControl.File -> Unit
+                is io.github.artcraftandroid.procraft.core.PluginControl.Folder -> Unit
                 is io.github.artcraftandroid.procraft.core.PluginControl.Texture -> edit.putInt(c.control.key, c.control.value)
             }
         }
@@ -1012,9 +1048,22 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         return Bitmap.createBitmap(argb, w, h, Bitmap.Config.ARGB_8888).asImageBitmap()
     }
 
-    /** A plugin's file control [key] lets its file go. */
+    /** A plugin's file control [key] lets its file go (a folder control its folder). */
     fun clearPluginFile(key: String) {
         if (plugins.clearFile(key)) pluginsChanged()
+    }
+
+    /** A folder picked with the system's picker at [tree] for a plugin's folder control [key]: its permission kept, then kept with the plugin; told if it can't be used. */
+    fun pickPluginFolder(key: String, tree: android.net.Uri) {
+        viewModelScope.launch {
+            val kept = withContext(Dispatchers.IO) {
+                val app = getApplication<Application>()
+                runCatching { app.contentResolver.takePersistableUriPermission(tree, SystemFolders.KEPT) }
+                    .onFailure { AppLog.e(TAG, "keeping a folder's permission", it) }
+                    .isSuccess && plugins.setFolder(key, tree.toString(), SystemFolders.shownName(app, tree) ?: "Folder")
+            }
+            if (kept) pluginsChanged() else message = "This folder couldn't be used."
+        }
     }
 
     /** The list as it stands: a plugin may have stopped on a stroke since it was read. */
@@ -1452,7 +1501,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         private set
 
     /** How the plugins lay the panels out, as last asked. */
-    var layoutLook by mutableStateOf(io.github.artcraftandroid.procraft.core.PanelLayoutLook(false, 0f, false, false, false))
+    var layoutLook by mutableStateOf(io.github.artcraftandroid.procraft.core.PanelLayoutLook(false, 0f, false, false, false, false, false))
         private set
 
     /** A panel's grabber is being dragged out: the panel stays, unseen, until let go, its window following the finger. */
@@ -1522,6 +1571,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     private fun followLayout() {
         panelLayout.follow(plugins)
         layoutLook = panelLayout.look()
+        // (Collapse to edge turned on or off: the bars know at once, not only once they are told again)
+        barLayout.setCollapsing(layoutLook.collapse)
         // the bars back where they always are as no plugin lets them move: no handles
         if (!layoutLook.edit && editingLayout) doneEditLayout()
         barChanges++
@@ -1557,13 +1608,18 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** [piece]'s strip or tab (or, [sizing], its corner) pressed: it moves (or is sized) with the finger until let go. */
-    fun holdPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, sizing: Boolean) {
-        panelLayout.hold(piece, sizing, 0f, 0f)
+    fun holdPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, sizing: Boolean, at: androidx.compose.ui.geometry.Offset) {
+        piecePressed = at
+        panelLayout.hold(piece, sizing, at.x, at.y)
     }
+
+    /** Where the piece held was pressed (dp of the interface): the pointer is there plus the drag. */
+    private var piecePressed = androidx.compose.ui.geometry.Offset.Zero
 
     /** The piece held dragged ([dx], [dy]) all told since it was pressed (dp of the interface). */
     fun dragPiece(dx: Float, dy: Float): io.github.artcraftandroid.procraft.core.PieceShown? {
-        val shown = panelLayout.drag(dx, dy)
+        // (the finger's place, as the layout takes it: where it was let go decides a tab or a park)
+        val shown = panelLayout.drag(piecePressed.x + dx, piecePressed.y + dy)
         layoutChanged()
         return shown
     }
@@ -1659,6 +1715,60 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         layoutChanged()
     }
 
+    /** The panels [piece]'s window holds as tabs, the first holding its place; none while it holds it alone. */
+    fun tabsOf(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): List<io.github.artcraftandroid.procraft.core.LayoutPiece> =
+        layoutChanges.let { panelLayout.tabsOf(piece) }
+
+    /** [piece], a tab of its window, shown there. */
+    fun pickTab(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        panelLayout.setActiveTab(piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** [piece], a tab of its window, torn out with the finger at ([x], [y]) (dp of the interface): it follows the finger. */
+    fun tearTab(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, x: Float, y: Float) {
+        panelLayout.tearTab(piece, x, y, io.github.artcraftandroid.procraft.ui.FloatingGrabY)
+        layoutChanged()
+    }
+
+    /** The tab torn out follows the finger, at ([x], [y]) (dp of the interface). */
+    fun followTorn(x: Float, y: Float) {
+        panelLayout.drag(x, y)
+        layoutChanged()
+    }
+
+    /** The Tool Belt as it shows, while a plugin says so. */
+    fun beltShown(): io.github.artcraftandroid.procraft.core.BeltShown? = layoutChanges.let { panelLayout.beltShown() }
+
+    /**
+     * Where the Tool Belt shows (dp of the interface): moved where Edit layout left it (a bar), else where [belt] says; told
+     * to the layout, which parks what is let go on it.
+     */
+    fun beltPlace(belt: io.github.artcraftandroid.procraft.core.BeltShown): io.github.artcraftandroid.procraft.core.BarPlace {
+        val k = belt.scale
+        val (length, thickness) = belt.width * k to belt.height * k
+        val own = io.github.artcraftandroid.procraft.core.BarPlace(belt.x, belt.y, false)
+        barLayout.setBar(io.github.artcraftandroid.procraft.core.LayoutBar.BELT, own, length, thickness)
+        val place = barChanges.let { barLayout.shown(io.github.artcraftandroid.procraft.core.LayoutBar.BELT) } ?: own
+        val (w, h) = if (place.vertical) thickness to length else length to thickness
+        panelLayout.setBeltPlace(io.github.artcraftandroid.procraft.core.LayoutRect(place.x, place.y, w, h))
+        return place
+    }
+
+    /** [piece], parked on the Tool Belt, taken off: back where it was. */
+    fun unparkPiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece) {
+        panelLayout.unpark(piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /** [piece], parked on the Tool Belt, dragged off with the finger at ([x], [y]) (dp of the interface): it follows the finger. */
+    fun unparkAt(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, x: Float, y: Float) {
+        panelLayout.unparkAt(piece, x, y, io.github.artcraftandroid.procraft.ui.FloatingGrabY)
+        layoutChanged()
+    }
+
     /** The floating windows in the order they are drawn, from the bottom up. */
     fun pieceOrder(): List<io.github.artcraftandroid.procraft.core.LayoutPiece> = layoutChanges.let { panelLayout.order() }
 
@@ -1703,6 +1813,67 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun barMoved(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarPlace? =
         barChanges.let { if (layoutLook.edit && barLayout.isMoved(bar)) barLayout.shown(bar) else null }
 
+    /** Which sides of [bar] lie against the window's edges where it shows now, as it is dragged too: square there, round elsewhere. */
+    fun barTouching(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarSides? =
+        barChanges.let { barLayout.touching(bar) }
+
+    /** Collapse to edge: [bar] collapsed into its side (the side, its tab there, how far it slid), while it is. */
+    fun barCollapsed(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.EdgeCollapse? = barChanges.let { barLayout.collapsed(bar) }
+
+    /** Where [bar] goes when it collapses, collapsed or not (to slide it there and back); none while it can't. */
+    fun barCollapsePlace(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.EdgeCollapse? = barChanges.let { barLayout.collapsePlace(bar) }
+
+    /** Where [bar]'s collapse button goes, while it has one (dp of the interface). */
+    fun barCollapseButton(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.LayoutRect? = barChanges.let { barLayout.collapseButton(bar) }
+
+    /** [bar] collapsed into its side, or brought back out, kept. */
+    fun collapseBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar, collapsed: Boolean) {
+        if (barLayout.setCollapsed(bar, collapsed)) keepBars()
+        barChanges++
+    }
+
+    /** A drag from collapsed [bar]'s tab, ([dx], [dy]) so far: out of the side far enough, it comes back out. */
+    fun pullBarTab(bar: io.github.artcraftandroid.procraft.core.LayoutBar, dx: Float, dy: Float) {
+        if (barLayout.pullTab(bar, dx, dy)) {
+            keepBars()
+            barChanges++
+        }
+    }
+
+    /** [piece]'s window collapsed into its side, while it is. */
+    fun pieceCollapsed(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.EdgeCollapse? = layoutChanges.let { panelLayout.pieceCollapsed(piece) }
+
+    /** Where [piece]'s window goes when it collapses, collapsed or not; none while it can't. */
+    fun pieceCollapsePlace(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.EdgeCollapse? = layoutChanges.let { panelLayout.pieceCollapsePlace(piece) }
+
+    /** The side [piece]'s window goes into at its collapse button, while it may. */
+    fun pieceCollapseEdge(piece: io.github.artcraftandroid.procraft.core.LayoutPiece): io.github.artcraftandroid.procraft.core.WindowEdge? = layoutChanges.let { panelLayout.pieceCollapseEdge(piece) }
+
+    /** [piece]'s window collapsed into its side, or brought back out, kept. */
+    fun collapsePiece(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, collapsed: Boolean) {
+        if (panelLayout.setPieceCollapsed(piece, collapsed)) keepLayout()
+        layoutChanged()
+    }
+
+    /** A drag from collapsed [piece]'s tab, ([dx], [dy]) so far: out of the side far enough, it comes back out. */
+    fun pullPieceTab(piece: io.github.artcraftandroid.procraft.core.LayoutPiece, dx: Float, dy: Float) {
+        if (panelLayout.pullPieceTab(piece, dx, dy)) {
+            keepLayout()
+            layoutChanged()
+        }
+    }
+
+    /** Whether any bar or window is collapsed into its side. */
+    fun anyCollapsed(): Boolean = barChanges.let { layoutChanges.let { barLayout.anyCollapsed() || panelLayout.anyCollapsed() } }
+
+    /** Collapse All ([collapsed]) or Open All: every bar and window against a side, kept. */
+    fun collapseAll(collapsed: Boolean) {
+        if (barLayout.setAllCollapsed(collapsed)) keepBars()
+        barChanges++
+        if (panelLayout.setAllCollapsed(collapsed)) keepLayout()
+        layoutChanged()
+    }
+
     /** Where [bar] shows now, moved or not (dp of the interface). */
     fun barShown(bar: io.github.artcraftandroid.procraft.core.LayoutBar): io.github.artcraftandroid.procraft.core.BarPlace? =
         barChanges.let { barMoved(bar) ?: barLayout.shown(bar) }
@@ -1711,7 +1882,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     fun tellBar(width: Float, height: Float, bar: io.github.artcraftandroid.procraft.core.LayoutBar, own: io.github.artcraftandroid.procraft.core.BarPlace, length: Float, thickness: Float) {
         val landscape = width >= height
         barLayout.setWindow(width, height, layoutLook.snap.coerceAtLeast(EDIT_SNAP))
+        barLayout.setCollapsing(layoutLook.collapse)
         barLayout.setBar(bar, own, length, thickness)
+        // where it always is changed (the side bar laid out again after Reset, say): its handle goes there too
+        val told = Triple(own, length, thickness)
+        if (barsTold[bar] != told) {
+            barsTold[bar] = told
+            barChanges++
+        }
         // turned, the bars moved the other way show
         if (landscape != barsLandscape) {
             barsLandscape = landscape
@@ -1720,6 +1898,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private var barsLandscape: Boolean? = null
+
+    /** What each bar was last told as where it always is. */
+    private val barsTold = mutableMapOf<io.github.artcraftandroid.procraft.core.LayoutBar, Triple<io.github.artcraftandroid.procraft.core.BarPlace, Float, Float>>()
 
     /** Edit layout on (from the Canvas tab): the panels close, and the bars show handles. */
     fun startEditLayout() {
@@ -1743,13 +1924,20 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** [bar]'s handle pressed, while editing. */
-    fun holdBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar) {
-        barLayout.hold(bar, 0f, 0f)
+    fun holdBar(bar: io.github.artcraftandroid.procraft.core.LayoutBar, x: Float, y: Float) {
+        barPressed = androidx.compose.ui.geometry.Offset(x, y)
+        barLayout.hold(bar, x, y)
     }
 
-    /** The bar held dragged ([dx], [dy]) all told since it was pressed (dp of the interface). */
+    /** Where the bar held was pressed (dp of the interface). */
+    private var barPressed = androidx.compose.ui.geometry.Offset.Zero
+
+    /**
+     * The bar held dragged ([dx], [dy]) all told since it was pressed (dp of the interface): the finger's place, which
+     * decides whether it stands upright and against which side.
+     */
     fun dragBar(dx: Float, dy: Float) {
-        barLayout.drag(dx, dy)
+        barLayout.drag(barPressed.x + dx, barPressed.y + dy)
         barChanges++
     }
 
@@ -1887,14 +2075,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * The sample strokes in [previews], the last drawn last: past [previewsMost] (by the device's
-     * memory, the core's brushPreviewsKept) the first go, a row showing one drawing it again from
-     * the core's packed copy. Kept all, every set looked through held some 100 MB of pictures.
+     * memory and what it has available as each is kept, see [previewBitmapsKept]) the first go, a row
+     * showing one drawing it again from the core's packed copy. Kept all, every set looked through
+     * held some 100 MB of pictures.
      */
     private val previewOrder = ArrayDeque<String>()
-    private val previewsMost by lazy {
+
+    private fun previewsMost(): Int {
         val memory = android.app.ActivityManager.MemoryInfo()
         getApplication<Application>().getSystemService(android.app.ActivityManager::class.java)?.getMemoryInfo(memory)
-        io.github.artcraftandroid.procraft.core.brushPreviewsKept(memory.totalMem.coerceAtLeast(0).toULong(), 530u, 162u).toInt()
+        return previewBitmapsKept(memory.totalMem, memory.availMem)
     }
 
     /** [bitmap] kept as brush [key]'s sample stroke, the oldest let go past the most kept. */
@@ -1903,7 +2093,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         previews[key] = bitmap
         previewOrder.remove(key)
         previewOrder.addLast(key)
-        while (previewOrder.size > previewsMost) {
+        val most = previewsMost()
+        while (previewOrder.size > most) {
             val old = previewOrder.removeFirst()
             previews.remove(old)
             shadedNames.remove(old)
@@ -1915,6 +2106,16 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         previews.clear()
         shadedNames.clear()
         previewOrder.clear()
+    }
+
+    /**
+     * The library closed: the core lets go of the canvas its sample strokes are drawn on (100 MB and
+     * more of the GPU's memory after a heavy set), made again for the next. The pictures stay, so it
+     * opens again at once.
+     */
+    fun libraryClosed() {
+        val s = session ?: return
+        viewModelScope.launch(Dispatchers.Default) { s.letGoOfPreviews() }
     }
 
     /** Counts the library's changes: a sample stroke asked for before the last one isn't kept. */
@@ -1965,7 +2166,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /**
      * Puts [copy] (premultiplied, as kept here) on the system's clipboard in place of what it held: a
-     * PNG other apps paste, its transparency kept, from the app's files. Made off the main thread, as
+     * PNG other apps paste, its transparency kept, from the app's files, marked sensitive so keyboards
+     * don't keep it in clipboards of their own (see [markedAsPictureCopy]). Made off the main thread, as
      * a big canvas takes a moment. Whatever goes wrong on the way (a picture too big to make, a
      * system that refuses it) costs only other apps' paste, told once: the copy stays here to paste.
      */
@@ -1989,7 +2191,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                 val superseded = turn != clipTurn
                 val uri = if (written && !superseded) runCatching { androidx.core.content.FileProvider.getUriForFile(app, app.packageName + ".files", file) }.getOrNull() else null
                 val board = systemClipboard
-                val put = uri != null && board != null && runCatching { board.setPrimaryClip(android.content.ClipData.newUri(app.contentResolver, "Picture", uri)) }.isSuccess
+                val put = uri != null && board != null && runCatching { board.setPrimaryClip(markedAsPictureCopy(android.content.ClipData.newUri(app.contentResolver, "Picture", uri))) }.isSuccess
                 if (put) {
                     clipUri = uri
                     clipPutAt = runCatching { board?.primaryClipDescription?.timestamp }.getOrNull()
@@ -2083,6 +2285,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         refreshGallery()
+        // (nothing is being saved yet as the app starts)
+        viewModelScope.launch { bringIn() }
         // the GPU made while the gallery shows, so the first artwork opens at once
         viewModelScope.launch(Dispatchers.Default) { io.github.artcraftandroid.procraft.core.warmGpu() }
         // and the brushes read (with many imported, reading them took seconds at each open)
@@ -2093,6 +2297,30 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Where new artworks go: the stack open, or the gallery. */
     private val galleryDir get() = openStack?.dir ?: store.root
+
+    /**
+     * The gallery shows: what a plugin brings in from its folder comes in (once what is being saved
+     * is kept, off the main thread), and the gallery is read again if anything came; a folder out of
+     * reach is told once. With no plugin bringing anything in, nothing happens.
+     */
+    fun galleryOpened() {
+        viewModelScope.launch {
+            while (closingSaves.get() > 0) kotlinx.coroutines.delay(100)
+            bringIn()
+        }
+    }
+
+    /** What a plugin brings in from its folder, brought in now (see [galleryOpened]). */
+    private suspend fun bringIn() {
+        val brought = withContext(Dispatchers.IO) {
+            runCatching { store.bringIn(plugins) }.onFailure { AppLog.e(TAG, "bringing artworks in from a folder", it) }.getOrNull()
+        } ?: return
+        if (brought.added + brought.updated + brought.copies > 0u) {
+            galleryVersion++
+            refreshGallery()
+        }
+        brought.notice?.let { message = it }
+    }
 
     fun refreshGallery() {
         viewModelScope.launch {
@@ -3336,9 +3564,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         val cell = thumbAt[a.dir.name]
         viewModelScope.launch {
             if (!anyway && withContext(Dispatchers.IO) { io.github.artcraftandroid.procraft.core.openingEndedApp(a.dir.path) }) {
-                val lowMemory = withContext(Dispatchers.IO) { endedShortOfMemory(a.dir) }
+                val end = withContext(Dispatchers.IO) { howOpeningEnded(a.dir) }
                 opening = false
-                openingEndedApp = OpeningEndedApp(a, then, lowMemory)
+                openingEndedApp = OpeningEndedApp(a, then, end)
                 return@launch
             }
             val s = withContext(Dispatchers.IO) {
@@ -3361,18 +3589,19 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Whether the run whose opening of the artwork in [dir] ended the app was ended by the system short
-     * of memory, as Android keeps how the app's runs ended (Android 11 on); false if it crashed, or
-     * it isn't known.
+     * How the run whose opening of the artwork in [dir] ended the app ended, as Android keeps how the
+     * app's runs ended (Android 11 on): the system short of memory, a crash, or not known (the core
+     * reads Android's reason).
      */
-    private fun endedShortOfMemory(dir: File): Boolean {
-        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return false
-        val run = io.github.artcraftandroid.procraft.core.openingEndedRun(dir.path) ?: return false
+    private fun howOpeningEnded(dir: File): io.github.artcraftandroid.procraft.core.RunEnd {
+        val unknown = io.github.artcraftandroid.procraft.core.RunEnd.UNKNOWN
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) return unknown
+        val run = io.github.artcraftandroid.procraft.core.openingEndedRun(dir.path) ?: return unknown
         val app = getApplication<Application>()
         val ended = runCatching {
             app.getSystemService(android.app.ActivityManager::class.java)?.getHistoricalProcessExitReasons(app.packageName, run.toInt(), 1)?.firstOrNull()
-        }.getOrNull() ?: return false
-        return io.github.artcraftandroid.procraft.core.androidRunEndedShortOfMemory(ended.reason)
+        }.getOrNull() ?: return unknown
+        return io.github.artcraftandroid.procraft.core.androidRunEnd(ended.reason)
     }
 
     /** How many of the gallery's artworks being shared are written, as a share of them. */
@@ -3578,6 +3807,12 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     resumeTracking()
                     leaveUnsaved = LeaveUnsaved(outcome.title, outcome.message, then)
                 }
+                is io.github.artcraftandroid.procraft.core.Leaving.Lost -> {
+                    // the graphics stopped: nothing more can be saved, nor would staying save it; left
+                    // as last saved (its folder never written over), and said so once
+                    leave(s, dir, saved = false, then)
+                    message = outcome.message
+                }
             }
         }
     }
@@ -3620,7 +3855,6 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             GalleryZoom(c, canvasPlace(s, s.viewMatrix()), opening = false, picture = picture, turns = turns)
         }
-        keepColour()
         // a plugin's panel goes with the artwork it was open over
         closePluginPanel()
         val lapse = timeLapse
@@ -3650,6 +3884,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             galleryVersion++
             refreshGallery()
+            galleryOpened()
         }
         then?.invoke()
     }
@@ -3905,7 +4140,6 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Saves the open artwork where it is (the app going into the background). */
     fun saveNow() {
-        keepColour()
         val s = session ?: return
         val dir = artworkDir ?: return
         noteTime()
@@ -3966,6 +4200,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         if (!brushesLoaded) loadBrushes(s)
         s.useColourHistory(colourHistory)
         session = s
+        reopenedSeen = s.reopenedAfterLoss()
         val model = s.modelInfo()
         modelOpen = model != null
         textureSets = model?.textureSets ?: emptyList()
@@ -5177,6 +5412,8 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             }
             // frames left in their place, not left out silently
             if (t.unread > 0) showNotice("${t.unread} frames of the time-lapse can't be read on this device: the one before each shows in its place.", warning = true)
+            // a copy for the folder a plugin keeps them in, if one does
+            plugins.videoExported(made.path, s.name())
             // full, then the check drawn in it before the card goes
             exportShown = ExportShown(1f, done = true)
             kotlinx.coroutines.delay(EXPORT_DONE_MS)
@@ -5362,6 +5599,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         var size by mutableStateOf(DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp))
             private set
 
+        /** Its picture's size until it is sized: 350 wide, the whole window the canvas's shape, so the canvas fills it (the core's). */
+        private var first = DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp)
+
         /** The screen the window was last laid out on (pixels), and its bars' height together (pixels). */
         private var room by mutableStateOf(androidx.compose.ui.geometry.Size.Unspecified)
         private var bars = 0f
@@ -5395,6 +5635,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
         /** The window as the artwork [s] left it, or none if it never had one. */
         fun restore(s: CanvasSession) {
+            val canvas = s.info()
+            val f = io.github.artcraftandroid.procraft.core.referenceWindowFirstSize(canvas.width, canvas.height)
+            first = DpSize(f.width.dp, f.height.dp)
             forget()
             val w = s.referenceWindowAt(index.toUInt()) ?: return
             mode = when (w.shows) {
@@ -5454,7 +5697,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             imageView = io.github.artcraftandroid.procraft.core.ReferenceView(1f, 0f, 0f)
             offset = Offset.Unspecified
             barsHidden = false
-            size = DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp)
+            size = first
         }
 
         /** The window as it now is, for the core. */
@@ -5467,7 +5710,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
                     ReferenceMode.IMAGE -> io.github.artcraftandroid.procraft.core.ReferenceShows.IMAGE
                     ReferenceMode.MODEL -> io.github.artcraftandroid.procraft.core.ReferenceShows.MODEL
                 },
-                sized = size != DpSize(REFERENCE_WIDTH_DP.dp, REFERENCE_HEIGHT_DP.dp),
+                sized = size != first,
                 width = size.width.value,
                 height = size.height.value,
                 placed = placed,
@@ -5500,7 +5743,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
 
         /**
          * The window laid out on a screen [width] × [height] (pixels), its bars [bars] (pixels) tall
-         * together: the first time in the middle, near the bottom; then where it was put, all of it on
+         * together: the first time in the middle, in the lower half; then where it was put, all of it on
          * the screen (an artwork may have left it on a screen of another shape, or the screen changed:
          * turned, or split). What the artwork keeps changes only as the window is moved or sized.
          */
@@ -5511,7 +5754,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
             if (offset == Offset.Unspecified) {
                 val shown = shown
                 val tall = shown.height.value * density + bars
-                offset = Offset((width - shown.width.value * density) / 2f, (height - REFERENCE_BOTTOM_DP * density - tall).coerceAtLeast(0f))
+                offset = Offset((width - shown.width.value * density) / 2f, minOf(height - REFERENCE_TOP_DP * density, height - tall).coerceAtLeast(0f))
                 return
             }
             val at = onScreen(offset)
@@ -6204,15 +6447,15 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * [brushes] (of one set, dragged together, in their order) let go at place [index] of set [set]
-     * (counted without them there): along their own set they move there; onto another set they are
-     * copied there, those dragged staying where they were (see the core's `brushDropCopies`).
+     * [brushes] (of one set, dragged together, in their order) let go [over] a set's row, a brush of
+     * the set shown (its upper or lower half) or its list: along their own set they move there; onto
+     * another set they are copied there, those dragged staying where they were (the core's
+     * `brushDropPlace` says where).
      */
-    fun dropBrushes(brushes: List<BrushInfo>, set: Int, index: Int) {
+    fun dropBrushesOver(brushes: List<BrushInfo>, over: io.github.artcraftandroid.procraft.core.BrushDropOver) {
         val first = brushes.firstOrNull() ?: return
-        if (brushes.size == 1 && set == first.set.toInt() && index == first.index.toInt()) return
         val indices = brushes.filter { it.set == first.set }.map { it.index }
-        if (session?.dropBrushes(first.set, indices, set.toUInt(), index.toUInt()) == true) libraryChanged()
+        if (session?.dropBrushesOver(first.set, indices, over) == true) libraryChanged()
     }
 
     /** A new brush at the top of the shown set, opened in the studio. */
@@ -7906,6 +8149,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         // recoloring, the area under the reticle takes the new colour
         val s = session
         if (recoloring && s != null) pourLater("colour") { s.recolorColour(r, g, b) }
+        keepColour()
     }
 
     private var naming: kotlinx.coroutines.Job? = null
@@ -8584,9 +8828,9 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         selectionRemoves = removes
     }
 
-    /** How a selection joins the one there is: selecting by colour always adds (Remove greyed). */
+    /** How a selection joins the one there is: selecting by colour always adds, and so does anything with nothing selected yet (Remove greyed). */
     private val join
-        get() = if (selectionRemoves && selectionKind != SelectionKind.AUTOMATIC) SelectionJoin.REMOVE else SelectionJoin.ADD
+        get() = if (selectionRemoves && selectionKind != SelectionKind.AUTOMATIC && hasSelection) SelectionJoin.REMOVE else SelectionJoin.ADD
 
     /** How the canvas's (shared) touches select while the selection tool is open; none otherwise. */
     fun selectTouch(): io.github.artcraftandroid.procraft.core.SelectTouch? {
@@ -10124,10 +10368,14 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         const val MAX_CANVAS_EDGE = 16384
         /** How much smaller than fitted to the screen the canvas is while cropping. */
         /** The reference window: its first place and picture size, its limits, and how sharp and how often its canvas is read. */
-        /** The reference window's picture at first, and its gap to the screen's bottom. */
+        /**
+         * The reference window's picture before an artwork gives it its first size (see `referenceWindowFirstSize`), and how
+         * far above the screen's bottom its top first is, whatever the canvas's shape: where a screen-shaped canvas's (532
+         * tall with its bars) has it, 50 above the bottom.
+         */
         const val REFERENCE_WIDTH_DP = 350f
         const val REFERENCE_HEIGHT_DP = 423f
-        const val REFERENCE_BOTTOM_DP = 50f
+        const val REFERENCE_TOP_DP = 582f
         const val REFERENCE_INTERVAL_MS = 300L
         /** How far down and right of the window it is opened from another Reference window opens (dp). */
         const val REFERENCE_STEP_DP = 24f
@@ -10266,6 +10514,7 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
         const val STUDIO_PREVIEW_DELAY_MS = 60L
         /** The first colour: a saturated blue. */
         const val DEFAULT_HUE = 0.59f
+        /** Where earlier versions kept the colours (now in the core's file): read once, to carry them over. */
         const val KEPT_HUE = "colour.hue"
         const val KEPT_SATURATION = "colour.saturation"
         const val KEPT_BRIGHTNESS = "colour.brightness"

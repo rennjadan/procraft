@@ -169,6 +169,8 @@ struct PluginControlView: View {
             PluginFileRow(file: one) { model.showNotice($0, warning: true) }
         case let .texture(one):
             PluginTextureRow(texture: one) { model.showNotice($0, warning: true) }
+        case let .folder(one):
+            PluginFolderRow(folder: one) { model.showNotice($0, warning: true) }
         }
     }
 }
@@ -424,7 +426,7 @@ struct PluginRingView: View {
                 .onTapGesture { model.closePluginPanel() }
             // the backdrop, which takes its own taps (between the items) without closing
             Circle()
-                .fill(Pc.popoverFrost)
+                .fill(Pc.popoverTint)
                 .frame(width: reach * 2, height: reach * 2)
                 .contentShape(Circle())
                 .onTapGesture {}

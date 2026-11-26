@@ -54,6 +54,8 @@ const PICKED_ROW: u32 = 0xFF2C5281;
 const LOCKED_LETTER: u32 = 0xFF808080;
 const LAYER_ROW: Themed = Themed(0x0DFFFFFF, 0xFFD8D8D8);
 const BACKGROUND_ROW: Themed = Themed(0x0DFFFFFF, 0xFFD8D8D8);
+/// How tall a plugin's action's row under the background's is (as that one is).
+const ACTION_ROW: f32 = 50.0;
 const CHECK_FILL: Themed = Themed(0xFFC7C7C7, 0xFF575757);
 pub(crate) const THUMB_BACKGROUND: Themed = Themed(0xFF4F4F4F, 0xFFC8C8C8);
 /// A text layer's glyph on its thumbnail.
@@ -510,8 +512,12 @@ impl Layers {
             Item::Mesh { .. } => ROW_HEIGHT + ROW_GAP,
             Item::Layer { l, .. } => height_of(l) + ROW_GAP + if tray_for == Some(l.id) { TRAY_HEIGHT } else { 0.0 },
         };
-        // a model has no background row
-        let below = if model.is_some() { 12.0 } else { 10.0 + 50.0 + 12.0 };
+        // a model has no background row; the plugins' actions' rows come under it, each as tall
+        let below = if model.is_some() {
+            12.0
+        } else {
+            10.0 + 50.0 + self.panel_actions.len() as f32 * (10.0 + ACTION_ROW) + 12.0
+        };
         let rows: f32 = items.iter().map(item_height).sum::<f32>() + editors + below;
         // as tall as its rows, up to the window's bottom less a gap
         let most = screen.bottom() - panel::POPOVER_GAP - top;
@@ -2532,7 +2538,7 @@ fn background_row(ui: &mut Ui, look: &mut Look, session: &CanvasSession) -> bool
 /// A row of a plugin's action under the background's, drawn as that is, its label alone: true when
 /// tapped.
 fn action_row(ui: &mut Ui, label: &str) -> bool {
-    let (row, response) = ui.allocate_exact_size(vec2(ui.available_width(), 50.0), Sense::click());
+    let (row, response) = ui.allocate_exact_size(vec2(ui.available_width(), ACTION_ROW), Sense::click());
     ui.painter().rect_filled(row, 17, argb(BACKGROUND_ROW));
     let ink = argb(PANEL_TITLE);
     let g = galley(ui, label, 17.0, Weight::Regular, ink, row.width() - 36.0);
@@ -3151,6 +3157,84 @@ mod tests {
             output.textures_delta.clear();
         }
         assert_eq!(tapped, Some(2), "the plain kind's row");
+    }
+
+    /// The plugins' actions for the Layers panel are rows under the background's, as on the tablet:
+    /// the panel grows to show them (not left below its bottom, to be found only by scrolling), and
+    /// a tap on one runs it.
+    #[test]
+    fn the_plugins_rows_under_the_background_show_in_the_panel_and_run_when_tapped() {
+        let (ctx, mut look) = (egui::Context::default(), Look::default());
+        crate::look::install_fonts(&ctx);
+        let session = CanvasSession::new(64, 64);
+        let (mut layers, mut colours) = (Layers::default(), Colours::default());
+        let action = |key: &str, label: &str| procraft_core::PluginAction {
+            key: key.to_owned(),
+            label: label.to_owned(),
+            place: procraft_core::PluginPlace::Layers,
+        };
+        layers.panel_actions = vec![action("p.settings", "Paper"), action("p.views", "Layer view")];
+        let screen = Rect::from_min_size(Pos2::ZERO, vec2(1200.0, 800.0));
+        let button = Rect::from_min_size(pos2(1000.0, 10.0), vec2(40.0, 40.0));
+        let mut step = 0;
+        let mut frame = |layers: &mut Layers, events: Vec<Event>| {
+            let raw = RawInput {
+                screen_rect: Some(screen),
+                time: Some(f64::from(step) / 60.0),
+                events,
+                ..RawInput::default()
+            };
+            step += 1;
+            let mut output = ctx.clone().run_ui(raw, |ui| {
+                layers.show(
+                    ui.ctx(),
+                    &mut look,
+                    &session,
+                    &mut colours,
+                    crate::panel::Hang::Button(button),
+                    &mut Vec::new(),
+                );
+            });
+            output.textures_delta.clear();
+            output.shapes
+        };
+        let mut shapes = Vec::new();
+        for _ in 0..30 {
+            shapes = frame(&mut layers, Vec::new());
+        }
+        let panel = layers.box_on_window.expect("the panel shows");
+        // each row's label drawn whole inside the panel, and not clipped away
+        let shown = |label: &str| {
+            shapes.iter().find_map(|c| match &c.shape {
+                egui::Shape::Text(t) if t.galley.text() == label => {
+                    let at = Rect::from_min_size(t.pos, t.galley.size());
+                    Some((at, c.clip_rect.contains_rect(at)))
+                }
+                _ => None,
+            })
+        };
+        let mut middles = Vec::new();
+        for label in ["Background color", "Paper", "Layer view"] {
+            let (at, whole) = shown(label).unwrap_or_else(|| panic!("{label} drawn"));
+            assert!(
+                whole && panel.contains_rect(at),
+                "{label} at {at:?}, in the panel {panel:?}, not clipped: {whole}"
+            );
+            middles.push(at.center());
+        }
+        assert!(middles[0].y < middles[1].y && middles[1].y < middles[2].y, "under the background, in order");
+        // Layer view's row tapped: its action runs
+        let press = |pos, pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        let at = middles[2];
+        frame(&mut layers, vec![Event::PointerMoved(at)]);
+        frame(&mut layers, vec![press(at, true)]);
+        frame(&mut layers, vec![press(at, false)]);
+        assert_eq!(layers.run_action.as_deref(), Some("p.views"));
     }
 
     #[test]

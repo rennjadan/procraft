@@ -279,6 +279,18 @@ fun PcPopup(
     }
 }
 
+/**
+ * [content] with the density and part size a [PcPopup]'s content is composed with, its text scaled by
+ * [textScale]: for a menu drawn in the window itself instead (see [WindowMenu]), which has the theme's
+ * screen already.
+ */
+@Composable
+internal fun PopupLocals(textScale: Float, content: @Composable () -> Unit) {
+    val density = popupDensity(textScale)
+    val menus = Pc.partScale(io.github.artcraftandroid.procraft.core.InterfacePart.MENUS)
+    CompositionLocalProvider(LocalDensity provides density, LocalPartScale provides menus, content = content)
+}
+
 /** [PcPopup] placed by a [popupPositionProvider]. */
 @Composable
 fun PcPopup(

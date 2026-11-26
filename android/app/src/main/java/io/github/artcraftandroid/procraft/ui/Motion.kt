@@ -28,7 +28,6 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.positionOnScreen
 import androidx.compose.ui.layout.positionInWindow
 import androidx.compose.animation.core.VectorConverter
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlin.math.abs
 import kotlin.math.cos
@@ -394,6 +393,14 @@ fun <T> PanelPresence(
     }
 }
 
+/**
+ * Takes every touch on it that what is inside doesn't (those go to what is inside first): none reaches the canvas under
+ * it, for all its drag. For what Edit layout moves, whose glass between its buttons would let a press through.
+ */
+fun Modifier.keepsItsTouches(): Modifier = pointerInput(Unit) {
+    awaitEachGesture { awaitFirstDown(requireUnconsumed = false).consume() }
+}
+
 /** Keeps touches from what is inside: a panel fading away takes none (the canvas around it does). */
 fun Modifier.takingNoTouches(): Modifier = pointerInput(Unit) {
     awaitEachGesture {
@@ -411,39 +418,96 @@ fun ProvidePanelLook(look: PanelLook, content: @Composable () -> Unit) {
 }
 
 /**
+ * How far from when it is first drawn a menu's `askedAt` ([MenuPresence]) may be, milliseconds: one
+ * asked for a frame or two before opens from then, and one composed ahead of its time (unseen until
+ * then) from that time; further back (a menu put up again as its anchor comes back into a list) or
+ * ahead, the time is stale, and it opens from when it is drawn.
+ */
+const val MENU_ASKED_TRUST_MS = 100L
+
+/**
+ * How a menu looks [elapsed] milliseconds into opening ([open]) or closing from how it looked when that
+ * began ([fromAlpha], [fromScale]), its alpha (not yet clamped: the opening overshoots) and scale. Opening
+ * goes to 1 and 1 by [Motion.menuOpen]'s curve, closing to nothing and [Motion.MENU_END_SCALE] by
+ * [Motion.menuClose]'s, both over [Motion.MENU_MS] times the animator duration scale [pace] (at 0, at once).
+ */
+internal fun menuLook(open: Boolean, fromAlpha: Float, fromScale: Float, elapsed: Long, pace: Float = 1f): Pair<Float, Float> {
+    val p = menuProgress(elapsed, pace)
+    return if (open) {
+        val e = Motion.MenuOpen.transform(p)
+        fromAlpha + (1f - fromAlpha) * e to fromScale + (1f - fromScale) * e
+    } else {
+        val e = Motion.Settle.transform(p)
+        fromAlpha * (1f - e) to fromScale + (Motion.MENU_END_SCALE - fromScale) * e
+    }
+}
+
+/** How far through its opening or closing a menu is [elapsed] milliseconds in, 0 to 1 (see [menuLook]). */
+internal fun menuProgress(elapsed: Long, pace: Float = 1f): Float {
+    val duration = Motion.MENU_MS * pace
+    return if (duration <= 0f) 1f else (elapsed / duration).coerceIn(0f, 1f)
+}
+
+/**
+ * When a menu's opening runs from ([MenuPresence]): uptime milliseconds, given a menu [asked] for
+ * then and drawn first [now] (until then, ahead of it, it is unseen). None (0), or a time more than
+ * [MENU_ASKED_TRUST_MS] either side of now, isn't one to go by: it runs from now.
+ */
+internal fun menuStart(asked: Long, now: Long): Long = if (asked > 0L && kotlin.math.abs(now - asked) <= MENU_ASKED_TRUST_MS) asked else now
+
+/** A menu's opening or closing: whether it opens, how it looked when it began, when it began (uptime ms). */
+private class MenuMove(val open: Boolean, val fromAlpha: Float, val fromScale: Float, val at: Long) {
+    // the last frame's time (uptime ms) as the frames go by; none yet before its first
+    var frame by androidx.compose.runtime.mutableLongStateOf(-1L)
+}
+
+/**
  * A menu (a popup) that grows out of [origin] (a point of the menu, in fractions of its size) as it
  * opens, and fades as it shrinks back towards it as it closes, staying up while it goes. [content] puts the
- * popup up and gives its menu the [Modifier] it gets, which carries how it looks now.
+ * popup up and gives its menu the [Modifier] it gets, which carries how it looks now. It is up in the
+ * frame it is opened, already as far into opening as the time since it was asked for ([askedAt], uptime
+ * milliseconds, see [menuStart]; else since that frame): no frame goes by with it there but unseen.
+ * Opened ahead of an [askedAt] still to come, it is unseen until then, and closed before then it goes at once.
  */
 @Composable
-fun MenuPresence(open: Boolean, origin: androidx.compose.ui.graphics.TransformOrigin, content: @Composable (Modifier) -> Unit) {
-    var showing by remember { mutableStateOf(open) }
-    // a menu first put up open still opens from its origin
-    val alpha = remember { Animatable(0f) }
-    val scale = remember { Animatable(Motion.MENU_START_SCALE) }
-    LaunchedEffect(open) {
-        if (open) {
-            if (!showing || alpha.value <= 0f) {
-                showing = true
-                alpha.snapTo(0f)
-                scale.snapTo(Motion.MENU_START_SCALE)
-            }
-            coroutineScope {
-                launch { alpha.animateTo(1f, Motion.menuOpen()) }
-                launch { scale.animateTo(1f, Motion.menuOpen()) }
-            }
-        } else {
-            coroutineScope {
-                launch { scale.animateTo(Motion.MENU_END_SCALE, Motion.menuClose()) }
-                launch { alpha.animateTo(0f, Motion.menuClose()) }
-            }
-            showing = false
-        }
+fun MenuPresence(open: Boolean, origin: androidx.compose.ui.graphics.TransformOrigin, askedAt: Long = 0L, content: @Composable (Modifier) -> Unit) {
+    // up at all: from being opened until it has closed
+    var showing by remember { mutableStateOf(false) }
+    // how it looked as last drawn (alpha, scale): where a change of mind starts from
+    val drawn = remember { floatArrayOf(0f, Motion.MENU_START_SCALE) }
+    // the animator duration scale (the developer options') the frames go by, as last seen
+    val pace = remember { floatArrayOf(1f) }
+    // this opening or closing. Opened from nothing (a menu first put up open too) it grows out of its
+    // origin; opened again as it closes, or closed, it goes on from how it looks
+    val move = remember(open) {
+        val now = android.os.SystemClock.uptimeMillis()
+        val fresh = open && (!showing || drawn[0] <= 0f)
+        MenuMove(open, if (fresh) 0f else drawn[0], if (fresh) Motion.MENU_START_SCALE else drawn[1], if (open) menuStart(askedAt, now) else now)
     }
-    if (!showing) return
+    LaunchedEffect(move) {
+        // closed unseen (composed ahead of its time and let go before it), it goes at once
+        if (move.open) {
+            showing = true
+        } else if (!showing || move.fromAlpha <= 0f) {
+            showing = false
+            return@LaunchedEffect
+        }
+        pace[0] = coroutineContext[androidx.compose.ui.MotionDurationScale]?.scaleFactor ?: 1f
+        while (true) {
+            val t = androidx.compose.runtime.withFrameMillis { it }
+            move.frame = t
+            if (menuProgress(t - move.at, pace[0]) >= 1f) break
+        }
+        if (!move.open) showing = false
+    }
+    if (!open && (!showing || move.fromAlpha <= 0f)) return
     var pivot by remember { mutableStateOf(Offset.Zero) }
-    val a = alpha.value.coerceIn(0f, 1f)
-    val k = scale.value
+    // the frame's time; before the first frame comes round, now (as it is first drawn)
+    val t = move.frame.takeIf { it >= 0L } ?: android.os.SystemClock.uptimeMillis()
+    val (alpha, k) = menuLook(move.open, move.fromAlpha, move.fromScale, t - move.at, pace[0])
+    drawn[0] = alpha
+    drawn[1] = k
+    val a = alpha.coerceIn(0f, 1f)
     val corner = LocalClearance.current.corner
     val backdrops = LocalBackdrops.current
     val look = Modifier

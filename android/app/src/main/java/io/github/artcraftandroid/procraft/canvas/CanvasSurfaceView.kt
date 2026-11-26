@@ -347,6 +347,8 @@ class CanvasSurfaceView(context: Context, private val vm: CanvasViewModel) : Sur
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
         val s = session ?: return true
+        // Edit Layout moves the bars: the canvas takes no touch (no colour picked, nothing painted)
+        if (vm.editingLayout) return true
         if (penButton(e)) return true
         predictor.record(e)
         if (e.actionMasked == MotionEvent.ACTION_DOWN) {

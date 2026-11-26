@@ -6,8 +6,9 @@
 //! Printed: the heap and the GPU (its allocator's blocks) at their highest over what they held
 //! with the canvas open, after the first set and after every set, and what is still held after.
 //! Measured on an NVIDIA laptop GPU: the first set's 10 strokes 7 MB of heap and 132 MB of the
-//! GPU; all 598, 83 MB and 196 MB, 80 MB of heap kept after (the strokes kept packed, some 20 MB,
-//! and the brushes' pictures drawn for them). Bounds: those, half again.
+//! GPU; all 598, 83 MB and 132 MB (196 MB while the strokes' canvas kept the most its work had
+//! grown to), 80 MB of heap kept after (the strokes kept packed, some 20 MB, and the brushes'
+//! pictures drawn for them). Bounds: those, half again.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,7 +26,7 @@ const MB: u64 = 1 << 20;
 /// The bounds (MB), from what was measured (see the module's note): the heap and the GPU at the
 /// first set, at every set, and the heap kept after.
 const FIRST_MOST: (u64, u64) = (16, 198);
-const ALL_MOST: (u64, u64) = (125, 294);
+const ALL_MOST: (u64, u64) = (125, 198);
 const KEPT_MOST: u64 = 120;
 
 static GPU_PEAK: AtomicU64 = AtomicU64::new(0);

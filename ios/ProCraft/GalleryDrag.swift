@@ -437,6 +437,8 @@ final class GalleryPresses: UIGestureRecognizer {
     private var start = CGPoint.zero
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        // counted for the log's look at a canvas left (what holds it may let go at the next touch)
+        CanvasLife.touched()
         guard (event.allTouches?.count ?? touches.count) == 1, let touch = touches.first, canPress(), let model else {
             release()
             return

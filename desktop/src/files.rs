@@ -8,7 +8,7 @@ use procraft_core::{
     CanvasPreset, CanvasSession, KeptGestures, ModelFile, PagesOutcome, PsdOutcome, ThumbnailImage, export_file_name,
     import_pages, import_psd, preset_height, preset_width,
 };
-use rfd::{FileDialog, MessageButtons, MessageDialog, MessageDialogResult, MessageLevel};
+use rfd::{FileDialog, MessageDialog, MessageLevel};
 
 use crate::ui::Interface;
 
@@ -445,6 +445,15 @@ pub fn pick_sound(title: &str) -> Option<(Vec<u8>, String)> {
     }
 }
 
+/// A folder the user picks (titled `title`) for a plugin's folder control: where it is, and its
+/// name.
+pub fn pick_plugin_folder(title: &str) -> Option<(String, String)> {
+    let path = dialog().set_title(title).pick_folder()?;
+    let name =
+        path.file_name().map_or_else(|| path.to_string_lossy().into_owned(), |n| n.to_string_lossy().into_owned());
+    Some((path.to_string_lossy().into_owned(), name))
+}
+
 /// A picture the user picks (titled `title`), a PNG or a JPEG, read whole, with its name.
 pub fn pick_control_picture(title: &str) -> Option<(Vec<u8>, String)> {
     let path = dialog().set_title(title).add_filter("Pictures", &["png", "jpg", "jpeg"]).pick_file()?;
@@ -514,29 +523,6 @@ pub fn keep_gestures(kept: &KeptGestures) {
     keep_text("gestures", &(lines.join("\n") + "\n"));
 }
 
-/// The brush colour and the one masks paint with as they were last left (hue, saturation and
-/// brightness, 0..1), if they were kept.
-pub fn kept_colours() -> Option<([f32; 3], [f32; 3])> {
-    let text = std::fs::read_to_string(app_dir().join("colour")).ok()?;
-    let v: Vec<f32> = text
-        .split_whitespace()
-        .filter_map(|t| t.parse::<f32>().ok())
-        .filter(|x| x.is_finite())
-        .map(|x| x.clamp(0.0, 1.0))
-        .collect();
-    match v[..] {
-        [h, s, b, mh, ms, mb] => Some(([h, s, b], [mh, ms, mb])),
-        [h, s, b] => Some(([h, s, b], [0.0; 3])),
-        _ => None,
-    }
-}
-
-pub fn keep_colours(brush: [f32; 3], mask: [f32; 3]) {
-    let [h, s, b] = brush;
-    let [mh, ms, mb] = mask;
-    keep_text("colour", &format!("{h} {s} {b} {mh} {ms} {mb}"));
-}
-
 /// The QuickMenu's buttons kept, as the core writes them.
 pub fn kept_quick_menu() -> Option<String> {
     std::fs::read_to_string(app_dir().join("quick_menu")).ok().map(|s| s.trim().to_owned())
@@ -589,6 +575,23 @@ pub fn keep_preset_time_lapse(preset: &CanvasPreset, dir: &str) {
         quality: preset.time_lapse_quality,
         hevc: preset.time_lapse_hevc,
     });
+}
+
+/// A new artwork saved into its gallery folder `dir` at once, on a thread of its own, as the
+/// tablets save one: it is in the gallery from the moment it is made, not only from its first
+/// change (the app may be ended before that is kept). One opened from the gallery is there
+/// already: nothing is done. The thread, if one was started.
+pub fn keep_new_artwork(session: &Arc<CanvasSession>, dir: &str) -> Option<std::thread::JoinHandle<()>> {
+    if Path::new(dir).join("artwork.json").exists() {
+        return None;
+    }
+    let (session, dir) = (Arc::clone(session), dir.to_owned());
+    let started = std::thread::Builder::new().name("first save".into()).spawn(move || {
+        if let Err(e) = session.save(dir) {
+            log::error!("saving a new artwork: {e}");
+        }
+    });
+    started.inspect_err(|e| log::error!("saving a new artwork: {e}")).ok()
 }
 
 /// A colour profile the user picks (an .icc file), added to those a canvas can be in; its name, or
@@ -931,61 +934,9 @@ pub fn dialog() -> FileDialog {
     dialog
 }
 
-/// Whether to open the artwork in gallery folder `dir`: at once, unless the app ended while opening
-/// it last time (stopped for memory, or crashed); then only if the person says so, so that it can't
-/// take the app down each time it is picked (the gallery stays as it is, the artwork in it).
-pub fn open_anyway(dir: &str) -> bool {
-    if !procraft_core::opening_ended_app(dir.to_owned()) {
-        return true;
-    }
-    log::warn!("the app ended while opening {dir} last time: asking before opening it again");
-    // nothing to ask with (Linux without its dialogs' program): opened as before
-    if cfg!(target_os = "linux") && !has_program("zenity") {
-        return true;
-    }
-    // how that run ended isn't known here: the log is asked for, and Share Log shows it to send on
-    let (action, share) = ("Open Anyway".to_owned(), "Share Log".to_owned());
-    loop {
-        let answer = message()
-            .set_level(MessageLevel::Warning)
-            .set_title(procraft_core::opening_ended_app_title())
-            .set_description(procraft_core::opening_ended_app_said(false))
-            .set_buttons(MessageButtons::YesNoCancelCustom(action.clone(), share.clone(), "Cancel".to_owned()))
-            .show();
-        // (Windows without its newer dialogs shows Yes, No and Cancel)
-        match answer {
-            MessageDialogResult::Yes => return true,
-            MessageDialogResult::Custom(chosen) if chosen == action => return true,
-            MessageDialogResult::No => reveal(&crate::startup::last_run_log()),
-            MessageDialogResult::Custom(chosen) if chosen == share => reveal(&crate::startup::last_run_log()),
-            _ => return false,
-        }
-    }
-}
-
-/// Asks, with `title` and what it says (`said`), whether to leave an artwork that couldn't be saved without
-/// saving it: Stay, the default (and what closing the question, or a system with no way of asking,
-/// comes to), or Leave Without Saving.
-pub fn leave_without_saving(title: &str, said: &str) -> bool {
-    log::warn!("{title}: {said}");
-    if cfg!(target_os = "linux") && !has_program("zenity") {
-        tell(title, said);
-        return false;
-    }
-    let (stay, leave) = ("Stay".to_owned(), "Leave Without Saving".to_owned());
-    let answer = message()
-        .set_level(MessageLevel::Warning)
-        .set_title(title)
-        .set_description(said)
-        .set_buttons(MessageButtons::OkCancelCustom(stay, leave.clone()))
-        .show();
-    // (Windows without its newer dialogs shows OK and Cancel: both stay)
-    matches!(answer, MessageDialogResult::Custom(chosen) if chosen == leave)
-}
-
 /// Shows the file at `path` in the system's file manager (its folder, on Linux), for the person to
 /// send it on.
-fn reveal(path: &Path) {
+pub fn reveal(path: &Path) {
     let shown = if cfg!(windows) {
         std::process::Command::new("explorer").arg("/select,").arg(path).spawn()
     } else if cfg!(target_os = "macos") {
@@ -1369,6 +1320,36 @@ mod tests {
         let settings = procraft_core::TimeLapse::new(dir.to_string_lossy().into_owned()).settings();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(settings, procraft_core::TimeLapseSettings { resolution: 2, quality: 3, hevc: true });
+    }
+
+    /// A new artwork is in the gallery from the moment it is made, with nothing painted yet (the
+    /// app ended before a change is kept loses nothing of it); one already saved isn't saved again.
+    #[test]
+    fn a_new_artwork_is_in_the_gallery_from_the_start() {
+        let root = folder("new-artwork");
+        let store = procraft_core::ArtworkStore::open(root.to_string_lossy().into_owned());
+        let mut made = Vec::new();
+        for n in 0..5 {
+            let session = CanvasSession::new(64 + n, 48);
+            let dir = store.new_folder(None);
+            keep_new_artwork(&session, &dir).expect("saved on a thread").join().unwrap();
+            assert!(keep_new_artwork(&session, &dir).is_none(), "saved once");
+            made.push(dir);
+        }
+        let shown: Vec<String> = store
+            .list(None)
+            .into_iter()
+            .filter_map(|e| match e {
+                procraft_core::GalleryEntry::Artwork { artwork } => Some(artwork.dir),
+                procraft_core::GalleryEntry::Stack { .. } => None,
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(&root);
+        println!("new artworks made: {}, in the gallery: {}", made.len(), shown.len());
+        made.sort();
+        let mut shown = shown;
+        shown.sort();
+        assert_eq!(shown, made);
     }
 
     #[test]

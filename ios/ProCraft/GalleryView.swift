@@ -20,6 +20,9 @@ private let swipeDeleteFill = Color(argb: 0xFFFE_604D)
 private let swipedFade = 0.64
 private let doneBlue = Color(argb: 0xFF01_90FF)
 private let renameBlur: CGFloat = 20
+/// How far the gallery behind a rename fades into its background (a white picture shows at 89 over
+/// the dark gallery's 33, as measured).
+private let renameDim = 0.75
 /// How long Gallery Recovery's pie takes to come most of the way, the card shown long enough to be
 /// read however quick the search; and how long it stays once done.
 private let recoverySearchSteps = 44
@@ -655,6 +658,7 @@ struct GalleryView: View {
             .onAppear {
                 model.onOpen = onOpen
                 model.reload()
+                model.bringIn()
                 #if DEBUG
                     // the capture says what it wants once the window is up
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1) { showForCapture() }
@@ -772,6 +776,11 @@ struct GalleryView: View {
                 }
                 .overlay { flyingBack(screen.size) }
                 .blur(radius: renamed ? renameBlur : 0)
+                .overlay {
+                    Pc.galleryBackground
+                        .opacity(renaming != nil ? renameDim : 0)
+                        .allowsHitTesting(false)
+                }
                 .animation(.easeInOut(duration: renamed ? 0.3 : 0.15), value: renamed)
                 overlays(screen.size)
                 if let what = renaming {

@@ -155,6 +155,9 @@ pub struct Interface {
     /// handles show).
     bars: Arc<procraft_core::BarLayout>,
     editing_layout: bool,
+    /// How far each bar is into its side (Collapse to edge; 0 showing, 1 gone), in
+    /// [`procraft_core::LayoutBar`]'s order, as the last frame had it.
+    bar_slides: [f32; 4],
     /// Edit layout's named layouts (the core's), kept with the preferences.
     named_layouts: Arc<procraft_core::NamedLayouts>,
     /// The interface is hidden (full screen).
@@ -317,6 +320,7 @@ impl Interface {
                 named
             },
             editing_layout: false,
+            bar_slides: [0.0; 4],
             bars_hidden: false,
             clipboard: None,
             system_clipboard: SystemClipboard::new(is_picture),
@@ -483,6 +487,9 @@ impl Interface {
         self.end_recolor(session);
         session.set_touch_layer_opacity(None);
         self.selection.close(session);
+        // a picker plugin's square drew from this artwork's session: kept, the session (and all
+        // the artwork's memory) would stay until another artwork showed the colour panel
+        self.colours.set_picker(None);
     }
 
     /// A new artwork just started: without time-lapse if that is turned off.
@@ -581,6 +588,10 @@ impl Interface {
         let typing = self.typing;
         self.gallery_button = None;
         self.show_frame(ui, session, input);
+        // the colour as it now is kept (written only as it changes)
+        self.colours.keep();
+        // the library closed this frame lets go of what draws its strokes
+        self.library.after_frame(session);
         let ctx = ui.ctx();
         self.follow_held(ctx, session);
         if !typing && escape_untaken(ctx) && self.canvas_shown() && input.idle() {
@@ -600,6 +611,7 @@ impl Interface {
         self.floating.follow(&self.prefs.plugins);
         self.floating.place(&ctx);
         crate::panel::set_panels_fold(&ctx, self.floating.layout.look().fold);
+        crate::panel::set_panels_solid(&ctx, self.floating.layout.look().on);
         self.ended_export = None;
         self.canvas_pressed = std::mem::take(&mut input.canvas_pressed);
         // looked at again soon while an insert is read, or brushes made
@@ -736,7 +748,7 @@ impl Interface {
         if self.time_lapse.replaying() {
             self.canvas_rect = Rect::NOTHING;
             self.animation.reset(session);
-            if let Some(said) = self.time_lapse.show(&ctx, &mut self.look, &session.name()) {
+            if let Some(said) = self.time_lapse.show(&ctx, &mut self.look, &session.name(), &self.prefs.plugins) {
                 crate::files::tell("Time-lapse", said);
             }
             session.set_backdrops(Vec::new());
@@ -816,15 +828,32 @@ impl Interface {
             self.popover_open = self.text.editing();
             return;
         }
-        // the top bar, or its halves where Edit layout moved them
-        let moved = crate::edit_layout::place_bars(
+        // the top bar, or its halves where Edit layout moved them (or as they slide into a side)
+        let [left_slid, right_slid, ..] = self.bar_slides;
+        let sliding = [left_slid > 0.0, right_slid > 0.0];
+        let mut moved = crate::edit_layout::place_bars(
             &ctx,
             &self.bars,
             &self.floating.layout.look(),
             self.prefs.right_handed,
             self.prefs.side_bar_centre,
+            sliding,
         );
+        let [left_slide, right_slide, side_slide, _] = self.bar_slides(&ctx);
         let mut halves_glass = Vec::new();
+        // (each square only on its sides against the window's edges)
+        let edges = |bar| self.bars.touching(bar).unwrap_or_default();
+        let half_edges = [edges(procraft_core::LayoutBar::TopLeft), edges(procraft_core::LayoutBar::TopRight)];
+        // the side bar sliding into its side or out: drawn where it is on the way
+        let side_home = moved.side_bar.is_none();
+        if let Some((offset, _)) = side_slide.filter(|(_, gone)| !gone)
+            && let Some(r) = self.bars.rect(procraft_core::LayoutBar::SideBar)
+            && offset != egui::Vec2::ZERO
+        {
+            moved.side_bar = Some(egui::pos2(r.x, r.y) + offset);
+        }
+        let side_gone = side_slide.is_some_and(|(_, gone)| gone);
+        let side_edges = moved.side_bar.map(|_| edges(procraft_core::LayoutBar::SideBar));
         let bar = match moved.halves {
             Some(places) => crate::chrome::top_bar_halves(
                 &ctx,
@@ -833,12 +862,21 @@ impl Interface {
                 colour,
                 self.colours.hsv[2],
                 &lit,
-                places,
+                {
+                    let [left, right] = places;
+                    [(left, left_slide), (right, right_slide)].map(|(p, slide)| {
+                        let off = slide.map_or(egui::Vec2::ZERO, |(o, _)| o);
+                        procraft_core::BarPlace { x: p.x + off.x, y: p.y + off.y, ..p }
+                    })
+                },
+                half_edges,
+                [left_slide, right_slide].map(|s| s.is_some_and(|(_, gone)| gone)),
                 &mut halves_glass,
             ),
             None => crate::chrome::top_bar(ui, &mut self.look, info.tool, colour, self.colours.hsv[2], &lit),
         };
         self.side_bar.moved = moved.side_bar;
+        self.side_bar.edges = side_edges;
         self.gallery_button = bar.rect(BarButton::Gallery);
         let held = self.tool_hold(&ctx, session, &bar);
         // another button tapped while placing shapes puts the shape tool away first
@@ -944,6 +982,7 @@ impl Interface {
         // a mode taking the screen puts the side bar away
         let adjusting = session.adjustment_shown();
         let side_bar = self.side_bar_shown
+            && !side_gone
             && !self.transform.on
             && !self.selection.on
             && session.touch_layer_opacity().is_none()
@@ -951,7 +990,7 @@ impl Interface {
             && (adjusting.adjustment.is_none() || adjusting.pencil);
         let side_bar_centre = self.prefs.side_bar_centre;
         // (moved off its edge by Edit layout, the panels keep clear of no side bar)
-        let at_edge = moved.side_bar.is_none();
+        let at_edge = side_home && !side_gone;
         crate::panel::side_bar_at(&ctx, self.side_bar_shown && at_edge, self.prefs.right_handed, side_bar_centre);
         let taps = if side_bar {
             let modify_lit = session.pick_next();
@@ -1058,7 +1097,10 @@ impl Interface {
         // Edit layout: a handle on each bar, Reset and Done
         if self.editing_layout {
             let hidden = !self.floating.layout.hidden_pieces().is_empty();
-            match crate::edit_layout::handles(&ctx, &self.bars, hidden, &self.named_layouts) {
+            let belt = self.floating.layout.belt_shown().is_some();
+            let collapse = self.floating.layout.look().collapse.then(|| self.any_collapsed());
+            match crate::edit_layout::handles(&ctx, &self.bars, hidden, &self.named_layouts, belt, collapse) {
+                Some(crate::edit_layout::Done::CollapseAll(collapsed)) => self.collapse_all(collapsed),
                 Some(crate::edit_layout::Done::ShowHidden) => {
                     self.floating.layout.show_hidden();
                     self.keep_floating();
@@ -1301,7 +1343,7 @@ impl Interface {
                 None => {}
             }
         }
-        if let Some(said) = self.time_lapse.show(&ctx, &mut self.look, &session.name()) {
+        if let Some(said) = self.time_lapse.show(&ctx, &mut self.look, &session.name(), &self.prefs.plugins) {
             crate::files::tell("Time-lapse", said);
         }
         self.touch_companion(&ctx, session);
@@ -3156,6 +3198,18 @@ impl Interface {
                 _ => continue,
             };
             let Some(window) = self.floating.layout.shown(piece) else { continue };
+            // sliding into its side or out of it (Collapse to edge): where it is on the way; gone, its
+            // tab instead (see Interface::collapse_tabs)
+            let window = match self.window_slide(ctx, piece) {
+                Some((_, true)) => continue,
+                Some((offset, false)) => {
+                    procraft_core::PieceShown { x: window.x + offset.x, y: window.y + offset.y, ..window }
+                }
+                None => window,
+            };
+            let collapses = self.floating.layout.look().collapse;
+            let edge = self.floating.layout.piece_collapse_edge(piece);
+            crate::panel::window_collapse(ctx, edge, collapses.then(|| self.any_collapsed()));
             // folded, its tab
             if window.folded {
                 let touch = crate::floating_panels::tab(ctx, &mut self.look, window, piece_title(piece), backdrops);
@@ -3171,6 +3225,9 @@ impl Interface {
             let (rect, space) = Floating::space(ctx, window);
             crate::panel::drawing_panel(ctx, Some(space));
             crate::panel::window_pinned(ctx, self.floating.layout.is_pinned(piece));
+            let tabs =
+                self.floating.layout.tabs_of(piece).into_iter().map(|p| (p, piece_title(p), p == piece)).collect();
+            crate::panel::window_tabs(ctx, tabs);
             let hang = crate::panel::Hang::Floating(rect);
             let chrome = match panel {
                 None => {
@@ -3209,8 +3266,14 @@ impl Interface {
                 }
             };
             crate::panel::drawing_panel(ctx, None);
+            crate::panel::window_tabs(ctx, Vec::new());
+            crate::panel::window_collapse(ctx, None, None);
             self.window_chrome(ctx, piece, chrome);
         }
+        // the Tool Belt, while a plugin says so
+        self.tool_belt(ctx);
+        // the collapse buttons of the bars against a side, and the tabs of all that went in
+        self.collapse_tabs(ctx);
         // the windows over one another as the layout orders them
         for &piece in &order {
             let id = match piece {
@@ -3456,6 +3519,20 @@ impl Interface {
             self.floating.changed = true;
         } else if chrome.folded {
             self.floating.fold(piece, true);
+        } else if chrome.collapse {
+            if layout.set_piece_collapsed(piece, true) {
+                self.floating.changed = true;
+            }
+        } else if let Some(tab) = chrome.pick {
+            layout.set_active_tab(tab);
+            self.floating.changed = true;
+        } else if let Some((tab, at)) = chrome.tear {
+            // torn out of its window, it follows the pointer until let go (one at a time: nothing
+            // else is torn out as the drag goes on)
+            if layout.holding().is_none() {
+                layout.tear_tab(tab, at.x, at.y, 12.0);
+                self.floating.changed = true;
+            }
         } else if let Some(act) = chrome.act {
             match act {
                 WindowAct::Fold => layout.set_folded(piece, true),
@@ -3464,12 +3541,128 @@ impl Interface {
                 WindowAct::Reset => {
                     layout.reset_place(piece);
                 }
+                WindowAct::CollapseAll => {
+                    let any = self.any_collapsed();
+                    self.collapse_all(!any);
+                }
             }
             self.floating.changed = true;
         } else if (chrome.moving || chrome.sizing)
             && let Some(from) = ctx.input(|i| i.pointer.press_origin())
         {
             self.floating.hold(piece, chrome.sizing, from);
+        }
+    }
+
+    /// Whether Edit Layout is moving the bars (the canvas takes no press meanwhile).
+    pub fn editing_layout(&self) -> bool {
+        self.editing_layout
+    }
+
+    /// How far each bar is into its side this frame (Collapse to edge), kept for the next: for each,
+    /// while it can go in, how far it is moved on its way and whether it is gone (all the way in).
+    fn bar_slides(&mut self, ctx: &egui::Context) -> [Option<(egui::Vec2, bool)>; 4] {
+        use procraft_core::LayoutBar;
+        let bars = [LayoutBar::TopLeft, LayoutBar::TopRight, LayoutBar::SideBar, LayoutBar::Belt];
+        let mut slides = [None; 4];
+        for (i, bar) in bars.into_iter().enumerate() {
+            let collapsed = self.bars.collapsed(bar).is_some();
+            let slid = crate::collapse::slid(ctx, egui::Id::unique("bar slide").with(bar), collapsed);
+            if let Some(s) = self.bar_slides.get_mut(i) {
+                *s = slid;
+            }
+            if let Some(place) = self.bars.collapse_place(bar)
+                && let Some(slot) = slides.get_mut(i)
+            {
+                *slot = Some((crate::collapse::offset(&place, slid), collapsed && slid >= 1.0));
+            }
+        }
+        slides
+    }
+
+    /// How far `piece`'s window is into its side this frame (Collapse to edge): how far it is moved
+    /// on its way and whether it is gone; none while it can't go in.
+    fn window_slide(&self, ctx: &egui::Context, piece: procraft_core::LayoutPiece) -> Option<(egui::Vec2, bool)> {
+        let layout = &self.floating.layout;
+        let collapsed = layout.piece_collapsed(piece).is_some();
+        let slid = crate::collapse::slid(ctx, egui::Id::unique("window slide").with(piece), collapsed);
+        let place = layout.piece_collapse_place(piece)?;
+        Some((crate::collapse::offset(&place, slid), collapsed && slid >= 1.0))
+    }
+
+    /// Whether any bar or window is collapsed into its side.
+    fn any_collapsed(&self) -> bool {
+        self.bars.any_collapsed() || self.floating.layout.any_collapsed()
+    }
+
+    /// Collapse All (`collapsed`) or Open All: every bar and window against a side, kept.
+    fn collapse_all(&mut self, collapsed: bool) {
+        if self.bars.set_all_collapsed(collapsed) {
+            self.prefs.bar_layout = Some(self.bars.kept());
+            self.prefs.keep();
+        }
+        if self.floating.layout.set_all_collapsed(collapsed) {
+            self.keep_floating();
+        }
+    }
+
+    /// Collapse to edge's buttons and tabs: a button by each bar against a side (none while Edit
+    /// Layout moves them), and the tab of each bar and window collapsed into a side; a tap on a tab, or
+    /// a drag out of the side, brings it back.
+    fn collapse_tabs(&mut self, ctx: &egui::Context) {
+        use procraft_core::{LayoutBar, LayoutPiece};
+        if !self.floating.layout.look().collapse {
+            return;
+        }
+        let belt = self.floating.layout.belt_shown().is_some();
+        let mut bars_changed = false;
+        for (i, bar) in
+            [LayoutBar::TopLeft, LayoutBar::TopRight, LayoutBar::SideBar, LayoutBar::Belt].into_iter().enumerate()
+        {
+            if (bar == LayoutBar::Belt && !belt) || (bar == LayoutBar::SideBar && !self.side_bar_shown) {
+                continue;
+            }
+            let slid = self.bar_slides.get(i).copied().unwrap_or(0.0);
+            let id = egui::Id::unique("bar collapse").with(bar);
+            match self.bars.collapsed(bar) {
+                Some(c) => {
+                    let touch = crate::collapse::tab(ctx, id, &c, slid);
+                    if touch.tapped {
+                        bars_changed |= self.bars.set_collapsed(bar, false);
+                    } else if let Some(d) = touch.pulled {
+                        bars_changed |= self.bars.pull_tab(bar, d.x, d.y);
+                    }
+                }
+                None if !self.editing_layout && slid <= 0.0 => {
+                    let (Some(at), Some(place)) = (self.bars.collapse_button(bar), self.bars.collapse_place(bar))
+                    else {
+                        continue;
+                    };
+                    if crate::collapse::button(ctx, id, crate::collapse::rect(at), place.edge) {
+                        bars_changed |= self.bars.set_collapsed(bar, true);
+                    }
+                }
+                None => {}
+            }
+        }
+        if bars_changed {
+            self.prefs.bar_layout = Some(self.bars.kept());
+            self.prefs.keep();
+        }
+        let layout = Arc::clone(&self.floating.layout);
+        let mut windows_changed = false;
+        for piece in [LayoutPiece::Layers, LayoutPiece::Brushes, LayoutPiece::Actions, LayoutPiece::Adjustments] {
+            let Some(c) = layout.piece_collapsed(piece) else { continue };
+            let slid = crate::collapse::slid(ctx, egui::Id::unique("window slide").with(piece), true);
+            let touch = crate::collapse::tab(ctx, egui::Id::unique("window collapse").with(piece), &c, slid);
+            if touch.tapped {
+                windows_changed |= layout.set_piece_collapsed(piece, false);
+            } else if let Some(d) = touch.pulled {
+                windows_changed |= layout.pull_piece_tab(piece, d.x, d.y);
+            }
+        }
+        if windows_changed {
+            self.keep_floating();
         }
     }
 
@@ -3513,6 +3706,7 @@ impl Interface {
                     .fixed_pos(strip.min)
                     .order(egui::Order::Foreground)
                     .show(ctx, |ui| {
+                        crate::screen::claim(ui, strip);
                         ui.painter().rect_filled(
                             egui::Rect::from_min_size(strip.min, egui::vec2(strip.width(), crate::panel::FLOATING_TOP)),
                             egui::CornerRadius { nw: 12, ne: 12, sw: 0, se: 0 },
@@ -3537,6 +3731,7 @@ impl Interface {
                             egui::vec2(40.0, 4.0),
                         );
                         ui.painter().rect_filled(pill, 2, crate::look::argb(crate::panel::grabber_ink()));
+                        crate::screen::claim(ui, handle);
                         let held = ui.interact(handle, ui.scope_id().with("tear"), egui::Sense::drag());
                         if held.dragged()
                             && let (Some(p), Some(from)) =
@@ -3550,6 +3745,92 @@ impl Interface {
             }
             None => {}
         }
+    }
+
+    /// The Tool Belt: a chip for each panel parked on it, at the floating windows' size; a click puts
+    /// one back where it was, and one dragged off floats under the pointer until let go.
+    fn tool_belt(&mut self, ctx: &egui::Context) {
+        let layout = Arc::clone(&self.floating.layout);
+        let Some(belt) = layout.belt_shown() else { return };
+        let k = belt.scale;
+        // where it shows: moved in Edit Layout (a bar), upright against a side; told to the layout
+        let (length, thickness) = (belt.width * k, belt.height * k);
+        let own = procraft_core::BarPlace { x: belt.x, y: belt.y, vertical: false };
+        self.bars.set_bar(procraft_core::LayoutBar::Belt, own, length, thickness);
+        let place = self.bars.shown(procraft_core::LayoutBar::Belt).unwrap_or(own);
+        // sliding into its side or out (Collapse to edge); gone, its tab instead
+        let slide = self.bar_slides.get(3).copied().unwrap_or(0.0);
+        let into = self.bars.collapse_place(procraft_core::LayoutBar::Belt);
+        let gone = slide >= 1.0 && self.bars.collapsed(procraft_core::LayoutBar::Belt).is_some();
+        let off = into.map_or(egui::Vec2::ZERO, |c| crate::collapse::offset(&c, slide));
+        let place = procraft_core::BarPlace { x: place.x + off.x, y: place.y + off.y, ..place };
+        let upright = place.vertical;
+        let size = if upright { egui::vec2(thickness, length) } else { egui::vec2(length, thickness) };
+        let rect = egui::Rect::from_min_size(egui::pos2(place.x, place.y), size);
+        layout.set_belt_place(Some(procraft_core::LayoutRect {
+            x: rect.left() - off.x,
+            y: rect.top() - off.y,
+            width: rect.width(),
+            height: rect.height(),
+        }));
+        if gone {
+            return;
+        }
+        egui::Area::new(egui::Id::unique("tool belt")).fixed_pos(rect.min).order(egui::Order::Middle).show(ctx, |ui| {
+            // round, but square on its sides against the window's edges
+            let sides = self.bars.touching(procraft_core::LayoutBar::Belt).unwrap_or_default();
+            let corners = crate::chrome::bar_corners(ctx, egui::Id::unique("tool belt corners"), sides, 18.0 * k);
+            ui.painter().rect_filled(
+                rect,
+                crate::chrome::corner_radius(corners),
+                crate::look::argb(crate::panel::POPOVER_FROST),
+            );
+            crate::screen::claim(ui, rect);
+            let ink = crate::look::argb(crate::panel::PANEL_TITLE);
+            // a word along the belt, turned to read up it while it stands upright
+            let word = |at: egui::Pos2, word: &str, ink: egui::Color32| {
+                let galley = ui.painter().layout_no_wrap(word.to_owned(), egui::FontId::proportional(13.0 * k), ink);
+                let half = galley.size() / 2.0;
+                let shape = if upright {
+                    egui::epaint::TextShape::new(at + egui::vec2(-half.y, half.x), galley, ink)
+                        .with_angle(-std::f32::consts::FRAC_PI_2)
+                } else {
+                    egui::epaint::TextShape::new(at - half, galley, ink)
+                };
+                ui.painter().add(shape);
+            };
+            if belt.pieces.is_empty() {
+                word(rect.center(), "Tool Belt", ink.gamma_multiply(0.5));
+            }
+            for (i, &piece) in belt.pieces.iter().enumerate() {
+                let along = 120.0 * k * i as f32;
+                let chip = if upright {
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left(), rect.top() + along),
+                        egui::vec2(rect.width(), 120.0 * k),
+                    )
+                } else {
+                    egui::Rect::from_min_size(
+                        egui::pos2(rect.left() + along, rect.top()),
+                        egui::vec2(120.0 * k, rect.height()),
+                    )
+                };
+                word(chip.center(), piece_title(piece), ink);
+                let touched = ui.interact(chip, ui.scope_id().with(("belt chip", i)), egui::Sense::click_and_drag());
+                if touched.clicked() {
+                    layout.unpark(piece);
+                    self.floating.changed = true;
+                } else if touched.dragged()
+                    && let (Some(p), Some(from)) =
+                        (touched.interact_pointer_pos(), ctx.input(|i| i.pointer.press_origin()))
+                    && p.distance(from) > 26.0
+                    && layout.holding() != Some(piece)
+                {
+                    layout.unpark_at(piece, p.x, p.y, 12.0);
+                    self.floating.changed = true;
+                }
+            }
+        });
     }
 
     /// The named layouts kept with the preferences, as they are now.
@@ -4014,7 +4295,7 @@ fn piece_title(piece: procraft_core::LayoutPiece) -> &'static str {
     use procraft_core::LayoutPiece;
     match piece {
         LayoutPiece::Layers => "Layers",
-        LayoutPiece::Brushes => "Brush Library",
+        LayoutPiece::Brushes => "Brush library",
         LayoutPiece::Colours => "Colors",
         LayoutPiece::Actions => "Actions",
         LayoutPiece::Adjustments => "Adjustments",
@@ -4143,7 +4424,7 @@ mod tests {
         /// A window event to the canvas, which leaves what lands on the interface to it.
         fn canvas_hears(&mut self, event: &WindowEvent) {
             let canvas = self.ui.canvas_rect;
-            let blocked = self.ui.popover_open && !self.ui.panel_lets_through;
+            let blocked = (self.ui.popover_open && !self.ui.panel_lets_through) || self.ui.editing_layout;
             let ctx = &self.ctx;
             self.input
                 .on_event(&self.session, event, false, |p| blocked || crate::screen::on_interface(ctx, p, canvas));
@@ -4750,5 +5031,215 @@ mod tests {
             open_median <= closed_median + Duration::from_millis(2),
             "open {open_median:?}, closed {closed_median:?}"
         );
+    }
+
+    /// The app's plugins in a folder of their own, Edit layout on with every panel floating.
+    fn edit_layout_on(name: &str) -> (Arc<procraft_core::Plugins>, PathBuf) {
+        edit_layout_with(name, &[])
+    }
+
+    /// As [`edit_layout_on`], its `more` features on too.
+    fn edit_layout_with(name: &str, more: &[&str]) -> (Arc<procraft_core::Plugins>, PathBuf) {
+        const EDIT: &str = "io.github.artcraftandroid.edit-layout";
+        let dir = std::env::temp_dir().join(format!("procraft-edit-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let plugins = procraft_core::Plugins::with_bundled(dir.to_string_lossy().into_owned());
+        assert!(plugins.set_on(EDIT.to_owned(), true));
+        for feature in ["movable_panels", "all_panels", "edit_layout"].iter().chain(more) {
+            assert!(plugins.set_switch(format!("{EDIT}.{feature}"), true), "{feature}");
+        }
+        (plugins, dir)
+    }
+
+    /// Collapse to edge: the side bar's collapse button slides it into its side (0.2 seconds), giving
+    /// its room back, and a tap on the tab left there brings it back out; neither press paints.
+    #[test]
+    fn a_bar_s_collapse_button_slides_it_into_its_side_and_its_tab_brings_it_back() {
+        use procraft_core::LayoutBar;
+        let (plugins, dir) = edit_layout_with("collapse", &["collapse_edge"]);
+        let prefs = crate::prefs::Prefs { plugins, ..Default::default() };
+        let Some(mut w) = Window::open_canvas(vec2(1000.0, 750.0), (2000, 1500), prefs) else { return };
+        let bars = Arc::clone(&w.ui.bars);
+        let room = |w: &Window| crate::panel::side_bar_shown_at(&w.ctx);
+        assert!(room(&w).is_some(), "the panels keep clear of the side bar");
+        let button = bars.collapse_button(LayoutBar::SideBar).expect("its collapse button, under its foot");
+        w.click(crate::collapse::rect(button).center());
+        assert!(bars.collapsed(LayoutBar::SideBar).is_some());
+        // a quarter of a second on: in, its room given back
+        for _ in 0..15 {
+            w.frame();
+        }
+        assert!(room(&w).is_none(), "its room given back");
+        untouched(&w, "the collapse button");
+        // its tab tapped: back out
+        let tab = bars.collapsed(LayoutBar::SideBar).unwrap().tab;
+        w.click(crate::collapse::rect(tab).center());
+        assert_eq!(bars.collapsed(LayoutBar::SideBar), None);
+        for _ in 0..15 {
+            w.frame();
+        }
+        assert!(room(&w).is_some());
+        untouched(&w, "its tab");
+        // kept with the preferences as it was left
+        assert!(!w.ui.prefs.bar_layout.as_deref().unwrap_or_default().contains("collapsed"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing reached the canvas: no stroke to undo, nothing painted.
+    fn untouched(w: &Window, what: &str) {
+        assert!(!w.steps().0, "{what}: a stroke to undo");
+        assert_eq!(w.painted(), 0, "{what}: painted");
+    }
+
+    /// A press on a moved bar's glass, on Edit Layout's row and its Layouts list, on Done, and a
+    /// window dragged by its strip: none reaches the canvas, which fills the window under them.
+    /// (Each went through to it and painted, a dot or a stroke along the drag: their areas lay
+    /// nothing out, so they measured no bigger than a point.)
+    #[test]
+    fn presses_on_moved_bars_edit_layout_s_row_and_window_strips_never_reach_the_canvas() {
+        use procraft_core::{LayoutBar, LayoutPiece};
+        let (plugins, dir) = edit_layout_on("presses");
+        let prefs = crate::prefs::Prefs { plugins, ..Default::default() };
+        let Some(mut w) = Window::open_canvas(vec2(1000.0, 750.0), (2000, 1500), prefs) else { return };
+        let paper = w.paper();
+        // the bars where they always are: their glass between their buttons (the side bar's ends, the
+        // top bar's middle between its two groups) is theirs
+        let bars = Arc::clone(&w.ui.bars);
+        let side = bars.rect(LayoutBar::SideBar).unwrap();
+        for at in [
+            pos2(side.x + side.width / 2.0, side.y + 3.0),
+            pos2(side.x + side.width / 2.0, side.y + side.height - 3.0),
+            pos2(500.0, 20.0),
+        ] {
+            w.click(at);
+            w.pen_tap(at);
+        }
+        untouched(&w, "the bars where they always are");
+        // the tools half moved down into the middle
+        let r = bars.rect(LayoutBar::TopRight).unwrap();
+        bars.set_editing(true);
+        assert!(bars.hold(LayoutBar::TopRight, r.x + 10.0, r.y + 10.0));
+        bars.drag(r.x + 10.0 - 300.0, r.y + 10.0 + 300.0);
+        bars.let_go();
+        bars.set_editing(false);
+        w.frame();
+        w.frame();
+        let moved = bars.rect(LayoutBar::TopRight).unwrap();
+        // its glass at its left end, short of its first button
+        let glass = pos2(moved.x + 4.0, moved.y + moved.height / 2.0);
+        assert!(paper.contains(glass), "{paper:?} {glass:?}");
+        w.click(glass);
+        w.pen_tap(glass);
+        untouched(&w, "the moved bar");
+        // Edit Layout: the canvas takes nothing meanwhile, not even a stroke across its middle...
+        w.ui.editing_layout = true;
+        bars.set_editing(true);
+        w.frame();
+        w.pen_stroke(pos2(400.0, 380.0), pos2(600.0, 380.0), 10);
+        w.mouse_stroke(pos2(400.0, 420.0), pos2(600.0, 420.0), 10);
+        untouched(&w, "a stroke while Edit Layout is on");
+        // ...and Layouts on its row (opening the list), a press on the list, then Done
+        let row = 750.0 - 28.0 - 22.0;
+        let layouts = pos2(500.0 - 135.0 + 45.0, row);
+        assert!(paper.contains(layouts), "{paper:?} {layouts:?}");
+        w.click(layouts);
+        w.frame();
+        w.click(pos2(500.0 - 174.0, row - 22.0 - 12.0 - 26.0));
+        untouched(&w, "Edit Layout's row and its list");
+        w.click(pos2(500.0 + 135.0 - 45.0, row));
+        assert!(!w.ui.editing_layout, "Done ends it");
+        untouched(&w, "Done");
+        // the Layers panel in a window of its own, dragged by its strip
+        let layout = Arc::clone(&w.ui.floating.layout);
+        layout.open_at(LayoutPiece::Layers, 500.0, 200.0, 12.0);
+        layout.let_go();
+        w.frame();
+        let before = layout.shown(LayoutPiece::Layers).unwrap();
+        let strip = pos2(before.x + 70.0, before.y + 12.0);
+        assert!(paper.contains(strip), "{paper:?} {strip:?}");
+        w.mouse_stroke(strip, strip + vec2(80.0, 120.0), 8);
+        let after = layout.shown(LayoutPiece::Layers).unwrap();
+        assert_ne!((after.x, after.y), (before.x, before.y), "the window moved");
+        untouched(&w, "a window dragged by its strip");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A tab dragged out of a window of four: that tab comes out alone, and the other three stay
+    /// tabs of their window. (Each tab was known by its place across the strip, so the one sliding
+    /// into the place of one torn out was torn out too as the drag went on, and the window fell
+    /// apart.)
+    #[test]
+    fn a_tab_dragged_out_of_a_window_of_four_takes_only_itself() {
+        use procraft_core::LayoutPiece;
+        let (plugins, dir) = edit_layout_on("tabs");
+        let prefs = crate::prefs::Prefs { plugins, ..Default::default() };
+        // (tall enough for the Adjustments menu's rows)
+        let Some(mut w) = Window::open_canvas(vec2(1300.0, 1000.0), (2600, 2000), prefs) else { return };
+        let layout = Arc::clone(&w.ui.floating.layout);
+        layout.open_at(LayoutPiece::Layers, 500.0, 150.0, 0.0);
+        layout.let_go();
+        w.frame();
+        let host = layout.shown(LayoutPiece::Layers).unwrap();
+        let middle = host.x + host.width * host.scale / 2.0;
+        for piece in [LayoutPiece::Brushes, LayoutPiece::Adjustments, LayoutPiece::Actions] {
+            layout.open_at(piece, middle, host.y + 5.0, 0.0);
+            layout.let_go();
+            w.frame();
+        }
+        let four = [LayoutPiece::Layers, LayoutPiece::Brushes, LayoutPiece::Adjustments, LayoutPiece::Actions];
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), four);
+        // the second tab, the brush library's, dragged down off the strip, Actions showing
+        let shown = layout.shown(LayoutPiece::Actions).unwrap();
+        let window = Rect::from_min_size(pos2(shown.x, shown.y), vec2(shown.width, shown.height) * shown.scale);
+        let cells = crate::panel::tab_cells(window, 4, usize::from(layout.look().fold));
+        let from = cells[1].center();
+        w.mouse_stroke(from, from + vec2(0.0, 200.0), 12);
+        let three = [LayoutPiece::Layers, LayoutPiece::Adjustments, LayoutPiece::Actions];
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), three);
+        assert!(layout.tabs_of(LayoutPiece::Brushes).is_empty());
+        let torn = layout.shown(LayoutPiece::Brushes).expect("the brush library in a window of its own");
+        assert!(torn.y > shown.y + 100.0, "{torn:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Artworks opened and left one after another in the same interface, as the app goes from one
+    /// to the next through the gallery: each painted on with its panels shown in turn, a picker
+    /// plugin's square drawn from it (the floating colour panel holds its session for that), then
+    /// left as the app leaves one. Nothing of the interface keeps a session left, so all of its
+    /// memory goes with it (once the brushes' sample strokes being drawn from it are done): one
+    /// kept is a whole artwork's state held for as long as the app runs.
+    #[test]
+    fn an_artwork_left_is_held_by_nothing_in_the_interface() {
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), true) else { return };
+        let dir = std::env::temp_dir().join(format!("procraft-desktop-left-{}", std::process::id()));
+        for round in 0..20 {
+            w.stroke();
+            for open in [Popover::Colour, Popover::Brushes, Popover::Layers, Popover::Actions] {
+                w.ui.open = Some(open);
+                w.frame();
+            }
+            w.ui.open = None;
+            let plugins = Arc::clone(&w.ui.prefs.plugins);
+            w.ui.colours.set_picker(Some((plugins, Arc::clone(&w.session))));
+            w.frame();
+            // left as the app leaves it (saved, the interface told), the next one opened in its place
+            let left = Arc::downgrade(&w.session);
+            w.ui.closing(&w.session);
+            let saved = dir.join(round.to_string()).to_string_lossy().into_owned();
+            assert_eq!(Arc::clone(&w.session).save_to_leave(saved), procraft_core::Leaving::Left);
+            let next = CanvasSession::new(400, 300);
+            next.set_display_scale(1.0);
+            next.use_gpu(w.gpu.clone());
+            next.show_in(w.size.x as u32, w.size.y as u32);
+            w.ui.opened(&next, 1.0);
+            w.session = next;
+            w.frame();
+            let since = std::time::Instant::now();
+            while left.upgrade().is_some() && since.elapsed() < std::time::Duration::from_secs(5) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(left.upgrade().is_none(), "round {round}: the artwork left is still held");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

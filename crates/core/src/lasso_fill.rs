@@ -7,8 +7,11 @@
 //! brush's grain fixed to the canvas, inside the selection, keeping the alpha lock, erasing with
 //! the eraser; one undo step, named [`STEP`]. Each copy a symmetry makes fills too.
 
+use std::sync::{Arc, mpsc};
+
 use procraft_engine::geom::{IRect, Vec2};
 use procraft_engine::input::Sample;
+use procraft_engine::selection::Mask;
 use procraft_engine::stroke::StrokeBuilder;
 
 use crate::{PointerKind, State, ToolKind};
@@ -44,8 +47,48 @@ pub(crate) struct Filling {
     /// Where the pen is now (canvas pixels): the path, which catches up with it only as the pen
     /// lifts, is shown going on to it, so that what shows as it grows is what is laid.
     pen: Option<Vec2>,
-    /// How many of the path's points the region last shown was made of, and where the pen was.
-    shown_at: Option<(usize, Option<Vec2>)>,
+    /// What the region last shown was made of.
+    shown_at: Option<MadeOf>,
+    /// The region being made on a thread of its own as it grows (a big one takes tens of
+    /// milliseconds, which the frames, on the desktop the window's thread, would wait for), and
+    /// what it is made of: the first frame after it is made shows it.
+    making: Option<(Option<MadeOf>, mpsc::Receiver<Region>)>,
+    /// What is selected as it began (it can't change while the stroke goes on), shared with the
+    /// regions being made.
+    selection: Option<Arc<Mask>>,
+}
+
+/// What a fill's region shown was made of: how many of the path's points, and where the pen was.
+type MadeOf = (usize, Option<Vec2>);
+
+/// A region a fill lays: its box and how much of each pixel there (see [`coverage`]); none if it
+/// fills none.
+type Region = Option<(IRect, Vec<u8>)>;
+
+/// What a fill's region is made from, apart from the canvas's state: the outlines (its path and
+/// each copy the symmetry makes of it, canvas pixels), the canvas's size and the selection.
+struct RegionOf {
+    outlines: Vec<Vec<Vec2>>,
+    width: u32,
+    height: u32,
+    selection: Option<Arc<Mask>>,
+}
+
+impl RegionOf {
+    /// The region the outlines fill together, inside the selection.
+    fn region(&self) -> Region {
+        let (rect, mut coverage) = coverage(&self.outlines, self.width, self.height)?;
+        if let Some(mask) = &self.selection {
+            let selected = crate::layer_ops::mask_part(mask, rect);
+            for (c, &m) in coverage.iter_mut().zip(&selected) {
+                *c = ((u16::from(*c) * u16::from(m) + 127) / 255) as u8;
+            }
+            if !coverage.iter().any(|&c| c > 0) {
+                return None;
+            }
+        }
+        Some((rect, coverage))
+    }
 }
 
 /// Where the last of `samples` that is a place is.
@@ -136,7 +179,9 @@ impl State {
     pub(crate) fn begin_fill(&mut self, shown: FillShown, builder: &StrokeBuilder, samples: &[Sample]) {
         let mut path = builder.fill_path();
         path.add(samples);
-        self.filling = Some(Filling { shown, path, pen: pen_of(samples), shown_at: None });
+        let selection = self.selection.as_ref().filter(|m| !m.is_empty()).map(|m| Arc::new(m.clone()));
+        let pen = pen_of(samples);
+        self.filling = Some(Box::new(Filling { shown, path, pen, shown_at: None, making: None, selection }));
     }
 
     /// More of the fill stroke's samples (canvas pixels): its path goes on. Whether its own stamps
@@ -149,9 +194,26 @@ impl State {
     }
 
     /// The region the fill stroke encloses so far shown, if its path went on since it was last
-    /// shown (once a frame, however many samples came).
+    /// shown (once a frame, however many samples came): made on a thread of its own, one at a time,
+    /// and shown by the first frame after it is made (frames go on being asked for meanwhile); the
+    /// path as it went on meanwhile is made next.
     pub(crate) fn show_fill(&mut self) {
-        let Some(filling) = self.filling.as_ref().filter(|f| f.shown == FillShown::Growing) else { return };
+        let Some(filling) = self.filling.as_mut().filter(|f| f.shown == FillShown::Growing) else { return };
+        if let Some((made_of, made)) = filling.making.take() {
+            match made.try_recv() {
+                Ok(region) => {
+                    filling.shown_at = made_of;
+                    self.lay_fill_region(region);
+                }
+                Err(mpsc::TryRecvError::Empty) => {
+                    filling.making = Some((made_of, made));
+                    self.needs_frame = true;
+                    return;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {}
+            }
+        }
+        let Some(filling) = self.filling.as_ref() else { return };
         let mut path = filling.path.path();
         let now = Some((path.len(), filling.pen));
         if filling.shown_at == now {
@@ -161,14 +223,40 @@ impl State {
         if let Some(pen) = filling.pen.filter(|p| path.last() != Some(p)) {
             path.push(pen);
         }
-        let region = self.fill_region(&path);
-        if let Some(filling) = self.filling.as_mut() {
-            filling.shown_at = now;
+        let of = self.region_of(&path, filling.selection.clone());
+        let (sent, made) = mpsc::channel();
+        let making = std::thread::Builder::new().name("procraft-fill-region".into()).spawn(move || {
+            // (the stroke may have ended meanwhile: then nothing waits for it)
+            let _ = sent.send(of.region());
+        });
+        let Some(filling) = self.filling.as_mut() else { return };
+        match making {
+            Ok(_) => {
+                filling.making = Some((now, made));
+                self.needs_frame = true;
+            }
+            // no thread to make it on: made here
+            Err(e) => {
+                log::warn!("a fill's region made on the frames' thread: {e}");
+                filling.shown_at = now;
+                let region = self.fill_region(&path);
+                self.lay_fill_region(region);
+            }
         }
+    }
+
+    /// `region` shown as the open fill stroke's (none: nothing yet).
+    fn lay_fill_region(&mut self, region: Region) {
         if let Some(canvas) = self.canvas.as_mut() {
             let (rect, coverage) = region.unwrap_or((IRect::EMPTY, Vec::new()));
             canvas.fill_stroke(rect, coverage);
         }
+    }
+
+    /// Whether the open fill stroke's region is still being made (see [`Self::show_fill`]).
+    #[cfg(test)]
+    pub(crate) fn fill_being_made(&self) -> bool {
+        self.filling.as_ref().is_some_and(|f| f.making.is_some())
     }
 
     /// Ends the fill stroke with its last `samples` (canvas pixels): its region laid as one step,
@@ -179,7 +267,8 @@ impl State {
         filling.path.finish();
         self.stroke = None;
         self.second = None;
-        let region = self.fill_region(&filling.path.path());
+        // (a region still being made as it grew is let go)
+        let region = self.region_of(&filling.path.path(), filling.selection.clone()).region();
         let Some(canvas) = self.canvas.as_mut() else { return true };
         match region {
             Some((rect, coverage)) => {
@@ -194,9 +283,17 @@ impl State {
 
     /// The region `path` (canvas pixels) and each copy the symmetry makes of it enclose, inside
     /// the selection (see [`coverage`]).
-    fn fill_region(&self, path: &[Vec2]) -> Option<(IRect, Vec<u8>)> {
+    fn fill_region(&self, path: &[Vec2]) -> Region {
+        let selection = self.selection.as_ref().filter(|m| !m.is_empty()).map(|m| Arc::new(m.clone()));
+        self.region_of(path, selection).region()
+    }
+
+    /// What the region `path` (canvas pixels) and each copy the symmetry makes of it enclose,
+    /// inside `selection`, is made from.
+    fn region_of(&self, path: &[Vec2], selection: Option<Arc<Mask>>) -> RegionOf {
+        let (width, height) = (self.doc.width(), self.doc.height());
         if path.len() < 3 {
-            return None;
+            return RegionOf { outlines: Vec::new(), width, height, selection };
         }
         let guide = self.doc.stroke_guide();
         let copied: Vec<Vec<(Vec2, f32, bool)>> = path.iter().map(|p| guide.copies(*p)).collect();
@@ -205,17 +302,7 @@ impl State {
         for k in 0..count {
             outlines.push(copied.iter().filter_map(|c| c.get(k).map(|(p, _, _)| *p)).collect());
         }
-        let (rect, mut coverage) = coverage(&outlines, self.doc.width(), self.doc.height())?;
-        if let Some(mask) = self.selection.as_ref().filter(|m| !m.is_empty()) {
-            let selected = crate::layer_ops::mask_part(mask, rect);
-            for (c, &m) in coverage.iter_mut().zip(&selected) {
-                *c = ((u16::from(*c) * u16::from(m) + 127) / 255) as u8;
-            }
-            if !coverage.iter().any(|&c| c > 0) {
-                return None;
-            }
-        }
-        Some((rect, coverage))
+        RegionOf { outlines, width, height, selection }
     }
 }
 
@@ -506,7 +593,11 @@ mod tests {
         for (i, p) in u.iter().enumerate().skip(1) {
             shown.stroke_add(vec![sample(p.x, p.y, i as f64 * 8.0)]);
         }
-        let growing = frame_of(&shown, 100);
+        let mut growing = frame_of(&shown, 100);
+        let made_by = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while shown.shared.lock().fill_being_made() && std::time::Instant::now() < made_by {
+            growing = frame_of(&shown, 100);
+        }
         shown.stroke_end(vec![]);
         let ended = frame_of(&shown, 100);
         draw(&laid, &u);
@@ -525,6 +616,58 @@ mod tests {
         assert!(ended == frame_of(&laid, 100), "as a fill shown plainly lays it");
         let at = |x: usize, y: usize| ended[(y * 100 + x) * 4..][..4].to_vec();
         assert_eq!(at(50, 50), RED.to_vec());
+    }
+
+    /// A big fill shown as it grows (a loop 1800 pixels across on a canvas 2048 square): its region,
+    /// which takes tens of milliseconds to make (more in a debug build), is made on a thread of its
+    /// own, so the frames, the desktop's on its window's thread, never wait for it: the frame's part
+    /// in it holds the calling thread a few milliseconds at most. Once made it shows, as it lays.
+    /// Prints both times.
+    #[test]
+    fn a_big_fill_s_region_is_made_beside_the_frames_as_it_grows() {
+        use std::time::{Duration, Instant};
+        let Some(s) = session(2048, 2048) else { return };
+        no_streamline(&s);
+        s.set_color(1.0, 0.0, 0.0);
+        filling(&s, "(i32.const 1)");
+        let rim = circle(1024.0, 1024.0, 900.0, 240, 1);
+        s.stroke_begin(PointerKind::Stylus, vec![sample(rim[0].x, rim[0].y, 0.0)]);
+        // a frame's part (the region shown) every four samples, as frames come while it is drawn
+        let (mut longest, mut frames) = (Duration::ZERO, 0);
+        for (i, p) in rim.iter().enumerate().skip(1) {
+            s.stroke_add(vec![sample(p.x, p.y, i as f64 * 8.0)]);
+            if i % 4 == 0 {
+                let t = Instant::now();
+                s.shared.lock().show_fill();
+                longest = longest.max(t.elapsed());
+                frames += 1;
+            }
+        }
+        // what making the region of the whole loop takes, here
+        let making = {
+            let st = s.shared.lock();
+            let t = Instant::now();
+            assert!(st.fill_region(&rim).is_some());
+            t.elapsed()
+        };
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        println!(
+            "a fill 1800 px across growing: the frames' part {:.2} ms at most over {frames}; making its region {:.1} ms",
+            ms(longest),
+            ms(making)
+        );
+        // made, it shows: the middle red before the lift, and after it
+        let middle = |frame: &[u8]| frame[(1024 * 2048 + 1024) * 4..][..4].to_vec();
+        let (made_by, mut drawn, mut frame) = (Instant::now() + Duration::from_secs(20), 0, Vec::new());
+        while (drawn < 2 || s.shared.lock().fill_being_made()) && Instant::now() < made_by {
+            frame = frame_of(&s, 2048);
+            drawn += 1;
+        }
+        assert_eq!(middle(&frame), RED.to_vec(), "shown as it grows");
+        s.stroke_end(vec![]);
+        assert_eq!(middle(&frame_of(&s, 2048)), RED.to_vec(), "laid");
+        assert!(longest < Duration::from_millis(8), "a frame waited {:.1} ms for the region", ms(longest));
+        assert!(longest * 4 < making, "the frames' part {:.2} ms against {:.1} ms", ms(longest), ms(making));
     }
 
     /// What filling a region costs, by its size: run with `--ignored --nocapture`.

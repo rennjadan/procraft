@@ -55,12 +55,94 @@ final class FloatingPanels {
 struct FloatingFrame {
     let width: CGFloat
     let height: CGFloat
-    let onHold: (Bool) -> Void
+    /// Held, sizing or not, the finger at a point (interface points).
+    let onHold: (Bool, CGPoint) -> Void
     let onDrag: (CGSize) -> Void
     let onLetGo: () -> Void
     let onClose: () -> Void
     var onFold: (() -> Void)?
     var menu: WindowMenu?
+    var tabs: [WindowTab] = []
+    /// Collapse to edge: the side its collapse button sends it into, and what that does.
+    var collapseEdge: WindowEdge?
+    var onCollapse: () -> Void = {}
+}
+
+/// A tab on a window holding several panels: its name, whether it shows, and what tapping it and
+/// dragging it out do (torn out at a point, then following the finger, then let go; interface
+/// points).
+struct WindowTab {
+    let piece: LayoutPiece
+    let active: Bool
+    let onPick: () -> Void
+    let onTear: (CGPoint) -> Void
+    let onTorn: (CGPoint) -> Void
+    let onLetGo: () -> Void
+}
+
+/// How far a tab is dragged before it is torn out of its window.
+private let tabTearDrag: CGFloat = 26
+
+/// `piece`'s window's tabs, while it holds several panels.
+func windowTabs(_ model: CanvasModel, _ piece: LayoutPiece) -> [WindowTab] {
+    model.tabsOf(piece).map { p in
+        WindowTab(
+            piece: p,
+            active: p == piece,
+            onPick: { model.pickTab(p) },
+            onTear: { model.tearTab(p, at: $0) },
+            onTorn: { model.followTorn($0) },
+            onLetGo: { model.letGoPiece() }
+        )
+    }
+}
+
+/// The tabs of a window holding several panels, in a row across its strip.
+private struct WindowTabs: View {
+    let tabs: [WindowTab]
+    /// How many buttons show beside Close (Fold, Collapse to edge's).
+    let buttons: Int
+    @State private var torn = false
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(tabs, id: \.piece) { tab in
+                Text(verbatim: pieceTitle(tab.piece))
+                    .font(.system(size: 13))
+                    .foregroundStyle(Pc.panelTitle)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, 10)
+                    .frame(height: 22)
+                    .background(Capsule().fill(tab.active ? Pc.accent.opacity(0.35) : .clear))
+                    .contentShape(Capsule())
+                    .onTapGesture(perform: tab.onPick)
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let at = Interface.shared.point(drag.location)
+                                if torn {
+                                    tab.onTorn(at)
+                                } else if hypot(drag.translation.width, drag.translation.height) > tabTearDrag {
+                                    torn = true
+                                    tab.onTear(at)
+                                }
+                            }
+                            .onEnded { _ in
+                                if torn {
+                                    torn = false
+                                    tab.onLetGo()
+                                }
+                            }
+                    )
+            }
+        }
+        .padding(.top, 1)
+        // between the menu button and Close (and Fold): narrower, titles cut short, as more share it
+        .padding(.leading, 50)
+        .padding(.trailing, 48 + 40 * CGFloat(buttons))
+        .frame(maxWidth: .infinity)
+    }
 }
 
 /// A floating window's menu, from the button on its strip: Fold, Hide, Pin to Top (or Unpin) and
@@ -71,6 +153,9 @@ struct WindowMenu {
     let onHide: () -> Void
     let onPin: () -> Void
     let onReset: () -> Void
+    /// Collapse to edge: Collapse All, or Open All while any bar or window is collapsed; none with it off.
+    var anyCollapsed = false
+    var onCollapseAll: (() -> Void)?
 }
 
 /// `piece`'s window menu, as the layout has it now.
@@ -81,13 +166,16 @@ func windowMenu(_ model: CanvasModel, _ piece: LayoutPiece) -> WindowMenu {
         onFold: model.layoutLook.fold ? { model.foldPiece(piece, true) } : nil,
         onHide: { model.hidePiece(piece) },
         onPin: { model.pinPiece(piece, !pinned) },
-        onReset: { model.resetPiece(piece) }
+        onReset: { model.resetPiece(piece) },
+        anyCollapsed: model.anyCollapsed(),
+        onCollapseAll: model.layoutLook.collapse ? { model.collapseAll(!model.anyCollapsed()) } : nil
     )
 }
 
 /// The window's menu button: three dots on a disc, opening its menu.
 struct FloatingMenuButton: View {
     let menu: WindowMenu
+    var height: CGFloat = 40
 
     var body: some View {
         Menu {
@@ -97,6 +185,9 @@ struct FloatingMenuButton: View {
             Button("Hide", action: menu.onHide)
             Button(menu.pinned ? "Unpin" : "Pin to Top", action: menu.onPin)
             Button("Reset Position", action: menu.onReset)
+            if let all = menu.onCollapseAll {
+                Button(menu.anyCollapsed ? "Open All" : "Collapse All", action: all)
+            }
         } label: {
             Canvas { context, size in
                 let o = CGPoint(x: size.width / 2, y: size.height / 2)
@@ -106,7 +197,7 @@ struct FloatingMenuButton: View {
                     context.fill(Path(ellipseIn: CGRect(x: o.x + dx - 1.1, y: o.y - 1.1, width: 2.2, height: 2.2)), with: .color(.black.opacity(0.35)))
                 }
             }
-            .frame(width: 40, height: 40)
+            .frame(width: 40, height: height)
         }
         .accessibilityLabel("Window")
     }
@@ -125,7 +216,7 @@ private struct HeldDrag: ViewModifier {
                 .onChanged { drag in
                     if !held {
                         held = true
-                        frame.onHold(sizing)
+                        frame.onHold(sizing, Interface.shared.point(drag.startLocation))
                     }
                     let k = Interface.shared.scale
                     frame.onDrag(CGSize(width: drag.translation.width / k, height: drag.translation.height / k))
@@ -148,25 +239,34 @@ struct FloatingTopStrip: View {
             Color.clear
                 .contentShape(Rectangle())
                 .modifier(HeldDrag(frame: frame, sizing: false))
-            Capsule()
-                .fill(Pc.grabber)
-                .frame(width: 40, height: 4)
-                .padding(.top, 10)
-                .allowsHitTesting(false)
-            FloatingPanelClose(onClose: frame.onClose)
+            // holding several panels: their tabs in place of the grabber
+            if frame.tabs.count > 1 {
+                WindowTabs(tabs: frame.tabs, buttons: (frame.onFold == nil ? 0 : 1) + (frame.collapseEdge == nil ? 0 : 1))
+            } else {
+                Capsule()
+                    .fill(Pc.grabber)
+                    .frame(width: 40, height: 4)
+                    .padding(.top, 10)
+                    .allowsHitTesting(false)
+            }
+            // (each as tall as the strip, inside the window: a touch on one never reaches the canvas)
+            FloatingPanelClose(onClose: frame.onClose, height: floatingTopHeight)
                 .padding(.trailing, 4)
-                .offset(y: -8)
                 .frame(maxWidth: .infinity, alignment: .trailing)
             if let fold = frame.onFold {
-                FloatingFold(onFold: fold)
+                FloatingFold(onFold: fold, height: floatingTopHeight)
                     .padding(.trailing, 44)
-                    .offset(y: -8)
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+            }
+            // Collapse to edge's, beside Fold (or Close)
+            if let edge = frame.collapseEdge {
+                FloatingCollapse(edge: edge, onCollapse: frame.onCollapse, height: floatingTopHeight)
+                    .padding(.trailing, frame.onFold == nil ? 44 : 84)
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
             if let menu = frame.menu {
-                FloatingMenuButton(menu: menu)
+                FloatingMenuButton(menu: menu, height: floatingTopHeight)
                     .padding(.leading, 6)
-                    .offset(y: -8)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
@@ -185,6 +285,7 @@ struct FloatingBottomStrip: View {
 /// Close: a disc with a cross cut out of it, as the floating colour window's.
 private struct FloatingPanelClose: View {
     let onClose: () -> Void
+    var height: CGFloat = 40
 
     var body: some View {
         Canvas { context, size in
@@ -199,7 +300,7 @@ private struct FloatingPanelClose: View {
             cross.addLine(to: CGPoint(x: o.x - d, y: o.y + d))
             context.stroke(cross, with: .color(.black.opacity(0.3)), lineWidth: 1.3)
         }
-        .frame(width: 40, height: 40)
+        .frame(width: 40, height: height)
         .contentShape(Rectangle())
         .onTapGesture(perform: onClose)
         .accessibilityLabel("Close")
@@ -280,17 +381,24 @@ struct FloatingPanelWindows: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
+            // the Tool Belt, under the windows
+            if let belt = model.beltShown() {
+                ToolBelt(model: model, belt: belt)
+            }
             // drawn as they were last pressed, those pinned over the rest
             ForEach(model.pieceOrder().filter { Self.drawn.contains($0) }, id: \.self) { piece in
+                // collapsed into its side (Collapse to edge): slid there, its tab on the side instead
+                let into = collapseOffset(model.pieceCollapsePlace(piece), model.pieceCollapsed(piece) != nil)
+                Group {
                 if let window = model.shownPiece(piece) {
                     if window.folded {
                         FloatingTab(
                             shown: window,
                             title: pieceTitle(piece),
                             onUnfold: { model.foldPiece(piece, false) },
-                            onDrag: { by in
+                            onDrag: { from, by in
                                 if model.panelLayout.holding() != piece {
-                                    model.holdPiece(piece, sizing: false)
+                                    model.holdPiece(piece, sizing: false, at: from)
                                 }
                                 model.dragPiece(by: by)
                             },
@@ -302,6 +410,9 @@ struct FloatingPanelWindows: View {
                         FloatingPopoverWindow(model: model, piece: piece, window: window)
                     }
                 }
+                }
+                .offset(into)
+                .animation(collapseSlide, value: into)
             }
         }
         .frame(width: screen.width, height: screen.height, alignment: .topLeading)
@@ -312,7 +423,7 @@ struct FloatingPanelWindows: View {
 func pieceTitle(_ piece: LayoutPiece) -> String {
     switch piece {
     case .layers: "Layers"
-    case .brushes: "Brush Library"
+    case .brushes: "Brush library"
     case .colours: "Colors"
     case .actions: "Actions"
     case .adjustments: "Adjustments"
@@ -336,11 +447,14 @@ private struct FloatingPopoverWindow: View {
         let frame = FloatingFrame(
             width: CGFloat(window.width),
             height: CGFloat(window.height),
-            onHold: { model.holdPiece(piece, sizing: $0) },
+            onHold: { model.holdPiece(piece, sizing: $0, at: $1) },
             onDrag: { model.dragPiece(by: $0) },
             onLetGo: { model.letGoPiece() },
             onClose: { model.closePiece(piece) },
-            menu: windowMenu(model, piece)
+            menu: windowMenu(model, piece),
+            tabs: windowTabs(model, piece),
+            collapseEdge: model.pieceCollapseEdge(piece),
+            onCollapse: { model.collapsePiece(piece, true) }
         )
         ZStack(alignment: .bottomTrailing) {
             Group {
@@ -462,7 +576,7 @@ struct FloatsAtBottom: ViewModifier {
                             frame: FloatingFrame(
                                 width: home.width,
                                 height: floatingTopHeight,
-                                onHold: { model.holdPiece(piece, sizing: $0) },
+                                onHold: { model.holdPiece(piece, sizing: $0, at: $1) },
                                 onDrag: { model.dragPiece(by: $0) },
                                 onLetGo: { model.letGoPiece() },
                                 onClose: { model.closePiece(piece) },
@@ -482,9 +596,9 @@ struct FloatsAtBottom: ViewModifier {
                         shown: tab,
                         title: pieceTitle(piece),
                         onUnfold: { model.foldPiece(piece, false) },
-                        onDrag: { by in
+                        onDrag: { from, by in
                             if model.panelLayout.holding() != piece {
-                                model.holdPiece(piece, sizing: false)
+                                model.holdPiece(piece, sizing: false, at: from)
                             }
                             model.dragPiece(by: by)
                         },
@@ -513,12 +627,15 @@ private struct FloatingPanelWindow: View {
         let frame = FloatingFrame(
             width: CGFloat(window.width),
             height: CGFloat(window.height),
-            onHold: { model.holdPiece(piece, sizing: $0) },
+            onHold: { model.holdPiece(piece, sizing: $0, at: $1) },
             onDrag: { model.dragPiece(by: $0) },
             onLetGo: { model.letGoPiece() },
             onClose: { model.closeFloating(panel) },
             onFold: folds ? { model.foldPiece(piece, true) } : nil,
-            menu: windowMenu(model, piece)
+            menu: windowMenu(model, piece),
+            tabs: windowTabs(model, piece),
+            collapseEdge: model.pieceCollapseEdge(piece),
+            onCollapse: { model.collapsePiece(piece, true) }
         )
         ZStack(alignment: .bottomTrailing) {
             switch panel {
@@ -537,5 +654,74 @@ private struct FloatingPanelWindow: View {
         .onTapGesture {}
         .scaleEffect(CGFloat(window.scale), anchor: .topLeading)
         .offset(x: CGFloat(window.x), y: CGFloat(window.y))
+    }
+}
+
+/// The Tool Belt: a chip for each panel parked on it (a window let go on it), at the floating
+/// windows' size. A tap puts one back where it was; dragged off, it floats under the finger until
+/// let go. Empty, it says what it is.
+private struct ToolBelt: View {
+    let model: CanvasModel
+    let belt: BeltShown
+    @State private var off = false
+
+    var body: some View {
+        // where it shows: moved in Edit Layout, upright against a side
+        let place = model.beltPlace(belt)
+        let upright = place.vertical
+        let layout = upright ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
+        let w = CGFloat(upright ? belt.height : belt.width)
+        let h = CGFloat(upright ? belt.width : belt.height)
+        layout {
+            if belt.pieces.isEmpty {
+                Text(verbatim: "Tool Belt")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Pc.panelTitle.opacity(0.5))
+                    .fixedSize()
+                    .rotationEffect(.degrees(upright ? -90 : 0))
+                    .frame(width: w, height: h)
+            }
+            ForEach(belt.pieces, id: \.self) { piece in
+                Text(verbatim: pieceTitle(piece))
+                    .font(.system(size: 13))
+                    .foregroundStyle(Pc.panelTitle)
+                    .lineLimit(1)
+                    .frame(width: 116)
+                    .rotationEffect(.degrees(upright ? -90 : 0))
+                    .frame(width: upright ? CGFloat(belt.height) : 120, height: upright ? 120 : CGFloat(belt.height))
+                    .contentShape(Rectangle())
+                    .onTapGesture { model.unparkPiece(piece) }
+                    .gesture(
+                        DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                            .onChanged { drag in
+                                let at = Interface.shared.point(drag.location)
+                                if off {
+                                    model.followTorn(at)
+                                } else if hypot(drag.translation.width, drag.translation.height) > 26 {
+                                    off = true
+                                    model.unparkAt(piece, at: at)
+                                }
+                            }
+                            .onEnded { _ in
+                                if off {
+                                    off = false
+                                    model.letGoPiece()
+                                }
+                            }
+                    )
+            }
+        }
+        .frame(width: w, height: h, alignment: .topLeading)
+        // round at its ends, square on its sides against the window's edges
+        .background(
+            UnevenRoundedRectangle(cornerRadii: barCorners(model.barTouching(.belt), radius: min(w, h) / 2), style: .circular)
+                .fill(Pc.popoverFill)
+                .animation(barCornerEase, value: model.barTouching(.belt))
+        )
+        .scaleEffect(CGFloat(belt.scale), anchor: .topLeading)
+        .offset(x: CGFloat(place.x), y: CGFloat(place.y))
+        // collapsed into its side (Collapse to edge): slid there
+        .offset(collapseOffset(model.barCollapsePlace(.belt), model.barCollapsed(.belt) != nil))
+        .animation(collapseSlide, value: model.barCollapsed(.belt) != nil)
     }
 }

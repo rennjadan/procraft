@@ -19,6 +19,8 @@ final class CanvasView: UIView {
     var beforeTouches: () -> Void = {}
     /// The touches moved, or the last of them went.
     var afterTouches: (_ ended: Bool) -> Void = { _ in }
+    /// Whether the canvas takes touches now (not while Edit Layout moves the bars).
+    var takesTouches: () -> Bool = { true }
     /// Where one touch is on the canvas or the Pencil hovers (points), for Liquify's ring; none
     /// with no touch, or more than one.
     var ringAt: (CGPoint?) -> Void = { _ in }
@@ -80,6 +82,7 @@ final class CanvasView: UIView {
     init(session: CanvasSession) {
         self.session = session
         super.init(frame: .zero)
+        CanvasLife.made(.view)
         isMultipleTouchEnabled = true
         isOpaque = true
         backgroundColor = .black
@@ -100,6 +103,10 @@ final class CanvasView: UIView {
     @available(*, unavailable)
     required init?(coder: NSCoder) {
         fatalError("the canvas is made in code")
+    }
+
+    deinit {
+        CanvasLife.gone(.view)
     }
 
     /// Pixels to a point on the screen the view is on.
@@ -204,6 +211,8 @@ final class CanvasView: UIView {
     // MARK: touches
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        // (none while Edit Layout moves the bars: nothing picked, nothing painted)
+        guard takesTouches() else { return }
         // painting, the hovering outline goes (Brush cursor may show one as it paints)
         cursor.hide()
         // a stroke may begin: the strokes' sound wakes if it rests

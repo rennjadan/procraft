@@ -326,22 +326,18 @@ impl SpherePreview {
 
 /// A `side` square grey texture of `pixels` (rows from the top).
 fn grey_texture(gpu: &Gpu, side: u32, pixels: &[u8]) -> wgpu::TextureView {
-    use wgpu::util::DeviceExt;
-    gpu.device
-        .create_texture_with_data(
-            &gpu.queue,
-            &wgpu::TextureDescriptor {
-                label: Some("sphere source"),
-                size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            pixels,
-        )
-        .create_view(&wgpu::TextureViewDescriptor::default())
+    gpu.texture_with_data(
+        &wgpu::TextureDescriptor {
+            label: Some("sphere source"),
+            size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        pixels,
+    )
+    .create_view(&wgpu::TextureViewDescriptor::default())
 }

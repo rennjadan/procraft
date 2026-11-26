@@ -42,8 +42,8 @@ const LIQUIFY_HELD_SLOP: f32 = 3.0;
 const TAP_SLOP: f32 = 24.0;
 /// How far from an item (points) a tap of the selection tool on a plugin's layer still takes it.
 const TAP_REACH: f32 = 6.0;
-/// Each of the fingers tapped together stays short of this (points) from where it landed: this
-/// far, they are moving the canvas.
+/// Each of the fingers tapped together stays short of this (points) from where it landed, and
+/// two of them short of moving the canvas ([`VIEW_SLOP`]).
 const FINGERS_TAP_SLOP: f32 = 15.0;
 /// A touch on the canvas with a panel open moved this far (points) is a drag, not a tap.
 const PANEL_SLOP: f32 = 10.0;
@@ -3057,7 +3057,12 @@ impl CanvasSession {
         t.pinch.drain(..old);
         t.last = (x, y, d, angle);
         let gone: f32 = t.down.iter().map(|d| dist(d.at, d.from)).sum();
-        t.view_moving |= gone >= VIEW_SLOP * t.scale;
+        if !t.view_moving && gone >= VIEW_SLOP * t.scale {
+            t.view_moving = true;
+            // once the canvas moves, turns or zooms, the fingers are no tap and no hold that
+            // repeats an undo or redo, however little each has gone: never both
+            t.tap_moved = f32::INFINITY;
+        }
         // from where they are when it starts, so it doesn't jump
         if t.view_moving {
             self.view_gesture(lx, ly, x - lx, y - ly, scale, turn);
@@ -3411,9 +3416,9 @@ mod tests {
     fn fingers_pinched_or_turned_a_little_are_still_a_tap() {
         let s = session();
         s.set_display_scale(1.0);
-        // each short of the tap's reach by itself, though they part by more: a tap, as each
-        // finger alone decides
-        for (dx, dy) in [(-8.0, 0.0), (0.0, 8.0), (10.0, 0.0)] {
+        // each short of the tap's reach by itself, and both short of moving the canvas: a tap,
+        // though they part
+        for (dx, dy) in [(-4.0, 0.0), (0.0, 4.0), (3.0, 3.0)] {
             s.touch_down(1, PointerKind::Finger, at(100.0, 100.0, 500.0));
             s.touch_down(2, PointerKind::Finger, at(200.0, 100.0, 510.0));
             s.touch_move(1, at(100.0 + dx, 100.0 + dy, 530.0));
@@ -3427,6 +3432,124 @@ mod tests {
             .map(|i| Finger { lands: 20.0 * f64::from(i), lifts: 200.0, drift: 9.0, towards: 2.1 * i as f32 })
             .collect();
         assert!(redid_once(&real_tap(&s, &fingers, 1.5, 8.0, true)));
+    }
+
+    /// Two fingers `spread` points apart about the window's middle: they land 10 ms apart, rest
+    /// `rest` ms, turn `degrees` over `ms`, moving every 8 ms (in one event, as Android gives
+    /// them, or each its own, as the desktop does), rest `hold` ms more and lift 10 ms apart, the
+    /// touches' waits running as they come due. What the touches asked for, and how far (degrees)
+    /// the canvas had turned (either way) as the first lifted.
+    fn turn_fingers(
+        s: &CanvasSession,
+        spread: f32,
+        degrees: f32,
+        timing: (f64, f64, f64),
+        batched: bool,
+    ) -> (Vec<TouchCommand>, f32) {
+        let (rest, ms, hold) = timing;
+        let scale = s.shared.lock().display_scale;
+        let rotation = || s.shared.lock().view.map_or(0.0, |v| v.rotation());
+        let finger = |id: u64, angle: f32, at_ms: f64| {
+            let (half, way) = (spread * scale / 2.0, if id == 1 { std::f32::consts::PI } else { 0.0 });
+            at(400.0 + half * (angle + way).cos(), 300.0 + half * (angle + way).sin(), at_ms)
+        };
+        let start = rotation();
+        let mut out = Vec::new();
+        let tick = |out: &mut Vec<TouchCommand>, now: f64| {
+            while let Some(due) = s.touch_deadline().filter(|due| *due <= now) {
+                out.extend(s.touch_tick(due));
+            }
+        };
+        out.extend(s.touch_down(1, PointerKind::Finger, finger(1, 0.3, 0.0)));
+        out.extend(s.touch_down(2, PointerKind::Finger, finger(2, 0.3, 10.0)));
+        let (from, end) = (10.0 + rest, 10.0 + rest + ms + hold);
+        // the last move where they lift
+        let mut times: Vec<f64> = (1..).map(|k| 10.0 + 8.0 * f64::from(k)).take_while(|now| *now < end).collect();
+        times.push(end);
+        for now in times {
+            tick(&mut out, now);
+            let part = ((now - from) / ms.max(1.0)).clamp(0.0, 1.0) as f32;
+            let angle = 0.3 + degrees.to_radians() * part;
+            let moves = vec![
+                TouchMove { id: 1, samples: finger(1, angle, now) },
+                TouchMove { id: 2, samples: finger(2, angle, now) },
+            ];
+            if batched {
+                out.extend(s.touch_moves(moves));
+            } else {
+                for m in moves {
+                    out.extend(s.touch_move(m.id, m.samples));
+                }
+            }
+        }
+        let turned = (rotation() - start).to_degrees().abs();
+        let angle = 0.3 + degrees.to_radians();
+        out.extend(s.touch_up(1, finger(1, angle, end)));
+        tick(&mut out, end + 10.0);
+        out.extend(s.touch_up(2, finger(2, angle, end + 10.0)));
+        (out, turned)
+    }
+
+    #[test]
+    fn two_fingers_that_turn_the_canvas_don_t_undo() {
+        // fingers 120 pt apart turned 10 degrees in 200 ms: each goes 10.5 pt, short of a tap's
+        // 15 by itself, but the canvas turns (about 5 of the 10 degrees, from where it began to)
+        for batched in [true, false] {
+            let s = shown(1.0);
+            let (out, turned) = turn_fingers(&s, 120.0, 10.0, (0.0, 200.0, 0.0), batched);
+            assert!(!out.contains(&TouchCommand::Undo), "{out:?}");
+            assert!(turned > 4.0 && turned < 10.0, "{turned}");
+            // turned slowly after a short rest, then held: no undo as it turns, nor any repeated
+            // from the hold (the hold's 650 ms came once the canvas had begun to turn, at about
+            // 460 ms)
+            let s = shown(1.0);
+            let (out, turned) = turn_fingers(&s, 120.0, 12.0, (300.0, 400.0, 1000.0), batched);
+            assert!(!out.contains(&TouchCommand::Undo), "{out:?}");
+            assert!(turned > 6.0, "{turned}");
+            // a real two-finger tap still undoes, once, and leaves the canvas as it was
+            let s = shown(1.0);
+            let (out, turned) = turn_fingers(&s, 120.0, 0.0, (0.0, 80.0, 0.0), batched);
+            assert_eq!(out.iter().filter(|c| **c == TouchCommand::Undo).count(), 1, "{out:?}");
+            assert_eq!(turned, 0.0);
+            // and held still, it repeats
+            let s = shown(1.0);
+            let (out, _) = turn_fingers(&s, 120.0, 0.0, (0.0, 80.0, 1000.0), batched);
+            assert!(out.iter().filter(|c| **c == TouchCommand::Undo).count() > 1, "{out:?}");
+        }
+    }
+
+    #[test]
+    fn fingers_never_both_turn_the_canvas_and_undo() {
+        // a sweep: screens of a point a pixel and two; how far apart; how far turned (degrees);
+        // how quickly (ms, all within a tap's time)
+        let mut cases = 0;
+        for scale in [1.0, 2.0] {
+            for batched in [true, false] {
+                for spread in [60.0f32, 100.0, 150.0, 250.0] {
+                    for degrees in [1.0f32, 2.0, 3.0, 4.0, 6.0, 8.0, 10.0, 12.0, 15.0, 20.0, 30.0] {
+                        for ms in [60.0, 120.0, 200.0, 280.0] {
+                            let s = shown(1.0);
+                            s.set_display_scale(scale);
+                            let (out, turned) = turn_fingers(&s, spread, degrees, (0.0, ms, 0.0), batched);
+                            let undid = out.contains(&TouchCommand::Undo);
+                            let case =
+                                format!("{spread} pt apart, {degrees} deg in {ms} ms at {scale}, batched {batched}");
+                            assert!(!(undid && turned != 0.0), "{case}: undid, turned {turned}");
+                            // each finger goes the chord of its arc; both together past the
+                            // canvas's slop turn it, short of it they tap
+                            let each = spread * (degrees.to_radians() / 2.0).sin();
+                            if 2.0 * each >= VIEW_SLOP + 0.5 {
+                                assert!(!undid && turned != 0.0, "{case}: each {each} pt, turned {turned}");
+                            } else if 2.0 * each < VIEW_SLOP - 0.5 {
+                                assert!(undid && turned == 0.0, "{case}: each {each} pt, turned {turned}");
+                            }
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 704);
     }
 
     #[test]

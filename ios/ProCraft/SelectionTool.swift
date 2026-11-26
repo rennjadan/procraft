@@ -125,9 +125,10 @@ final class SelectionTool {
         removes = value
     }
 
-    /// How a selection joins the one there is: selecting by colour always adds (Remove greyed).
+    /// How a selection joins the one there is: selecting by colour always adds, and so does
+    /// anything with nothing selected yet (Remove greyed).
     private var join: SelectionJoin {
-        removes && kind != .automatic ? .remove : .add
+        removes && kind != .automatic && hasSelection ? .remove : .add
     }
 
     /// How the canvas's touches select while the tool is open; none otherwise.
@@ -339,8 +340,10 @@ struct SelectionToolbar: View {
         let tool = model.selection
         let has = tool.hasSelection
         let drawing = !tool.freehand.isEmpty
-        // selecting by colour always adds: Add shows chosen, and only the other ways can remove
+        // selecting by colour always adds: Add shows chosen, and only the other ways can remove,
+        // and only from a selection there is
         let joins = tool.kind != .automatic
+        let removable = joins && has
         FloatingToolbar(
             layout: ToolbarLayout(screenWidth: screenWidth, count: 8, roomy: buttonRoomy, narrow: buttonNarrow),
             onBackground: { tool.setPopup(.none) }
@@ -352,12 +355,12 @@ struct SelectionToolbar: View {
                 }
             }
         } buttons: { w in
-            ToolbarButton(icon: PcIcons.selectAdd, label: "Add", active: !joins || !tool.removes, width: w, iconSize: 44) {
+            ToolbarButton(icon: PcIcons.selectAdd, label: "Add", active: !removable || !tool.removes, width: w, iconSize: 44) {
                 if joins {
                     tool.chooseRemoves(false)
                 }
             }
-            ToolbarButton(icon: PcIcons.selectRemove, label: "Remove", active: joins && tool.removes, enabled: joins, width: w, iconSize: 44) {
+            ToolbarButton(icon: PcIcons.selectRemove, label: "Remove", active: removable && tool.removes, enabled: removable, width: w, iconSize: 44) {
                 tool.chooseRemoves(true)
             }
             ToolbarButton(icon: PcIcons.invert, label: "Invert", enabled: has, width: w, iconSize: 44) { tool.invert() }

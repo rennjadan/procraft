@@ -286,13 +286,15 @@ impl State {
     }
 
     /// `edit`'s shape was just kept: undo can give back the stroke it was made of.
-    pub(crate) fn note_kept_shape(&mut self, edit: Option<ShapeEdit>) {
-        let Some(ShapeEdit { first, choices, drawn, along, stroke: Some(stroke), .. }) = edit else { return };
+    pub(crate) fn note_kept_shape(&mut self, edit: Option<Box<ShapeEdit>>) {
+        let Some(ShapeEdit { first, choices, drawn, along, stroke: Some(stroke), .. }) = edit.map(|e| *e) else {
+            return;
+        };
         // its step is made now, so that a later change shows against it
         self.flush();
         let Some(canvas) = self.canvas.as_ref() else { return };
         let steps = canvas.steps_made();
-        self.kept_shape = Some(KeptShape { first, choices, drawn, along, stroke, steps });
+        self.kept_shape = Some(Box::new(KeptShape { first, choices, drawn, along, stroke, steps }));
     }
 
     /// Whether `kept` is still the last thing done, with nothing undone after it.
@@ -320,7 +322,7 @@ impl State {
         crate::draw_samples(canvas, &mut builder, second.as_mut(), &kept.stroke.samples, &guide, false);
         crate::close_stroke(canvas, builder, second, &guide);
         self.flush();
-        kept.steps = self.canvas.as_ref().map_or(0, Canvas::steps_made);
+        kept.steps = self.canvas.as_deref().map_or(0, Canvas::steps_made);
         self.unkept_shape = Some(kept);
         true
     }
@@ -335,9 +337,10 @@ impl State {
         let (Some(kept), Some(canvas)) = (self.unkept_shape.take(), self.canvas.as_mut()) else { return false };
         canvas.undo();
         begin_again(canvas, &kept.stroke);
-        self.stroke = Some(kept.stroke.builder.clone());
+        self.stroke = Some(Box::new(kept.stroke.builder.clone()));
         self.second = None;
-        self.shape = Some(ShapeEdit::new(kept.first, kept.choices, kept.drawn, kept.along, None, Some(kept.stroke)));
+        self.shape =
+            Some(Box::new(ShapeEdit::new(kept.first, kept.choices, kept.drawn, kept.along, None, Some(kept.stroke))));
         self.draw_shape();
         self.finish_stroke();
         true
@@ -388,8 +391,8 @@ impl State {
             }
             canvas.replace_stamps(&crate::guide::mirrored(&guide, &stamps));
         }
-        self.stroke = Some(builder);
-        self.second = second;
+        self.stroke = Some(Box::new(builder));
+        self.second = second.map(Box::new);
     }
 
     /// Redraws the open stroke along the shape if it moved since it was last drawn: as a frame is
@@ -731,7 +734,7 @@ impl CanvasSession {
         let held = st.drawn.last().map(|&at| Held { snapped: first.clone(), from: at, at, finger: false });
         let (drawn, along) = (line, StrokeAlong::of(&st.drawn_samples, st.pace()));
         let stroke = st.began.take().and_then(|began| began.laid_again(st.drawn_samples.clone()));
-        st.shape = Some(ShapeEdit::new(first, choices, drawn, along, held, stroke));
+        st.shape = Some(Box::new(ShapeEdit::new(first, choices, drawn, along, held, stroke)));
         st.draw_shape();
         self.shared.frame(st);
         st.shape_info()
@@ -771,9 +774,9 @@ impl CanvasSession {
         let builder = StrokeBuilder::with_seed(last.brush, last.diameter, last.pointer.into(), SHAPE_SEED)
             .scaled(scale)
             .drawn_like(&last.line);
-        st.stroke = Some(crate::pressure::pressed_like(builder, &last.line));
+        st.stroke = Some(Box::new(crate::pressure::pressed_like(builder, &last.line)));
         st.second = None;
-        st.shape = Some(ShapeEdit::new(first, choices, line, along, None, stroke));
+        st.shape = Some(Box::new(ShapeEdit::new(first, choices, line, along, None, stroke)));
         st.draw_shape();
         self.shared.frame(st);
         st.shape_info()
@@ -1086,7 +1089,7 @@ mod tests {
         {
             let mut st = s.shared.lock();
             st.view = Some(procraft_engine::view::View::fit((1000, 800), (1000, 800)));
-            st.stroke = Some(StrokeBuilder::new(brush, 8.0, Pointer::Stylus));
+            st.stroke = Some(Box::new(StrokeBuilder::new(brush, 8.0, Pointer::Stylus)));
             st.remember_input(samples);
         }
         assert!(s.quickshape_hold().is_some());

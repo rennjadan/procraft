@@ -141,6 +141,18 @@ pub struct PluginFile {
     pub chosen: Option<String>,
 }
 
+/// A folder someone picks outside the app (interface 22), kept with the plugin, for the app to keep
+/// files in or read them from as the plugin's hooks say (see `folders.rs`). While one is picked,
+/// `chosen` is its name as the app's folder picker gave it, and `location` where it is, as the app's
+/// folder access reads it (a document tree's address, a path, a bookmark).
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct PluginFolder {
+    pub key: String,
+    pub label: String,
+    pub chosen: Option<String>,
+    pub location: Option<String>,
+}
+
 /// A texture someone picks (interface 15): one of the app's own grains, by its number in the Source
 /// Library (from 1; 0, its Blank, for none), or the picture picked for one of the plugin's `file`
 /// controls of pictures it offers (`own`, their keys in order), as -1 less its place there.
@@ -230,10 +242,22 @@ pub struct PluginBrushControl {
 
 #[derive(Clone, Debug, PartialEq, uniffi::Enum)]
 pub enum PluginControl {
-    Switch { control: PluginSwitch },
-    Slider { control: PluginSlider },
-    File { control: PluginFile },
-    Texture { control: PluginTexture },
+    Switch {
+        control: PluginSwitch,
+    },
+    Slider {
+        control: PluginSlider,
+    },
+    File {
+        control: PluginFile,
+    },
+    Texture {
+        control: PluginTexture,
+    },
+    /// A folder someone picks (interface 22).
+    Folder {
+        control: PluginFolder,
+    },
 }
 
 /// One as its page shows it.
@@ -267,8 +291,13 @@ pub struct PluginInfo {
     pub layer_kinds: Vec<crate::PluginKind>,
     pub permissions: Vec<crate::plugin_commands::PluginPermission>,
     /// The features it is made of (interface 16), each with what comes under it while it is on;
-    /// none for a plugin written without. Its controls and actions are then all of theirs.
+    /// none for a plugin written without. Its controls and actions are then all of theirs, but for
+    /// `top`.
     pub features: Vec<PluginFeature>,
+    /// A plugin of features' controls that come under none of them (interface 22, its `folder`
+    /// controls), shown at the top of its card while it is on, before its features; none for a
+    /// plugin written without features.
+    pub top: Vec<PluginControl>,
 }
 
 /// One of the features of a plugin made of several (interface 16), as its card shows it: its
@@ -305,6 +334,7 @@ impl PluginControl {
             PluginControl::Slider { control } => &control.key,
             PluginControl::File { control } => &control.key,
             PluginControl::Texture { control } => &control.key,
+            PluginControl::Folder { control } => &control.key,
         }
     }
 
@@ -327,7 +357,7 @@ impl PluginControl {
                 }
             }
             // what was picked is kept with the plugin, not with the settings
-            PluginControl::File { .. } => {}
+            PluginControl::File { .. } | PluginControl::Folder { .. } => {}
         }
     }
 
@@ -337,7 +367,7 @@ impl PluginControl {
             PluginControl::Switch { control } => control.on = control.starts,
             PluginControl::Slider { control } => control.value = control.starts,
             PluginControl::Texture { control } => control.value = control.starts,
-            PluginControl::File { .. } => {}
+            PluginControl::File { .. } | PluginControl::Folder { .. } => {}
         }
     }
 
@@ -347,7 +377,7 @@ impl PluginControl {
             PluginControl::Switch { control } => control.starts = control.on,
             PluginControl::Slider { control } => control.starts = control.value,
             PluginControl::Texture { control } => control.starts = control.value,
-            PluginControl::File { .. } => {}
+            PluginControl::File { .. } | PluginControl::Folder { .. } => {}
         }
     }
 
@@ -357,7 +387,7 @@ impl PluginControl {
             PluginControl::Switch { control } => control.starts = control.on,
             PluginControl::Slider { control } => control.starts = control.value,
             PluginControl::Texture { control } => control.starts = control.value,
-            PluginControl::File { .. } => {}
+            PluginControl::File { .. } | PluginControl::Folder { .. } => {}
         }
         self
     }
@@ -369,6 +399,7 @@ impl PluginControl {
             PluginControl::Slider { control } => control.value,
             PluginControl::File { control } => f32::from(u8::from(control.chosen.is_some())),
             PluginControl::Texture { control } => control.value as f32,
+            PluginControl::Folder { control } => f32::from(u8::from(control.location.is_some())),
         }
     }
 
@@ -379,6 +410,7 @@ impl PluginControl {
             PluginControl::Slider { control } => control.value.to_string(),
             PluginControl::File { control } => control.chosen.is_some().to_string(),
             PluginControl::Texture { control } => control.value.to_string(),
+            PluginControl::Folder { control } => control.location.is_some().to_string(),
         }
     }
 
@@ -394,6 +426,10 @@ impl PluginControl {
             }
             (PluginControl::Texture { control }, PluginControl::Texture { control: from }) => {
                 control.value = control.within(from.value as f32);
+            }
+            (PluginControl::Folder { control }, PluginControl::Folder { control: from }) => {
+                control.chosen.clone_from(&from.chosen);
+                control.location.clone_from(&from.location);
             }
             _ => {}
         }
@@ -550,11 +586,19 @@ pub fn plugin_file_most_bytes() -> u64 {
 /// The names of the files picked for `plugin`'s file controls, as kept in `store`.
 fn read_chosen(store: &std::path::Path, plugin: &mut PluginInfo) {
     let id = plugin.id.clone();
+    let text = |path: &std::path::Path| {
+        std::fs::read_to_string(path).ok().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty())
+    };
     for control in &mut plugin.controls {
         if let PluginControl::File { control } = control {
             let (file, name) = plugin_file::chosen_paths(store, &id, &control.key);
-            let named = || std::fs::read_to_string(&name).ok().map(|n| n.trim().to_owned()).filter(|n| !n.is_empty());
-            control.chosen = file.is_file().then(|| named().unwrap_or_else(|| "Recording".to_owned()));
+            control.chosen = file.is_file().then(|| text(&name).unwrap_or_else(|| "Recording".to_owned()));
+        }
+        // a folder: where it is, and its name (interface 22)
+        if let PluginControl::Folder { control } = control {
+            let (at, name, _) = plugin_file::chosen_folder_paths(store, &id, &control.key);
+            control.location = text(&at);
+            control.chosen = control.location.as_ref().map(|_| text(&name).unwrap_or_else(|| "Folder".to_owned()));
         }
     }
 }
@@ -582,6 +626,7 @@ fn from_file(manifest: Manifest) -> (PluginInfo, Shape) {
         layer_kinds: manifest.layer_kinds,
         permissions: manifest.permissions,
         features: Vec::new(),
+        top: Vec::new(),
     };
     (info, manifest.shape)
 }
@@ -673,11 +718,15 @@ fn shown(plugin: &PluginInfo, shape: Option<&Shape>) -> PluginInfo {
             actions: actions.map(|(_, a)| a.clone()).collect(),
         })
     });
+    // a plugin of features' own, under none of them (interface 22)
+    let featured = !shape.features.is_empty();
+    let top = plugin.controls.iter().enumerate().filter(|(at, _)| featured && shape.feature_of(*at).is_none());
     PluginInfo {
         controls: controls.map(|(_, c)| c.clone()).collect(),
         actions: actions.map(|(_, a)| a.clone()).collect(),
         brush_controls: rows.map(|(_, r)| r.clone()).collect(),
         features: features.collect(),
+        top: top.map(|(_, c)| c.clone()).collect(),
         ..plugin.clone()
     }
 }
@@ -979,6 +1028,8 @@ pub struct Plugins {
     artwork: Mutex<std::sync::Weak<crate::CanvasSession>>,
     /// The controls plugins' code set of their own since the app last took them (interface 12).
     controls_set: Mutex<Vec<PluginControl>>,
+    /// The folders plugins name, and the work for them (interface 22).
+    folders: Arc<crate::folders::Folders>,
 }
 
 /// A plugin's panel open: whose, what it shows, and the copy of its code its touches go to (under a
@@ -1051,14 +1102,31 @@ impl Plugins {
             list.give_way(store);
         }
         let hooks = Arc::new(Hooks::kept_in(store.clone()));
-        Arc::new(Plugins {
+        Arc::new_cyclic(|me| Plugins {
             list: Mutex::new(list),
+            folders: crate::folders::Folders::new(me.clone(), Arc::clone(&hooks)),
             hooks,
             store,
             panel: Mutex::new(None),
             artwork: Mutex::new(std::sync::Weak::new()),
             controls_set: Mutex::new(Vec::new()),
         })
+    }
+
+    /// The folders plugins name (interface 22).
+    pub(crate) fn folders(&self) -> Arc<crate::folders::Folders> {
+        Arc::clone(&self.folders)
+    }
+
+    /// The folder picked for plugin `id`'s control `at`: one of its `folder` controls, with one
+    /// picked, while it is on (interface 22). None for none.
+    pub(crate) fn folder_target(&self, id: &str, at: u32) -> Option<crate::folders::Target> {
+        let list = self.listed();
+        let plugin = list.files.iter().find(|p| p.id == id && p.on && p.problem.is_none())?;
+        let PluginControl::Folder { control } = plugin.controls.get(at as usize)? else { return None };
+        let location = control.location.clone()?;
+        let records = self.store.as_deref().map(|store| plugin_file::chosen_folder_paths(store, id, &control.key).2);
+        Some(crate::folders::Target { key: control.key.clone(), location, records })
     }
 
     /// Adds each of `files`, which the app comes with, the first time it comes with it: as if
@@ -1477,7 +1545,7 @@ impl Plugins {
                         let to = value.map_or(control.starts, |v| control.within(v));
                         std::mem::replace(&mut control.value, to) != to
                     }
-                    PluginControl::File { .. } => false,
+                    PluginControl::File { .. } | PluginControl::Folder { .. } => false,
                 };
                 if changed {
                     self.hooks.control(&plugin.id, at, control.number());
@@ -1497,7 +1565,11 @@ impl Plugins {
     pub fn kept_lines(&self) -> Vec<String> {
         let list = self.listed();
         // (a file picked is kept with its plugin)
-        let values = list.files.iter().flat_map(|p| &p.controls).filter(|c| !matches!(c, PluginControl::File { .. }));
+        let values = list
+            .files
+            .iter()
+            .flat_map(|p| &p.controls)
+            .filter(|c| !matches!(c, PluginControl::File { .. } | PluginControl::Folder { .. }));
         let values = values.map(|c| format!("{} {}", c.key(), c.kept()));
         let flags = list.files.iter().map(|p| format!("{} {}", p.on_key, p.on));
         values.chain(flags).chain(list.moved.iter().map(|(key, value)| format!("{key} {value}"))).collect()
@@ -2116,11 +2188,25 @@ impl Plugins {
         true
     }
 
-    /// The file control kept under `key` lets its file go. False if there is no such control.
+    /// The file control kept under `key` lets its file go, or the folder control its folder (what
+    /// is in the folder stays as it is). False if there is no such control.
     pub fn clear_file(&self, key: String) -> bool {
         let mut list = self.listed();
         let Some((plugin, at)) = list.control_mut(&key) else { return false };
         let id = plugin.id.clone();
+        if let Some(PluginControl::Folder { control }) = plugin.controls.get_mut(at) {
+            if let Some(store) = self.store.as_deref() {
+                let (location, name, records) = plugin_file::chosen_folder_paths(store, &id, &key);
+                for path in [location, name, records] {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            control.chosen = None;
+            control.location = None;
+            self.hooks.control(&id, at, 0.0);
+            self.folders.chosen_again();
+            return true;
+        }
         let Some(PluginControl::File { control }) = plugin.controls.get_mut(at) else { return false };
         if let Some(store) = self.store.as_deref() {
             let (file, named) = plugin_file::chosen_paths(store, &id, &key);
@@ -2132,6 +2218,68 @@ impl Plugins {
         self.hooks.control(&id, at, 0.0);
         self.hooks.give_file(&id, feature, at, None);
         true
+    }
+
+    /// The folder control kept under `key` takes the folder at `location`, as the app's folder access
+    /// reads it (see [`Plugins::use_folder_access`]), shown as `name` (interface 22): kept with its
+    /// plugin, and what was noted of another folder forgotten. False if there is no such control, the
+    /// plugins can't be kept, or `location` is nothing.
+    pub fn set_folder(&self, key: String, location: String, name: String) -> bool {
+        let Some(store) = self.store.as_deref() else { return false };
+        if location.trim().is_empty() || location.contains('\0') {
+            return false;
+        }
+        let name: String = name.chars().filter(|c| !c.is_control()).take(80).collect();
+        let name = if name.trim().is_empty() { "Folder".to_owned() } else { name.trim().to_owned() };
+        let mut list = self.listed();
+        let Some((plugin, at)) = list.control_mut(&key) else { return false };
+        let id = plugin.id.clone();
+        let Some(PluginControl::Folder { control }) = plugin.controls.get_mut(at) else { return false };
+        let (kept_at, named, records) = plugin_file::chosen_folder_paths(store, &id, &key);
+        let write = |path: &std::path::Path, text: &str| {
+            crate::project::write_atomically(path, |tmp| {
+                crate::storage::write(tmp, text).map_err(|e| crate::project::file_error("saving", e))
+            })
+            .is_ok()
+        };
+        let kept = kept_at.parent().is_some_and(|folder| std::fs::create_dir_all(folder).is_ok())
+            && write(&kept_at, &location)
+            && write(&named, &name);
+        if !kept {
+            log::warn!("a folder for {key} couldn't be kept");
+            return false;
+        }
+        if control.location.as_deref() != Some(location.as_str()) {
+            let _ = std::fs::remove_file(records);
+        }
+        control.chosen = Some(name);
+        control.location = Some(location);
+        self.hooks.control(&id, at, 1.0);
+        self.folders.chosen_again();
+        true
+    }
+
+    /// The app's way into the folders picked for plugins' `folder` controls, and a folder of its own
+    /// (in its cache) where files are made before they go into one (interface 22). Until it is given,
+    /// nothing goes to a folder or comes from one.
+    pub fn use_folder_access(&self, access: Arc<dyn crate::folders::FolderAccess>, work: String) {
+        self.folders.use_access(access, PathBuf::from(work));
+    }
+
+    /// The gallery opened, its artworks in `store` (interface 22): the packages in the folder a
+    /// plugin on the `gallery_opened` hook names come in, those that changed there since the app last
+    /// wrote or read them or that it never had, never over an artwork changed here too (that one
+    /// comes as a copy beside it); and what to tell once of a folder that can't be reached. A long
+    /// call, not for the main thread: with none on the hook, it does nothing.
+    pub fn gallery_opened(&self, store: Arc<crate::gallery::ArtworkStore>) -> crate::folders::FolderBroughtIn {
+        self.folders.gallery_opened(&store)
+    }
+
+    /// A time-lapse video of the artwork named `name` was exported to `path` (interface 22): copied
+    /// to the folder a plugin on the `video_exported` hook names, before long, from a thread of its
+    /// own. False if none names one (nothing to wait for then).
+    pub fn video_exported(&self, path: String, name: String) -> bool {
+        self.folders.video_exported(std::path::Path::new(&path), &name)
     }
 
     /// Runs the action `key` (`<id>.<key>`) of a plugin that is on, on the artwork `session`: what
@@ -2609,7 +2757,7 @@ impl Plugins {
                 PluginControl::Switch { control } => control.on = value != 0.0,
                 PluginControl::Slider { control } => control.value = control.stepped(value),
                 PluginControl::Texture { control } => control.value = control.within(value),
-                PluginControl::File { .. } => continue,
+                PluginControl::File { .. } | PluginControl::Folder { .. } => continue,
             }
             self.hooks.control(&plugin.id, at, control.number());
             if artwork.get(at) == Some(&true) {
@@ -2656,13 +2804,14 @@ impl Plugins {
     /// How the floating panels are laid out, as the plugins on the panel layout's hook say
     /// (interface 20): with none on, as the app always had them.
     pub fn panel_layout(&self) -> crate::layout::PanelLayoutLook {
-        use crate::hooks::{LAYOUT_EDIT, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_SNAP};
+        use crate::hooks::{LAYOUT_BELT, LAYOUT_COLLAPSE, LAYOUT_EDIT, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_SNAP};
         let hooks = self.hooks();
         if !hooks.listens(crate::plugin_run::Hook::PanelLayout) {
             return crate::layout::PanelLayoutLook::default();
         }
-        let [snap, fold, room, edit] =
-            [LAYOUT_SNAP, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_EDIT].map(|p| hooks.panel_layout(p));
+        let [snap, fold, room, edit, belt, collapse] =
+            [LAYOUT_SNAP, LAYOUT_FOLD, LAYOUT_ROOM, LAYOUT_EDIT, LAYOUT_BELT, LAYOUT_COLLAPSE]
+                .map(|p| hooks.panel_layout(p));
         let yes = |said: Option<f32>| said.is_some_and(|v| v >= 0.5);
         crate::layout::PanelLayoutLook {
             // the panels are laid out while a plugin says anything of how; the bars alone don't
@@ -2671,6 +2820,8 @@ impl Plugins {
             fold: yes(fold),
             make_room: yes(room),
             edit: yes(edit),
+            belt: yes(belt),
+            collapse: yes(collapse),
         }
     }
 
@@ -2821,6 +2972,7 @@ mod tests {
     fn stranger() -> PluginInfo {
         PluginInfo {
             features: Vec::new(),
+            top: Vec::new(),
             brush_controls: Vec::new(),
             actions: Vec::new(),
             kinds: Vec::new(),
@@ -3797,6 +3949,7 @@ mod tests {
                 PluginControl::Slider { control } => control.label.clone(),
                 PluginControl::File { control } => control.label.clone(),
                 PluginControl::Texture { control } => control.label.clone(),
+                PluginControl::Folder { control } => control.label.clone(),
             });
             controls.chain(card.actions.iter().map(|a| a.label.clone())).collect::<Vec<_>>()
         };
@@ -3856,7 +4009,8 @@ mod tests {
         assert_eq!(labels(&plugins, LAYER_TOOLBOX)[5..12], lines);
         assert_eq!(labels(&plugins, LAYER_TOOLBOX).len(), 12, "Filter layers are Infinite Plugins' now");
         // Edit layout: its panels and its bars; Movable panels with what it does
-        let edit_features = ["Movable panels", "All panels float", "Panels stay open", "Edit layout"];
+        let edit_features =
+            ["Movable panels", "All panels float", "Panels stay open", "Tool Belt", "Edit layout", "Collapse to edge"];
         assert_eq!(labels(&plugins, EDIT_LAYOUT), edit_features);
         assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), true));
         let movable = [
@@ -4412,7 +4566,15 @@ mod tests {
         assert_eq!(floats(&plugins), [false; 2]);
         // on: snapping within 16, folding, no room made; both panels float
         assert!(plugins.set_on(EDIT_LAYOUT.to_owned(), true));
-        let look = PanelLayoutLook { on: true, snap: 16.0, fold: true, make_room: false, edit: false };
+        let look = PanelLayoutLook {
+            on: true,
+            snap: 16.0,
+            fold: true,
+            make_room: false,
+            edit: false,
+            belt: false,
+            collapse: false,
+        };
         assert_eq!(plugins.panel_layout(), look);
         assert_eq!(floats(&plugins), [true; 2]);
         // the other panels (by their numbers on the hook, interface 20) as they always are: All panels
@@ -4457,6 +4619,11 @@ mod tests {
         assert!(plugins.hooks().pin_panels());
         assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.edit_layout"), true));
         assert!(plugins.panel_layout().edit);
+        // the Tool Belt by its own feature
+        assert!(!plugins.panel_layout().belt);
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.tool_belt"), true));
+        assert!(plugins.panel_layout().belt);
+        assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.tool_belt"), false));
         // Edit layout alone: the bars move, the panels as the app has them
         assert!(plugins.set_switch(format!("{EDIT_LAYOUT}.movable_panels"), false));
         let bars_only = PanelLayoutLook { edit: true, ..PanelLayoutLook::default() };
@@ -5439,15 +5606,19 @@ mod tests {
             let grained = |b: &procraft_engine::brush::Brush| b.grain.image.is_some() || b.grain.source.is_some();
             assert!(!grained(&set.brushes[0]) && set.brushes[1..].iter().all(grained));
         }
-        // again, and off and on again: one set
+        // again: nothing given again, nothing to read again; off, the set goes (see
+        // `lasso_fill_s_brushes_come_and_go_with_its_switch_as_they_were_left`), and on again it
+        // comes back: one set
         s.use_plugins(Arc::clone(&plugins));
+        assert!(!s.take_brushes_changed(), "nothing given again, nothing to read again");
         assert!(plugins.set_on(LASSO_FILL.to_owned(), false));
         s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 0);
         assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
         s.use_plugins(Arc::clone(&plugins));
         assert_eq!(fills(&s), 1);
         assert_eq!(s.shared.lock().library.len(), sets + 1);
-        assert!(!s.take_brushes_changed(), "nothing given again, nothing to read again");
+        assert!(s.take_brushes_changed(), "the library read again");
         // kept with the library: the brushes opened again have it, and aren't given it twice (told
         // the plugins before the brushes open, as Android does)
         let t = viewed();
@@ -5479,6 +5650,186 @@ mod tests {
         assert!(!w.open_brushes(before.to_string_lossy().into_owned()));
         assert_eq!(fills(&w), 0);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A feature's brushes come and go with its switch, and with its plugin: off, the set is hidden,
+    /// not deleted: it waits in a file of its own beside the brushes, as it was left (a brush
+    /// renamed, one put in it, one moved to its top, the set moved down the library), and is out of
+    /// the library, which is kept without it (a restart finds it still hidden); the paint tool on one
+    /// of its brushes goes to another. On again, it shows again as it was left, at the place it had,
+    /// and the file it waited in goes. A set given by an earlier version (not marked as the
+    /// plugin's) is found by its name and comes and goes too; a copy of the set is the person's own
+    /// and stays.
+    #[test]
+    fn lasso_fill_s_brushes_come_and_go_with_its_switch_as_they_were_left() {
+        let dir = store("bundled-lasso-fill-come-and-go");
+        let brushes = std::path::Path::new(&dir).join("brushes");
+        let parked = || std::fs::read_dir(brushes.join("plugin-sets")).map_or(0, |d| d.flatten().count());
+        let brushes = brushes.to_string_lossy().into_owned();
+        let plugins = featured_app(&dir, LASSO_FILL, "lasso_fill");
+        assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
+        let named =
+            |s: &crate::CanvasSession, name: &str| s.brush_library().iter().filter(|set| set.name == name).count();
+        let fills = |s: &crate::CanvasSession| named(s, "Fills");
+        let switch = |on: bool| assert!(plugins.set_switch(format!("{LASSO_FILL}.lasso_fill"), on));
+        let s = viewed();
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(!s.open_brushes(brushes.clone()));
+        let sets = s.brush_library().len();
+        assert_eq!((fills(&s), s.brush_library()[0].name.as_str()), (1, "Fills"));
+        let _ = s.take_brushes_changed();
+        // a brush of it renamed, one of the stock brushes put in it, and the paint tool on its second
+        assert!(s.rename_brush(0, 0, "My Solid".to_owned()));
+        let stock = s.brush_library()[1].brushes[0].name.clone();
+        assert!(s.move_brush(1, 0, 0, 1));
+        assert!(s.select_brush(0, 2));
+        assert_eq!(s.current_brush().name, "Screentone Fill");
+        let left: Vec<String> = s.brush_library()[0].brushes.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(left[..3], ["My Solid".to_owned(), stock.clone(), "Screentone Fill".to_owned()]);
+        // one of its brushes moved to its top, and the set moved down the library
+        assert!(s.move_brush(0, 4, 0, 0));
+        assert!(s.move_brush_set(0, 2));
+        let left: Vec<String> = s.brush_library()[2].brushes.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(left[..4], ["Grunge Fill".to_owned(), "My Solid".to_owned(), stock, "Screentone Fill".to_owned()]);
+        assert_eq!(s.current_brush().name, "Screentone Fill");
+        // the switch off: the set goes, the paint tool on another brush, the set kept aside
+        switch(false);
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!((fills(&s), s.brush_library().len()), (0, sets - 1));
+        assert!(s.take_brushes_changed(), "the library read again");
+        assert_ne!(s.current_brush().name, "Screentone Fill");
+        assert_eq!(parked(), 1);
+        // the library kept without it: opened again, still away
+        let t = viewed();
+        t.use_plugins(Arc::clone(&plugins));
+        assert!(t.open_brushes(brushes.clone()));
+        assert_eq!(fills(&t), 0);
+        // on again: shown again as it was left, at the place it had, and its file gone
+        switch(true);
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!((fills(&s), s.brush_library().len()), (1, sets));
+        assert!(s.take_brushes_changed());
+        assert_eq!(s.brush_library()[2].name, "Fills");
+        let back: Vec<String> = s.brush_library()[2].brushes.iter().map(|b| b.name.clone()).collect();
+        assert_eq!(back, left);
+        // (its file goes once the library is kept with it, on a thread of its own)
+        crate::brush_library::plugin_sets_kept();
+        assert_eq!(parked(), 0);
+        // and opened again (a restart), there
+        let u = viewed();
+        u.use_plugins(Arc::clone(&plugins));
+        assert!(u.open_brushes(brushes.clone()));
+        assert_eq!(fills(&u), 1);
+        // the plugin off: it goes too; on, back
+        assert!(plugins.set_on(LASSO_FILL.to_owned(), false));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 0);
+        assert!(plugins.set_on(LASSO_FILL.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 1);
+        // a copy of it stays when the switch goes off, as the person's own
+        let at = s.brush_library().iter().position(|set| set.name == "Fills").unwrap() as u32;
+        let copy = s.duplicate_brush_set(at).unwrap();
+        assert_eq!(fills(&s), 2);
+        switch(false);
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 1, "the copy stays");
+        assert!(s.delete_brush_set(copy));
+        switch(true);
+        s.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&s), 1);
+        assert!(s.keep_brushes(brushes.clone()));
+        // a set given before sets were marked as a plugin's (the mark taken out of the library's
+        // file, as an earlier version kept it) comes and goes too
+        let library = std::path::Path::new(&brushes).join("library.json");
+        let text = std::fs::read_to_string(&library).unwrap();
+        let unmarked = text.replace(&format!(r#","plugin":"{}""#, "io.github.artcraftandroid.lasso-fill"), "");
+        assert_ne!(unmarked, text, "the library's file marks the set as the plugin's");
+        std::fs::write(&library, unmarked).unwrap();
+        let v = viewed();
+        v.use_plugins(Arc::clone(&plugins));
+        assert!(v.open_brushes(brushes.clone()));
+        assert_eq!(fills(&v), 1);
+        switch(false);
+        v.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&v), 0, "found by its name");
+        switch(true);
+        v.use_plugins(Arc::clone(&plugins));
+        assert_eq!(fills(&v), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Switching each of Infinite Plugins' features on and off, as the apps do it (the switch set,
+    /// then the canvas told the plugins and a frame drawn): how long the calling thread (the
+    /// interface's) is held each time, and as the canvas is told the plugins again with nothing
+    /// changed (as the desktop does on every change of a setting). Prints each. Before, every part
+    /// of the plugin (its code, its brushes, its filters) was read and hashed whole each time it
+    /// was read, and the library kept as Lasso fill's brushes came or went: a feature switched on
+    /// held a debug build's calling thread 150 to 500 ms, and telling the canvas again 60 to 200 ms.
+    /// Bounds (a debug build's): a feature switched under 150 ms, telling it again under 50 ms; a
+    /// paper chosen, its tile drawn by the plugin's own code, is printed.
+    #[test]
+    fn switching_infinite_plugins_features_on_holds_the_calling_thread_briefly() {
+        use std::time::{Duration, Instant};
+        let Some(s) = crate::tests::session(1600, 1600) else { return };
+        let dir = store("bundled-switch-timing");
+        let brushes = std::path::Path::new(&dir).join("brushes").to_string_lossy().into_owned();
+        let plugins = app_at(&dir);
+        s.use_plugins(Arc::clone(&plugins));
+        s.open_brushes(brushes);
+        let frame = |s: &crate::CanvasSession| {
+            let t = Instant::now();
+            let _ = crate::tests::frame_of(s, 1600);
+            t.elapsed()
+        };
+        frame(&s);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mut longest = (Duration::ZERO, String::new());
+        let time = |what: String, s: &crate::CanvasSession, change: &dyn Fn()| -> Duration {
+            // (what an earlier step keeps on a thread of its own done first: nobody flips a switch
+            // again within the tenth of a second that takes)
+            crate::brush_library::plugin_sets_kept();
+            let t = Instant::now();
+            change();
+            let switched = t.elapsed();
+            let t = Instant::now();
+            s.use_plugins(Arc::clone(&plugins));
+            let told = t.elapsed();
+            let drawn = frame(s);
+            eprintln!("{what}: switch {:.1} ms, told {:.1} ms, frame {:.1} ms", ms(switched), ms(told), ms(drawn));
+            switched + told + drawn
+        };
+        let mut switch = |what: String, change: &dyn Fn()| {
+            let held = time(what.clone(), &s, change);
+            if held > longest.0 {
+                longest = (held, what);
+            }
+        };
+        switch("plugin on".into(), &|| assert!(plugins.set_on(INFINITE.to_owned(), true)));
+        for feature in ["lasso_fill", "paper", "trace_view", "filter_layers", "colour_extras"] {
+            let key = format!("{INFINITE}.{feature}");
+            switch(format!("{feature} on"), &|| assert!(plugins.set_switch(key.clone(), true)));
+            switch(format!("{feature} off"), &|| assert!(plugins.set_switch(key.clone(), false)));
+            switch(format!("{feature} on again"), &|| assert!(plugins.set_switch(key.clone(), true)));
+        }
+        // told again with nothing changed, every feature on
+        let again = (0..3).map(|_| time("told again".into(), &s, &|| ())).max().unwrap_or_default();
+        // a paper chosen, and the layer view's steps
+        let slider = |key: &str, value: f32| assert!(plugins.set_slider(format!("{INFINITE}.{key}"), value).is_some());
+        time("paper Cold press".into(), &s, &|| slider("kind", 1.0));
+        time("paper Rough".into(), &s, &|| slider("kind", 3.0));
+        time("layer view Solo".into(), &s, &|| slider("view", 1.0));
+        time("layer view Trace".into(), &s, &|| slider("view", 2.0));
+        eprintln!("longest switch: {} ({:.1} ms); told again {:.1} ms", longest.1, ms(longest.0), ms(again));
+        crate::brush_library::plugin_sets_kept();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            longest.0 < Duration::from_millis(150),
+            "{} held the calling thread {:.1} ms",
+            longest.1,
+            ms(longest.0)
+        );
+        assert!(again < Duration::from_millis(50), "told again, the calling thread held {:.1} ms", ms(again));
     }
 
     const LASSO_FILL: &str = INFINITE;
@@ -5965,9 +6316,9 @@ mod tests {
                 assert!(same_value(&got, value), "{id} off: {now}: {got}, not {value}");
             }
         }
-        // thirteen in all, each off as the app comes
+        // fourteen in all, each off as the app comes
         let plugins = app_at(&dir);
-        assert_eq!(plugins.plugins().len(), 13);
+        assert_eq!(plugins.plugins().len(), 14);
         assert!(plugins.plugins().iter().all(|p| !p.on));
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -230,13 +230,13 @@ impl Gpu {
                 .map_err(|_| if self.is_lost() { PictureStop::Lost } else { PictureStop::Cut })
         };
         if program.loops {
-            let probe = texture(device, "plugin picture probe", PROBE_SIDE, PROBE_SIDE, FORMAT);
+            let probe = texture(self, "plugin picture probe", PROBE_SIDE, PROBE_SIDE, FORMAT);
             draw(&program.probe, &probe)?;
             if read(&probe, PROBE_SIDE)?.as_chunks::<4>().0.iter().any(|[red, ..]| *red > 127) {
                 return Err(PictureStop::Spent);
             }
         }
-        let target = texture(device, "plugin picture", side, side, FORMAT);
+        let target = texture(self, "plugin picture", side, side, FORMAT);
         draw(&program.draw, &target)?;
         read(&target, side)
     }

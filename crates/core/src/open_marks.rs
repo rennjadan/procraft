@@ -16,9 +16,22 @@ static FILE: Mutex<Option<PathBuf>> = Mutex::new(None);
 pub fn set_open_marks_file(path: String) {
     let file = PathBuf::from(path);
     *FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(file.clone());
+    crate::app_log::keep_log_of_ended_runs(&ended_runs(&file));
+}
+
+/// The desktop app's: its log is its own (in the app's folder `dir`, with the names the tablet's
+/// has), so the log of a run that closed while it opened an artwork is kept apart from here, as
+/// [`set_open_marks_file`] keeps the tablet's. Once the marks' file is set.
+pub fn keep_desktop_logs_of_ended_runs(dir: &Path) {
+    if let Some(file) = file() {
+        crate::app_log::keep_ended_in(dir, &ended_runs(&file));
+    }
+}
+
+/// The runs whose openings the marks in `file` say closed the app: any but this one.
+fn ended_runs(file: &Path) -> Vec<u32> {
     let this_run = std::process::id();
-    let ended: Vec<u32> = read(&file).into_iter().map(|(run, _)| run).filter(|&run| run != this_run).collect();
-    crate::app_log::keep_log_of_ended_runs(&ended);
+    read(file).into_iter().map(|(run, _)| run).filter(|&run| run != this_run).collect()
 }
 
 /// Whether the artwork in folder `dir` was being opened when the app last ended: its opening
@@ -47,22 +60,59 @@ pub fn opening_ended_app_title() -> String {
 /// other apps may help; else a crash, or not known, when it may close again and its log is wanted.
 #[uniffi::export]
 pub fn opening_ended_app_said(low_memory: bool) -> String {
-    if low_memory {
-        "Your device ran low on memory. Closing other apps first may help.".to_owned()
-    } else {
-        "It may close again if you open it now. Share the log so the problem can be found.".to_owned()
-    }
+    opening_ended_app_said_after(if low_memory { RunEnd::LowMemory } else { RunEnd::Unknown })
 }
 
-/// Android's reason for a run that the system ended short of memory
-/// (`ApplicationExitInfo.REASON_LOW_MEMORY`).
+/// How a run of the app ended, as far as the platform tells.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunEnd {
+    /// The system ended it short of memory (Android says so).
+    LowMemory,
+    /// It crashed (the desktop's log has the crash, or the app stopping itself on an error).
+    Crashed,
+    /// Nothing says how it ended.
+    Unknown,
+}
+
+/// What is asked, by how that run ended (`end`): short of memory, closing other apps may help; a
+/// crash, it may crash again; not known, it may close again. The log is asked for unless the
+/// device ran short of memory.
+#[uniffi::export]
+pub fn opening_ended_app_said_after(end: RunEnd) -> String {
+    match end {
+        RunEnd::LowMemory => "Your device ran low on memory. Closing other apps first may help.",
+        RunEnd::Crashed => {
+            "It crashed. It may crash again if you open it now. Share the log so the problem can be found."
+        }
+        RunEnd::Unknown => "It may close again if you open it now. Share the log so the problem can be found.",
+    }
+    .to_owned()
+}
+
+/// Android's reasons for a run that the system ended short of memory, that crashed, and whose
+/// native code crashed (`ApplicationExitInfo.REASON_LOW_MEMORY`, `REASON_CRASH` and
+/// `REASON_CRASH_NATIVE`).
 const ANDROID_LOW_MEMORY: i32 = 3;
+const ANDROID_CRASH: i32 = 4;
+const ANDROID_CRASH_NATIVE: i32 = 5;
+
+/// How a run Android says ended for `reason` (its `ApplicationExitInfo` reason) ended: short of
+/// memory; a crash, of its Kotlin or its native code; anything else (a signal, not responding, the
+/// person stopping it...) not known.
+#[uniffi::export]
+pub fn android_run_end(reason: i32) -> RunEnd {
+    match reason {
+        ANDROID_LOW_MEMORY => RunEnd::LowMemory,
+        ANDROID_CRASH | ANDROID_CRASH_NATIVE => RunEnd::Crashed,
+        _ => RunEnd::Unknown,
+    }
+}
 
 /// Whether a run Android says ended for `reason` (its `ApplicationExitInfo` reason) was ended for
 /// want of memory; a crash, one not responding, a signal or anything else isn't.
 #[uniffi::export]
 pub fn android_run_ended_short_of_memory(reason: i32) -> bool {
-    reason == ANDROID_LOW_MEMORY
+    android_run_end(reason) == RunEnd::LowMemory
 }
 
 /// Whether the marks in `file` say artwork `dir`'s opening began in a run other than `run`.
@@ -72,7 +122,7 @@ fn ended_in(file: &Path, dir: &Path, run: u32) -> bool {
 }
 
 /// An artwork being opened: its mark goes when this is dropped (it showed, its opening failed
-/// and was told, or it was let go), so only an opening the app ended in leaves one.
+/// and was told, or it was let go), so only an opening the app ended in, or a panic, leaves one.
 pub(crate) struct Mark {
     file: PathBuf,
     name: String,
@@ -101,6 +151,10 @@ impl Mark {
 
 impl Drop for Mark {
     fn drop(&mut self) {
+        // a panic as it opens is as the app ending: the artwork is asked about when next picked
+        if std::thread::panicking() {
+            return;
+        }
         let mut marks = read(&self.file);
         let before = marks.len();
         marks.retain(|(_, n)| *n != self.name);
@@ -160,8 +214,91 @@ fn write(file: &Path, marks: &[(u32, String)]) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// How a session being built on this thread ends, for the tests of an opening that ends the
+    /// app: by a panic, or by aborting the process (as a stack overflow does).
+    #[derive(Clone, Copy)]
+    enum Ending {
+        Panic,
+        Abort,
+    }
+
+    thread_local! {
+        static BUILDING_ENDS: std::cell::Cell<Option<Ending>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// Called as a session is built: ends it as this thread's test asked.
+    pub(crate) fn while_building() {
+        match BUILDING_ENDS.with(std::cell::Cell::get) {
+            Some(Ending::Panic) => panic!("the session ends as it is built"),
+            Some(Ending::Abort) => std::process::abort(),
+            None => {}
+        }
+    }
+
+    /// What [`opening_ends_the_process`] is told: "<marks file>|<artwork folder>".
+    const ENDING_PROBE: &str = "PROCRAFT_OPENING_ENDS";
+
+    /// Opens an artwork whose session ends the process as it is built, as [`ENDING_PROBE`] says,
+    /// in a process of its own (run by the test below). Nothing without it.
+    #[test]
+    #[ignore = "run by a_crash_while_the_session_is_built_leaves_the_artwork_noted, in a process of its own"]
+    fn opening_ends_the_process() {
+        let Ok(asked) = std::env::var(ENDING_PROBE) else { return };
+        let Some((marks, dir)) = asked.split_once('|') else { return };
+        use_file_on_this_thread(Some(PathBuf::from(marks)));
+        BUILDING_ENDS.with(|e| e.set(Some(Ending::Abort)));
+        let _ = crate::CanvasSession::open(dir.to_owned());
+    }
+
+    /// The mark is written before the session is built: an opening that ends the app there (a
+    /// stack overflow, an abort, a panic) leaves it, and the artwork is asked about when next
+    /// picked.
+    #[test]
+    fn a_crash_while_the_session_is_built_leaves_the_artwork_noted() {
+        let root = std::env::temp_dir().join(format!("procraft-open-building-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marks = root.join("opening.txt");
+        use_file_on_this_thread(Some(marks.clone()));
+        let dir = root.join("Artwork");
+        let path = dir.to_string_lossy().into_owned();
+        let picture = crate::ThumbnailImage { width: 8, height: 6, rgba: vec![200; 8 * 6 * 4] };
+        crate::CanvasSession::from_image(picture, "Art".to_owned()).save(path.clone()).unwrap();
+        // a panic as the session is built: noted still, by this run
+        BUILDING_ENDS.with(|e| e.set(Some(Ending::Panic)));
+        let opened = std::panic::catch_unwind(|| crate::CanvasSession::open(path.clone()));
+        BUILDING_ENDS.with(|e| e.set(None));
+        assert!(opened.is_err());
+        let this_run = std::process::id();
+        assert_eq!(read(&marks), [(this_run, "Artwork".to_owned())], "a panic as it was built left no mark");
+        assert!(!opening_ended_app(path.clone()), "told while this run goes on");
+        assert!(ended_in(&marks, &dir, this_run + 1), "not told to the next run");
+        std::fs::write(&marks, "").unwrap();
+        // the process aborted as the session is built (a run of its own): noted, and told now
+        let ended = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "open_marks::tests::opening_ends_the_process", "--test-threads=1", "-q"])
+            .env(ENDING_PROBE, format!("{}|{path}", marks.display()))
+            .output()
+            .unwrap();
+        assert!(!ended.status.success(), "the probe didn't end: {}", String::from_utf8_lossy(&ended.stdout));
+        let noted = read(&marks);
+        println!("noted after the probe's abort: {noted:?}");
+        assert!(
+            noted.iter().any(|(run, name)| *run != this_run && name == "Artwork"),
+            "an abort as it was built left no mark"
+        );
+        assert!(opening_ended_app(path.clone()));
+        // opened anyway: it opens, its mark this run's until it is let go
+        let s = crate::CanvasSession::open(path.clone()).unwrap();
+        assert!(!opening_ended_app(path.clone()));
+        drop(s);
+        assert!(read(&marks).is_empty());
+        use_file_on_this_thread(None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn an_opening_the_app_ended_in_is_told_when_it_starts_again_and_one_that_showed_is_not() {
@@ -219,5 +356,46 @@ mod tests {
         // nothing known of how it ended (before Android 11, the desktop, the iPad): the log is asked for
         assert_eq!(opening_ended_app_said(false), crashed);
         assert_eq!(opening_ended_app_title(), "ProCraft closed while opening this artwork");
+    }
+
+    /// The desktop knows a crash from its log: said as one, apart from an end not known; Android's
+    /// words stay as they were.
+    #[test]
+    fn a_run_known_to_have_crashed_is_told_as_a_crash() {
+        let said = opening_ended_app_said_after;
+        assert_eq!(said(RunEnd::LowMemory), opening_ended_app_said(true));
+        assert_eq!(said(RunEnd::Unknown), opening_ended_app_said(false));
+        assert_eq!(
+            said(RunEnd::Crashed),
+            "It crashed. It may crash again if you open it now. Share the log so the problem can be found."
+        );
+        assert_ne!(said(RunEnd::Crashed), said(RunEnd::Unknown));
+    }
+
+    /// Android's reason for how a run ended: short of memory (3), a crash of the app's Kotlin (4) or
+    /// of its native code (5), anything else not known; the question says each so.
+    #[test]
+    fn android_s_reasons_tell_a_crash_a_memory_end_or_neither() {
+        assert_eq!(android_run_end(3), RunEnd::LowMemory);
+        assert_eq!(android_run_end(4), RunEnd::Crashed);
+        assert_eq!(android_run_end(5), RunEnd::Crashed);
+        // 0 unknown, 1 exit itself, 2 signaled, 6 not responding, 7 initialization failure, 8
+        // permission change, 9 excessive resource use, 10 user requested, 11 user stopped, 12
+        // dependency died, 13 other, 14 freezer, 15 package state change, 16 package updated
+        for reason in [-1, 0, 1, 2, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 99] {
+            assert_eq!(android_run_end(reason), RunEnd::Unknown, "reason {reason}");
+        }
+        // short of memory still as it was for its callers
+        for reason in -1..20 {
+            assert_eq!(android_run_ended_short_of_memory(reason), reason == 3, "reason {reason}");
+        }
+        // a crash asks with the crash's words, the log wanted
+        assert_eq!(
+            opening_ended_app_said_after(android_run_end(4)),
+            "It crashed. It may crash again if you open it now. Share the log so the problem can be found."
+        );
+        assert_eq!(opening_ended_app_said_after(android_run_end(5)), opening_ended_app_said_after(RunEnd::Crashed));
+        assert_eq!(opening_ended_app_said_after(android_run_end(3)), opening_ended_app_said(true));
+        assert_eq!(opening_ended_app_said_after(android_run_end(6)), opening_ended_app_said(false));
     }
 }

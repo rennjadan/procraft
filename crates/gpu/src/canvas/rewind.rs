@@ -7,28 +7,32 @@
 //! before the first stamp that changed where a display frame's stamps begin, and lays only what
 //! follows: that leaves what laying it all again from its start would.
 
+use crate::Gpu;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use procraft_engine::geom::IRect;
 
-use super::smudge::{tile_rect, tiles_of};
-use super::{Canvas, Carry, Kept, LAYER_FORMAT, Op, PacedStamp, copy_at, extent, texture, wet_pass};
+use super::smudge::{Tile, tile_rect, tiles_of};
+use super::{
+    Canvas, Carry, Kept, LAYER_FORMAT, Op, PacedStamp, StampInstance as Instance, copy_at, extent, in_place_writes,
+    texture, wet_pass,
+};
 
 /// Marks are at least this far apart in the stroke's input time (ms): two display frames.
-const MARK_EVERY_MS: f64 = 2.0 * super::WET_FRAME_MS;
+pub(super) const MARK_EVERY_MS: f64 = 2.0 * super::WET_FRAME_MS;
 /// Marks are kept this far back in input time from the newest (ms), the oldest at least this far
 /// back: past where an end taper reaches (its time is at most `TAPER_TIME_MS`, and it is eased over
 /// a point either side, and walked again from a little before).
-const MARKS_REACH_MS: f64 = 240.0;
+pub(super) const MARKS_REACH_MS: f64 = 240.0;
 /// The most the marks' pictures may take (bytes), and on a device of little memory: past it the
 /// oldest go, and a stroke whose end reaches back past those left is laid again from its start.
-const MARKS_MOST: u64 = 160 << 20;
+pub(super) const MARKS_MOST: u64 = 160 << 20;
 const MARKS_MOST_LOW: u64 = 48 << 20;
 /// The bytes of the plots wet paint carries from one pass to the next (two, taking turns, at the
 /// start of the stroke's carry buffer; see `CARRIED` in the shader).
 const CARRIED_BYTES: u64 = 2 * (super::WET_PLOT_MOST as u64 * super::WET_PLOT_MOST as u64) * 16;
 /// The most stamps a stroke keeps as they were given to go back over (past it, it can't).
-const GIVEN_MOST: usize = 1 << 17;
+pub(super) const GIVEN_MOST: usize = 1 << 17;
 
 /// What a stroke painting in place keeps to go back to (see the module).
 pub(super) struct Rewind {
@@ -48,6 +52,35 @@ pub(super) struct Rewind {
     /// Whether it keeps what going back takes (not past the most stamps it keeps, nor with a
     /// symmetry's copies of the stroke, which take turns in what they carry).
     on: bool,
+    /// Whether it keeps marks and the stamps given, for the stroke laid again as it ends (else only
+    /// what its tip laid in place writes, see `Canvas::set_in_place_tip`); and what it keeps under
+    /// that tip while one is laid.
+    relays: bool,
+    tip: Option<TipMark>,
+}
+
+/// What a stroke painting in place keeps under its tip laid in place as it begins (see
+/// `Canvas::set_in_place_tip`), as a mark keeps it (see [`Mark`]): the tiles its stamps may write
+/// as they were and those made since, and what it carried; the stamps waiting for the rest of their
+/// display frame, which the tip lays with its own; how many of the stroke's stamps were given and
+/// laid, and whether it had laid any.
+pub(super) struct TipMark {
+    carries: Vec<Carry>,
+    resident: Option<(usize, Kept)>,
+    carry: Option<wgpu::Buffer>,
+    saved: BTreeMap<(u32, u32), Saved>,
+    made: BTreeSet<(u32, u32)>,
+    pending: Vec<PacedStamp>,
+    given: usize,
+    laid: usize,
+    smudge_laid: bool,
+}
+
+impl TipMark {
+    fn let_go(self, rewind_free: &mut Vec<wgpu::Texture>, carries: &mut Vec<wgpu::Buffer>) {
+        carries.extend(self.carry);
+        rewind_free.extend(self.saved.into_values().flat_map(Saved::textures));
+    }
 }
 
 /// A place in the stroke to go back to: before its `at`th stamp (input at `time_ms`).
@@ -85,7 +118,7 @@ impl Mark {
 }
 
 /// Whether two stamps painted in place are the same: as drawn, and where they come in the stroke.
-fn same((a, aw, ap): &PacedStamp, (b, bw, bp): &PacedStamp) -> bool {
+pub(super) fn same((a, aw, ap): &PacedStamp, (b, bw, bp): &PacedStamp) -> bool {
     bytemuck::bytes_of(a) == bytemuck::bytes_of(b)
         && aw.iter().zip(bw).all(|(x, y)| x.to_bits() == y.to_bits())
         && ap.time_ms.to_bits() == bp.time_ms.to_bits()
@@ -95,8 +128,9 @@ fn same((a, aw, ap): &PacedStamp, (b, bw, bp): &PacedStamp) -> bool {
 
 impl Rewind {
     /// Kept for a stroke beginning whose tiles are `side` pixels across, its marks' pictures within
-    /// `most` bytes (none: as much as a device of little memory, or not, gives them).
-    pub(super) fn new(low_memory: bool, most: Option<u64>, side: u32) -> Rewind {
+    /// `most` bytes (none: as much as a device of little memory, or not, gives them); with marks
+    /// for the stroke laid again as it ends if it `relays`, else only for its tip.
+    pub(super) fn new(low_memory: bool, most: Option<u64>, side: u32, relays: bool) -> Rewind {
         Rewind {
             given: Vec::new(),
             laid: 0,
@@ -107,12 +141,22 @@ impl Rewind {
             most: most.unwrap_or(if low_memory { MARKS_MOST_LOW } else { MARKS_MOST }),
             side,
             on: true,
+            relays,
+            tip: None,
         }
     }
 
     /// Stamps given to the stroke, to be laid.
     pub(super) fn give(&mut self, stamps: impl Iterator<Item = PacedStamp>) {
         if !self.on {
+            return;
+        }
+        let mut stamps = stamps;
+        // (kept only for its tip: nothing to keep of them, but a symmetry's copies)
+        if !self.relays {
+            if stamps.any(|s| s.2.copy != 0) {
+                self.stop();
+            }
             return;
         }
         let before = self.given.len();
@@ -132,6 +176,9 @@ impl Rewind {
     pub(super) fn restart(&mut self) {
         self.given.clear();
         self.laid = 0;
+        if let Some(tip) = self.tip.take() {
+            tip.let_go(&mut self.free, &mut self.free_carries);
+        }
         while let Some(mark) = self.marks.pop_front() {
             mark.let_go(&mut self.free, &mut self.free_carries);
         }
@@ -142,6 +189,7 @@ impl Rewind {
         self.on = false;
         self.given = Vec::new();
         self.marks.clear();
+        self.tip = None;
         self.free.clear();
         self.free_carries.clear();
         self.bytes = 0;
@@ -155,13 +203,14 @@ impl Rewind {
     /// The textures the marks' pictures are kept in, and those kept to be taken again.
     pub(super) fn textures(&self) -> impl Iterator<Item = &wgpu::Texture> {
         let saved = self.marks.iter().flat_map(|m| m.saved.values());
+        let saved = saved.chain(self.tip.iter().flat_map(|t| t.saved.values()));
         let saved = saved.flat_map(|s| std::iter::once(&s.layer).chain(s.kept.iter().flatten()));
         saved.chain(&self.free)
     }
 
     /// A tile picture to keep a mark's in: one let go of, else a new one if the most allows,
     /// letting go of the oldest marks (not the newest) for room.
-    fn take(&mut self, device: &wgpu::Device) -> Option<wgpu::Texture> {
+    fn take(&mut self, gpu: &Gpu) -> Option<wgpu::Texture> {
         loop {
             if let Some(t) = self.free.pop() {
                 return Some(t);
@@ -170,7 +219,7 @@ impl Rewind {
             let tile_bytes = u64::from(self.side) * u64::from(self.side) * 4;
             if self.bytes + tile_bytes <= self.most {
                 self.bytes += tile_bytes;
-                return Some(texture(device, "stroke mark", self.side, self.side, LAYER_FORMAT));
+                return Some(texture(gpu, "stroke mark", self.side, self.side, LAYER_FORMAT));
             }
             if self.marks.len() < 2 {
                 return None;
@@ -192,7 +241,7 @@ impl Rewind {
     /// the marks, and how many of the stamps lie before it. `given` more were given after those it
     /// keeps, yet to be laid (in the work queued before these).
     fn point(&self, stamps: &[PacedStamp], given: &[PacedStamp], preview: bool) -> Option<(usize, usize)> {
-        if !self.on {
+        if !self.on || !self.relays {
             return None;
         }
         let kept = self.given.iter().chain(given);
@@ -218,7 +267,7 @@ impl Canvas {
         self.smudge
             .as_ref()
             .and_then(|s| s.rewind.as_ref())
-            .filter(|r| r.on && r.laid > 0)
+            .filter(|r| r.on && r.relays && r.laid > 0)
             .is_some_and(|r| r.marks.back().is_none_or(|m| time_ms - m.time_ms >= MARK_EVERY_MS))
     }
 
@@ -226,7 +275,7 @@ impl Canvas {
     /// on are laid (if it is time for one).
     pub(super) fn mark_in_place(&mut self, encoder: &mut wgpu::CommandEncoder, device: &wgpu::Device, time_ms: f64) {
         let Some(smudge) = self.smudge.as_mut() else { return };
-        let Some(rewind) = smudge.rewind.as_mut().filter(|r| r.on && r.laid > 0) else { return };
+        let Some(rewind) = smudge.rewind.as_mut().filter(|r| r.on && r.relays && r.laid > 0) else { return };
         if rewind.marks.back().is_some_and(|m| time_ms - m.time_ms < MARK_EVERY_MS) {
             return;
         }
@@ -271,12 +320,7 @@ impl Canvas {
     /// The tiles `writes` reach, about to be written by the open stroke painting in place, kept as
     /// they are for its newest mark if this is their first write since (those not made yet noted as
     /// made since: as they were before the stroke).
-    pub(super) fn keep_for_mark(
-        &mut self,
-        device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-        writes: &[IRect],
-    ) {
+    pub(super) fn keep_for_mark(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, writes: &[IRect]) {
         let full = self.full();
         let Some(smudge) = self.smudge.as_mut() else { return };
         let Some(layer) = self.layers.get(&smudge.into) else { return };
@@ -290,42 +334,183 @@ impl Canvas {
         mark.made.extend(touched.iter().filter(|t| !smudge.tiles.contains_key(t)));
         for at in touched {
             let Some(tile) = smudge.tiles.get(&at) else { continue };
-            let kept = [&tile.grained, &tile.amount, &tile.shown];
-            let wanted = 1 + kept.iter().filter(|k| k.is_some()).count();
-            let mut taken = Vec::with_capacity(wanted);
-            for _ in 0..wanted {
-                match rewind.take(device) {
-                    Some(t) => taken.push(t),
-                    None => break,
-                }
-            }
             // past the most it keeps: this mark can't be gone back to
-            if taken.len() < wanted {
-                rewind.free.extend(taken);
+            let Some(saved) = keep_tile(gpu, encoder, rewind, (&layer.texture, tile), (at, side, full)) else {
                 rewind.drop_newest();
                 return;
-            }
-            let r = tile_rect(at, side).intersect(full);
-            let mut taken = taken.into_iter();
-            let Some(picture) = taken.next() else { return };
-            encoder.copy_texture_to_texture(
-                copy_at(&layer.texture, r.x0, r.y0),
-                copy_at(&picture, 0, 0),
-                extent(r.width(), r.height()),
-            );
-            let mut saved = Saved { layer: picture, kept: [None, None, None] };
-            for (from, into) in kept.into_iter().zip(saved.kept.iter_mut()) {
-                if let Some(from) = from {
-                    let Some(t) = taken.next() else { break };
-                    encoder.copy_texture_to_texture(copy_at(from, 0, 0), copy_at(&t, 0, 0), extent(side, side));
-                    *into = Some(t);
-                }
-            }
+            };
             // (the newest mark is still there: none was let go for room but older ones)
             if let Some(mark) = rewind.marks.back_mut() {
                 mark.saved.insert(at, saved);
             }
         }
+    }
+
+    /// Whether the open stroke painting in place into `target` keeps what its tip laid in place
+    /// writes (see [`Canvas::save_in_place_tip`]): the tip's stamps are laid only then.
+    pub(super) fn keeps_in_place_tip(&self, target: procraft_engine::document::LayerId) -> bool {
+        self.smudge.as_ref().is_some_and(|s| s.layer == target && s.rewind.as_ref().is_some_and(|r| r.tip.is_some()))
+    }
+
+    /// The open stroke painting in place begins its tip laid in place, which writes within `writes`
+    /// (see `Canvas::set_in_place_tip`): it keeps what it carries, the stamps waiting for the rest
+    /// of their display frame (the tip lays them too), and every tile the tip and those stamps may
+    /// write as it is, before any is written, so that none is let go of for room as the tip is
+    /// laid. Whether it does: not before the stroke has laid anything, nor where it keeps nothing to
+    /// go back to (a symmetry's copies), nor past the memory its marks may take; the tip is then
+    /// not laid, and the stroke shows as far as it is laid.
+    pub(super) fn save_in_place_tip(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, writes: IRect) -> bool {
+        let full = self.full();
+        let device = &gpu.device;
+        let Some(smudge) = self.smudge.as_mut() else { return false };
+        let Some(layer) = self.layers.get(&smudge.into) else { return false };
+        let side = smudge.tile;
+        let Some(rewind) = smudge.rewind.as_mut().filter(|r| r.on) else { return false };
+        // (one whose stamps never came, a render's work cut short)
+        if let Some(old) = rewind.tip.take() {
+            old.let_go(&mut rewind.free, &mut rewind.free_carries);
+        }
+        if smudge.stalled {
+            return false;
+        }
+        let pending: Vec<Instance> = smudge.pending.iter().map(|s| s.0).collect();
+        let writes = writes.union(in_place_writes(&pending, full));
+        // what it carries over between passes, copied
+        let carry = match (smudge.carry.as_ref(), smudge.wet) {
+            (Some(from), true) => {
+                let into = rewind.free_carries.pop().or_else(|| {
+                    (rewind.bytes + CARRIED_BYTES <= rewind.most).then(|| {
+                        rewind.bytes += CARRIED_BYTES;
+                        device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("stroke tip carry"),
+                            size: CARRIED_BYTES,
+                            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        })
+                    })
+                });
+                let Some(into) = into else { return false };
+                encoder.copy_buffer_to_buffer(from, 0, &into, 0, CARRIED_BYTES);
+                Some(into)
+            }
+            _ => None,
+        };
+        let mut tip = TipMark {
+            carries: smudge.carries.iter().map(Carry::plain).collect(),
+            resident: smudge.resident,
+            carry,
+            saved: BTreeMap::new(),
+            made: BTreeSet::new(),
+            pending: smudge.pending.clone(),
+            given: rewind.given.len(),
+            laid: rewind.laid,
+            smudge_laid: smudge.laid,
+        };
+        for at in tiles_of(writes, side) {
+            let Some(tile) = smudge.tiles.get(&at) else {
+                tip.made.insert(at);
+                continue;
+            };
+            let Some(saved) = keep_tile(gpu, encoder, rewind, (&layer.texture, tile), (at, side, full)) else {
+                tip.let_go(&mut rewind.free, &mut rewind.free_carries);
+                return false;
+            };
+            tip.saved.insert(at, saved);
+        }
+        rewind.tip = Some(tip);
+        true
+    }
+
+    /// The tiles `writes` reach, about to be written while the open stroke lays its tip in place:
+    /// kept for it as they are where it doesn't keep them yet (none, but where a pass reached past
+    /// what the tip was told it writes), those not made yet noted as made since.
+    pub(super) fn keep_for_tip(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, writes: &[IRect]) {
+        let full = self.full();
+        let Some(smudge) = self.smudge.as_mut() else { return };
+        let Some(layer) = self.layers.get(&smudge.into) else { return };
+        let side = smudge.tile;
+        let Some(rewind) = smudge.rewind.as_mut() else { return };
+        let Some(tip) = rewind.tip.as_ref() else { return };
+        let mut touched: Vec<(u32, u32)> = writes.iter().flat_map(|w| tiles_of(*w, side)).collect();
+        touched.sort_unstable();
+        touched.dedup();
+        touched.retain(|t| !tip.saved.contains_key(t) && !tip.made.contains(t));
+        for at in touched {
+            let saved = match smudge.tiles.get(&at) {
+                Some(tile) => match keep_tile(gpu, encoder, rewind, (&layer.texture, tile), (at, side, full)) {
+                    Some(saved) => Some(saved),
+                    None => {
+                        log::error!("a stroke's tip laid in place couldn't keep a tile it writes");
+                        continue;
+                    }
+                },
+                None => None,
+            };
+            if let Some(tip) = rewind.tip.as_mut() {
+                match saved {
+                    Some(saved) => {
+                        tip.saved.insert(at, saved);
+                    }
+                    None => {
+                        tip.made.insert(at);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes the open stroke's tip laid in place off (see [`Canvas::save_in_place_tip`]): the tiles
+    /// it wrote as they were (those made since as they were before the stroke, and no longer kept),
+    /// what it carried as it was, and the stamps waiting for the rest of their display frame
+    /// waiting again.
+    pub(super) fn untip_in_place_now(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder) {
+        let full = self.full();
+        let Some(smudge) = self.smudge.as_mut() else { return };
+        let Some(layer) = self.layers.get(&smudge.into) else { return };
+        let side = smudge.tile;
+        let Some(rewind) = smudge.rewind.as_mut() else { return };
+        let Some(tip) = rewind.tip.take() else { return };
+        let mut changed = IRect::EMPTY;
+        for at in &tip.made {
+            let Some(made) = smudge.tiles.remove(at) else { continue };
+            let r = tile_rect(*at, side).intersect(full);
+            gpu.copy_texture_to_texture(
+                encoder,
+                copy_at(&made.before, 0, 0),
+                copy_at(&layer.texture, r.x0, r.y0),
+                extent(r.width(), r.height()),
+            );
+            changed = changed.union(r);
+        }
+        for (at, saved) in &tip.saved {
+            let Some(tile) = smudge.tiles.get(at) else { continue };
+            let r = tile_rect(*at, side).intersect(full);
+            gpu.copy_texture_to_texture(
+                encoder,
+                copy_at(&saved.layer, 0, 0),
+                copy_at(&layer.texture, r.x0, r.y0),
+                extent(r.width(), r.height()),
+            );
+            for (from, into) in saved.kept.iter().zip([&tile.grained, &tile.amount, &tile.shown]) {
+                if let (Some(from), Some(into)) = (from, into) {
+                    gpu.copy_texture_to_texture(encoder, copy_at(from, 0, 0), copy_at(into, 0, 0), extent(side, side));
+                }
+            }
+            changed = changed.union(r);
+        }
+        if let (Some(from), Some(into)) = (tip.carry.as_ref(), smudge.carry.as_ref()) {
+            encoder.copy_buffer_to_buffer(from, 0, into, 0, CARRIED_BYTES);
+        }
+        smudge.carries = tip.carries.iter().map(Carry::plain).collect();
+        smudge.resident = tip.resident;
+        smudge.pending.clone_from(&tip.pending);
+        smudge.laid = tip.smudge_laid;
+        rewind.given.truncate(tip.given);
+        rewind.laid = tip.laid;
+        tip.let_go(&mut rewind.free, &mut rewind.free_carries);
+        // (paint laid apart, put together there with its second as it then was)
+        smudge.stale = smudge.stale.union(changed);
+        self.dirty = self.dirty.union(changed);
     }
 
     /// The open stroke painting in place, laid again from its start in `ops` (the work queued for a
@@ -383,9 +568,11 @@ impl Canvas {
                         times: times.into_iter().skip(at).collect(),
                         style,
                         clear: false,
+                        again: true,
                         layer,
                         pencil,
                         carry,
+                        tip: false,
                     });
                 }
                 op => out.push(op),
@@ -397,12 +584,17 @@ impl Canvas {
     /// Goes back to the open stroke's mark before its `at`th stamp (see [`Canvas::rewound`]): the
     /// tiles written since as they were then (those made since as they were before the stroke, and
     /// no longer kept), and what it carried; the stamps waiting for the rest of their frame dropped.
-    pub(super) fn rewind_in_place(&mut self, encoder: &mut wgpu::CommandEncoder, at: usize) {
+    pub(super) fn rewind_in_place(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, at: usize) {
         let full = self.full();
         let Some(smudge) = self.smudge.as_mut() else { return };
         let Some(layer) = self.layers.get(&smudge.into) else { return };
         let side = smudge.tile;
         let Some(rewind) = smudge.rewind.as_mut() else { return };
+        // (a tip laid in place since is gone back over with the rest: the marks kept what it wrote
+        // as it was too)
+        if let Some(tip) = rewind.tip.take() {
+            tip.let_go(&mut rewind.free, &mut rewind.free_carries);
+        }
         let Some(k) = rewind.marks.iter().position(|m| m.at == at) else {
             log::error!("a stroke's mark at {at} went before it was gone back to");
             return;
@@ -422,7 +614,8 @@ impl Canvas {
         for at in &made {
             let Some(tile) = smudge.tiles.remove(at) else { continue };
             let r = tile_rect(*at, side).intersect(full);
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(&tile.before, 0, 0),
                 copy_at(&layer.texture, r.x0, r.y0),
                 extent(r.width(), r.height()),
@@ -432,14 +625,15 @@ impl Canvas {
         for (at, saved) in first {
             let Some(tile) = smudge.tiles.get(&at) else { continue };
             let r = tile_rect(at, side).intersect(full);
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(&saved.layer, 0, 0),
                 copy_at(&layer.texture, r.x0, r.y0),
                 extent(r.width(), r.height()),
             );
             for (from, into) in saved.kept.iter().zip([&tile.grained, &tile.amount, &tile.shown]) {
                 if let (Some(from), Some(into)) = (from, into) {
-                    encoder.copy_texture_to_texture(copy_at(from, 0, 0), copy_at(into, 0, 0), extent(side, side));
+                    gpu.copy_texture_to_texture(encoder, copy_at(from, 0, 0), copy_at(into, 0, 0), extent(side, side));
                 }
             }
             changed = changed.union(r);
@@ -466,6 +660,48 @@ impl Canvas {
     }
 }
 
+/// Keeps tile `at` of the stroke's layer (`layer`) and what the stroke keeps of it (`tile`) as they
+/// are, in pictures `rewind` takes: none if it can't take them all (those it took given back).
+fn keep_tile(
+    gpu: &Gpu,
+    encoder: &mut wgpu::CommandEncoder,
+    rewind: &mut Rewind,
+    (layer, tile): (&wgpu::Texture, &Tile),
+    (at, side, full): ((u32, u32), u32, IRect),
+) -> Option<Saved> {
+    let kept = [&tile.grained, &tile.amount, &tile.shown];
+    let wanted = 1 + kept.iter().filter(|k| k.is_some()).count();
+    let mut taken = Vec::with_capacity(wanted);
+    for _ in 0..wanted {
+        match rewind.take(gpu) {
+            Some(t) => taken.push(t),
+            None => break,
+        }
+    }
+    if taken.len() < wanted {
+        rewind.free.extend(taken);
+        return None;
+    }
+    let r = tile_rect(at, side).intersect(full);
+    let mut taken = taken.into_iter();
+    let picture = taken.next()?;
+    gpu.copy_texture_to_texture(
+        encoder,
+        copy_at(layer, r.x0, r.y0),
+        copy_at(&picture, 0, 0),
+        extent(r.width(), r.height()),
+    );
+    let mut saved = Saved { layer: picture, kept: [None, None, None] };
+    for (from, into) in kept.into_iter().zip(saved.kept.iter_mut()) {
+        if let Some(from) = from {
+            let Some(t) = taken.next() else { break };
+            gpu.copy_texture_to_texture(encoder, copy_at(from, 0, 0), copy_at(&t, 0, 0), extent(side, side));
+            *into = Some(t);
+        }
+    }
+    Some(saved)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::StampInstance;
@@ -477,7 +713,7 @@ mod tests {
     }
 
     fn rewind_with(marks: &[usize], given: &[PacedStamp]) -> Rewind {
-        let mut r = Rewind::new(false, None, super::super::smudge::TILE);
+        let mut r = Rewind::new(false, None, super::super::smudge::TILE, true);
         r.give(given.iter().copied());
         r.laid(given.len());
         for &at in marks {

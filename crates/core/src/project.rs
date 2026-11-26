@@ -35,6 +35,10 @@ pub enum Leaving {
     /// It couldn't be saved: it stays open, with what to ask (a title and what it says): stay (the
     /// default), or leave without saving, which loses what wasn't saved.
     Stays { title: String, message: String },
+    /// Its GPU device was lost, and what it held with it: nothing more can be saved, so it is left
+    /// as its folder has it (as last saved, never written over), and the canvas may go. What it
+    /// says tells that plainly, once, as it is left.
+    Lost { message: String },
 }
 /// How long after a change an open artwork kept saved looks for what to save (it waits for a
 /// change first: nothing changing, it never looks).
@@ -139,6 +143,10 @@ struct ArtworkFile {
         skip_serializing_if = "Option::is_none"
     )]
     turns: Option<u8>,
+    /// The view it was left with, as versions before `turns` kept it instead: read only for the
+    /// quarter turn it gives a file without `turns`, never written.
+    #[serde(default, deserialize_with = "procraft_engine::document::or_default", skip_serializing)]
+    view: Option<LeftView>,
     /// The model painted on, if it is one (its current texture set is `document`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<crate::scene3d::SavedModel>,
@@ -176,6 +184,29 @@ struct ArtworkFile {
 
 /// A plugin's artwork's data in its folder.
 pub(crate) const PLUGIN_DATA: &str = "plugin-data.bin";
+
+/// The view an artwork was left with, as earlier versions kept it: of it only its turn counts now
+/// (`rotation`, radians clockwise on screen), less what of that was the view turning with the
+/// device (`followed`); where on the canvas it was and its zoom are not kept.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize)]
+struct LeftView {
+    #[serde(default)]
+    rotation: f32,
+    #[serde(default)]
+    followed: f32,
+}
+
+impl ArtworkFile {
+    /// The quarter turns clockwise it is kept at: as kept, or, kept by a version before that, the
+    /// turn nearest the view it was left with; upright if neither.
+    fn kept_turns(&self) -> u8 {
+        let left = self.view.and_then(|v| {
+            let followed = if v.followed.is_finite() { v.followed } else { 0.0 };
+            crate::nearest_quarter_turns(v.rotation - followed)
+        });
+        self.turns.or(left).unwrap_or(0) % 4
+    }
+}
 
 /// An artwork's time-lapse in a package: whether it records, its video's settings (quality 0 to 3,
 /// resolution 0 to 2, HEVC or H.264), and its video so far as MP4 files in order, `width` ×
@@ -361,6 +392,19 @@ impl Saved {
     pub(crate) fn read(&mut self, id: LayerId, hash: u64) {
         self.layers.insert(id, hash);
     }
+
+    /// The folder the artwork was opened from or last saved into; empty before either.
+    pub(crate) fn folder(&self) -> &Path {
+        &self.dir
+    }
+
+    /// The artwork opened again from its folder in place (see `lost.rs`): what the folder holds is
+    /// as `fresh`, that open, found it; the autosave running goes on.
+    pub(crate) fn reopened(&mut self, fresh: Saved) {
+        let autosave = self.autosave;
+        *self = fresh;
+        self.autosave = autosave;
+    }
 }
 
 /// A quick hash of pixels, to tell a changed layer from one saved already.
@@ -439,6 +483,11 @@ impl crate::State {
             let there = known.get(&id) == Some(&hash) && layer_path(dir, id).exists();
             (!there).then_some((id, hash, rgba))
         };
+        // a device lost read back nothing true, and a canvas that went with one held the pixels:
+        // nothing is saved, and the folder keeps the last save as it is
+        if self.lost_device() {
+            return Err(file_error("reading the layers", "the graphics device was lost"));
+        }
         // the time on it up to now saved with it
         self.count_tracked_time();
         let model = self.model_snapshot()?;
@@ -451,6 +500,7 @@ impl crate::State {
             document: self.doc.clone(),
             info: self.info.clone(),
             turns: Some(self.turns).filter(|&t| t != 0),
+            view: None,
             model: model.as_ref().map(|m| m.saved.clone()),
             reference: Some(self.reference_window.clone()).filter(|w| !w.is_unused()),
             references: self.more_references.iter().map(|m| m.window.clone()).collect(),
@@ -667,7 +717,40 @@ fn write_or_keep_changed(
         canvas.mark_changed(changed);
     }
     session.note_room(&result);
+    if result.is_ok() {
+        session.folder_saved(dir);
+    }
     result
+}
+
+impl CanvasSession {
+    /// The artwork was saved into `dir`: a plugin keeping artworks in a folder writes it there
+    /// before long (interface 22). Nothing with none on that hook.
+    fn folder_saved(&self, dir: &Path) {
+        let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(folders) = folders {
+            folders.artwork_saved(self.me.clone(), dir);
+        }
+    }
+
+    /// The artwork in `dir` was left, saved: what a plugin's folder waits for goes before long.
+    fn folder_left(&self, dir: &Path) {
+        let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(folders) = folders {
+            folders.artwork_left(dir);
+        }
+    }
+
+    /// Whether its canvas is there to read: made, on a GPU, and not let go.
+    pub(crate) fn shows_canvas(&self) -> bool {
+        let st = self.shared.lock();
+        st.canvas.is_some() && st.gpu.is_some() && !st.closed
+    }
+
+    /// Whether its canvas was let go ([`CanvasSession::release_canvas`]).
+    pub(crate) fn closed(&self) -> bool {
+        self.shared.lock().closed
+    }
 }
 
 impl CanvasSession {
@@ -710,6 +793,8 @@ impl CanvasSession {
             saved.autosave
         };
         let session = Arc::downgrade(&self);
+        // open there: nothing from a plugin's folder comes in over it
+        crate::folders::opened(Path::new(&dir), Arc::downgrade(&self));
         // (its own handle on the changes: waiting on them keeps nothing else of the session alive)
         let nudge = Arc::clone(&self.shared.nudge);
         let mut seen = nudge.seen();
@@ -755,9 +840,13 @@ impl CanvasSession {
                     unsaved = None;
                     continue;
                 }
-                let lost = || session.shared.lock().gpu.as_ref().is_some_and(procraft_gpu::Gpu::is_lost);
+                // a device lost holds nothing to save: the last save stands, and the autosave waits for
+                // the next change, which comes once the artwork is opened again on a new device
+                // (see `lost.rs`)
+                let lost = || session.shared.lock().lost_device();
                 if lost() {
-                    return;
+                    unsaved = None;
+                    continue;
                 }
                 // (strokes, which come and go, the save waits for itself, reading ahead meanwhile)
                 if !session.shared.lock().settled() {
@@ -769,7 +858,8 @@ impl CanvasSession {
                 let result = session.save_if_idle_with(&mut saved, &dir);
                 // lost during the save: that is what failed it, and it tells of itself
                 if result.is_err() && lost() {
-                    return;
+                    unsaved = None;
+                    continue;
                 }
                 let mut failure = session.shared.save_failure.lock().unwrap_or_else(|e| e.into_inner());
                 match result {
@@ -982,14 +1072,19 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         saved.layer_data.clear();
     }
     let (w, h) = (file.document.width(), file.document.height());
+    // (what it writes beside isn't taken for a save cut short meanwhile)
+    let _saving = SavingInto::begin(dir);
     fs::create_dir_all(dir.join("layers")).map_err(|e| file_error("making the folder", e))?;
     // Everything new is written beside its place first and only then put in place, the document
     // last: a save cut short while writing (the slow part) leaves the last one as it was. Written
     // in place one by one, a save after a crop cut short left layers of the new size beside a
-    // document of the old, which the next open would drop.
+    // document of the old, which the next open would drop. A first save cut short once its
+    // document is written is put in place when the gallery next looks (see `finish_first_save`).
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let stage = |result: Result<PathBuf, MobileError>, to: PathBuf, staged: &mut Vec<(PathBuf, PathBuf)>| {
-        result.map(|tmp| staged.push((tmp, to)))
+        let staged = result.map(|tmp| staged.push((tmp, to)));
+        cut_short::step();
+        staged
     };
     // the layers whose stores are in the folder once this save is in place
     let mut stored = stores_kept;
@@ -998,7 +1093,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         // layer's PNG made in memory before it is written
         let each = w as usize * h as usize * 4;
         let results = procraft_engine::par::side_by_side_within(&layers, each, |(id, _, rgba)| {
-            write_beside(&layer_path(dir, *id), |p| write_png(p, w, h, rgba, &[]))
+            stage_beside(&layer_path(dir, *id), |p| write_png(p, w, h, rgba, &[]))
         });
         // every one written kept track of, so a failure among them leaves none of them beside
         let mut failed = None;
@@ -1014,7 +1109,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         for (id, bytes) in &files {
             let to = layer_path(dir, *id);
             stage(
-                write_beside(&to, |p| crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
+                stage_beside(&to, |p| crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer", e))),
                 to,
                 &mut staged,
             )?;
@@ -1026,7 +1121,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         let thumb = dir.join("thumbnail.png");
         if let Some((pw, ph, rgba)) = model.and_then(|m| m.picture) {
             let (tw, th, small) = thumbnail(&rgba, pw, ph, THUMBNAIL_SIDE);
-            stage(write_beside(&thumb, |p| write_png(p, tw, th, &small, &[])), thumb, &mut staged)?;
+            stage(stage_beside(&thumb, |p| write_png(p, tw, th, &small, &[])), thumb, &mut staged)?;
         } else if let Some((tw, th, small)) =
             composite.map(|t| (t.width, t.height, straight_alpha(&t.rgba))).or(unshown)
         {
@@ -1037,14 +1132,14 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 table.apply_rgba(&mut small, false);
             }
             let icc = file.document.picture_icc();
-            stage(write_beside(&thumb, |p| write_png(p, tw, th, &small, &icc)), thumb, &mut staged)?;
+            stage(stage_beside(&thumb, |p| write_png(p, tw, th, &small, &icc)), thumb, &mut staged)?;
         }
         // the Reference window's picture, unless the folder has it already
         let picture_path = dir.join(crate::reference_window::REFERENCE_PICTURE);
         if let Some(png) = reference_picture.as_deref()
             && (saved.reference_picture != Some(pixels_hash(png)) || !picture_path.exists())
         {
-            let written = write_beside(&picture_path, |p| {
+            let written = stage_beside(&picture_path, |p| {
                 crate::storage::write(p, png).map_err(|e| file_error("writing the reference picture", e))
             });
             stage(written, picture_path, &mut staged)?;
@@ -1056,7 +1151,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             if saved.more_pictures.get(i).copied().flatten() == Some(pixels_hash(png)) && path.exists() {
                 continue;
             }
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, png).map_err(|e| file_error("writing a reference picture", e))
             });
             stage(written, path, &mut staged)?;
@@ -1067,7 +1162,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
             if saved.layer_data.get(id) == Some(&pixels_hash(data)) && path.exists() {
                 continue;
             }
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, data.as_slice()).map_err(|e| file_error("writing a layer's plugin data", e))
             });
             stage(written, path, &mut staged)?;
@@ -1084,7 +1179,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
                 .collect::<Result<Vec<_>, _>>()?;
             let bytes = crate::layer_store::encode(kind, (w, h), layer_hash, &planes)?;
             let path = crate::layer_store::store_path(dir, id);
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, &bytes).map_err(|e| file_error("writing a layer's store", e))
             });
             stage(written, path, &mut staged)?;
@@ -1092,7 +1187,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         }
         for (id, bytes) in &store_files {
             let path = crate::layer_store::store_path(dir, *id);
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, bytes).map_err(|e| file_error("writing a layer's store", e))
             });
             stage(written, path, &mut staged)?;
@@ -1101,7 +1196,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         // a plugin's artwork's own data, whole, before the document that names its kind
         if let Some(data) = plugin_data.as_deref() {
             let path = dir.join(PLUGIN_DATA);
-            let written = write_beside(&path, |p| {
+            let written = stage_beside(&path, |p| {
                 crate::storage::write(p, data).map_err(|e| file_error("writing the plugin's artwork", e))
             });
             stage(written, path, &mut staged)?;
@@ -1109,7 +1204,7 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
         let json = serde_json::to_string(&file).map_err(|e| file_error("writing the artwork", e))?;
         let doc = dir.join("artwork.json");
         stage(
-            write_beside(&doc, |p| {
+            stage_beside(&doc, |p| {
                 crate::storage::write(p, json.as_bytes()).map_err(|e| file_error("writing the artwork", e))
             }),
             doc,
@@ -1118,7 +1213,11 @@ fn write_artwork(saved: &mut Saved, dir: &Path, snapshot: SaveSnapshot) -> Resul
     })();
     // in place, in the order written (the document last), or, short of that, none of it
     let placed = written.and_then(|()| {
-        staged.iter().try_for_each(|(tmp, to)| fs::rename(tmp, to).map_err(|e| file_error("saving", e)))
+        staged.iter().try_for_each(|(tmp, to)| {
+            fs::rename(tmp, to).map_err(|e| file_error("saving", e))?;
+            cut_short::step();
+            Ok(())
+        })
     });
     if let Err(e) = placed {
         for (tmp, _) in &staged {
@@ -1247,6 +1346,10 @@ impl CanvasSession {
     #[uniffi::constructor]
     pub fn open(dir: String) -> Result<Arc<CanvasSession>, MobileError> {
         let dir = PathBuf::from(dir);
+        // noted as being opened before anything is read, until it shows (see `open_marks.rs`): an
+        // opening that ends the app, even as its session is built, is asked about when next picked.
+        // One that fails here is told, and its mark goes
+        let open_mark = crate::open_marks::Mark::new(&dir);
         let text = fs::read_to_string(dir.join("artwork.json")).map_err(|e| file_error("reading the artwork", e))?;
         let file: ArtworkFile = serde_json::from_str(&text).map_err(|e| file_error("reading the artwork", e))?;
         if file.format != FORMAT || file.version > VERSION {
@@ -1254,6 +1357,8 @@ impl CanvasSession {
                 reason: format!("not an artwork this version can open ({} {})", file.format, file.version),
             });
         }
+        // the quarter turn it is kept at (before its parts are taken)
+        let turns = file.kept_turns();
         let mut doc = file.document.repaired();
         // plugins' layers' data, as it is (an empty file: none yet). One whose file is gone or can't
         // be read takes no strokes, which would draw it again without what its pixels show, and
@@ -1313,14 +1418,13 @@ impl CanvasSession {
         }
         {
             let mut st = session.shared.lock();
-            // noted as being opened until it shows (see `open_marks.rs`)
-            st.open_mark = crate::open_marks::Mark::new(&dir);
+            st.open_mark = open_mark;
             st.pending_pixels = pngs;
             st.pending_stores = stores;
             st.layer_data_unread.extend(data_unread);
             st.info = file.info;
-            st.turns = file.turns.unwrap_or(0) % 4;
-            st.scene = scene;
+            st.turns = turns;
+            st.scene = scene.map(Box::new);
             st.reference_window = file.reference.unwrap_or_default();
             st.reference_picture = reference_picture.map(Arc::new);
             st.more_references = more_references;
@@ -1408,13 +1512,23 @@ impl CanvasSession {
     /// that is only in memory: one that can't be saved (the storage full, say) [`Leaving::Stays`]
     /// open, painting from memory and kept saved again (what wasn't saved goes at the autosave's next
     /// look, once there is room), with what to ask: stay, or leave without saving, which loses it.
-    /// The apps all leave so; only the system ending the app can lose it.
+    /// The apps all leave so; only the system ending the app can lose it. One whose GPU device was
+    /// lost (and what was painted since its last save with it) is [`Leaving::Lost`] at once, as
+    /// its folder has it: staying could never save it (see `lost.rs`).
     pub fn save_to_leave(self: Arc<Self>, dir: String) -> Leaving {
         self.stop_autosave();
+        // the device lost: nothing more can be saved, and staying would save nothing either; left
+        // as last saved (told, unless nothing changed since)
+        if let Some(left) = self.leave_lost(Path::new(&dir)) {
+            return left;
+        }
         let mut failed = None;
         for _ in 0..LEAVE_SAVES {
             match self.save(dir.clone()) {
-                Ok(()) if self.edits_saved() == Some(self.edits()) => return Leaving::Left,
+                Ok(()) if self.edits_saved() == Some(self.edits()) => {
+                    self.folder_left(Path::new(&dir));
+                    return Leaving::Left;
+                }
                 Ok(()) => failed = None,
                 Err(e) => {
                     failed = Some(e.to_string());
@@ -1423,7 +1537,10 @@ impl CanvasSession {
             }
         }
         // (painted on through every round: what the last saved stands, the rest is the next save's)
-        let Some(reason) = failed else { return Leaving::Left };
+        let Some(reason) = failed else {
+            self.folder_left(Path::new(&dir));
+            return Leaving::Left;
+        };
         let saved = self.shared.edits_saved.load(std::sync::atomic::Ordering::Relaxed);
         let ever_saved = Path::new(&dir).join("artwork.json").is_file();
         let (title, message) = crate::storage::leave_unsaved_said(&reason, ever_saved);
@@ -1451,7 +1568,11 @@ impl CanvasSession {
     /// whichever comes first, as a driver that takes the app down on another may), else one of its
     /// own; false if there is none.
     pub fn prepare_offscreen(&self) -> bool {
-        let app = crate::device::kept().clone();
+        // (a lost one can't draw: made again, else one of its own)
+        if crate::device::kept().as_ref().is_some_and(procraft_gpu::Gpu::is_lost) {
+            crate::device::warm_gpu();
+        }
+        let app = crate::device::kept().clone().filter(|g| !g.is_lost());
         let mut st = self.shared.lock();
         if st.gpu.is_none() {
             match app.map_or_else(procraft_gpu::Gpu::headless, Ok) {
@@ -1532,6 +1653,21 @@ impl CanvasSession {
         seed: u64,
         time_lapse: Option<PackageTimeLapse>,
     ) -> Result<(), MobileError> {
+        self.export_package_when(path, seed, time_lapse, false).map(|_| ())
+    }
+}
+
+impl CanvasSession {
+    /// [`CanvasSession::export_package`]; with `idle_only`, only while nothing is under way that it
+    /// would end (false then, nothing written), and quietly: the progress of an export someone
+    /// started is left as it is (a package made for a plugin's folder).
+    pub(crate) fn export_package_when(
+        &self,
+        path: String,
+        seed: u64,
+        time_lapse: Option<PackageTimeLapse>,
+        idle_only: bool,
+    ) -> Result<bool, MobileError> {
         let time_lapse = match time_lapse {
             Some(t) => {
                 let mut segments = Vec::with_capacity(t.segments.len());
@@ -1551,10 +1687,16 @@ impl CanvasSession {
             }
             None => None,
         };
-        self.exported(0.0);
+        // (made for a plugin's folder: the progress of an export someone started is left alone)
+        if !idle_only {
+            self.exported(0.0);
+        }
         let (doc, composite, name, info, reference, reference_picture, turns, edits) = {
             let mut guard = self.shared.lock_finished();
             let st = &mut *guard;
+            if idle_only && !st.idle() {
+                return Ok(false);
+            }
             st.finish_stroke();
             st.settle();
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else {
@@ -1585,7 +1727,8 @@ impl CanvasSession {
         let preview = png_bytes(tw, th, &thumb, &doc.picture_icc())?;
         // every layer and mask read as it is written, a layer at a time
         let count = doc.layers().iter().filter(|l| l.kind != LayerKind::Group).count();
-        let pixels = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        let mut pixels = ExportLayers::new(self, edits, count, (0.1, 0.9));
+        pixels.tells = !idle_only;
         let export = procraft_engine::native::Export {
             document: &doc,
             pixels: &pixels,
@@ -1602,10 +1745,15 @@ impl CanvasSession {
             turns: u32::from(turns),
         };
         write_file_atomically(Path::new(&path), |out| procraft_engine::native::write_to(&export, out).map(|_| ()))?;
-        self.exported(1.0);
-        Ok(())
+        if !idle_only {
+            self.exported(1.0);
+        }
+        Ok(true)
     }
+}
 
+#[uniffi::export]
+impl CanvasSession {
     /// The artwork as a layered PSD (groups, masks, clipping, blend modes kept) at `path`, its
     /// layers read and written one at a time.
     pub fn export_psd(&self, path: String) -> Result<(), MobileError> {
@@ -1704,9 +1852,12 @@ impl CanvasSession {
         st.info.clone()
     }
 
-    /// Time on the artwork counts while `on` (it is shown and the app in front), from now; off,
-    /// what was counted is added to the artwork's. Each save and [`Self::artwork_info`] takes the
-    /// time counted so far. (Android counts it itself, by [`Self::add_tracked_time`].)
+    /// Time on the artwork counts while `on` (it is shown and the app active: not while the
+    /// device is locked, or the app is in the background or under the system's own screens, nor
+    /// for being idle otherwise), from now; on again while on, it counts on from when it was
+    /// turned on. Off, what was counted is added to the artwork's. Each save and
+    /// [`Self::artwork_info`] takes the time counted so far. (Android counts it itself, by
+    /// [`Self::add_tracked_time`].)
     pub fn set_tracking(&self, on: bool) {
         let mut st = self.shared.lock();
         st.count_tracked_time();
@@ -2036,11 +2187,13 @@ struct ExportLayers<'a> {
     count: usize,
     done: std::cell::Cell<usize>,
     progress: (f32, f32),
+    /// Whether it tells the export's progress (not for a package made for a plugin's folder).
+    tells: bool,
 }
 
 impl<'a> ExportLayers<'a> {
     fn new(session: &'a CanvasSession, edits: u64, count: usize, progress: (f32, f32)) -> ExportLayers<'a> {
-        ExportLayers { session, edits, count, done: std::cell::Cell::new(0), progress }
+        ExportLayers { session, edits, count, done: std::cell::Cell::new(0), progress, tells: true }
     }
 
     /// Layer `id`'s pixels as the canvas has them (premultiplied RGBA8, the canvas's size).
@@ -2059,7 +2212,9 @@ impl<'a> ExportLayers<'a> {
         let done = self.done.get() + 1;
         self.done.set(done);
         let (from, to) = self.progress;
-        self.session.exported(from + (to - from) * done.min(self.count) as f32 / self.count.max(1) as f32);
+        if self.tells {
+            self.session.exported(from + (to - from) * done.min(self.count) as f32 / self.count.max(1) as f32);
+        }
         Ok(pixels)
     }
 
@@ -2151,12 +2306,171 @@ pub(crate) fn write_beside(
     Ok(tmp)
 }
 
+/// The number of the next write beside a file: each its own, one after another in this run.
+fn next_write() -> u64 {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A file beside `path` to write what goes there into: a name of its own, so that no other write
 /// of the same file can touch it.
 fn beside(path: &Path) -> PathBuf {
-    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    path.with_extension(format!("{}.tmp", n))
+    path.with_extension(format!("{}.tmp", next_write()))
+}
+
+/// What a save of an artwork writes into `path` written beside it first (removed again if the write
+/// fails), as [`write_beside`] does, under a name that keeps the whole name of the file it goes to
+/// (`<name>.<n>.tmp`, `n` larger for each written later): a save cut short once its document was
+/// written can then be put in place (see [`finish_first_save`]).
+fn stage_beside(path: &Path, write: impl FnOnce(&Path) -> Result<(), MobileError>) -> Result<PathBuf, MobileError> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = path.with_file_name(format!("{name}.{}.tmp", next_write()));
+    if let Err(e) = write(&tmp) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(tmp)
+}
+
+/// Of a file a save wrote beside its place (`<name>.<n>.tmp`), the name it goes to (one with an
+/// extension: earlier versions' names dropped it) and its number.
+fn staged_for(file: &str) -> Option<(&str, u64)> {
+    let (to, n) = file.strip_suffix(".tmp")?.rsplit_once('.')?;
+    let n = n.parse().ok().filter(|_| n.bytes().all(|b| b.is_ascii_digit()))?;
+    (to.contains('.') && !to.starts_with('.')).then_some((to, n))
+}
+
+/// The folders saves are being written into in this run, each as many times as saves into it.
+static SAVING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A save being written into a folder, while this is held.
+struct SavingInto(PathBuf);
+
+impl SavingInto {
+    fn begin(dir: &Path) -> SavingInto {
+        SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(dir.to_path_buf());
+        SavingInto(dir.to_path_buf())
+    }
+}
+
+impl Drop for SavingInto {
+    fn drop(&mut self) {
+        let mut saving = SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(at) = saving.iter().position(|d| *d == self.0) {
+            saving.swap_remove(at);
+        }
+    }
+}
+
+/// Whether a save is being written into `dir` in this run (what it has written beside isn't left
+/// from a save cut short).
+fn being_saved(dir: &Path) -> bool {
+    SAVING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|d| d == dir)
+}
+
+/// Whether the file at `path` holds an artwork's document whole.
+fn whole_document(path: &Path) -> bool {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .is_some_and(|j| j.get("document").is_some())
+}
+
+/// Finishes the first save of an artwork into `dir` that the app being ended cut short once all
+/// of it was written beside its place, before the document was put there: what it wrote put in
+/// place as that save would have, the document last, so the artwork is in the gallery whole. Only
+/// a folder with no document yet and no save being written into it now; the document written
+/// beside must be whole (written last, it means everything before it was). An earlier version's
+/// save, whose names don't tell where each file goes, is finished only when its document is all
+/// it left. True if it was finished.
+pub(crate) fn finish_first_save(dir: &Path) -> bool {
+    let doc = dir.join("artwork.json");
+    if doc.exists() || being_saved(dir) {
+        return false;
+    }
+    let left_in = |at: &Path| -> Vec<(PathBuf, String)> {
+        fs::read_dir(at).map_or_else(
+            |_| Vec::new(),
+            |entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                    .map(|e| (e.path(), e.file_name().to_string_lossy().into_owned()))
+                    .filter(|(_, name)| name.ends_with(".tmp"))
+                    .collect()
+            },
+        )
+    };
+    let mut left = left_in(dir);
+    left.extend(left_in(&dir.join("layers")));
+    let staged: Vec<(&PathBuf, PathBuf, u64)> = left
+        .iter()
+        .filter_map(|(tmp, name)| {
+            let (to, n) = staged_for(name)?;
+            Some((tmp, tmp.with_file_name(to), n))
+        })
+        .collect();
+    let newest_doc =
+        staged.iter().filter(|(tmp, to, _)| *to == doc && whole_document(tmp)).max_by_key(|(_, _, n)| *n).cloned();
+    let Some((doc_tmp, _, last)) = newest_doc else {
+        // an earlier version's: its document alone left, whole
+        return match left.as_slice() {
+            [(tmp, name)] if name.starts_with("artwork.") && staged_for(name).is_none() && whole_document(tmp) => {
+                fs::rename(tmp, &doc).is_ok()
+            }
+            _ => false,
+        };
+    };
+    // the rest of that save (written before its document), the latest for each place
+    let mut rest: Vec<(&PathBuf, &PathBuf, u64)> = Vec::new();
+    for (tmp, to, n) in &staged {
+        if *to == doc || *n > last {
+            continue;
+        }
+        match rest.iter_mut().find(|(_, t, _)| *t == to) {
+            Some(kept) if kept.2 < *n => *kept = (tmp, to, *n),
+            Some(_) => {}
+            None => rest.push((tmp, to, *n)),
+        }
+    }
+    rest.iter().all(|(tmp, to, _)| fs::rename(tmp, to).is_ok()) && fs::rename(doc_tmp, &doc).is_ok()
+}
+
+/// Tests end a save (or a copy in the gallery) part way, as the app being ended would: after so
+/// many of its steps (a file written beside its place, one put in place, an artwork copied),
+/// nothing after it done and nothing tidied away.
+#[cfg(test)]
+pub(crate) mod cut_short {
+    use std::cell::Cell;
+
+    thread_local! {
+        static AFTER: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    /// What a save ended part way unwinds with.
+    pub(crate) struct Ended;
+
+    /// The next save on this thread ends after `steps` more of its steps (none: it isn't ended).
+    pub(crate) fn after(steps: Option<usize>) {
+        AFTER.with(|a| a.set(steps));
+    }
+
+    /// A step of a save: the one it is to end at ends it (unwinding, with no message).
+    pub(crate) fn step() {
+        AFTER.with(|a| match a.get() {
+            Some(0) => {
+                a.set(None);
+                std::panic::resume_unwind(Box::new(Ended));
+            }
+            Some(n) => a.set(Some(n - 1)),
+            None => {}
+        });
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) mod cut_short {
+    pub(crate) fn step() {}
 }
 
 /// A PNG of RGBA8 pixels, carrying the colour profile `icc` (none if empty).

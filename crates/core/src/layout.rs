@@ -5,6 +5,10 @@
 //! `panel_layout` hook lays the panels out (interface 20); and the Reference window, which the
 //! others snap against and which snaps as it moves (its place is the artwork's, kept there).
 //!
+//! Windows hold up to [`MOST_TABS`] panels as tabs: one let go with its strip on another's (its top
+//! middle within [`TAB_ZONE`] of that one's top) joins it, showing; a tab dragged out floats again.
+//! The window is where its first panel's place is; each tab shows there at its own size.
+//!
 //! Each window can be folded to a tab, hidden (its button, or showing the hidden ones, brings it
 //! back), pinned over the others, and put back where it first goes (Reset Position): the panels
 //! from the right of the top bar against the window's right edge under it, those from its left
@@ -22,6 +26,7 @@
 
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use crate::bars::{EdgeCollapse, WindowEdge, collapse_into, pulled_out};
 use crate::floating::{FloatingPanel, FloatingRoom, FloatingWindow, floating_sizes};
 use crate::plugins::Plugins;
 
@@ -34,6 +39,23 @@ pub(crate) const TAB_WIDTH: f32 = 148.0;
 pub(crate) const TAB_HEIGHT: f32 = 36.0;
 /// What the layout is kept under, with the interface's other settings.
 const KEY: &str = "panel_layout";
+/// The Tool Belt's chips, and its height, in its own points; and how far it is in from the room's
+/// left and bottom edges (window points).
+pub(crate) const BELT_CHIP: f32 = 120.0;
+pub(crate) const BELT_HEIGHT: f32 = 36.0;
+pub(crate) const BELT_GAP: f32 = 12.0;
+/// The most panels a window holds as tabs.
+pub(crate) const MOST_TABS: usize = 4;
+/// How near a window's top middle comes to another's top (points), within its width, for it to
+/// join it as a tab when let go.
+pub(crate) const TAB_ZONE: f32 = 40.0;
+
+/// A window holding several panels as tabs: the first holds the window's place; the one showing.
+#[derive(Clone, Debug, PartialEq)]
+struct Group {
+    pieces: Vec<LayoutPiece>,
+    active: LayoutPiece,
+}
 
 /// A piece of the interface the layout places.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, uniffi::Enum)]
@@ -135,6 +157,12 @@ impl LayoutPiece {
             LayoutPiece::Liquify => Some(7),
             LayoutPiece::Colours | LayoutPiece::Reference => None,
         }
+    }
+
+    /// Whether it may be a tab of a window holding others: the panels, not the colour panel (whose
+    /// window is its own), a toolbar or an adjustment's controls.
+    fn tabbed(self) -> bool {
+        matches!(self, LayoutPiece::Layers | LayoutPiece::Brushes | LayoutPiece::Actions | LayoutPiece::Adjustments)
     }
 
     fn home(self) -> Home {
@@ -286,6 +314,25 @@ pub struct PanelLayoutLook {
     /// The interface's bars may be moved: Edit Layout in the Canvas tab, and the bars where it left
     /// them (see [`crate::BarLayout`]).
     pub edit: bool,
+    /// The Tool Belt shows: floating panels let go on it are parked there as chips (see
+    /// [`PanelLayout::belt_shown`]).
+    pub belt: bool,
+    /// Collapse to edge: a bar or a window against a side of the window has a button sliding it into
+    /// that side, a tab left there bringing it back (see [`PanelLayout::piece_collapsed`] and
+    /// [`crate::BarLayout::collapsed`]).
+    pub collapse: bool,
+}
+
+/// The Tool Belt as it shows: its top-left in the window, its size in its own points (shown `scale`
+/// times as big), and the panels parked on it, in order, each a chip [`BELT_CHIP`] wide.
+#[derive(Clone, Debug, PartialEq, uniffi::Record)]
+pub struct BeltShown {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub scale: f32,
+    pub pieces: Vec<LayoutPiece>,
 }
 
 /// A piece as it shows: its top-left in the window (points as it measures them), its size in its own
@@ -321,6 +368,8 @@ struct Spot {
     height: f32,
     folded: bool,
     dock: LayoutDock,
+    /// Collapsed into the side it is docked to (Collapse to edge).
+    collapsed: bool,
 }
 
 /// A piece being moved by its strip (or its tab), or sized from its corner: which, where the
@@ -331,6 +380,10 @@ struct Held {
     sizing: bool,
     from: (f32, f32),
     start: PieceShown,
+    /// It was moved (torn off, or dragged since it was pressed): let go on another's strip, a tab.
+    moved: bool,
+    /// Where the pointer is now (window points).
+    at: (f32, f32),
 }
 
 #[derive(Debug)]
@@ -353,6 +406,12 @@ struct Inner {
     pinned: [bool; PIECES],
     /// The pieces from the bottom up: the last pressed goes on top (the pinned over all of them).
     stack: Vec<LayoutPiece>,
+    /// The windows holding panels as tabs.
+    groups: Vec<Group>,
+    /// The panels parked on the Tool Belt, in order; and where it shows, as the app says (moved as a
+    /// bar, see [`crate::BarLayout`]), else at the room's bottom left.
+    belt: Vec<LayoutPiece>,
+    belt_place: Option<LayoutRect>,
     /// The Layers panel's and the brush library's windows as an app kept them before there were
     /// layouts (one for both orientations): what an orientation with nothing kept starts from.
     old: [Option<FloatingWindow>; 2],
@@ -361,6 +420,14 @@ struct Inner {
     sizes: [(f32, f32); PIECES],
     reference: Option<LayoutRect>,
     held: Option<Held>,
+    /// A tab torn out of its window and held still: it, and the tabs its window had. Until it is let
+    /// go the strips go on showing those tabs, so that what drags it (the tab pressed, in an app
+    /// that lays the strip out anew) is still there to the end of the drag.
+    tearing: Option<(LayoutPiece, Vec<LayoutPiece>)>,
+    /// A chip dragged off the Tool Belt, still held: it, and where it was among the chips. Until it is
+    /// let go the belt goes on showing it there, so that what drags it (the chip pressed, in an app
+    /// that lays the belt out anew) is still there to the end of the drag.
+    unparking: Option<(LayoutPiece, usize)>,
 }
 
 impl Default for Inner {
@@ -378,6 +445,9 @@ impl Default for Inner {
             hidden: [false; PIECES],
             pinned: [false; PIECES],
             stack: KEPT.to_vec(),
+            groups: Vec::new(),
+            belt: Vec::new(),
+            belt_place: None,
             old: [None; 2],
             sizes: KEPT.map(|p| {
                 let s = piece_sizes(p);
@@ -385,6 +455,8 @@ impl Default for Inner {
             }),
             reference: None,
             held: None,
+            tearing: None,
+            unparking: None,
         }
     }
 }
@@ -494,7 +566,8 @@ impl PanelLayout {
     /// or shown again.
     pub fn set_hidden(&self, piece: LayoutPiece, hidden: bool) {
         let mut inner = self.lock();
-        if let Some(slot) = piece.kept_at().and_then(|at| inner.hidden.get_mut(at)) {
+        let owner = inner.owner(piece);
+        if let Some(slot) = owner.kept_at().and_then(|at| inner.hidden.get_mut(at)) {
             *slot = hidden;
         }
         if hidden && inner.held.is_some_and(|h| h.piece == piece) {
@@ -522,7 +595,8 @@ impl PanelLayout {
     /// they are pressed.
     pub fn set_pinned(&self, piece: LayoutPiece, pinned: bool) {
         let mut inner = self.lock();
-        if let Some(slot) = piece.kept_at().and_then(|at| inner.pinned.get_mut(at)) {
+        let owner = inner.owner(piece);
+        if let Some(slot) = owner.kept_at().and_then(|at| inner.pinned.get_mut(at)) {
             *slot = pinned;
         }
     }
@@ -551,6 +625,9 @@ impl PanelLayout {
     pub fn reset_place(&self, piece: LayoutPiece) -> Option<PieceShown> {
         let mut inner = self.lock();
         piece.kept_at()?;
+        // a tab goes back as a window of its own, and one parked comes off the belt
+        inner.untab(piece);
+        inner.belt.retain(|&p| p != piece);
         let sizes = inner.sizes_of(piece);
         let k = inner.scale;
         let (width, height) = (sizes.width * k, sizes.height * k);
@@ -592,7 +669,94 @@ impl PanelLayout {
     /// it hangs), the middle of its grabber, `grab` of its own points down its top, under the pointer,
     /// and follows it until let go.
     pub fn open_at(&self, piece: LayoutPiece, x: f32, y: f32, grab: f32) -> Option<PieceShown> {
+        self.lock().opened_at(piece, x, y, grab)
+    }
+
+    /// The panels `piece`'s window holds as tabs, the first holding its place; none while it holds
+    /// it alone. While a tab torn out is still held, its window's tabs as they were, on that window's
+    /// strip and on the torn one's alike.
+    pub fn tabs_of(&self, piece: LayoutPiece) -> Vec<LayoutPiece> {
+        let inner = self.lock();
+        if let Some((torn, before)) = &inner.tearing
+            && inner.held.is_some_and(|h| h.piece == *torn)
+            && before.contains(&piece)
+        {
+            return before.clone();
+        }
+        inner.group_of(piece).map(|g| g.pieces.clone()).unwrap_or_default()
+    }
+
+    /// The Tool Belt as it shows, while a plugin says so: at the bottom left of the room, a chip for
+    /// each panel parked on it (as wide as one while none is).
+    /// (Where it always is, in the room as it is now, however the app moved it as a bar: the app
+    /// shows it moved, and tells where with [`PanelLayout::set_belt_place`].)
+    pub fn belt_shown(&self) -> Option<BeltShown> {
+        let inner = self.lock();
+        let r = inner.belt_home()?;
+        Some(BeltShown {
+            x: r.x,
+            y: r.y,
+            width: r.width / inner.scale,
+            height: r.height / inner.scale,
+            scale: inner.scale,
+            pieces: inner.belt_chips(),
+        })
+    }
+
+    /// Where the Tool Belt shows now (window points), moved where Edit layout left it, or none for
+    /// the room's bottom left: what a panel is let go on to park it.
+    pub fn set_belt_place(&self, rect: Option<LayoutRect>) {
+        self.lock().belt_place = rect.filter(LayoutRect::finite);
+    }
+
+    /// `piece`, parked on the Tool Belt, taken off: it shows where it was before it was parked.
+    pub fn unpark(&self, piece: LayoutPiece) -> Option<PieceShown> {
         let mut inner = self.lock();
+        if !inner.belt.contains(&piece) {
+            return None;
+        }
+        inner.belt.retain(|&p| p != piece);
+        inner.raise(piece);
+        inner.shown(piece)
+    }
+
+    /// `piece`, parked on the Tool Belt, dragged off with the pointer at (`x`, `y`): a window under
+    /// the pointer, following it as one torn off does (see [`PanelLayout::open_at`]).
+    pub fn unpark_at(&self, piece: LayoutPiece, x: f32, y: f32, grab: f32) -> Option<PieceShown> {
+        let mut inner = self.lock();
+        let at = inner.belt.iter().position(|&p| p == piece);
+        inner.belt.retain(|&p| p != piece);
+        let shown = inner.opened_at(piece, x, y, grab);
+        inner.unparking = at.filter(|_| shown.is_some()).map(|at| (piece, at));
+        shown
+    }
+
+    /// `piece`, a tab of its window, shown there (the others' tabs hide).
+    pub fn set_active_tab(&self, piece: LayoutPiece) {
+        let mut inner = self.lock();
+        if let Some(group) = inner.groups.iter_mut().find(|g| g.pieces.contains(&piece)) {
+            group.active = piece;
+            inner.raise(piece);
+        }
+    }
+
+    /// `piece`, a tab of its window, torn out with the pointer at (`x`, `y`): a window of its own,
+    /// following the pointer as one torn off does (see [`PanelLayout::open_at`]). The window keeps
+    /// its other tabs (one left alone is a window as any other).
+    pub fn tear_tab(&self, piece: LayoutPiece, x: f32, y: f32, grab: f32) -> Option<PieceShown> {
+        let mut inner = self.lock();
+        let before = inner.group_of(piece).map(|g| g.pieces.clone());
+        inner.untab(piece);
+        let shown = inner.opened_at(piece, x, y, grab);
+        inner.tearing = before.filter(|_| shown.is_some()).map(|tabs| (piece, tabs));
+        shown
+    }
+}
+
+impl Inner {
+    /// See [`PanelLayout::open_at`].
+    fn opened_at(&mut self, piece: LayoutPiece, x: f32, y: f32, grab: f32) -> Option<PieceShown> {
+        let inner = self;
         let at = piece.kept_at()?;
         if !(x.is_finite() && y.is_finite()) {
             return None;
@@ -615,10 +779,161 @@ impl PanelLayout {
         }
         inner.raise(piece);
         let shown = inner.shown_spot(piece, spot);
-        inner.held = Some(Held { piece, sizing: false, from: (x, y), start: shown });
+        // (dragged from where it was meant to be: kept inside the room at first, it comes back under
+        // the finger as the finger moves on)
+        let meant = PieceShown { x: rect.x, y: rect.y, ..shown };
+        inner.held = Some(Held { piece, sizing: false, from: (x, y), start: meant, moved: true, at: (x, y) });
         Some(shown)
     }
 
+    /// The Tool Belt where it shows (window points), while a plugin says so.
+    fn belt_rect(&self) -> Option<LayoutRect> {
+        if !self.look.belt {
+            return None;
+        }
+        self.belt_place.or_else(|| self.belt_home())
+    }
+
+    /// Where the Tool Belt always is (window points): the room's bottom left as it is now (turned,
+    /// the new one's), as long as its chips (one while none is).
+    fn belt_home(&self) -> Option<LayoutRect> {
+        if !self.look.belt {
+            return None;
+        }
+        let k = self.scale;
+        let chips = self.belt_chips().len().max(1) as f32;
+        let (width, height) = (chips * BELT_CHIP * k, BELT_HEIGHT * k);
+        Some(LayoutRect { x: self.room.left + BELT_GAP, y: self.room.bottom - BELT_GAP - height, width, height })
+    }
+
+    /// The chips on the Tool Belt: those parked, and one dragged off still held, where it was.
+    fn belt_chips(&self) -> Vec<LayoutPiece> {
+        let mut chips = self.belt.clone();
+        if let Some((piece, at)) = self.unparking
+            && self.held.is_some_and(|h| h.piece == piece)
+            && !chips.contains(&piece)
+        {
+            chips.insert(at.min(chips.len()), piece);
+        }
+        chips
+    }
+
+    /// `piece`, just let go with the pointer at `at`, parked on the Tool Belt if the pointer was on
+    /// it (within [`TAB_ZONE`]): back where it was when it was pressed, for when it is taken off.
+    /// Whether it was.
+    fn park(&mut self, piece: LayoutPiece, start: PieceShown, at: (f32, f32)) -> bool {
+        if !piece.tabbed() || self.belt.contains(&piece) {
+            return false;
+        }
+        let Some(belt) = self.belt_rect() else { return false };
+        let (x, y) = at;
+        let on = x >= belt.x - TAB_ZONE
+            && x <= belt.right() + TAB_ZONE
+            && y >= belt.y - TAB_ZONE
+            && y <= belt.bottom() + TAB_ZONE;
+        if !on {
+            return false;
+        }
+        // a window of tabs parks whole, each of its tabs a chip (in its order), each kept where the
+        // window was for when it is taken off
+        let pieces = self.group_of(piece).map_or_else(|| vec![piece], |g| g.pieces.clone());
+        self.groups.retain(|g| !g.pieces.contains(&piece));
+        for p in pieces {
+            let spot = self.place(p, start.rect(), start.folded);
+            self.set_spot(p, spot);
+            if !self.belt.contains(&p) {
+                self.belt.push(p);
+            }
+        }
+        true
+    }
+
+    /// The window holding `piece` as a tab, if one does.
+    fn group_of(&self, piece: LayoutPiece) -> Option<&Group> {
+        self.groups.iter().find(|g| g.pieces.contains(&piece))
+    }
+
+    /// The piece whose place, hiding and pinning `piece`'s window has: its window's first tab, or
+    /// itself.
+    fn owner(&self, piece: LayoutPiece) -> LayoutPiece {
+        self.group_of(piece).and_then(|g| g.pieces.first().copied()).unwrap_or(piece)
+    }
+
+    /// `piece` taken out of the window it is a tab of (if it is one): the next tab shows; the first
+    /// gone, the next holds the window's place; one left alone is a window as any other.
+    fn untab(&mut self, piece: LayoutPiece) {
+        let Some(at) = self.groups.iter().position(|g| g.pieces.contains(&piece)) else { return };
+        let Some(group) = self.groups.get_mut(at) else { return };
+        let was_first = group.pieces.first() == Some(&piece);
+        group.pieces.retain(|&p| p != piece);
+        if group.active == piece
+            && let Some(&next) = group.pieces.first()
+        {
+            group.active = next;
+        }
+        let (next, alone) = (group.pieces.first().copied(), group.pieces.len() < 2);
+        // the window's place goes to its next first tab, in each orientation, as are its hiding
+        // and pinning
+        if was_first
+            && let Some(next) = next
+            && let (Some(from), Some(to)) = (piece.kept_at(), next.kept_at())
+        {
+            for way in 0..2 {
+                let spot = self.spots.get(way).and_then(|s| s.get(from)).copied().flatten();
+                if let Some(slot) = self.spots.get_mut(way).and_then(|s| s.get_mut(to)) {
+                    *slot = spot;
+                }
+            }
+            let (hidden, pinned) = (self.hidden.get(from).copied(), self.pinned.get(from).copied());
+            if let (Some(slot), Some(v)) = (self.hidden.get_mut(to), hidden) {
+                *slot = v;
+            }
+            if let (Some(slot), Some(v)) = (self.pinned.get_mut(to), pinned) {
+                *slot = v;
+            }
+        }
+        if alone {
+            self.groups.remove(at);
+        }
+    }
+
+    /// `piece`, just let go with the pointer at `pointer`, joining the window whose strip it was let
+    /// go on as a tab (see [`TAB_ZONE`]): its own strip there, or the pointer (a tall window kept
+    /// inside the room can't bring its strip down to a strip low in the window, but the pointer
+    /// can). The window's tabs and its own (if it held some), at most [`MOST_TABS`].
+    fn tab_in(&mut self, piece: LayoutPiece, pointer: (f32, f32)) {
+        if !piece.tabbed() {
+            return;
+        }
+        let Some(moved) = self.shown(piece).filter(|s| !s.folded) else { return };
+        let r = moved.rect();
+        let middle = r.x + r.width / 2.0;
+        let mine: Vec<LayoutPiece> = self.group_of(piece).map_or_else(|| vec![piece], |g| g.pieces.clone());
+        let (px, py) = pointer;
+        let target = self.stack.iter().rev().copied().find(|&o| {
+            !mine.contains(&o)
+                && o.tabbed()
+                && self.shown(o).is_some_and(|s| {
+                    let w = s.rect();
+                    let strip = middle >= w.x && middle <= w.right() && (r.y - w.y).abs() <= TAB_ZONE;
+                    let pointed = px >= w.x && px <= w.right() && (py - w.y).abs() <= TAB_ZONE;
+                    !s.folded && (strip || pointed)
+                })
+        });
+        let Some(target) = target else { return };
+        let theirs: Vec<LayoutPiece> = self.group_of(target).map_or_else(|| vec![target], |g| g.pieces.clone());
+        if theirs.len() + mine.len() > MOST_TABS {
+            return;
+        }
+        self.groups.retain(|g| !g.pieces.contains(&piece) && !g.pieces.contains(&target));
+        let pieces: Vec<LayoutPiece> = theirs.into_iter().chain(mine).collect();
+        self.groups.push(Group { pieces, active: piece });
+        self.raise(piece);
+    }
+}
+
+#[uniffi::export]
+impl PanelLayout {
     /// `piece`'s strip or tab (or, `sizing`, its corner) pressed with the pointer at (`x`, `y`): it
     /// moves (or is sized) with the pointer until let go. The Reference window is held as the app
     /// last said it shows. False for a piece that doesn't show.
@@ -634,12 +949,18 @@ impl PanelLayout {
                 folded: false,
                 dock: LayoutDock::default(),
             }),
-            _ => inner.shown(piece),
+            _ => {
+                // (collapsed, it comes back out to be moved)
+                if let Some(spot) = inner.spot(piece).filter(|s| s.collapsed) {
+                    inner.set_spot(piece, Spot { collapsed: false, ..spot });
+                }
+                inner.shown(piece)
+            }
         };
         let Some(start) = start.filter(|_| x.is_finite() && y.is_finite()) else { return false };
         // a piece without a corner and a folded one aren't sized
         let sizing = sizing && piece.kept_at().is_some() && inner.sizes_of(piece).sizable && !start.folded;
-        inner.held = Some(Held { piece, sizing, from: (x, y), start });
+        inner.held = Some(Held { piece, sizing, from: (x, y), start, moved: false, at: (x, y) });
         inner.raise(piece);
         true
     }
@@ -653,6 +974,10 @@ impl PanelLayout {
         if !(x.is_finite() && y.is_finite()) {
             return Some(held.start);
         }
+        if let Some(h) = inner.held.as_mut() {
+            h.moved |= (x, y) != h.from;
+            h.at = (x, y);
+        }
         Some(inner.dragged(held, x - held.from.0, y - held.from.1))
     }
 
@@ -660,7 +985,17 @@ impl PanelLayout {
     /// a kept piece was held (the Reference window is kept with the artwork).
     pub fn let_go(&self) -> bool {
         let mut inner = self.lock();
-        inner.held.take().is_some_and(|held| held.piece.kept_at().is_some())
+        inner.tearing = None;
+        inner.unparking = None;
+        let Some(held) = inner.held.take() else { return false };
+        if held.piece.kept_at().is_none() {
+            return false;
+        }
+        // moved and let go on the Tool Belt: parked there; on another window's strip: a tab of it
+        if !held.sizing && held.moved && !inner.park(held.piece, held.start, held.at) {
+            inner.tab_in(held.piece, held.at);
+        }
+        true
     }
 
     /// Whether a piece is held.
@@ -668,9 +1003,12 @@ impl PanelLayout {
         self.lock().held.map(|h| h.piece)
     }
 
-    /// `piece` closed: kept where it was for when it opens again (shown, if it was hidden).
+    /// `piece` closed: kept where it was for when it opens again (shown, if it was hidden). A tab
+    /// closes alone, the window's next tab showing.
     pub fn close(&self, piece: LayoutPiece) {
         let mut inner = self.lock();
+        inner.untab(piece);
+        inner.belt.retain(|&p| p != piece);
         if let Some(open) = piece.kept_at().and_then(|at| inner.open.get_mut(at)) {
             *open = Some(false);
         }
@@ -692,6 +1030,68 @@ impl PanelLayout {
         if let Some(spot) = inner.spot(piece) {
             inner.set_spot(piece, Spot { folded, ..spot });
         }
+    }
+
+    /// The side of the window `piece`'s window goes into when collapsed: the left or the right side it
+    /// is docked to (not folded); none away from both, or with Collapse to edge off.
+    pub fn piece_collapse_edge(&self, piece: LayoutPiece) -> Option<WindowEdge> {
+        let inner = self.lock();
+        inner.look.collapse.then(|| inner.window_edge(piece)).flatten()
+    }
+
+    /// `piece`'s window collapsed into its side (see [`PanelLayout::piece_collapse_edge`]), or brought
+    /// back out, in this orientation (a window of tabs goes as one): true when that changed something
+    /// to keep.
+    pub fn set_piece_collapsed(&self, piece: LayoutPiece, collapsed: bool) -> bool {
+        let mut inner = self.lock();
+        inner.collapse(piece, collapsed)
+    }
+
+    /// `piece`'s window collapsed into its side, while Collapse to edge is on: the side, its tab on
+    /// the room's edge there, and how far it slid to go in (from where [`PanelLayout::shown`] has
+    /// it); none while it shows.
+    pub fn piece_collapsed(&self, piece: LayoutPiece) -> Option<EdgeCollapse> {
+        let inner = self.lock();
+        if !inner.gone(piece) {
+            return None;
+        }
+        let edge = inner.window_edge(piece)?;
+        let rect = inner.shown(piece)?.rect();
+        Some(collapse_into(edge, rect, inner.room, inner.window))
+    }
+
+    /// Where `piece`'s window goes when it collapses (as [`PanelLayout::piece_collapsed`] would say),
+    /// collapsed or not: for an app sliding it in and back out. None while it can't collapse.
+    pub fn piece_collapse_place(&self, piece: LayoutPiece) -> Option<EdgeCollapse> {
+        let inner = self.lock();
+        let edge = inner.look.collapse.then(|| inner.window_edge(piece)).flatten()?;
+        let rect = inner.shown(piece)?.rect();
+        Some(collapse_into(edge, rect, inner.room, inner.window))
+    }
+
+    /// A drag from collapsed `piece`'s tab, (`dx`, `dy`) so far: once it comes out of the side far
+    /// enough, the window comes back out. True when it did.
+    pub fn pull_piece_tab(&self, piece: LayoutPiece, dx: f32, dy: f32) -> bool {
+        let mut inner = self.lock();
+        let Some(edge) = inner.gone(piece).then(|| inner.window_edge(piece)).flatten() else { return false };
+        pulled_out(edge, dx, dy) && inner.collapse(piece, false)
+    }
+
+    /// Every window against a side collapsed into it (`collapsed`), or every one brought back out:
+    /// true when that changed something to keep.
+    pub fn set_all_collapsed(&self, collapsed: bool) -> bool {
+        let mut inner = self.lock();
+        let mut changed = false;
+        for piece in KEPT {
+            changed |= inner.collapse(piece, collapsed);
+        }
+        changed
+    }
+
+    /// Whether any window is collapsed into its side now.
+    pub fn any_collapsed(&self) -> bool {
+        let inner = self.lock();
+        KEPT.into_iter().any(|p| inner.gone(p))
     }
 
     /// What the panels docked against the window's edges take from the drawing area, while the
@@ -719,6 +1119,8 @@ impl PanelLayout {
         inner.pinned = [false; PIECES];
         inner.old = [None; 2];
         inner.held = None;
+        inner.groups.clear();
+        inner.belt.clear();
         inner.read(kept);
     }
 
@@ -751,11 +1153,11 @@ impl Inner {
     }
 
     fn is_hidden(&self, piece: LayoutPiece) -> bool {
-        piece.kept_at().and_then(|at| self.hidden.get(at)).copied().unwrap_or(false)
+        self.owner(piece).kept_at().and_then(|at| self.hidden.get(at)).copied().unwrap_or(false)
     }
 
     fn is_pinned(&self, piece: LayoutPiece) -> bool {
-        piece.kept_at().and_then(|at| self.pinned.get(at)).copied().unwrap_or(false)
+        self.owner(piece).kept_at().and_then(|at| self.pinned.get(at)).copied().unwrap_or(false)
     }
 
     fn raise(&mut self, piece: LayoutPiece) {
@@ -787,7 +1189,8 @@ impl Inner {
     /// else (the Layers panel and the brush library) the window an app kept before there were
     /// layouts.
     fn spot(&self, piece: LayoutPiece) -> Option<Spot> {
-        let at = piece.kept_at()?;
+        // a tab's is its window's
+        let at = self.owner(piece).kept_at()?;
         let way = self.way();
         let own = self.spots.get(way).and_then(|s| s.get(at)).copied().flatten().map(|s| self.of_share(s));
         let other = self.spots.get(1 - way).and_then(|s| s.get(at)).copied().flatten().map(|s| self.of_share(s));
@@ -798,6 +1201,7 @@ impl Inner {
             height: w.height,
             folded: false,
             dock: LayoutDock::default(),
+            collapsed: false,
         });
         own.or(other).or(old)
     }
@@ -806,7 +1210,8 @@ impl Inner {
     fn set_spot(&mut self, piece: LayoutPiece, spot: Spot) {
         let way = self.way();
         let kept = self.as_share(spot);
-        if let Some(slot) = piece.kept_at().and_then(|at| self.spots.get_mut(way).and_then(|s| s.get_mut(at))) {
+        let owner = self.owner(piece);
+        if let Some(slot) = owner.kept_at().and_then(|at| self.spots.get_mut(way).and_then(|s| s.get_mut(at))) {
             *slot = Some(kept);
         }
     }
@@ -830,9 +1235,48 @@ impl Inner {
         Spot { x: point(spot.x * w), y: point(spot.y * h), ..spot }
     }
 
+    /// The side `piece`'s window would go into: the one it is docked to, while it shows unfolded (a
+    /// window that may hold tabs: the Layers panel, the library, the Actions panel, the Adjustments
+    /// menu).
+    fn window_edge(&self, piece: LayoutPiece) -> Option<WindowEdge> {
+        if !piece.tabbed() {
+            return None;
+        }
+        let shown = self.shown(piece).filter(|s| !s.folded)?;
+        match (shown.dock.left, shown.dock.right) {
+            (true, _) => Some(WindowEdge::Left),
+            (false, true) => Some(WindowEdge::Right),
+            _ => None,
+        }
+    }
+
+    /// Whether `piece`'s window is collapsed out of sight now (it takes no room, and the others may go
+    /// where it was).
+    fn gone(&self, piece: LayoutPiece) -> bool {
+        self.look.collapse && self.spot(piece).is_some_and(|s| s.collapsed) && self.window_edge(piece).is_some()
+    }
+
+    /// `piece`'s window collapsed or brought back out: whether that changed anything.
+    fn collapse(&mut self, piece: LayoutPiece, collapsed: bool) -> bool {
+        if collapsed && (!self.look.collapse || self.window_edge(piece).is_none()) {
+            return false;
+        }
+        let Some(spot) = self.spot(piece).filter(|s| s.collapsed != collapsed) else { return false };
+        // (only a window that shows, as a window of its own or the tab showing in one)
+        if self.shown(piece).is_none() {
+            return false;
+        }
+        self.set_spot(piece, Spot { collapsed, ..spot });
+        true
+    }
+
     fn shown(&self, piece: LayoutPiece) -> Option<PieceShown> {
         piece.kept_at()?;
         if !self.may(piece) || !self.is_open(piece) || self.is_hidden(piece) {
+            return None;
+        }
+        // a tab not showing in its window, or a panel parked on the Tool Belt while it shows
+        if self.group_of(piece).is_some_and(|g| g.active != piece) || (self.look.belt && self.belt.contains(&piece)) {
             return None;
         }
         let spot = self.spot(piece)?;
@@ -844,7 +1288,7 @@ impl Inner {
     fn shown_rects(&self, but: Option<LayoutPiece>, folded_too: bool) -> Vec<LayoutRect> {
         let mut rects: Vec<LayoutRect> = KEPT
             .into_iter()
-            .filter(|&p| Some(p) != but)
+            .filter(|&p| Some(p) != but && !self.gone(p))
             .filter_map(|p| self.shown(p))
             .filter(|s| folded_too || !s.folded)
             .map(|s| s.rect())
@@ -907,7 +1351,8 @@ impl Inner {
         let k = self.scale;
         let dock = docked(rect, self.room, self.bar);
         if !folded {
-            return Spot { x: rect.x, y: rect.y, width: rect.width / k, height: rect.height / k, folded, dock };
+            let (width, height) = (rect.width / k, rect.height / k);
+            return Spot { x: rect.x, y: rect.y, width, height, folded, dock, collapsed: false };
         }
         // the panel's own top-left, from its tab
         let sizes = self.sizes_of(piece);
@@ -917,7 +1362,7 @@ impl Inner {
         };
         let x = if dock.right && !dock.left { rect.right() - width * k } else { rect.x };
         let y = if dock.bottom && !dock.top { rect.bottom() - height * k } else { rect.y };
-        Spot { x, y, width, height, folded, dock }
+        Spot { x, y, width, height, folded, dock, collapsed: false }
     }
 
     fn dragged(&mut self, held: Held, dx: f32, dy: f32) -> PieceShown {
@@ -942,6 +1387,17 @@ impl Inner {
             LayoutRect { width: width * k, height: height * k, ..snapped }
         } else {
             let moved = LayoutRect { x: rect.x + dx, y: rect.y + dy, ..rect };
+            // a tall window (over half the room) taken down past the room's bottom gets shorter, so it
+            // goes on under the finger (no shorter than it may be)
+            let sizes = self.sizes_of(held.piece);
+            let tall = rect.height > (self.room.bottom - self.room.top) / 2.0;
+            let moved =
+                if held.piece != LayoutPiece::Reference && sizes.sizable && tall && moved.bottom() > self.room.bottom {
+                    let height = (self.room.bottom - moved.y).max(sizes.least_height * k).min(rect.height);
+                    LayoutRect { height, ..moved }
+                } else {
+                    moved
+                };
             let inside = inside_room(moved, self.room);
             let snapped = snap_moved(inside, &others, self.room, self.bar, reach);
             inside_room(snapped, self.room)
@@ -970,7 +1426,8 @@ impl Inner {
                         s.y,
                         s.width,
                         s.height,
-                        u8::from(s.folded),
+                        // (folded 1, collapsed into its side 2)
+                        u8::from(s.folded) | (u8::from(s.collapsed) << 1),
                         s.dock.letters()
                     ));
                 }
@@ -988,6 +1445,20 @@ impl Inner {
                 pieces.push(words.join(" "));
             }
         }
+        // each window of tabs: its tabs, the one showing marked (an app from before tabs passes it over)
+        for group in &self.groups {
+            let words: Vec<String> = group
+                .pieces
+                .iter()
+                .map(|&p| if p == group.active { format!("*{}", p.word()) } else { p.word().to_owned() })
+                .collect();
+            pieces.push(format!("tabs {}", words.join(" ")));
+        }
+        // the panels parked on the Tool Belt (an app from before it passes this over)
+        if !self.belt.is_empty() {
+            let words: Vec<&str> = self.belt.iter().map(|p| p.word()).collect();
+            pieces.push(format!("belt {}", words.join(" ")));
+        }
         pieces.join(";")
     }
 
@@ -995,6 +1466,18 @@ impl Inner {
     /// passed over, the rest taken.
     fn read(&mut self, kept: &str) {
         for piece in kept.split(';') {
+            if let Some(tabs) = piece.trim().strip_prefix("tabs ") {
+                self.read_tabs(tabs);
+                continue;
+            }
+            if let Some(belt) = piece.trim().strip_prefix("belt ") {
+                for parked in belt.split_whitespace().filter_map(LayoutPiece::of_word) {
+                    if parked.tabbed() && !self.belt.contains(&parked) {
+                        self.belt.push(parked);
+                    }
+                }
+                continue;
+            }
             let mut words = piece.split_whitespace();
             let Some(piece) = words.next().and_then(LayoutPiece::of_word) else { continue };
             let Some(at) = piece.kept_at() else { continue };
@@ -1035,8 +1518,9 @@ impl Inner {
                 if width <= 0.0 || height <= 0.0 {
                     continue;
                 }
-                let folded = *folded == "1";
-                let spot = Spot { x, y, width, height, folded, dock: LayoutDock::of_letters(dock) };
+                let state = folded.parse::<u8>().unwrap_or(0);
+                let (folded, collapsed) = (state & 1 == 1, state & 2 == 2);
+                let spot = Spot { x, y, width, height, folded, dock: LayoutDock::of_letters(dock), collapsed };
                 if let Some(slot) = self.spots.get_mut(way).and_then(|s| s.get_mut(at)) {
                     *slot = Some(spot);
                 }
@@ -1066,6 +1550,31 @@ fn resized(sizes: PieceSizes, window: FloatingWindow, dx: f32, dy: f32, room: Fl
     let width = sized.width.min(((room.right - window.x) / k).max(sizes.least_width));
     let height = sized.height.min(((room.bottom - window.y) / k).max(sizes.least_height));
     fitted(sizes, FloatingWindow { width, height, ..sized }, room, k)
+}
+
+impl Inner {
+    /// A window of tabs as [`Inner::kept`] writes it: 2 to [`MOST_TABS`] panels not in another,
+    /// the one showing marked; else passed over.
+    fn read_tabs(&mut self, words: &str) {
+        let mut pieces = Vec::new();
+        let mut active = None;
+        for word in words.split_whitespace() {
+            let (showing, word) = word.strip_prefix('*').map_or((false, word), |w| (true, w));
+            let Some(piece) = LayoutPiece::of_word(word) else { return };
+            if pieces.contains(&piece) || self.group_of(piece).is_some() {
+                return;
+            }
+            if showing {
+                active = Some(piece);
+            }
+            pieces.push(piece);
+        }
+        if (2..=MOST_TABS).contains(&pieces.len())
+            && let Some(first) = pieces.first().copied()
+        {
+            self.groups.push(Group { active: active.unwrap_or(first), pieces });
+        }
+    }
 }
 
 /// A scale a piece may show at: the floating windows' size, a plugin's, or 1.
@@ -1403,8 +1912,15 @@ mod tests {
         layout
     }
 
-    const SNAPPING: PanelLayoutLook =
-        PanelLayoutLook { on: true, snap: 16.0, fold: true, make_room: true, edit: false };
+    const SNAPPING: PanelLayoutLook = PanelLayoutLook {
+        on: true,
+        snap: 16.0,
+        fold: true,
+        make_room: true,
+        edit: false,
+        belt: false,
+        collapse: false,
+    };
 
     #[test]
     fn a_panel_torn_off_follows_the_pointer_snapping_and_is_kept_where_it_was_let_go() {
@@ -1451,6 +1967,63 @@ mod tests {
         let moved = layout.drag(1010.0, 420.0).unwrap();
         assert_eq!((moved.width, moved.height), (260.0, 351.0));
         assert_eq!((moved.x, moved.y), (880.0, 412.5));
+    }
+
+    const COLLAPSING: PanelLayoutLook = PanelLayoutLook { collapse: true, ..SNAPPING };
+
+    #[test]
+    fn a_window_against_a_side_collapses_into_it_and_gives_its_room_back() {
+        let layout = laid_out(COLLAPSING);
+        // the Layers panel at the right side under the bar (1216, 48, 384 by 520), making room
+        let layers = opened(&layout, LayoutPiece::Layers);
+        assert_eq!(at(layers), (1216.0, 48.0, 384.0, 520.0));
+        assert_eq!(layout.piece_collapse_edge(LayoutPiece::Layers), Some(WindowEdge::Right));
+        let room = layout.canvas_insets();
+        assert_eq!(room.right, 384.0);
+        // collapsed: its tab on the right side across from its middle (308), 14 by 56; slid 384 to
+        // the right to go in; the room given back
+        assert!(layout.set_piece_collapsed(LayoutPiece::Layers, true));
+        let tab = LayoutRect { x: 1600.0 - 14.0, y: 308.0 - 28.0, width: 14.0, height: 56.0 };
+        let slid = EdgeCollapse { edge: WindowEdge::Right, tab, slide_x: 384.0, slide_y: 0.0 };
+        assert_eq!(layout.piece_collapsed(LayoutPiece::Layers), Some(slid));
+        assert_eq!(layout.canvas_insets(), LayoutInsets::default());
+        assert!(layout.any_collapsed());
+        // the colour window against a side doesn't (only windows that hold tabs do)
+        assert_eq!(layout.piece_collapse_edge(LayoutPiece::Colours), None);
+        // a window away from the sides doesn't go in
+        layout.open_at(LayoutPiece::Brushes, 800.0, 400.0, 0.0);
+        layout.let_go();
+        assert_eq!(layout.piece_collapse_edge(LayoutPiece::Brushes), None);
+        assert!(!layout.set_piece_collapsed(LayoutPiece::Brushes, true));
+        // kept, and read back by the next start
+        let next = laid_out(COLLAPSING);
+        next.read_kept(panel_layout_key(), layout.kept());
+        assert_eq!(next.piece_collapsed(LayoutPiece::Layers), Some(slid));
+        // a drag from its tab: 10 out of the side isn't enough, 14 is; the room made again
+        assert!(!layout.pull_piece_tab(LayoutPiece::Layers, -10.0, 0.0));
+        assert!(layout.pull_piece_tab(LayoutPiece::Layers, -14.0, 2.0));
+        assert_eq!(layout.piece_collapsed(LayoutPiece::Layers), None);
+        assert_eq!(layout.piece_collapse_place(LayoutPiece::Layers), Some(slid));
+        // (the library, docked to the bottom, makes room there now too)
+        assert_eq!(layout.canvas_insets().right, room.right);
+        // all at once, the one against a side
+        assert!(layout.set_all_collapsed(true));
+        assert!(layout.piece_collapsed(LayoutPiece::Layers).is_some());
+        assert!(layout.piece_collapsed(LayoutPiece::Brushes).is_none());
+        // Collapse to edge off: it shows, and is collapsed again once it is back on
+        layout.lock().look = SNAPPING;
+        assert!(layout.piece_collapsed(LayoutPiece::Layers).is_none() && !layout.any_collapsed());
+        assert_eq!(layout.canvas_insets().right, room.right);
+        layout.lock().look = COLLAPSING;
+        assert!(layout.any_collapsed());
+        // held by its strip, it comes back out to be moved
+        assert!(layout.hold(LayoutPiece::Layers, false, 1408.0, 60.0));
+        assert_eq!(layout.piece_collapsed(LayoutPiece::Layers), None);
+        layout.let_go();
+        // open all
+        layout.set_all_collapsed(true);
+        assert!(layout.set_all_collapsed(false));
+        assert!(!layout.any_collapsed());
     }
 
     #[test]
@@ -1881,6 +2454,328 @@ mod tests {
         // and each piece's number on the hook: the two from before, then the rest from 2
         let numbers: Vec<Option<i32>> = KEPT.into_iter().map(LayoutPiece::hook_number).collect();
         assert_eq!(numbers, [Some(0), Some(1), None, Some(2), Some(3), Some(4), Some(5), Some(6), Some(7)]);
+    }
+
+    /// `piece` torn off with the middle of its top at (`middle`, `top`) and let go: a tab of the
+    /// window whose strip that is on, if one's is.
+    fn dropped(layout: &PanelLayout, piece: LayoutPiece, middle: f32, top: f32) {
+        layout.open_at(piece, middle, top, 0.0).unwrap();
+        layout.let_go();
+    }
+
+    #[test]
+    fn a_window_let_go_on_another_s_strip_becomes_its_tab_and_a_tab_torn_out_floats_again() {
+        let layout = laid_out(SNAPPING);
+        let layers = opened(&layout, LayoutPiece::Layers);
+        assert_eq!(at(layers), (1216.0, 48.0, 384.0, 520.0));
+        // the library floating apart, then let go with its strip on the Layers panel's
+        layout.open_at(LayoutPiece::Brushes, 800.0, 400.0, 0.0);
+        layout.let_go();
+        assert!(layout.tabs_of(LayoutPiece::Brushes).is_empty());
+        let over = moved(&layout, LayoutPiece::Brushes, (600.0, 410.0), (610.0, -340.0));
+        assert_eq!((over.x, over.y), (1160.0, 48.0), "snapped onto the right edge and under the bar");
+        let tabs = [LayoutPiece::Layers, LayoutPiece::Brushes];
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), tabs);
+        assert_eq!(layout.tabs_of(LayoutPiece::Brushes), tabs);
+        // it shows, in the Layers panel's window at the size it has there; the Layers panel waits
+        assert_eq!(layout.shown(LayoutPiece::Layers), None);
+        assert_eq!(at(layout.shown(LayoutPiece::Brushes).unwrap()), (1216.0, 48.0, 384.0, 520.0));
+        assert_eq!(layout.order().last(), Some(&LayoutPiece::Brushes));
+        // the other tab chosen
+        layout.set_active_tab(LayoutPiece::Layers);
+        assert_eq!(layout.shown(LayoutPiece::Layers), Some(layers));
+        assert_eq!(layout.shown(LayoutPiece::Brushes), None);
+        // the window moved by its strip takes its tabs with it
+        let window = moved(&layout, LayoutPiece::Layers, (1300.0, 60.0), (-400.0, 300.0));
+        layout.set_active_tab(LayoutPiece::Brushes);
+        let brushes = layout.shown(LayoutPiece::Brushes).unwrap();
+        assert_eq!((brushes.x, brushes.y), (window.x, window.y));
+        // torn out: a window of its own under the pointer, the Layers panel alone again
+        let torn = layout.tear_tab(LayoutPiece::Brushes, 400.0, 700.0, 0.0).unwrap();
+        layout.let_go();
+        assert_eq!((torn.x, torn.y, torn.width, torn.height), (180.0, 400.0, 440.0, 600.0));
+        assert!(layout.tabs_of(LayoutPiece::Layers).is_empty());
+        assert_eq!(
+            (layout.shown(LayoutPiece::Layers).unwrap().x, layout.shown(LayoutPiece::Layers).unwrap().y),
+            (window.x, window.y)
+        );
+    }
+
+    #[test]
+    fn a_tall_window_joins_a_strip_low_in_the_window_where_the_pointer_lets_it_go() {
+        // the Layers panel (520 tall) at the bottom on the left, its strip at 1000 - 520 = 480
+        let low_panel = |layout: &PanelLayout| {
+            dropped(layout, LayoutPiece::Layers, 400.0, 480.0);
+            layout.shown(LayoutPiece::Layers).unwrap().rect()
+        };
+        let layout = laid_out(SNAPPING);
+        let low = low_panel(&layout);
+        assert_eq!(low.y, 480.0);
+        // the Adjustments menu held low on it, 400 under its strip, and brought so that the finger is
+        // on that strip: its own strip 400 higher, nowhere near it
+        let menu = opened(&layout, LayoutPiece::Adjustments);
+        let grip = (menu.x + 100.0, menu.y + 400.0);
+        assert!(layout.hold(LayoutPiece::Adjustments, false, grip.0, grip.1));
+        let pointer = (low.x + low.width / 2.0, low.y + 10.0);
+        let held = layout.drag(pointer.0, pointer.1).unwrap();
+        assert!(low.y - held.y > TAB_ZONE, "{held:?}");
+        // let go with the pointer on that strip: a tab of it all the same
+        layout.let_go();
+        assert_eq!(layout.tabs_of(LayoutPiece::Adjustments), [LayoutPiece::Layers, LayoutPiece::Adjustments]);
+        // let go with the pointer well under that strip (and the window's own away from it): no tab
+        let apart = laid_out(SNAPPING);
+        low_panel(&apart);
+        opened(&apart, LayoutPiece::Adjustments);
+        assert!(apart.hold(LayoutPiece::Adjustments, false, grip.0, grip.1));
+        apart.drag(pointer.0, pointer.1 + 200.0);
+        apart.let_go();
+        assert!(apart.tabs_of(LayoutPiece::Adjustments).is_empty());
+    }
+
+    #[test]
+    fn a_tab_torn_out_leaves_the_strips_as_they_were_until_it_is_let_go() {
+        let layout = laid_out(SNAPPING);
+        opened(&layout, LayoutPiece::Layers);
+        dropped(&layout, LayoutPiece::Brushes, 1408.0, 53.0);
+        let two = [LayoutPiece::Layers, LayoutPiece::Brushes];
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), two);
+        // the brush library (showing) torn out and dragged on: both strips still show both tabs,
+        // so the tab pressed stays on the strip to the end of the drag (in an app laying the strip
+        // out anew, one gone mid-drag ends it there)
+        layout.tear_tab(LayoutPiece::Brushes, 900.0, 300.0, 0.0).unwrap();
+        layout.drag(800.0, 400.0).unwrap();
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), two);
+        assert_eq!(layout.tabs_of(LayoutPiece::Brushes), two);
+        // its window follows the pointer, out of the Layers panel's
+        let torn = layout.shown(LayoutPiece::Brushes).unwrap();
+        assert_eq!((torn.x + torn.width / 2.0, torn.y), (800.0, 400.0));
+        assert!(layout.shown(LayoutPiece::Layers).is_some());
+        // let go: each a window of its own
+        layout.let_go();
+        assert!(layout.tabs_of(LayoutPiece::Layers).is_empty());
+        assert!(layout.tabs_of(LayoutPiece::Brushes).is_empty());
+        // and a window only moved (not a tab torn out) changes no strip as it goes
+        dropped(&layout, LayoutPiece::Brushes, 1408.0, 53.0);
+        assert!(layout.hold(LayoutPiece::Brushes, false, 1408.0, 60.0));
+        layout.drag(1300.0, 300.0);
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), two);
+        layout.let_go();
+    }
+
+    #[test]
+    fn either_tab_tears_out_and_follows_the_pointer_while_the_brush_library_shows() {
+        for torn in [LayoutPiece::Brushes, LayoutPiece::Layers] {
+            // the library let go on the Layers panel's strip: a tab of its window, showing, the only
+            // window drawn (the Layers panel waits)
+            let layout = laid_out(SNAPPING);
+            opened(&layout, LayoutPiece::Layers);
+            dropped(&layout, LayoutPiece::Brushes, 1408.0, 53.0);
+            let two = [LayoutPiece::Layers, LayoutPiece::Brushes];
+            assert_eq!(layout.tabs_of(LayoutPiece::Brushes), two);
+            assert_eq!(layout.order(), [LayoutPiece::Brushes]);
+            // the tab pulled down out of the strip, then on 430 down and 400 left, step by step: its
+            // window under the pointer all the way (its strip 12 over it; across, its middle at the
+            // pointer but for snapping, within 16, to the other window's side), both strips as they were
+            layout.tear_tab(torn, 1300.0, 80.0, 12.0).unwrap();
+            for step in 1..=10 {
+                let (x, y) = (1300.0 - step as f32 * 40.0, 80.0 + step as f32 * 43.0);
+                let shown = layout.drag(x, y).unwrap();
+                assert_eq!(shown.y, y - 12.0, "{torn:?} {step}");
+                assert!((shown.x + shown.width / 2.0 - x).abs() <= SNAPPING.snap, "{torn:?} {step}: {shown:?}");
+                assert_eq!(layout.tabs_of(LayoutPiece::Layers), two, "{torn:?} {step}");
+                assert_eq!(layout.tabs_of(LayoutPiece::Brushes), two, "{torn:?} {step}");
+            }
+            // both drawn now, the torn one over the other
+            assert_eq!(layout.order().last(), Some(&torn));
+            assert_eq!(layout.order().len(), 2);
+            // let go there: a window of its own where it was let go, the other alone where the two were
+            let held = layout.shown(torn).unwrap();
+            assert!(layout.let_go());
+            assert_eq!(layout.shown(torn), Some(held), "{torn:?}");
+            assert!(layout.tabs_of(LayoutPiece::Layers).is_empty() && layout.tabs_of(LayoutPiece::Brushes).is_empty());
+            let other = if torn == LayoutPiece::Layers { LayoutPiece::Brushes } else { LayoutPiece::Layers };
+            assert_eq!(layout.shown(other).map(|s| (s.x, s.y)), Some((1216.0, 48.0)), "{torn:?}");
+        }
+    }
+
+    #[test]
+    fn a_window_holds_four_tabs_at_most_and_windows_side_by_side_stay_apart() {
+        let layout = laid_out(SNAPPING);
+        opened(&layout, LayoutPiece::Layers);
+        // beside it, its top in line: not a tab
+        dropped(&layout, LayoutPiece::Brushes, 1216.0 - 220.0, 48.0);
+        assert!(layout.tabs_of(LayoutPiece::Brushes).is_empty());
+        layout.close(LayoutPiece::Brushes);
+        // three dropped on its strip, 5 under its top: four tabs, the last dropped showing
+        for piece in [LayoutPiece::Actions, LayoutPiece::Adjustments, LayoutPiece::Brushes] {
+            dropped(&layout, piece, 1408.0, 53.0);
+        }
+        let four = [LayoutPiece::Layers, LayoutPiece::Actions, LayoutPiece::Adjustments, LayoutPiece::Brushes];
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), four);
+        assert!(layout.shown(LayoutPiece::Brushes).is_some());
+        assert!(four[..3].iter().all(|&p| layout.shown(p).is_none()));
+        // the colour panel, its window its own, isn't one
+        dropped(&layout, LayoutPiece::Colours, 1408.0, 53.0);
+        assert!(layout.tabs_of(LayoutPiece::Colours).is_empty());
+        assert!(layout.shown(LayoutPiece::Colours).is_some());
+        // kept, and read back by the next start
+        let kept = layout.kept();
+        assert!(kept.contains("tabs layers actions adjustments *brushes"), "{kept}");
+        let next = laid_out(SNAPPING);
+        next.read_kept(panel_layout_key(), kept);
+        assert_eq!(next.tabs_of(LayoutPiece::Actions), four);
+        assert_eq!(next.shown(LayoutPiece::Brushes), layout.shown(LayoutPiece::Brushes));
+        // a tab closed alone, the first showing then; a window left with one is a window again
+        layout.close(LayoutPiece::Brushes);
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers), four[..3]);
+        assert!(layout.shown(LayoutPiece::Layers).is_some());
+        layout.close(LayoutPiece::Actions);
+        layout.close(LayoutPiece::Adjustments);
+        assert!(layout.tabs_of(LayoutPiece::Layers).is_empty());
+        // a Reset Position takes a tab out as a window of its own
+        dropped(&layout, LayoutPiece::Actions, 1408.0, 53.0);
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers).len(), 2);
+        let home = layout.reset_place(LayoutPiece::Actions).unwrap();
+        assert_eq!((home.x, home.y), (0.0, 48.0));
+        assert!(layout.tabs_of(LayoutPiece::Layers).is_empty());
+        // what doesn't read is passed over
+        let lenient = laid_out(SNAPPING);
+        lenient.read_kept(panel_layout_key(), "tabs layers;tabs layers nonsense;tabs actions actions".to_owned());
+        assert!(lenient.tabs_of(LayoutPiece::Layers).is_empty() && lenient.tabs_of(LayoutPiece::Actions).is_empty());
+    }
+
+    #[test]
+    fn panels_let_go_on_the_tool_belt_park_there_and_come_off_where_they_were() {
+        let layout = laid_out(SNAPPING);
+        // with no plugin saying so, no belt
+        assert_eq!(layout.belt_shown(), None);
+        layout.lock().look.belt = true;
+        // empty, at the bottom left, a chip wide
+        let empty = layout.belt_shown().unwrap();
+        assert_eq!((empty.x, empty.y, empty.width, empty.height), (12.0, 1000.0 - 12.0 - 36.0, 120.0, 36.0));
+        assert!(empty.pieces.is_empty());
+        // the Layers panel dragged by its strip onto it: parked, kept where it was pressed for later
+        let layers = opened(&layout, LayoutPiece::Layers);
+        let park = |piece: LayoutPiece, from: (f32, f32), to: (f32, f32)| {
+            assert!(layout.hold(piece, false, from.0, from.1));
+            layout.drag(to.0, to.1);
+            assert!(layout.let_go());
+        };
+        park(LayoutPiece::Layers, (1300.0, 60.0), (60.0, 970.0));
+        assert_eq!(layout.shown(LayoutPiece::Layers), None);
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers]);
+        // a second: two chips
+        opened(&layout, LayoutPiece::Actions);
+        park(LayoutPiece::Actions, (100.0, 60.0), (150.0, 960.0));
+        let belt = layout.belt_shown().unwrap();
+        assert_eq!((belt.width, belt.pieces), (240.0, vec![LayoutPiece::Layers, LayoutPiece::Actions]));
+        // a tap takes one off where it was; dragged off, it goes under the pointer
+        assert_eq!(layout.unpark(LayoutPiece::Layers), Some(layers));
+        let off = layout.unpark_at(LayoutPiece::Actions, 800.0, 400.0, 0.0).unwrap();
+        layout.let_go();
+        assert_eq!((off.x, off.y), (605.0, 400.0));
+        assert!(layout.belt_shown().unwrap().pieces.is_empty());
+        // the colour panel, its window its own, isn't parked
+        opened(&layout, LayoutPiece::Colours);
+        park(LayoutPiece::Colours, (1350.0, 60.0), (60.0, 970.0));
+        assert!(layout.shown(LayoutPiece::Colours).is_some());
+        // kept: what was parked comes back parked
+        park(LayoutPiece::Layers, (1300.0, 60.0), (60.0, 970.0));
+        let kept = layout.kept();
+        assert!(kept.contains("belt layers"), "{kept}");
+        let next = laid_out(SNAPPING);
+        next.lock().look.belt = true;
+        next.read_kept(panel_layout_key(), kept);
+        assert_eq!(next.belt_shown().unwrap().pieces, [LayoutPiece::Layers]);
+        assert_eq!(next.shown(LayoutPiece::Layers), None);
+        // moved to the top right (as a bar, by the app): what is let go there parks
+        layout.unpark(LayoutPiece::Layers);
+        layout.set_belt_place(Some(LayoutRect { x: 1300.0, y: 48.0, width: 120.0, height: 36.0 }));
+        park(LayoutPiece::Layers, (1300.0, 60.0), (1350.0, 70.0));
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers]);
+        // the belt gone (no plugin saying so): what was parked shows as a window
+        layout.lock().look.belt = false;
+        assert_eq!(layout.belt_shown(), None);
+        assert_eq!(layout.shown(LayoutPiece::Layers), Some(layers));
+    }
+
+    #[test]
+    fn the_tool_belt_keeps_to_the_room_s_bottom_left_and_a_chip_dragged_off_stays_until_let_go() {
+        let layout = laid_out(SNAPPING);
+        layout.lock().look.belt = true;
+        // the app shows it where it always is and says so (a bar it may move)
+        let shown = layout.belt_shown().unwrap();
+        let tell = |b: &BeltShown| {
+            let place = LayoutRect { x: b.x, y: b.y, width: b.width * b.scale, height: b.height * b.scale };
+            layout.set_belt_place(Some(place));
+        };
+        tell(&shown);
+        // two parked: two chips wide, though the place told was one chip wide
+        let park = |piece: LayoutPiece, from: (f32, f32), to: (f32, f32)| {
+            assert!(layout.hold(piece, false, from.0, from.1));
+            layout.drag(to.0, to.1);
+            assert!(layout.let_go());
+        };
+        opened(&layout, LayoutPiece::Layers);
+        park(LayoutPiece::Layers, (1300.0, 60.0), (60.0, 970.0));
+        tell(&layout.belt_shown().unwrap());
+        opened(&layout, LayoutPiece::Actions);
+        park(LayoutPiece::Actions, (100.0, 60.0), (150.0, 960.0));
+        let two = layout.belt_shown().unwrap();
+        assert_eq!((two.width, two.pieces.len()), (240.0, 2), "a second park grows the belt");
+        tell(&two);
+        // a chip dragged off: a window under the finger, following it, the chip staying on the belt
+        // (where it was) until let go, then gone, the window where it was let go
+        // (low on the window, kept inside the room: its top 1000 - 520 up, not 888 under the finger)
+        let off = layout.unpark_at(LayoutPiece::Layers, 300.0, 900.0, 12.0).unwrap();
+        assert_eq!((off.x + off.width / 2.0, off.y), (300.0, 1000.0 - 520.0));
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers, LayoutPiece::Actions]);
+        let under = layout.drag(800.0, 300.0).unwrap();
+        layout.let_go();
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Actions]);
+        assert_eq!(layout.shown(LayoutPiece::Layers), Some(under));
+        // (under the finger as it was meant to be, its grabber 12 under it: not 408 higher, as it
+        // would be moved from where the room kept it at first)
+        assert_eq!((under.x + under.width / 2.0, under.y), (800.0, 300.0 - 12.0));
+        // turned the other way: at the new bottom left, the place told for the old way notwithstanding
+        layout.set_room(FloatingRoom { left: 0.0, top: 0.0, right: 1000.0, bottom: 1600.0 }, 1000.0, 1600.0, BAR, 1.0);
+        let portrait = layout.belt_shown().unwrap();
+        assert_eq!((portrait.x, portrait.y), (12.0, 1600.0 - 12.0 - 36.0));
+    }
+
+    #[test]
+    fn a_window_of_tabs_parks_whole_and_a_tall_window_goes_down_under_the_finger() {
+        let layout = laid_out(SNAPPING);
+        layout.lock().look.belt = true;
+        // the library a tab of the Layers panel's window: let go on the belt, both park
+        opened(&layout, LayoutPiece::Layers);
+        dropped(&layout, LayoutPiece::Brushes, 1408.0, 53.0);
+        assert_eq!(layout.tabs_of(LayoutPiece::Layers).len(), 2);
+        assert!(layout.hold(LayoutPiece::Brushes, false, 1408.0, 60.0));
+        layout.drag(60.0, 970.0);
+        assert!(layout.let_go());
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers, LayoutPiece::Brushes]);
+        assert!(layout.shown(LayoutPiece::Layers).is_none() && layout.shown(LayoutPiece::Brushes).is_none());
+        assert!(layout.tabs_of(LayoutPiece::Layers).is_empty());
+        // each taken off on its own
+        layout.unpark(LayoutPiece::Brushes);
+        assert!(layout.shown(LayoutPiece::Brushes).is_some());
+        assert_eq!(layout.belt_shown().unwrap().pieces, [LayoutPiece::Layers]);
+        // the library (as tall as its window was, over half the room) held by its strip and taken down
+        // 500: 500 lower, its strip still under the finger, shorter to stay in the room; a short one
+        // (the Adjustments menu) stops at the bottom
+        let tall = layout.shown(LayoutPiece::Brushes).unwrap();
+        assert!(tall.height > 500.0, "{tall:?}");
+        assert!(layout.hold(LayoutPiece::Brushes, false, tall.x + 100.0, tall.y + 10.0));
+        let down = layout.drag(tall.x + 100.0, tall.y + 10.0 + 500.0).unwrap();
+        layout.let_go();
+        assert_eq!((down.y, down.y + down.height), (tall.y + 500.0, 1000.0));
+        assert!(down.height < tall.height);
+        let short = opened(&layout, LayoutPiece::Adjustments);
+        assert!(layout.hold(LayoutPiece::Adjustments, false, short.x + 100.0, short.y + 10.0));
+        let stopped = layout.drag(short.x + 100.0, short.y + 10.0 + 900.0).unwrap();
+        layout.let_go();
+        assert_eq!((stopped.y + stopped.height, stopped.height), (1000.0, short.height));
     }
 
     #[test]

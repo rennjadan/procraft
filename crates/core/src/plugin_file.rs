@@ -15,8 +15,8 @@ use serde_json::Value;
 
 use crate::plugin_run::{self, Hook, MODULE, MOST_MODULE};
 use crate::plugins::{
-    self, PluginBrushControl, PluginControl, PluginFile, PluginFileKind, PluginPart, PluginSlider, PluginSwitch,
-    PluginTexture,
+    self, PluginBrushControl, PluginControl, PluginFile, PluginFileKind, PluginFolder, PluginPart, PluginSlider,
+    PluginSwitch, PluginTexture,
 };
 
 /// The manifest's name in a plugin file, and in its folder.
@@ -24,7 +24,7 @@ const MANIFEST: &str = "craft-extension.json";
 /// The manifest format read here: a newer one may mean anything, so it is refused.
 const SCHEMA: u64 = 1;
 /// What a plugin's code is written to, see [`crate::plugin_run`]: a newer one is refused too.
-const INTERFACE: u32 = 20;
+const INTERFACE: u32 = 22;
 /// The first interface with features (several plugins' worth in one, each a switch of its own).
 const FEATURES_FROM: u32 = 16;
 /// The interface filter layers came in.
@@ -33,6 +33,8 @@ const FILTER_LAYERS_FROM: u32 = 17;
 const FILTER_EDITORS_FROM: u32 = 18;
 /// The interface features taken from a plugin that stays, and brushes under a switch, came in.
 const TAKES_FROM: u32 = 19;
+/// The interface `folder` controls came in, with the hooks that name one.
+const FOLDERS_FROM: u32 = 22;
 /// A plugin of features: so many features, controls under each (besides its own switch) and
 /// actions under each; and in all so many controls (files among them), hooks and actions.
 const MOST_FEATURES: usize = 16;
@@ -1099,6 +1101,14 @@ fn checked_control(id: &str, raw: RawControl) -> Result<PluginControl, Refusal> 
             let own = own.iter().map(|k| format!("{id}.{k}")).collect();
             Ok(PluginControl::Texture { control: PluginTexture { key, label: raw.label, own, value: starts, starts } })
         }
+        // a folder someone picks outside the app, kept with the plugin (interface 22): nothing to
+        // start at, and no setting the app used to have
+        "folder" => {
+            if raw.keeps.is_some() || raw.starts.is_some() || raw.accepts.is_some() {
+                return Err(Refusal::Described);
+            }
+            Ok(PluginControl::Folder { control: PluginFolder { key, label: raw.label, chosen: None, location: None } })
+        }
         // a file someone picks, kept with the plugin; it takes no setting the app used to have
         "file" => {
             let accepts = match raw.accepts.as_deref() {
@@ -1224,8 +1234,13 @@ fn read_manifest(text: &[u8]) -> Result<Manifest, Refusal> {
         }
         files.push(Listed { path: file.path, sha256: file.sha256, size: file.size });
     }
-    // files besides the rest, and only for code to use (a filter has no way to)
-    let picked = raw.controls.iter().filter(|c| c.kind == "file").count();
+    // files and folders besides the rest, and only for code to use (a filter has no way to);
+    // folders from interface 22
+    let picked = raw.controls.iter().filter(|c| c.kind == "file" || c.kind == "folder").count();
+    let folders = raw.controls.iter().any(|c| c.kind == "folder");
+    if folders && compat.interface.is_none_or(|interface| interface < FOLDERS_FROM) {
+        return Err(Refusal::Described);
+    }
     let more = compat.interface.is_some_and(|interface| interface >= 6) && !holds.contains(&PluginPart::Filter);
     let most = if more { MOST_CONTROLS_6 } else { MOST_CONTROLS };
     // (a plugin of features counted already, its files among its controls; each filter it lists
@@ -1541,14 +1556,19 @@ fn shape_of(
         None if featured => Err(Refusal::Described),
         None => Ok(None),
     };
-    let control_at =
-        |key: &str| controls.iter().position(|c| c.key == key && c.kind != "file").ok_or(Refusal::Described);
+    let control_at = |key: &str| {
+        controls.iter().position(|c| c.key == key && c.kind != "file" && c.kind != "folder").ok_or(Refusal::Described)
+    };
     let mut under = Vec::new();
     for c in controls {
         under.push(if c.kind == "feature" {
             if c.under.is_some() {
                 return Err(Refusal::Described);
             }
+            None
+        } else if c.kind == "folder" && c.under.is_none() {
+            // a folder may be the whole plugin's, its features' alike, at the top of its card
+            // (interface 22)
             None
         } else {
             under_of(c.under.as_deref())?
@@ -1568,7 +1588,7 @@ fn shape_of(
         };
         let fits = matches!(place, plugins::PluginPlace::Card | plugins::PluginPlace::Canvas);
         let elsewhere = place != plugins::PluginPlace::Card;
-        if !fits || (elsewhere && matches!(c.kind.as_str(), "file" | "texture" | "feature")) {
+        if !fits || (elsewhere && matches!(c.kind.as_str(), "file" | "texture" | "feature" | "folder")) {
             return Err(Refusal::Described);
         }
         places.push(place);
@@ -1591,7 +1611,7 @@ fn shape_of(
     let action_presses = action_presses.collect::<Result<Vec<_>, _>>()?;
     // kept with each artwork: a switch or a slider that keeps no setting the app used to have
     let artwork: Vec<bool> = controls.iter().map(|c| c.artwork == Some(true)).collect();
-    let unkeepable = |c: &RawControl| c.kind == "file" || c.kind == "feature" || c.keeps.is_some();
+    let unkeepable = |c: &RawControl| matches!(c.kind.as_str(), "file" | "feature" | "folder") || c.keeps.is_some();
     if controls.iter().zip(&artwork).any(|(c, &kept)| kept && unkeepable(c)) {
         return Err(Refusal::Described);
     }
@@ -1937,6 +1957,14 @@ pub(crate) fn chosen_paths(dir: &Path, id: &str, key: &str) -> (PathBuf, PathBuf
     (folder.join(format!("{key}.wav")), folder.join(format!("{key}.name")))
 }
 
+/// Where the folder picked for `key`, a `folder` control of plugin `id` kept in `dir`, is kept (as
+/// the app's folder access reads it), the name it was picked by, and what was written to it and read
+/// from it (interface 22). They go with the plugin.
+pub(crate) fn chosen_folder_paths(dir: &Path, id: &str, key: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let folder = dir.join(id).join(CHOSEN);
+    (folder.join(format!("{key}.folder")), folder.join(format!("{key}.name")), folder.join(format!("{key}.noted.json")))
+}
+
 /// What plugin `id`, kept in `dir`, keeps of its own, if anything holds up.
 pub(crate) fn read_kept(dir: &Path, id: &str) -> Option<Vec<u8>> {
     read_capped(&dir.join(id).join(KEPT), plugin_run::MOST_KEPT)
@@ -2061,10 +2089,17 @@ fn files_under(folder: &Path, prefix: &str, depth: usize, found: &mut Vec<String
     Some(())
 }
 
-/// The plugin in `folder`, if all of it is as its manifest says and it is `id` at `version`.
+/// The plugin in `folder`, if all of it is as its manifest says and it is `id` at `version`. A
+/// folder found to hold up isn't read and checked whole again while each of its files is as it was
+/// then (see [`HELD_UP`]).
 pub(crate) fn read_folder(folder: &Path, id: &str, version: &str) -> Option<Manifest> {
     let mut found = Vec::new();
     files_under(folder, "", 0, &mut found)?;
+    // (as the files are before they are read: one changed meanwhile is read again next time)
+    let stamps = stamps_of(folder, &found);
+    if let Some(manifest) = held_up(folder, stamps.as_deref()).filter(|m| m.id == id && m.version == version) {
+        return Some(manifest);
+    }
     let text = read_capped(&folder.join(MANIFEST), MOST_MANIFEST)?;
     let manifest = read_manifest(&text).ok()?;
     if manifest.id != id || manifest.version != version || found.len() != manifest.files.len() + 1 {
@@ -2082,7 +2117,54 @@ pub(crate) fn read_folder(folder: &Path, id: &str, version: &str) -> Option<Mani
             return None;
         }
     }
+    if let Some(stamps) = stamps {
+        hold_up(folder, stamps, &manifest);
+    }
     Some(manifest)
+}
+
+/// A file of a plugin's folder as it is on the disk: its path in the folder, its size and when it
+/// was last written.
+type Stamp = (String, u64, std::time::SystemTime);
+
+/// The plugin folders found to hold up (see [`read_folder`]), each with its files as they were and
+/// its manifest. Every part of a plugin (its code, its brushes, its filters) is read through its
+/// folder, and the apps take the plugins up again on every change of a setting: each file hashed
+/// each time took tens of milliseconds on the interface's thread. A folder whose files are as they
+/// were (none added, gone, resized or written since) holds up as it did; any other is checked whole.
+static HELD_UP: std::sync::Mutex<Vec<(PathBuf, Vec<Stamp>, Manifest)>> = std::sync::Mutex::new(Vec::new());
+
+/// The most folders [`HELD_UP`] remembers (a plugin's folder each), the oldest forgotten first.
+const MOST_HELD_UP: usize = 64;
+
+/// The `found` files of `folder` as they are on the disk now, in order; none if one can't be told.
+fn stamps_of(folder: &Path, found: &[String]) -> Option<Vec<Stamp>> {
+    let mut stamps: Vec<Stamp> = found
+        .iter()
+        .map(|path| {
+            let meta = std::fs::metadata(folder.join(path)).ok()?;
+            Some((path.clone(), meta.len(), meta.modified().ok()?))
+        })
+        .collect::<Option<_>>()?;
+    stamps.sort();
+    Some(stamps)
+}
+
+/// The manifest of `folder`, if it held up when its files were as `stamps` say they are now.
+fn held_up(folder: &Path, stamps: Option<&[Stamp]>) -> Option<Manifest> {
+    let stamps = stamps?;
+    let held = HELD_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.iter().find(|(at, was, _)| at == folder && was.as_slice() == stamps).map(|(.., manifest)| manifest.clone())
+}
+
+/// `folder` held up, its files as `stamps` say, its manifest `manifest`.
+fn hold_up(folder: &Path, stamps: Vec<Stamp>, manifest: &Manifest) {
+    let mut held = HELD_UP.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    held.retain(|(at, ..)| at != folder);
+    if held.len() >= MOST_HELD_UP {
+        held.remove(0);
+    }
+    held.push((folder.to_path_buf(), stamps, manifest.clone()));
 }
 
 /// The set of brushes (interface 14) of the plugin `id` at `version` in `dir`, if it holds one and
@@ -2987,7 +3069,9 @@ pub(crate) mod tests {
             let mut st = s.shared.lock();
             let origins = vec![None; count];
             let icon = crate::brush_library::IMPORTED_ICON;
-            st.library.insert(0, crate::brush_library::LibrarySet { name: "Fills".to_owned(), brushes, origins, icon });
+            let set =
+                crate::brush_library::LibrarySet { name: "Fills".to_owned(), brushes, origins, icon, plugin: None };
+            st.library.insert(0, set);
         }
         s.brushes_as_set_file(0, 0..count, "Fills", 1).unwrap()
     }
@@ -3079,6 +3163,62 @@ pub(crate) mod tests {
             let read = pictures(own.clone(), interface, starts.clone(), place.clone());
             assert_eq!(read.err(), Some(Refusal::Described), "{own} {interface} {starts} {place}");
         }
+    }
+
+    #[test]
+    fn a_folder_control_comes_with_interface_22_and_may_be_a_whole_plugin_of_features() {
+        let module = wat::parse_str(
+            r#"(module (func (export "procraft_control") (param i32 f32))
+                (func (export "procraft_artwork_saved") (result i32) (i32.const 0)))"#,
+        )
+        .unwrap();
+        let folders = |interface: u32, folder: Value, holds: Value| {
+            let mut manifest = coded("org.example.folders", &module);
+            manifest["compat"]["procraft"]["interface"] = json!(interface);
+            manifest["hooks"] = json!(["artwork_saved"]);
+            manifest["holds"] = holds;
+            manifest["controls"] = json!([
+                folder,
+                { "key": "keep", "type": "feature", "label": "Keep", "description": "Keeps.", "hooks": ["artwork_saved"] },
+            ]);
+            read_package(&pack(&manifest, &[(MODULE, module.as_slice())]))
+        };
+        let hooks = json!(["hooks"]);
+        let folder = json!({ "key": "folder", "type": "folder", "label": "Folder" });
+        let package = folders(22, folder.clone(), hooks.clone()).unwrap();
+        let PluginControl::Folder { control } = &package.manifest.controls[0] else { panic!() };
+        assert_eq!(
+            (control.key.as_str(), control.chosen.as_ref(), control.location.as_ref()),
+            ("org.example.folders.folder", None, None)
+        );
+        // the whole plugin's, under no feature; or one feature's
+        assert_eq!(package.manifest.shape.feature_of(0), None);
+        let under = json!({ "key": "folder", "type": "folder", "label": "Folder", "under": "keep" });
+        assert!(folders(22, under, hooks.clone()).is_ok());
+        // before interface 22; elsewhere than the card, kept with each artwork, starting somewhere,
+        // keeping a setting the app had, taking files; or with no code: refused
+        let refused = [
+            (21, folder.clone(), hooks.clone()),
+            (22, json!({ "key": "folder", "type": "folder", "label": "Folder", "place": "canvas" }), hooks.clone()),
+            (22, json!({ "key": "folder", "type": "folder", "label": "Folder", "artwork": true }), hooks.clone()),
+            (22, json!({ "key": "folder", "type": "folder", "label": "Folder", "starts": "/sdcard" }), hooks.clone()),
+            (
+                22,
+                json!({ "key": "folder", "type": "folder", "label": "Folder", "keeps": "interface_size" }),
+                hooks.clone(),
+            ),
+            (22, json!({ "key": "folder", "type": "folder", "label": "Folder", "accepts": "picture" }), hooks.clone()),
+            (22, json!({ "key": "on_top", "type": "switch", "label": "A switch" }), hooks.clone()),
+        ];
+        for (interface, folder, holds) in refused {
+            assert_eq!(
+                folders(interface, folder.clone(), holds).err(),
+                Some(Refusal::Described),
+                "{interface} {folder}"
+            );
+        }
+        // a hook this app has, written to a later interface than it reads: for a newer app
+        assert_eq!(folders(23, folder, hooks).err(), Some(Refusal::Newer));
     }
 
     #[test]
@@ -3568,6 +3708,46 @@ pub(crate) mod tests {
         std::fs::write(dir.join("org.example.plugin/1.0.0").join(MODULE), b"something else").unwrap();
         assert!(read_all(&dir).is_empty());
         assert_eq!(read_code(&dir, "org.example.plugin", "1.0.0"), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A kept plugin's folder that held up isn't read and hashed whole again while its files are as
+    /// they were: read again for each of its parts (as the apps take the plugins up again on every
+    /// change of a setting), it comes back quickly and the same. A file changed since, even to one
+    /// of the same size, has it checked whole again, and refused. Prints both times.
+    #[test]
+    fn a_plugin_folder_that_held_up_is_read_again_quickly_and_a_change_is_still_caught() {
+        use std::time::{Duration, Instant};
+        let dir = folder("held-up");
+        let file = crate::bundled::BUNDLED.iter().find(|(name, _)| *name == "infinite-plugins").unwrap().1;
+        let package = read_package(file).unwrap();
+        let (id, version) = (package.manifest.id.clone(), package.manifest.version.clone());
+        keep(&dir, &package).unwrap();
+        let at = dir.join(&id).join(&version);
+        let t = Instant::now();
+        let first = read_folder(&at, &id, &version).expect("it holds up");
+        let checked = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..10 {
+            assert_eq!(read_folder(&at, &id, &version).as_ref(), Some(&first));
+        }
+        let again = t.elapsed() / 10;
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        println!(
+            "a plugin's folder checked whole in {:.1} ms; read again as it was in {:.2} ms",
+            ms(checked),
+            ms(again)
+        );
+        assert!(again * 5 < checked, "read again in {:.2} ms against {:.1} ms", ms(again), ms(checked));
+        // its module changed to another of the same size: no longer held up
+        let module = at.join(MODULE);
+        let mut bytes = std::fs::read(&module).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&module, &bytes).unwrap();
+        assert_eq!(read_folder(&at, &id, &version), None);
+        assert_eq!(read_code(&dir, &id, &version), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

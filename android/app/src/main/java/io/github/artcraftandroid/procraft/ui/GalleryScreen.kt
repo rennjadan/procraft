@@ -826,8 +826,9 @@ fun GalleryScreen(vm: CanvasViewModel) {
     Alert(
         vm.openingEndedApp,
         title = { io.github.artcraftandroid.procraft.core.openingEndedAppTitle() },
-        // why that run ended, where Android kept it: short of memory, or else (a crash) the log asked for
-        message = { o -> io.github.artcraftandroid.procraft.core.openingEndedAppSaid(o.lowMemory) },
+        // how that run ended, where Android kept it: short of memory, a crash (the log asked for), or
+        // not known (the log asked for too)
+        message = { o -> io.github.artcraftandroid.procraft.core.openingEndedAppSaidAfter(o.end) },
         action = "Open Anyway",
         destructive = false,
         extra = "Share Log",

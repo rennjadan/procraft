@@ -293,6 +293,8 @@ struct PathPoint {
     roll: f32,
     /// How fast the input moves, 0..1 of [`FAST`].
     speed: f32,
+    /// When the input it came of was made (milliseconds), for a brush engine handed the path.
+    ms: f64,
 }
 
 impl PathPoint {
@@ -308,6 +310,7 @@ impl PathPoint {
             azimuth: to.azimuth,
             roll: to.roll,
             speed: self.speed + (to.speed - self.speed) * t,
+            ms: self.ms + (to.ms - self.ms) * f64::from(t),
         }
     }
 }
@@ -916,8 +919,9 @@ pub enum WarpKind {
 /// A brush engine outside the app's own (a plugin's): it lays a stroke's stamps from its input
 /// itself, in place of the brush's settings (see [`StrokeBuilder::with_engine`]).
 pub trait OutsideEngine: Send + std::fmt::Debug {
-    /// The stamps `samples` add (canvas pixels, each finite; a pen's pressure through the app's
-    /// pressure curve, a finger's 1 with no lean).
+    /// The stamps `samples` add: the path as the app's own smoothing has settled it (canvas
+    /// pixels, each finite; a pen's pressure through the app's pressure curve, a finger's 1 with
+    /// no lean), each point timed as the input it came of.
     fn add(&mut self, samples: &[Sample]) -> Vec<Stamp>;
     /// The stroke's last stamps, as it ends.
     fn finish(&mut self) -> Vec<Stamp>;
@@ -932,9 +936,11 @@ struct OutsideSlot(Option<Outside>);
 struct Outside {
     engine: Box<dyn OutsideEngine>,
     stamps: Vec<Stamp>,
-    /// The path's length so far (canvas pixels), and its last point.
+    /// The points smoothing has settled that the engine hasn't been handed yet.
+    settled: Vec<PathPoint>,
+    /// The path's length so far (canvas pixels), and its last point handed over.
     length: f32,
-    last: Option<Vec2>,
+    last: Option<PathPoint>,
     ended: bool,
 }
 
@@ -1371,9 +1377,11 @@ impl StrokeBuilder {
     }
 
     /// The stroke's stamps laid by `engine` from its input, in place of the brush's settings: it
-    /// is handed the samples as they come, and nothing predicts or previews ahead of them.
+    /// is handed the path as the app's own smoothing settles it (the app's Pressure and Smoothing,
+    /// see [`StrokeBuilder::with_input`]), and nothing predicts or previews ahead of it.
     pub fn with_engine(mut self, engine: Box<dyn OutsideEngine>) -> StrokeBuilder {
-        let outside = Outside { engine, stamps: Vec::new(), length: 0.0, last: None, ended: false };
+        let outside =
+            Outside { engine, stamps: Vec::new(), settled: Vec::new(), length: 0.0, last: None, ended: false };
         self.outside = OutsideSlot(Some(outside));
         self
     }
@@ -1383,50 +1391,97 @@ impl StrokeBuilder {
         self.outside.0.is_some()
     }
 
-    /// `samples` handed to the outside engine as it takes them, and the stamps it answers; none
-    /// without one.
+    /// `samples` smoothed as every stroke's input is (the app's stabilisation, motion filtering
+    /// and pressure), what that settles handed to the outside engine, and the stamps it answers;
+    /// none without one.
     fn add_outside(&mut self, samples: &[Sample]) -> Option<Vec<Stamp>> {
-        let pen = self.pointer.has_pressure();
-        let given = self.given_pressure;
-        let curve = &self.input.pressure_curve;
-        let outside = self.outside.0.as_mut()?;
-        if outside.ended {
+        if self.outside.0.as_ref()?.ended {
             return Some(Vec::new());
         }
-        let taken: Vec<Sample> = samples
-            .iter()
-            .filter(|s| s.is_finite())
-            .map(|s| {
-                let mut s = *s;
-                if pen {
-                    s.pressure = curve.eval(s.pressure.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-                    for v in [&mut s.tilt, &mut s.azimuth, &mut s.roll] {
-                        if !v.is_finite() {
-                            *v = 0.0;
-                        }
-                    }
-                } else {
-                    // a given pressure as it was given (no pen's curve), and no lean or turn
-                    let pressure = if given { s.pressure.clamp(0.0, 1.0) } else { 1.0 };
-                    (s.pressure, s.tilt, s.azimuth, s.roll) = (pressure, 0.0, 0.0, 0.0);
+        // (nothing is laid here: the settled path goes to the engine, see `path_to`)
+        let mut none = Vec::new();
+        for s in samples.iter().filter(|s| s.is_finite()) {
+            let mut s = *s;
+            for v in [&mut s.tilt, &mut s.azimuth, &mut s.roll] {
+                if !v.is_finite() {
+                    *v = 0.0;
                 }
-                s
-            })
-            .collect();
-        for s in &taken {
-            if let Some(last) = outside.last {
-                outside.length += s.pos.distance(last);
             }
-            outside.last = Some(s.pos);
+            self.push(s, &mut none);
+        }
+        Some(self.hand_outside())
+    }
+
+    /// The points smoothing has settled handed to the outside engine (a pen's pressure through
+    /// the app's curve; one given as it was given; a finger's 1, with no lean or turn), and the
+    /// stamps it answers.
+    fn hand_outside(&mut self) -> Vec<Stamp> {
+        let Some(outside) = self.outside.0.as_mut() else { return Vec::new() };
+        let mut taken = Vec::with_capacity(outside.settled.len());
+        for p in std::mem::take(&mut outside.settled) {
+            let s = Sample {
+                pos: p.pos,
+                pressure: p.pressure.clamp(0.0, 1.0),
+                tilt: p.tilt,
+                azimuth: p.azimuth,
+                roll: p.roll,
+                time_ms: p.ms,
+            };
+            if !s.is_finite() {
+                continue;
+            }
+            if let Some(last) = outside.last {
+                outside.length += s.pos.distance(last.pos);
+            }
+            outside.last = Some(p);
+            taken.push(s);
         }
         if taken.is_empty() {
-            return Some(Vec::new());
+            return Vec::new();
         }
         let stamps = outside.engine.add(&taken);
         outside.stamps.extend_from_slice(&stamps);
         self.length = outside.length;
         self.bounds = stamps.iter().fold(self.bounds, |b, s| b.union(s.bounds()));
-        Some(stamps)
+        stamps
+    }
+
+    /// The outside engine's stroke ends: what smoothing still holds settled and handed over, on to
+    /// where the pen lifted (as the app's own strokes end, unless motion filtering leaves the end
+    /// short of the pen), then the engine's last stamps.
+    fn finish_outside(&mut self) {
+        let mut none = Vec::new();
+        self.average_on(&mut none);
+        self.stream_on(&mut none);
+        self.stabilise_on(&mut none);
+        let lifted = self.last_sample.filter(|_| !self.averaged.mirrored);
+        if let (Some(outside), Some(lifted)) = (self.outside.0.as_mut(), lifted) {
+            let newest = outside.settled.last().or(outside.last.as_ref()).copied();
+            if let Some(p) = newest.filter(|p| p.pos.distance(lifted.pos) > 1e-4) {
+                outside.settled.push(PathPoint { pos: lifted.pos, ms: lifted.time_ms.max(p.ms), ..p });
+            }
+        }
+        self.hand_outside();
+        if let Some(outside) = self.outside.0.as_mut() {
+            outside.ended = true;
+            let last = outside.engine.finish();
+            outside.stamps.extend(last);
+        }
+    }
+
+    /// Whether the brush's own smoothing (its StreamLine, stabilisation, motion filtering and
+    /// pressure smoothing) counts, besides the app's Pressure and Smoothing: not for an outside
+    /// engine's stroke. Its brush's settings are its engine's, edited in the engine's own studio in
+    /// place of the brush studio, so the app's reading of the brush keeps settings no one sees (a
+    /// StreamLine of the round pen's, which would round every stroke and keep it behind the pen,
+    /// with nothing previewed ahead of an engine's stroke).
+    fn own_smoothing(&self) -> bool {
+        !self.is_outside()
+    }
+
+    /// The brush's StreamLine, where its own smoothing counts.
+    fn streamline(&self) -> f32 {
+        if self.own_smoothing() { self.brush.streamline } else { 0.0 }
     }
 
     /// A stroke with `brush` at `diameter` canvas pixels (the size slider's value).
@@ -1732,6 +1787,7 @@ impl StrokeBuilder {
             azimuth: newest.azimuth,
             roll: newest.roll,
             speed: newest.speed,
+            ms: last.time_ms,
         })
     }
 
@@ -2025,12 +2081,10 @@ impl StrokeBuilder {
     /// Ends the stroke as [`StrokeBuilder::finish`] does, returning its final stamps from the
     /// `from`th on (none past its last).
     pub fn finish_from(&mut self, from: usize) -> Vec<Stamp> {
-        if let Some(outside) = self.outside.0.as_mut() {
-            if !outside.ended {
-                outside.ended = true;
-                let last = outside.engine.finish();
-                outside.stamps.extend(last);
-            }
+        if self.outside.0.as_ref().is_some_and(|o| !o.ended) {
+            self.finish_outside();
+        }
+        if let Some(outside) = &self.outside.0 {
             return outside.stamps.get(from..).unwrap_or_default().to_vec();
         }
         self.walk_to_end();
@@ -2170,7 +2224,7 @@ impl StrokeBuilder {
         }
         // (each use's pressure, and the speed, follow once all smoothing has settled it, see
         // `pressed_on`)
-        let target = PathPoint { pos: s.pos, pressure, soft: [1.0; 5], tilt, azimuth, roll, speed: 0.0 };
+        let target = PathPoint { pos: s.pos, pressure, soft: [1.0; 5], tilt, azimuth, roll, speed: 0.0, ms: s.time_ms };
         // (none for the first sample; nothing of its own for one in a batch with the last)
         let dt = self.last_sample.map(|last| if batched { 0.0 } else { (s.time_ms - last.time_ms).clamp(0.5, 50.0) });
         self.keep_time(s);
@@ -2206,7 +2260,7 @@ impl StrokeBuilder {
     /// rate), streamlined: it goes into the window, and those it pushes out are settled and go on
     /// to stabilisation.
     fn go_on(&mut self, target: PathPoint, dt: Option<f64>, batched: bool, samples: f64, out: &mut Vec<Stamp>) {
-        let streams = self.brush.streamline > 0.0 || self.pressure_streams();
+        let streams = self.streamline() > 0.0 || self.pressure_streams();
         let Some(dt) = dt.filter(|_| !self.exact && !self.steady && streams) else {
             self.smoothed = Some(target);
             self.stabilise_to(target, dt, samples, out);
@@ -2295,13 +2349,15 @@ impl StrokeBuilder {
     /// tuned rate (1: all of it, not smoothed).
     fn stream_strengths(&self) -> [f32; 2] {
         let pressure = if self.pressure_streams() { pressure_keep(self.pressure_smoothing()) } else { 0.0 };
-        [1.0 - streamline_keep(self.brush.streamline), 1.0 - pressure]
+        [1.0 - streamline_keep(self.streamline()), 1.0 - pressure]
     }
 
     /// How much a pen's pressure changes are smoothed: the brush's and the app's together, each
-    /// taking away what the other leaves.
+    /// taking away what the other leaves (the app's alone where the brush's own smoothing doesn't
+    /// count).
     fn pressure_smoothing(&self) -> f32 {
-        together(self.brush.pressure_smoothing, self.input.pressure_smoothing)
+        let own = if self.own_smoothing() { self.brush.pressure_smoothing } else { 0.0 };
+        together(own, self.input.pressure_smoothing)
     }
 
     /// Whether streamline smooths the pressure (a pen's, or one given, its smoothing on).
@@ -2460,28 +2516,38 @@ impl StrokeBuilder {
         self.weights.as_deref().map_or(0, |weights| weights.len() / 2)
     }
 
-    /// Motion filtering's weights, the stronger of the app's and the brush's.
+    /// Motion filtering's weights, the stronger of the app's and the brush's (where its own
+    /// smoothing counts).
     fn made_weights(&self) -> Vec<f32> {
-        let amount = self.extras.motion_filtering.max(self.input.motion_filtering);
+        let own = self.own_smoothing();
+        let amount = if own { self.extras.motion_filtering } else { 0.0 }.max(self.input.motion_filtering);
         if self.exact || self.steady || amount <= 0.0 {
             return Vec::new();
         }
-        let expression = self.extras.motion_expression.max(self.input.motion_expression);
+        let expression = if own { self.extras.motion_expression } else { 0.0 }.max(self.input.motion_expression);
         let rate = if self.pointer.has_pressure() { PEN_RATE } else { FINGER_RATE };
         motion_weights(amount, expression, rate)
     }
 
-    /// How many samples each way stabilisation averages.
+    /// How many samples each way stabilisation averages: the stronger of the app's and the
+    /// brush's (see [`StrokeBuilder::with_input`]), the app's alone where the brush's own smoothing
+    /// doesn't count.
     fn stabilised(&self) -> usize {
         if self.exact || self.steady {
             return 0;
         }
-        (self.extras.stabilization.clamp(0.0, 1.0).powf(STABILIZATION_POWER) * MOST_AVERAGED) as usize
+        let amount = if self.own_smoothing() { self.extras.stabilization } else { self.input.stabilization };
+        (amount.clamp(0.0, 1.0).powf(STABILIZATION_POWER) * MOST_AVERAGED) as usize
     }
 
     /// Takes the path on to `to`: input read in whole pixels evened out first (see
     /// [`StrokeBuilder::destepped`]), as soon as the path has gone far enough on past each point.
+    /// An outside engine's stroke is handed it instead (see [`StrokeBuilder::hand_outside`]).
     fn path_to(&mut self, to: PathPoint, out: &mut Vec<Stamp>) {
+        if let Some(outside) = self.outside.0.as_mut() {
+            outside.settled.push(to);
+            return;
+        }
         if self.whole_pixels.is_none() || self.exact {
             self.path_on(to, out);
             return;
@@ -4653,6 +4719,71 @@ mod tests {
         }
     }
 
+    /// A pen drawn along a line at `speed` (px a millisecond) and `rate` samples a second for
+    /// `ms`, pressure 0.6: how far (ms) the line as shown (laid, then the tip on to the input)
+    /// and what is laid for good trail the pen at its end.
+    fn trails(brush: &Brush, speed: f32, rate: f64, ms: f64) -> (f32, f32) {
+        let n = (rate * ms / 1000.0) as usize;
+        let samples: Vec<Sample> = (0..=n)
+            .map(|i| {
+                let t = i as f64 * 1000.0 / rate;
+                Sample::at(Vec2::new(100.0 + speed * t as f32, 50.0), 0.6, t)
+            })
+            .collect();
+        let pen = samples[n].pos.x;
+        let mut b = StrokeBuilder::new(brush.clone(), 4.0, Pointer::Stylus);
+        b.add(&samples);
+        let laid = b.placed_stamps().last().map_or(f32::NAN, |s| s.center.x);
+        let shown = b.preview_to_input(&[]).iter().chain(&b.placed_stamps()).map(|s| s.center.x).fold(laid, f32::max);
+        ((pen - shown) / speed, (pen - laid) / speed)
+    }
+
+    /// The per-sample model's line at a pen's 240 samples a second: how far (ms) what it has
+    /// settled trails the pen (each point followed by `strength` of the way from the one before,
+    /// settled once 11 newer have come).
+    fn modelled_trail(amount: f32, speed: f32, ms: f64) -> f32 {
+        let strength = 1.0 - streamline_keep(amount);
+        let interval = 1000.0 / 240.0;
+        let n = (240.0 * ms / 1000.0) as usize;
+        let mut at = 0.0f32;
+        let path: Vec<f32> = (0..=n)
+            .map(|i| {
+                let x = speed * (i as f64 * interval) as f32;
+                at = if i == 0 { x } else { at + strength * (x - at) };
+                at
+            })
+            .collect();
+        (speed * (n as f64 * interval) as f32 - path[n - 11]) / speed
+    }
+
+    #[test]
+    fn the_line_shown_ends_at_the_pen_and_what_is_laid_keeps_its_time_behind_at_any_pen_rate() {
+        // 2000 px a second for 400 ms, at a slow pen's rate, a pen's own and a fast one's
+        for streamline in [0.0, 0.1, 0.5, 0.88] {
+            for pressure_smoothing in [0.0, 0.06, 0.3] {
+                let brush = Brush { streamline, pressure_smoothing, ..plain() };
+                let windowed = streamline > 0.0 || pressure_smoothing > 0.0;
+                let model = if windowed { modelled_trail(streamline, 2.0, 400.0) } else { 0.0 };
+                for rate in [120.0, 240.0, 500.0] {
+                    let (shown, laid) = trails(&brush, 2.0, rate, 400.0);
+                    // the line as shown reaches the pen
+                    assert!(
+                        shown.abs() < 0.5,
+                        "{streamline}/{pressure_smoothing} at {rate} Hz: shown {shown} ms behind"
+                    );
+                    // what is laid trails it by the model's time and up to two samples at this
+                    // rate more: the window lets a point go at a whole sample, and the last stretch
+                    // waits for the point after it to curve by
+                    let off = laid - model;
+                    assert!(
+                        off > -0.5 && off < 2000.0 / rate as f32 + 0.5,
+                        "{streamline}/{pressure_smoothing} at {rate} Hz: laid {laid} ms behind, the model {model}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn with_no_smoothing_a_slow_line_read_in_whole_pixels_evens_its_steps_out_and_read_finer_goes_straight() {
         // a pen drawn slowly across at 30 degrees, 100 px a second, read at 240 Hz and handed over
@@ -6819,5 +6950,145 @@ mod tests {
             assert!((went - moved).abs() < 1e-3, "{went} {moved}");
         }
         assert!(stamps[10].grain_size != stamps[40].grain_size);
+    }
+
+    /// An outside engine that keeps what it is handed, and lays nothing.
+    #[derive(Debug)]
+    struct Handed(Arc<std::sync::Mutex<Vec<Sample>>>);
+
+    impl OutsideEngine for Handed {
+        fn add(&mut self, samples: &[Sample]) -> Vec<Stamp> {
+            self.0.lock().unwrap().extend_from_slice(samples);
+            Vec::new()
+        }
+
+        fn finish(&mut self) -> Vec<Stamp> {
+            Vec::new()
+        }
+    }
+
+    /// What an outside engine is handed of `samples` drawn with a pen in batches of 4, with
+    /// `input` (the app's Pressure and Smoothing) and `brush`.
+    fn handed(brush: Brush, input: InputSettings, samples: &[Sample]) -> Vec<Sample> {
+        let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = StrokeBuilder::new(brush, 20.0, Pointer::Stylus)
+            .with_input(input)
+            .with_engine(Box::new(Handed(Arc::clone(&kept))));
+        for batch in samples.chunks(4) {
+            b.add(batch);
+        }
+        b.finish();
+        kept.lock().unwrap().clone()
+    }
+
+    /// A shaky line along y = 100 at 240 samples a second, 3 pixels a sample, each sample 6 pixels
+    /// off it one way or the other, pressed from nothing to all the way.
+    fn shaky() -> Vec<Sample> {
+        (0..240)
+            .map(|i| {
+                let off = if i % 2 == 0 { 6.0 } else { -6.0 };
+                let mut s = Sample::at(
+                    Vec2::new(20.0 + 3.0 * i as f32, 100.0 + off),
+                    i as f32 / 239.0,
+                    1000.0 + f64::from(i) * 1000.0 / 240.0,
+                );
+                s.tilt = 0.4;
+                s.azimuth = 1.0;
+                s
+            })
+            .collect()
+    }
+
+    /// How far off the line the points between the first and last fifth of the way lie, on
+    /// average (pixels).
+    fn shake(points: &[Sample]) -> f32 {
+        let middle: Vec<f32> =
+            points.iter().filter(|s| s.pos.x > 164.0 && s.pos.x < 576.0).map(|s| (s.pos.y - 100.0).abs()).collect();
+        middle.iter().sum::<f32>() / middle.len().max(1) as f32
+    }
+
+    #[test]
+    fn an_outside_engine_is_handed_the_input_as_it_comes_without_smoothing() {
+        // the app's Pressure and Smoothing at rest: each sample as it came, its time and lean kept
+        let input = shaky();
+        let got = handed(plain(), InputSettings::default(), &input);
+        assert_eq!(got.len(), input.len());
+        for (g, s) in got.iter().zip(&input) {
+            assert_eq!((g.pos, g.time_ms, g.tilt, g.azimuth), (s.pos, s.time_ms, s.tilt, s.azimuth));
+            assert!((g.pressure - s.pressure).abs() < 1e-3, "{} {}", g.pressure, s.pressure);
+        }
+        // a finger's pressure is full, with no lean
+        let kept = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut b = StrokeBuilder::new(plain(), 20.0, Pointer::Finger).with_engine(Box::new(Handed(Arc::clone(&kept))));
+        b.add(&input);
+        b.finish();
+        assert!(kept.lock().unwrap().iter().all(|s| s.pressure == 1.0 && s.tilt == 0.0 && s.azimuth == 0.0));
+    }
+
+    #[test]
+    fn an_outside_engine_is_handed_the_path_the_apps_pressure_and_smoothing_settles() {
+        let input = shaky();
+        let raw = shake(&input);
+        let report = |what: &str, got: &[Sample]| {
+            let end = got.last().map(|s| s.pos).unwrap();
+            eprintln!(
+                "{what}: {} points, {:.2} px off the line (raw {raw:.2}), most pressure {:.3}, ends at {end:?}",
+                got.len(),
+                shake(got),
+                got.iter().map(|s| s.pressure).fold(0.0, f32::max)
+            );
+        };
+        // the app's pressure curve: a pen pressed all the way is pressed half as far
+        let half = InputSettings {
+            pressure_curve: Curve::new(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.5)]),
+            ..InputSettings::default()
+        };
+        let got = handed(plain(), half, &input);
+        report("pressure curve", &got);
+        for (g, s) in got.iter().zip(&input) {
+            assert!((g.pressure - s.pressure * 0.5).abs() < 0.01, "{} {}", g.pressure, s.pressure);
+        }
+        // stabilisation and motion filtering take out most of the shake, and the stroke still ends
+        // where the pen lifted, every point timed in order
+        let lifted = input.last().unwrap().pos;
+        for (what, settings, most) in [
+            ("stabilization 50%", InputSettings { stabilization: 0.5, ..InputSettings::default() }, 1.0),
+            ("motion filtering 50%", InputSettings { motion_filtering: 0.5, ..InputSettings::default() }, 1.0),
+            (
+                "both, 30% and 40%",
+                InputSettings { stabilization: 0.3, motion_filtering: 0.4, ..InputSettings::default() },
+                1.0,
+            ),
+        ] {
+            let got = handed(plain(), settings, &input);
+            report(what, &got);
+            assert!(shake(&got) < most, "{what}: {} px off the line, raw {raw}", shake(&got));
+            assert!(got.last().unwrap().pos.distance(lifted) < 1e-3, "{what}: ends at the pen");
+            assert!(got.windows(2).all(|w| w[1].time_ms >= w[0].time_ms), "{what}: in time");
+            assert!(got.len() >= input.len() / 2, "{what}: {} points", got.len());
+        }
+        // Tip Attachment off: motion filtering leaves the end short of the pen, as the app's
+        // strokes' ends
+        let loose = InputSettings { motion_filtering: 0.5, tip_attached: false, ..InputSettings::default() };
+        let got = handed(plain(), loose, &input);
+        assert!(got.last().unwrap().pos.distance(lifted) > 1.0, "short of the pen");
+    }
+
+    #[test]
+    fn an_outside_engines_stroke_takes_the_apps_smoothing_not_its_brushs_own() {
+        // the brush's StreamLine, stabilisation and pressure smoothing belong to the app's reading
+        // of the brush, which its engine's studio stands in for: they don't smooth its stroke
+        let input = shaky();
+        let mut own = Brush { streamline: 0.9, pressure_smoothing: 0.9, ..plain() };
+        own.set_setting("stabilization", 0.8);
+        own.set_setting("motion_filtering", 0.8);
+        let got = handed(own.clone(), InputSettings::default(), &input);
+        assert_eq!(got.len(), input.len());
+        assert!(got.iter().zip(&input).all(|(g, s)| g.pos == s.pos), "as it came");
+        // drawn by the app, they do
+        let mut b = StrokeBuilder::new(own, 20.0, Pointer::Stylus);
+        b.add(&input);
+        let centres: Vec<Sample> = b.finish().iter().map(|s| Sample::at(s.center, 1.0, 0.0)).collect();
+        assert!(shake(&centres) < shake(&input) / 2.0, "{}", shake(&centres));
     }
 }

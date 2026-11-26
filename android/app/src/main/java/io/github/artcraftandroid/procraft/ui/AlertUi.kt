@@ -18,6 +18,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.paddingFromBaseline
@@ -84,6 +85,8 @@ fun <T : Any> Alert(
     onExtra: (T) -> Unit = {},
     first: ((T) -> Unit)? = null,
     alone: Boolean = false,
+    field: String? = null,
+    onField: (String) -> Unit = {},
 ) {
     val last = remember { arrayOfNulls<Any>(1) }
     if (value != null) last[0] = value
@@ -104,6 +107,8 @@ fun <T : Any> Alert(
     ) {
         Box(
             Modifier.fillMaxSize().background(Color.Black.copy(alpha = ALERT_DIM * shown))
+                // (asking for a name, above the keyboard as it comes up, and high in the screen)
+                .then(if (field != null) Modifier.imePadding() else Modifier)
                 // nothing under it is touched while it is up, and a tap beside the panel cancels
                 .pointerInput(Unit) {
                     awaitEachGesture {
@@ -111,7 +116,7 @@ fun <T : Any> Alert(
                         if (waitForUpOrCancellation() != null) cancelling.value?.invoke()
                     }
                 },
-            contentAlignment = Alignment.Center,
+            contentAlignment = if (field != null) androidx.compose.ui.BiasAlignment(0f, -0.5f) else Alignment.Center,
         ) {
             val buttons = if (alone) 1 else if (extra != null) 3 else 2
             val need = AlertButtonWidth * buttons + AlertButtonGap * (buttons - 1) + AlertSide * 2
@@ -150,6 +155,18 @@ fun <T : Any> Alert(
                 }
                 Spacer(Modifier.height(13.dp))
                 said.takeIf { it.isNotEmpty() }?.let { Text(it, color = AlertInk, fontSize = 16.sp, lineHeight = 20.sp, textAlign = TextAlign.Center) }
+                // a field for a name (a layout saved or renamed), when there is one
+                field?.let { text ->
+                    androidx.compose.foundation.text.BasicTextField(
+                        text,
+                        onValueChange = onField,
+                        singleLine = true,
+                        textStyle = androidx.compose.ui.text.TextStyle(color = AlertInk, fontSize = 17.sp),
+                        cursorBrush = androidx.compose.ui.graphics.SolidColor(Pc.Accent),
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = AlertTextSide - AlertSide).height(40.dp)
+                            .clip(RoundedCornerShape(10.dp)).background(AlertCancelFill).padding(horizontal = 12.dp, vertical = 10.dp),
+                    )
+                }
                 Spacer(Modifier.height(27.dp))
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(AlertButtonGap)) {
                     // a first choice of three, blue too (a tap outside still cancels), or Cancel; a

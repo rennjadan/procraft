@@ -637,7 +637,7 @@ impl Gpu {
                     None,
                 )
             };
-            let probe_target = texture(device, "plugin filter probe", PROBE_SIZE, PROBE_SIZE, LAYER_FORMAT);
+            let probe_target = texture(self, "plugin filter probe", PROBE_SIZE, PROBE_SIZE, LAYER_FORMAT);
             Arc::new(FilterProgram {
                 draw: pipeline("host_main"),
                 probe: pipeline("host_probe"),
@@ -776,7 +776,8 @@ impl Canvas {
         let run = run();
         // nothing of a filter that didn't finish stays
         if run.is_err() {
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(&t.before, 0, 0),
                 copy_at(&layer.texture, 0, 0),
                 extent(self.width, self.height),

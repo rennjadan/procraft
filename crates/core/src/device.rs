@@ -9,7 +9,9 @@
 //! backend; one that drew a canvas is kept for good, until the app or the system is updated: new
 //! shaders to compile or a new driver can crash where the old ones drew, and a backend kept for
 //! good would then crash every start. A driver that crashes the app later, once drawing, is told
-//! from how the last runs ended (see [`driver_crashes`]).
+//! from how the last runs ended (see [`driver_crashes`]). A Vulkan driver that loses the app's
+//! device again and again, or as a canvas opens, sends the rest of the run, and later starts in the
+//! same build, to OpenGL ES (see [`lost`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -18,6 +20,11 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use procraft_gpu::Gpu;
 
 mod driver_crashes;
+mod lost;
+
+pub(crate) use lost::canvas_made;
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) use lost::{lost, recover};
 
 static DEVICE: Mutex<Option<Gpu>> = Mutex::new(None);
 
@@ -97,12 +104,13 @@ pub fn keep_device(gpu: &Gpu) {
 }
 
 /// Makes the app's device and its canvases' pipelines ahead of the first artwork, so that it opens
-/// at once; nothing if it is made. Slow: call it off the main thread.
+/// at once; nothing if it is made (and not lost: one lost draws nothing, and is made again). Slow:
+/// call it off the main thread.
 #[uniffi::export]
 pub fn warm_gpu() {
     start_log();
     let mut kept = kept();
-    if kept.is_some() {
+    if kept.as_ref().is_some_and(|g| !g.is_lost()) {
         return;
     }
     let from = first_backend();
@@ -131,8 +139,8 @@ pub fn warm_gpu() {
 #[uniffi::export]
 pub fn set_gpu_record_folder(dir: String, build: String) {
     start_log();
-    // the canvases' pipelines kept there between runs as well, where the GPU can
-    procraft_gpu::keep_pipelines_in(PathBuf::from(&dir));
+    // the canvases' pipelines kept there between runs as well, where the GPU can, for this build
+    procraft_gpu::keep_pipelines_for(PathBuf::from(&dir), &build);
     *RECORD_FOLDER.lock().unwrap_or_else(PoisonError::into_inner) = Some((PathBuf::from(dir), build));
 }
 
@@ -163,7 +171,11 @@ pub(crate) fn start_log() {
 /// note), else the one used last; OpenGL ES, not Vulkan, where Vulkan's driver crashed the app
 /// (see [`start_in`]).
 pub(crate) fn first_backend() -> usize {
-    record().map_or(0, |(dir, _)| start_in(&dir, &Gpu::backends()))
+    let order = Gpu::backends();
+    if let Some(opengl) = lost::left_vulkan(&order) {
+        return opengl;
+    }
+    record().map_or(0, |(dir, build)| lost::start_for(&dir, &build, &order, start_in(&dir, &order)))
 }
 
 /// Backend `backend` is about to be tried.

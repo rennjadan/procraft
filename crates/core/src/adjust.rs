@@ -212,7 +212,7 @@ impl State {
         }
         canvas.begin_pencil_stroke(current, style);
         canvas.add_stamps(&stamps);
-        self.stroke = Some(builder);
+        self.stroke = Some(Box::new(builder));
         self.redraw_painted_on();
     }
 
@@ -275,7 +275,7 @@ impl State {
             self.liquify.halt();
             self.close_liquify_step();
             self.flush();
-            self.canvas.as_ref().map_or(0, Canvas::steps_made)
+            self.canvas.as_deref().map_or(0, Canvas::steps_made)
         } else {
             0
         };

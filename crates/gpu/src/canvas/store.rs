@@ -17,6 +17,7 @@
 //! the store goes, the layer staying as it shows, and that change's undo step keeps the store to
 //! bring back with it. A layer without a store costs nothing.
 
+use crate::Gpu;
 use procraft_engine::document::LayerId;
 use procraft_engine::geom::{IRect, Vec2};
 use procraft_engine::stroke::PickUp;
@@ -198,11 +199,12 @@ impl Canvas {
     /// stroke then paints the layer itself).
     pub(super) fn store_for_stroke(
         &mut self,
-        device: &wgpu::Device,
+        gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         layer: LayerId,
         kind: u32,
     ) -> Option<StoreStroke> {
+        let device = &gpu.device;
         if kind != STORE_LIT {
             return None;
         }
@@ -218,15 +220,20 @@ impl Canvas {
         let memory = device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let made = [
-            texture(device, "store paint", self.width, self.height, LAYER_FORMAT),
-            texture(device, "store height", self.width, self.height, LAYER_FORMAT),
+            texture(gpu, "store paint", self.width, self.height, LAYER_FORMAT),
+            texture(gpu, "store height", self.width, self.height, LAYER_FORMAT),
         ];
         if let Some(e) = pollster::block_on(invalid.pop()).or(pollster::block_on(memory.pop())) {
             log::error!("a layer's store: {e}");
             return None;
         }
         let [paint, height] = made;
-        encoder.copy_texture_to_texture(copy_at(from, 0, 0), copy_at(&paint, 0, 0), extent(self.width, self.height));
+        gpu.copy_texture_to_texture(
+            encoder,
+            copy_at(from, 0, 0),
+            copy_at(&paint, 0, 0),
+            extent(self.width, self.height),
+        );
         let height_view = height.create_view(&wgpu::TextureViewDescriptor::default());
         drop(render_pass(encoder, "store height clear", &height_view, wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)));
         let ids = [self.next_plane(), self.next_plane()];
@@ -242,12 +249,13 @@ impl Canvas {
     /// layer drawn from the planes wherever they reached. `brush`: the stroke's shapes.
     pub(super) fn lay_store(
         &mut self,
-        device: &wgpu::Device,
+        gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         brush: &wgpu::BindGroup,
         (instances, picks): (&[StampInstance], &[Option<PickUp>]),
         style: &StrokeStyle,
     ) {
+        let device = &gpu.device;
         let Some((layer, [paint, height])) =
             self.smudge.as_ref().and_then(|s| Some((s.layer, s.store.as_ref()?.planes)))
         else {
@@ -284,7 +292,7 @@ impl Canvas {
             return;
         }
         // what it changes there kept as it was first, for its undo step
-        if !self.smudge_keep(device, encoder, &rects) {
+        if !self.smudge_keep(gpu, encoder, &rects) {
             return;
         }
         let pipelines = self.pipelines.clone();
@@ -395,7 +403,7 @@ impl Canvas {
     /// aside once, as they are); the layers whose planes are, to draw from them once transformed.
     pub(super) fn transform_stores_too(
         &mut self,
-        device: &wgpu::Device,
+        gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Vec<(LayerId, [LayerId; 2])> {
         let moving: Vec<LayerId> = self.transforming.iter().chain(&self.transform_more).map(|t| t.layer).collect();
@@ -406,7 +414,7 @@ impl Canvas {
             for plane in [paint, height] {
                 if !moving.contains(&plane)
                     && !self.transform_more.iter().any(|t| t.layer == plane)
-                    && let Some(t) = self.copy_aside(device, encoder, plane)
+                    && let Some(t) = self.copy_aside(gpu, encoder, plane)
                 {
                     self.transform_more.push(t);
                 }

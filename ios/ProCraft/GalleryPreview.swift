@@ -179,11 +179,11 @@ struct ArtworkPreview: View {
         guard !Task.isCancelled else { return }
         picture = read
         if loads {
-            let drawn = await Task.detached(priority: .userInitiated) { previewPicture(artwork, box: box) }.value
+            let drawn = await Task.detached(priority: .userInitiated) { onBigStack { previewPicture(artwork, box: box) } }.value
             guard !Task.isCancelled else { return }
             sharp = drawn
         }
-        let played = await Task.detached(priority: .userInitiated) { readFrames(artwork.dir, side: side) }.value
+        let played = await Task.detached(priority: .userInitiated) { onBigStack { readFrames(artwork.dir, side: side) } }.value
         guard let played, !Task.isCancelled else { return }
         // as its settings say
         var at: UInt32 = 0

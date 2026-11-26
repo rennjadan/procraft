@@ -108,6 +108,17 @@ internal fun animationBarWidth(window: Dp, screen: Dp, pitch: Dp): Dp {
     return pitch * frames + 26.dp
 }
 
+/** The settings' popover's width. */
+private val SettingsWidth = 290.dp
+
+/**
+ * Where the settings' popover stands from the bar's left: its middle over Settings' middle
+ * [settingsAt], kept within a [barWidth] bar, or from the bar's left end on a bar narrower than it
+ * (a narrow window and a wide canvas: three frames of a 16:9 canvas on a phone held upright).
+ */
+internal fun settingsPopoverLeft(settingsAt: Dp, barWidth: Dp): Dp =
+    (settingsAt - SettingsWidth / 2).coerceIn(0.dp, (barWidth - SettingsWidth).coerceAtLeast(0.dp))
+
 /** The screen's width as it is turned now ([window]'s, where it can't be told). */
 @Composable
 private fun displayWidth(window: Dp): Dp {
@@ -147,7 +158,7 @@ fun BoxScope.AnimationBar(vm: CanvasViewModel) {
             var colorsPage by remember { mutableStateOf(false) }
             if (!vm.animationSettingsOpen) colorsPage = false
             if (vm.animationSettingsOpen) {
-                DownPopover(290.dp, 145.dp, Modifier.offset(x = (settingsAt - 145.dp).coerceIn(0.dp, barWidth - 290.dp))) {
+                DownPopover(SettingsWidth, SettingsWidth / 2, Modifier.offset(x = settingsPopoverLeft(settingsAt, barWidth))) {
                     if (colorsPage) OnionColorsPage(vm) { colorsPage = false } else AnimationSettingsPage(vm) { colorsPage = true }
                 }
             } else if (vm.frameOptionsOpen) {

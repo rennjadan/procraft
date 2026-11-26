@@ -3,7 +3,6 @@
 
 use procraft_engine::geom::IRect;
 use procraft_engine::mesh::Mesh;
-use wgpu::util::DeviceExt;
 
 use crate::lighting::{CUBE_LEVELS, Lighting};
 use crate::{Gpu, GpuError, SelectionLook, SurroundGrid, read_texture};
@@ -64,8 +63,7 @@ pub fn material_source(gpu: &Gpu, side: u32, pixels: &[u8]) -> Option<wgpu::Text
 
 /// `side` square grey `pixels` as a texture.
 fn grey_view(gpu: &Gpu, side: u32, pixels: &[u8]) -> wgpu::TextureView {
-    let texture = gpu.device.create_texture_with_data(
-        &gpu.queue,
+    let texture = gpu.texture_with_data(
         &wgpu::TextureDescriptor {
             label: Some("material source"),
             size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
@@ -76,7 +74,6 @@ fn grey_view(gpu: &Gpu, side: u32, pixels: &[u8]) -> wgpu::TextureView {
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         },
-        wgpu::util::TextureDataOrder::LayerMajor,
         pixels,
     );
     texture.create_view(&wgpu::TextureViewDescriptor::default())
@@ -674,9 +671,8 @@ impl MeshView {
             ],
         });
         // nothing painted in a channel: the material's own value shows
-        let blank = device
-            .create_texture_with_data(
-                &gpu.queue,
+        let blank = gpu
+            .texture_with_data(
                 &wgpu::TextureDescriptor {
                     label: Some("mesh blank map"),
                     size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -687,7 +683,6 @@ impl MeshView {
                     usage: wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
                 },
-                wgpu::util::TextureDataOrder::LayerMajor,
                 &[0, 0, 0, 0],
             )
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -855,7 +850,7 @@ impl MeshView {
     /// textures' own colours (for a thumbnail). Waits for the GPU.
     pub fn picture(&mut self, gpu: &Gpu, width: u32, height: u32, clear: [f64; 4]) -> Result<Vec<u8>, GpuError> {
         let (width, height) = (width.max(1), height.max(1));
-        let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        let target = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("model picture"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -929,7 +924,7 @@ impl MeshView {
         }
         // its own texture, made the first time and shown from now on in place of any other
         let texture = p.texture.get_or_insert_with(|| {
-            gpu.device.create_texture(&wgpu::TextureDescriptor {
+            gpu.texture(&wgpu::TextureDescriptor {
                 label: Some("mesh albedo"),
                 size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -943,7 +938,7 @@ impl MeshView {
         p.views[0] = texture.create_view(&wgpu::TextureViewDescriptor::default());
         p.mips = None;
         p.bind = part_bind(&gpu.device, &self.part_layout, &self.sampler, &p.views, &p.uniform);
-        gpu.queue.write_texture(
+        gpu.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture,
                 mip_level: 0,
@@ -986,8 +981,7 @@ impl MeshView {
         };
         let texture =
             map.filter(|(side, rgba)| *side > 0 && rgba.len() == (*side as usize).pow(2) * 4).map(|(side, rgba)| {
-                gpu.device.create_texture_with_data(
-                    &gpu.queue,
+                gpu.texture_with_data(
                     &wgpu::TextureDescriptor {
                         label: Some("mesh surface map"),
                         size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
@@ -998,7 +992,6 @@ impl MeshView {
                         usage: wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
                     },
-                    wgpu::util::TextureDataOrder::LayerMajor,
                     rgba,
                 )
             });
@@ -1030,7 +1023,7 @@ impl MeshView {
         let Some(p) = self.parts.get_mut(part) else { return };
         if p.mips.is_none() {
             let levels = u32::BITS - side.max(1).leading_zeros();
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = gpu.texture(&wgpu::TextureDescriptor {
                 label: Some("albedo levels"),
                 size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
                 mip_level_count: levels,
@@ -1369,7 +1362,7 @@ impl MeshView {
         let at = if let Some(i) = found {
             i
         } else {
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = gpu.texture(&wgpu::TextureDescriptor {
                 label: Some("mesh depth"),
                 size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -1777,7 +1770,7 @@ impl MeshView {
         for i in 0..self.parts.len() {
             hiding.extend(self.shown_ranges(i).into_iter().flat_map(|r| without(r, &painted)));
         }
-        let depth = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        let depth = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("seen depth"),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -1886,7 +1879,7 @@ impl MeshView {
         let (width, height) = (width.max(1), height.max(1));
         let side = self.texture_size;
         let make = |label, format, usage, w, h| {
-            gpu.device.create_texture(&wgpu::TextureDescriptor {
+            gpu.texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -1899,7 +1892,7 @@ impl MeshView {
         };
         let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST;
         let source = make("screen coverage", wgpu::TextureFormat::R8Unorm, usage, width, height);
-        gpu.queue.write_texture(
+        gpu.write_texture(
             source.as_image_copy(),
             coverage,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(width), rows_per_image: None },
@@ -1956,7 +1949,7 @@ impl MeshView {
         let stale = projector.screen.as_ref().is_none_or(|(t, _, _)| t.width() != width || t.height() != height);
         if stale {
             let make = |label, format, usage| {
-                gpu.device.create_texture(&wgpu::TextureDescriptor {
+                gpu.texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
                     mip_level_count: 1,
@@ -2301,7 +2294,7 @@ impl MeshView {
         let side = self.texture_size;
         let projector = self.projector.as_mut()?;
         if projector.grain.is_none() {
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = gpu.texture(&wgpu::TextureDescriptor {
                 label: Some("stroke grain"),
                 size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: gpu.array_layers_least() },
                 mip_level_count: 1,
@@ -2410,7 +2403,7 @@ impl MeshView {
         let side = self.texture_size;
         let projector = self.projector.get_or_insert_with(|| Projector::new(gpu));
         let make_square = |label, format| {
-            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            let texture = gpu.texture(&wgpu::TextureDescriptor {
                 label: Some(label),
                 size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
                 mip_level_count: 1,
@@ -2663,7 +2656,7 @@ impl FootprintMarks {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        let marks = device.create_texture(&wgpu::TextureDescriptor {
+        let marks = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("stroke footprint marks"),
             size: wgpu::Extent3d { width: FOOTPRINT_TILES, height: FOOTPRINT_TILES, depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -2944,8 +2937,7 @@ impl Projector {
                 texture_entry(3),
             ],
         });
-        let everywhere = device.create_texture_with_data(
-            &gpu.queue,
+        let everywhere = gpu.texture_with_data(
             &wgpu::TextureDescriptor {
                 label: Some("reach everywhere"),
                 size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -2956,7 +2948,6 @@ impl Projector {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
-            wgpu::util::TextureDataOrder::LayerMajor,
             &[255],
         );
         let everywhere = everywhere.create_view(&wgpu::TextureViewDescriptor::default());

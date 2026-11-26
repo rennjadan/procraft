@@ -487,7 +487,7 @@ impl CanvasSession {
             st.doc.text_style = st.doc.layer(layer).and_then(|l| l.text.as_ref()).map(LayerText::look);
             // the step made, so undo and redo of it can go back to editing this text
             st.flush();
-            if let Some(step) = st.canvas.as_ref().and_then(procraft_gpu::Canvas::undo_step) {
+            if let Some(step) = st.canvas.as_deref().and_then(procraft_gpu::Canvas::undo_step) {
                 st.text_steps.push((step, layer));
                 let over = st.text_steps.len().saturating_sub(TEXT_STEPS_KEPT);
                 st.text_steps.drain(..over);

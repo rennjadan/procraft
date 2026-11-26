@@ -53,6 +53,34 @@ enum Pc {
         Color(argb: Look.shared.light ? light : dark)
     }
 
+    /// A frost's tint, `dark` as measured laid straight over what is behind it (blurred), or `light`
+    /// on the light interface: see `onDarkFrost`.
+    private static func frost(_ dark: UInt32, _ light: UInt32) -> Color {
+        Look.shared.light ? Color(argb: light) : onDarkFrost(dark)
+    }
+
+    /// How much of what is behind the dark frost (the dark material) keeps, and what it adds: over
+    /// a white canvas it shows 177, over the dark grid's 36 it shows 53, as measured through the
+    /// panels' tint.
+    private static let darkFrostKeeps = 0.566
+    private static let darkFrostAdds = 33.0
+
+    /// A tint as measured laid straight over what is behind it (blurred), made for the dark frost
+    /// it lies on: that frost already greys what is behind, so the tint is made thinner and darker
+    /// to come out as measured over a dark canvas and a white one alike.
+    static func onDarkFrost(_ argb: UInt32) -> Color {
+        let a = Double((argb >> 24) & 0xFF) / 255
+        // how much of the frost shows through, for as much of what is behind as the tint lets
+        let through = min((1 - a) / darkFrostKeeps, 1)
+        let opacity = 1 - through
+        guard opacity > 0 else { return .clear }
+        func channel(_ shift: UInt32) -> Double {
+            let c = Double((argb >> shift) & 0xFF)
+            return min(max((a * c - through * darkFrostAdds) / opacity, 0), 255) / 255
+        }
+        return Color(.sRGB, red: channel(16), green: channel(8), blue: channel(0), opacity: opacity)
+    }
+
     static var panel: Color { pick(0xF726_2626, 0xF7E6_E6E6) }
     static var row: Color { pick(0xFF30_3030, 0xFFD8_D8D8) }
     static let rowSelected = Color(argb: 0xFF00_76FD)
@@ -65,7 +93,7 @@ enum Pc {
     static let surround = Color(argb: 0xFF1C_1C1C)
 
     // the bar across the top of the canvas: translucent, #333333 over white as the bar measures
-    static var bar: Color { pick(0xE61C_1C1C, 0xCFE6_E6E6) }
+    static var bar: Color { frost(0xE61C_1C1C, 0xCFE6_E6E6) }
     static var barText: Color { pick(0xFFAA_AAAA, 0xFF3B_3B3B) }
     static var barGlyph: Color { pick(0xFFC7_C7C7, 0xFF37_3737) }
     static let barGlyphSelected = Color(argb: 0xFF00_76FD)
@@ -85,8 +113,15 @@ enum Pc {
 
     // the panels hanging from the top bar
     static var popoverFill: Color { pick(0xFF38_3838, 0xFFE6_E6E6) }
-    /// A panel's own material over the canvas: what is behind it shows through, blurred.
-    static var popoverFrost: Color { pick(0xDE1E_1E1E, 0xFFE6_E6E6) }
+    /// A panel's own material over the canvas: what is behind it shows through, blurred (as
+    /// measured, 31 over the dark grid and 57 over a white canvas).
+    static var popoverFrost: Color { frost(0xE11E_1E1E, 0xFFE6_E6E6) }
+    /// That tint laid straight over what is behind, for what has no frost under it.
+    static var popoverTint: Color { pick(0xE11E_1E1E, 0xFFE6_E6E6) }
+    /// That tint wholly opaque: a panel's ground while a plugin lays the panels out, when a panel
+    /// may lie over a window or a window over another (only the canvas blurs behind the frost: a
+    /// window under it would show through it sharp).
+    static var popoverSolid: Color { pick(0xFF1E_1E1E, 0xFFE6_E6E6) }
     /// The gallery's popovers: their glass as it shows over the gallery's dark.
     static var galleryPopover: Color { pick(0xFF21_2121, 0xFFE6_E6E6) }
     static var popoverShadow: Color { pick(0x3800_0000, 0x2400_0000) }
@@ -125,7 +160,7 @@ enum Pc {
     /// A menu's words: white, black on the light interface's menus.
     static var menuInk: Color { pick(0xFFFF_FFFF, 0xFF00_0000) }
     /// The small frosted menus: over the canvas what is behind shows through, blurred.
-    static var glassMenu: Color { pick(0xCF31_3135, 0xFAF0_F0F0) }
+    static var glassMenu: Color { frost(0xCF31_3135, 0xFAF0_F0F0) }
     /// A small menu over a panel: the panel can't show through blurred, so it is nearly solid, grey.
     static var glassMenuOverPanel: Color { pick(0xFA22_2222, 0xFAF0_F0F0) }
     static var glassMenuEdge: Color { pick(0x24FF_FFFF, 0x1400_0000) }
@@ -182,19 +217,33 @@ enum Pc {
 
     // the side bar: the bar and the tracks translucent, each straight over what is behind; the
     // thumbs opaque
-    static var sideBar: Color { pick(0xE717_1717, 0xCFE5_E5E5) }
+    static var sideBar: Color { frost(0xE717_1717, 0xCFE5_E5E5) }
+    // a track: 93 over white along its middle, as measured
     static var sliderTrack: Color {
-        let own = pick(0xC93E_3E3E, 0xBFF0_F0F0)
+        let own = pick(0xD63E_3E3E, 0xBFF0_F0F0)
         return Look.shared.trackOpacity.map { own.opacity(Double(min(max($0, 0), 1))) } ?? own
     }
-    // a lighter rim round each track, more of what is behind showing through it (light 249 over
-    // white)
-    static var sliderRim: Color { pick(0xB96E_6E6E, 0xB9F7_F7F7) }
-    static let sliderRimWidth: CGFloat = 0.8
-    // a hairline round each track's window in the bar, a little darker than the bar (38 against
-    // the dark bar's 45 over white, about 220 against the light bar's 235)
-    static var sliderEdge: Color { pick(0x2800_0000, 0x1000_0000) }
+    /// A track's two ends catch the light (its sides don't): white this strong in each half-point
+    /// band in from an end, a bright rim (192 then 161 over white) fading in to the track's own
+    /// 93 by 8 points, as measured.
+    static let sliderShine: [Double] = [0.611, 0.420, 0.142, 0.105, 0.080, 0.062, 0.049, 0.037, 0.031, 0.025, 0.019, 0.012, 0.012, 0.006, 0.006]
+    // a hairline round each track's window in the bar, darker than the bar: down its sides 18
+    // against the dark bar's 45 over white, across its ends 38; about 220 against the light bar's
+    // 235
+    static var sliderEdgeSide: Color { pick(0x9900_0000, 0x1000_0000) }
+    static var sliderEdgeEnd: Color { pick(0x2900_0000, 0x1000_0000) }
     static let sliderEdgeWidth: CGFloat = 0.5
+
+    /// Down a track `height` tall: `end` along its ends, `side` down its sides, turning from one to
+    /// the other round its corners.
+    static func sliderEnds(_ end: Color, _ side: Color, height: CGFloat) -> Gradient {
+        let flat = min(8 / max(height, 1), 0.5)
+        let round = min(sliderCorner / max(height, 1), 0.5)
+        return Gradient(stops: [
+            .init(color: end, location: 0), .init(color: end, location: flat), .init(color: side, location: round),
+            .init(color: side, location: 1 - round), .init(color: end, location: 1 - flat), .init(color: end, location: 1),
+        ])
+    }
     // white on the light look, as measured
     static var sliderThumb: Color { pick(0xFFA6_A6A6, 0xFFFF_FFFF) }
     /// A value saved on a slider (a notch): mid grey, see-through, so that it shows on either

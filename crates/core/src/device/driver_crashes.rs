@@ -345,6 +345,13 @@ fn update_in(
     write_record(&path, &first, build, &decided.crashes.line());
 }
 
+/// Whether the record `saved` counts a crash in OpenGL ES's driver (under the system it is kept
+/// for): a Vulkan device lost isn't then a reason to go there (see `lost.rs`).
+#[cfg_attr(not(any(target_os = "android", target_os = "ios", test)), allow(dead_code))]
+pub(super) fn opengl_crashed(saved: &str) -> bool {
+    after_build(saved).lines().find_map(Crashes::parse).is_some_and(|c| c.gl > 0)
+}
+
 /// Whether the record `saved` says the app was sent off Vulkan for its driver's crashes, and not
 /// settled back on it as the driver crashing less.
 pub(super) fn vulkan_crashed(saved: &str) -> bool {

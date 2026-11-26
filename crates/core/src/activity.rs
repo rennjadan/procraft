@@ -55,6 +55,35 @@ impl Counts {
     }
 }
 
+/// Sessions alive now (see [`live_sessions`]).
+static LIVE: AtomicU64 = AtomicU64::new(0);
+
+/// How many sessions are alive: made and not yet let go, counting what their own threads still
+/// hold of them (the autosave, a fill, the render thread). With no artwork open and none being
+/// made, exported or previewed, none: the apps check it once a canvas is left, as a session kept
+/// alive keeps all its state (its brushes, its document) for as long as the app runs.
+#[uniffi::export]
+pub fn live_sessions() -> u64 {
+    LIVE.load(Ordering::Relaxed)
+}
+
+/// One session alive while this is: kept in the session's shared state, so it counts until the
+/// last of whatever holds that state lets go.
+pub(crate) struct Alive(());
+
+impl Alive {
+    pub(crate) fn new() -> Alive {
+        LIVE.fetch_add(1, Ordering::Relaxed);
+        Alive(())
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Changes to the session, told to whoever waits for one (the autosave) without the canvas's lock:
 /// a count that moves with each, and whether the session has gone.
 #[derive(Default)]

@@ -152,12 +152,12 @@ impl State {
         self.finish_stroke();
         self.settle();
         self.flush();
-        let steps = |st: &State| st.canvas.as_ref().map_or(0, procraft_gpu::Canvas::steps_made);
+        let steps = |st: &State| st.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
         let before = steps(self);
         if !self.fill_selected() {
             return false;
         }
-        let made = self.canvas.as_ref().and_then(procraft_gpu::Canvas::undo_step).filter(|_| steps(self) > before);
+        let made = self.canvas.as_deref().and_then(procraft_gpu::Canvas::undo_step).filter(|_| steps(self) > before);
         self.drop_selection_with_step(made);
         true
     }

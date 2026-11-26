@@ -110,6 +110,10 @@ extension CanvasModel {
                 return self?.exportCancelled != true
             }
             let unread = lapse.unread
+            // a copy for the folder a plugin keeps them in, if one does
+            if made {
+                _ = PluginsModel.shared.store.videoExported(path: out.path, name: session.name())
+            }
             if made, unread > 0 {
                 // frames left in their place, not left out silently
                 DispatchQueue.main.async {

@@ -386,12 +386,12 @@ impl State {
     /// first if it outgrew the part read for it.
     fn show_pour(&mut self, same_flood: bool) {
         let Some(pour) = self.pour.as_mut() else { return };
-        if pour.show(self.canvas.as_mut(), same_flood).is_ok() {
+        if pour.show(self.canvas.as_deref_mut(), same_flood).is_ok() {
             return;
         }
         self.widen_pour();
         if let Some(pour) = self.pour.as_mut() {
-            let _ = pour.show(self.canvas.as_mut(), false);
+            let _ = pour.show(self.canvas.as_deref_mut(), false);
         }
     }
 
@@ -941,7 +941,7 @@ impl CanvasSession {
             let st = &mut *guard;
             if let (Some(pour), Some(closed)) = (st.pour.as_mut(), closed) {
                 pour.closed = Some(closed);
-                let _ = pour.show(st.canvas.as_mut(), false);
+                let _ = pour.show(st.canvas.as_deref_mut(), false);
             }
             end_pour(&shared, st, true, name.as_deref());
             drop(guard);

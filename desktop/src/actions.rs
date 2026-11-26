@@ -316,6 +316,7 @@ fn plugin_placed_rows(showing: &Showing) -> Vec<Row> {
         ),
         PluginControl::File { control } => Row::Button(kept_label(&control.label), None, None),
         PluginControl::Texture { control } => Row::Button(kept_label(&control.label), None, None),
+        PluginControl::Folder { control } => Row::Button(kept_label(&control.label), None, None),
     });
     let actions = showing.plugin_actions.iter().map(|action| Row::Button(kept_label(&action.label), None, None));
     // each by its place, as far as a number counts
@@ -668,7 +669,7 @@ impl Actions {
                 let to = plugin_slider_choice(control.clone(), next);
                 prefs.plugins.set_slider(control.key.clone(), to).is_some()
             }
-            PluginControl::File { .. } | PluginControl::Texture { .. } => false,
+            PluginControl::File { .. } | PluginControl::Texture { .. } | PluginControl::Folder { .. } => false,
         };
         changed.then_some(Act::Prefs)
     }
@@ -1500,7 +1501,10 @@ fn feature_head_height(painter: &Painter, feature: &procraft_core::PluginFeature
 /// How tall `control` is as a card's row, its line above it with it.
 fn control_height(control: &PluginControl) -> f32 {
     match control {
-        PluginControl::Switch { .. } | PluginControl::File { .. } | PluginControl::Texture { .. } => 1.0 + ROW_HEIGHT,
+        PluginControl::Switch { .. }
+        | PluginControl::File { .. }
+        | PluginControl::Texture { .. }
+        | PluginControl::Folder { .. } => 1.0 + ROW_HEIGHT,
         PluginControl::Slider { control } if !plugin_slider_choices(control.clone()).is_empty() => 1.0 + ROW_HEIGHT,
         PluginControl::Slider { .. } => 1.0 + SLIDE_HEIGHT,
     }
@@ -1544,7 +1548,9 @@ fn plugin_height(painter: &Painter, plugin: &PluginInfo, width: f32) -> f32 {
             let rows: f32 = f.controls.iter().map(control_height).sum();
             if f.control.on { rows + f.actions.len() as f32 * (1.0 + ROW_HEIGHT) } else { 0.0 }
         };
-        plugin.features.iter().map(|f| 1.0 + feature_head_height(painter, f, width) + under(f)).sum()
+        // its own controls at the top (a folder of the whole plugin's), then each feature
+        let top: f32 = plugin.top.iter().map(control_height).sum();
+        top + plugin.features.iter().map(|f| 1.0 + feature_head_height(painter, f, width) + under(f)).sum::<f32>()
     };
     let rows = card_rows(plugin).len() as f32 * (1.0 + ROW_HEIGHT);
     PLUGIN_HEAD + said.size().y + problem + PLUGIN_FOOT + controls + rows
@@ -1591,6 +1597,12 @@ fn plugin_card(
     let line = |y: f32| Rect::from_min_size(pos2(area.left(), y), vec2(width, 1.0));
     let mut changed = false;
     if controls_show(plugin) && !plugin.features.is_empty() {
+        // its own, under none of its features (a folder of the whole plugin's)
+        for (i, control) in plugin.top.iter().enumerate() {
+            painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
+            y += 1.0;
+            changed |= card_control(ui, &painter, area, &mut y, (g, 90 + i), control, plugins, moved, choice, textures);
+        }
         // made of features: each a heading with its switch, what comes under it while it is on
         for (f, feature) in plugin.features.iter().enumerate() {
             painter.rect_filled(line(y), 0, argb(ACTIONS_SEPARATOR));
@@ -1739,6 +1751,43 @@ fn card_control(
             text(painter, right, Align2::RIGHT_CENTER, &shown, 17.0, Weight::Regular, argb(pc::ACCENT));
             if ui.interact(cell, ui.scope_id().with(("plugin texture", g, i)), Sense::click()).clicked() {
                 *textures = Some(control.key.clone());
+            }
+            *y += ROW_HEIGHT;
+        }
+        PluginControl::Folder { control } => {
+            // its label; the folder's name and Clear, or Choose; a click picks another
+            let cell = Rect::from_min_size(pos2(area.left(), *y), vec2(width, ROW_HEIGHT));
+            let at = pos2(cell.left() + 16.0, cell.center().y);
+            text(painter, at, Align2::LEFT_CENTER, &control.label, 17.0, Weight::Regular, argb(ACTIONS_ROW));
+            let right = pos2(cell.right() - 16.0, cell.center().y);
+            let clear = control.chosen.as_ref().map(|chosen| {
+                let clear =
+                    text(painter, right, Align2::RIGHT_CENTER, "Clear", 17.0, Weight::Regular, argb(pc::ACCENT));
+                let shown: String = if chosen.chars().count() > 28 {
+                    chosen.chars().take(27).chain(['\u{2026}']).collect()
+                } else {
+                    chosen.clone()
+                };
+                let name_at = pos2(clear.left() - 12.0, cell.center().y);
+                text(painter, name_at, Align2::RIGHT_CENTER, &shown, 15.0, Weight::Regular, argb(SLIDE_VALUE));
+                clear
+            });
+            if clear.is_none() {
+                text(painter, right, Align2::RIGHT_CENTER, "Choose", 17.0, Weight::Regular, argb(pc::ACCENT));
+            }
+            let response = ui.interact(cell, ui.scope_id().with(("plugin folder", g, i)), Sense::click());
+            if response.clicked() {
+                let on_clear =
+                    clear.zip(response.interact_pointer_pos()).is_some_and(|(c, at)| c.expand(8.0).contains(at));
+                if on_clear {
+                    changed |= plugins.clear_file(control.key.clone());
+                } else if let Some((location, name)) = crate::files::pick_plugin_folder(&control.label) {
+                    if plugins.set_folder(control.key.clone(), location, name) {
+                        changed = true;
+                    } else {
+                        crate::files::say("This folder couldn't be used.");
+                    }
+                }
             }
             *y += ROW_HEIGHT;
         }
@@ -3345,6 +3394,7 @@ mod tests {
     fn a_plugin_nothing_answers_to_draws_and_does_nothing() {
         let stranger = PluginInfo {
             features: Vec::new(),
+            top: Vec::new(),
             brush_controls: Vec::new(),
             actions: Vec::new(),
             kinds: Vec::new(),

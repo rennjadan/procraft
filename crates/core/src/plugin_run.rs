@@ -104,7 +104,13 @@
 //!   floating panels are laid out: `part` 0 how near (points, 0 to 64) a panel comes to an edge or
 //!   another before it snaps to it, 1 whether panels fold to a tab (1) or not (0), 2 whether panels
 //!   docked against the window's edges take that room from the drawing area (1) or not (0), 3
-//!   whether the interface's bars may be moved (1) or not (0); below 0 to leave it as it is.
+//!   whether the interface's bars may be moved (1) or not (0), 4 whether the Tool Belt shows (1)
+//!   or not (0); below 0 to leave it as it is.
+//! - `procraft_artwork_saved() -> i32`, `procraft_video_exported() -> i32` and
+//!   `procraft_gallery_opened() -> i32`: for the hooks `artwork_saved`, `video_exported` and
+//!   `gallery_opened` (interface 22), the place in its `controls` of a `folder` control: the folder
+//!   an artwork just saved is kept in as a package, the folder a time-lapse video just exported is
+//!   put in too, and the folder whose packages come into the gallery as it opens; -1 for none.
 //! - `procraft_colour_panel(part: i32) -> i32`: for the hook `colour_panel` (interface 12), whether
 //!   the colour panel does `part` of what it may (not 0 for yes): 0 its sliders step one unit at a
 //!   tap on either end, 1 its swatch shows the colour as the panel opened beside the colour now.
@@ -309,6 +315,9 @@ const LAYER_LABEL: &str = "procraft_layer_label";
 const SURROUND_PICTURE: &str = "procraft_surround_picture";
 const SLIDER_LOOK: &str = "procraft_slider_look";
 const PANEL_LAYOUT: &str = "procraft_panel_layout";
+const ARTWORK_SAVED: &str = "procraft_artwork_saved";
+const VIDEO_EXPORTED: &str = "procraft_video_exported";
+const GALLERY_OPENED: &str = "procraft_gallery_opened";
 const COLOUR_PANEL: &str = "procraft_colour_panel";
 const STROKE_FILL: &str = "procraft_stroke_fill";
 const CURVE_BEGIN: &str = "procraft_curve_begin";
@@ -484,6 +493,12 @@ pub(crate) enum Hook {
     ViewDimOthers,
     /// How the floating panels are laid out: snapped, folded, making room (interface 20).
     PanelLayout,
+    /// The folder an artwork just saved is kept in, as a package (interface 22).
+    ArtworkSaved,
+    /// The folder a time-lapse video just exported is put in too (interface 22).
+    VideoExported,
+    /// The folder whose packages come into the gallery as it opens (interface 22).
+    GalleryOpened,
 }
 
 impl Hook {
@@ -527,6 +542,9 @@ impl Hook {
             "colour_panel" => Some(Hook::ColourPanel),
             "view_dim_others" => Some(Hook::ViewDimOthers),
             "panel_layout" => Some(Hook::PanelLayout),
+            "artwork_saved" => Some(Hook::ArtworkSaved),
+            "video_exported" => Some(Hook::VideoExported),
+            "gallery_opened" => Some(Hook::GalleryOpened),
             _ => None,
         }
     }
@@ -574,6 +592,9 @@ impl Hook {
             Hook::ColourPanel => "This plugin can change how the colour panel's sliders and swatch work.",
             Hook::ViewDimOthers => "This plugin can dim the layers but the one you're on, on the screen alone.",
             Hook::PanelLayout => "This plugin can snap, fold and dock the floating panels.",
+            Hook::ArtworkSaved => "This plugin can keep a copy of each artwork you save in a folder you pick.",
+            Hook::VideoExported => "This plugin can put the time-lapse videos you export in a folder you pick.",
+            Hook::GalleryOpened => "This plugin can bring artworks from a folder you pick into your gallery.",
         }
     }
 
@@ -620,6 +641,9 @@ impl Hook {
             Hook::ColourPanel => exports(module, COLOUR_PANEL, &[ValType::I32], &[ValType::I32]),
             Hook::ViewDimOthers => exports(module, VIEW_DIM_OTHERS, &[], &[ValType::F32]),
             Hook::PanelLayout => exports(module, PANEL_LAYOUT, &[ValType::I32], &[ValType::F32]),
+            Hook::ArtworkSaved => exports(module, ARTWORK_SAVED, &[], &[ValType::I32]),
+            Hook::VideoExported => exports(module, VIDEO_EXPORTED, &[], &[ValType::I32]),
+            Hook::GalleryOpened => exports(module, GALLERY_OPENED, &[], &[ValType::I32]),
             Hook::OpacityTogether => exports(module, OPACITY_TOGETHER, &[], &[ValType::I32]),
             Hook::RandomiseBrush => exports(module, RANDOMISE, &[ValType::I32, ValType::I32], &[ValType::F32]),
             Hook::ColourTriangle => exports(module, COLOUR_TRIANGLE, &[], &[ValType::I32]),
@@ -1124,6 +1148,9 @@ pub(crate) struct Running {
     colour_panel: Option<TypedFunc<i32, i32>>,
     view_dim_others: Option<TypedFunc<(), f32>>,
     panel_layout: Option<TypedFunc<i32, f32>>,
+    /// The folders it names when an artwork is saved, a time-lapse video exported and the gallery
+    /// opened, in that order (interface 22).
+    folders: [Option<TypedFunc<(), i32>>; 3],
     curve: Option<CurveCalls>,
     stroke_sound: Option<SoundCall>,
     sound_prepare: Option<TypedFunc<i32, i32>>,
@@ -1288,6 +1315,8 @@ impl Running {
             let colour_panel = instance.get_typed_func(&store, COLOUR_PANEL).ok();
             let view_dim_others = instance.get_typed_func(&store, VIEW_DIM_OTHERS).ok();
             let panel_layout = instance.get_typed_func(&store, PANEL_LAYOUT).ok();
+            let folders =
+                [ARTWORK_SAVED, VIDEO_EXPORTED, GALLERY_OPENED].map(|name| instance.get_typed_func(&store, name).ok());
             let curve = (|| {
                 Some(CurveCalls {
                     begin: instance.get_typed_func(&store, CURVE_BEGIN).ok()?,
@@ -1403,6 +1432,7 @@ impl Running {
                 colour_panel,
                 view_dim_others,
                 panel_layout,
+                folders,
                 curve,
                 stroke_sound,
                 sound_prepare,
@@ -2615,6 +2645,29 @@ impl Running {
             _ if said.is_nan() || said > most => Err(Stop::Nonsense),
             _ if said < 0.0 => Ok(None),
             _ => Ok(Some(said)),
+        }
+    }
+
+    /// The place in its controls of the folder it names on `hook` ([`Hook::ArtworkSaved`],
+    /// [`Hook::VideoExported`] or [`Hook::GalleryOpened`], interface 22); none for none (below 0),
+    /// or for another hook. One past its 64 controls stops it.
+    pub(crate) fn folder(&mut self, hook: Hook) -> Result<Option<u32>, Stop> {
+        let at = match hook {
+            Hook::ArtworkSaved => 0,
+            Hook::VideoExported => 1,
+            Hook::GalleryOpened => 2,
+            _ => return Ok(None),
+        };
+        let Running { store, folders, .. } = self;
+        let Some(Some(call)) = folders.get(at) else { return Ok(None) };
+        let said = guarded(|| {
+            store.set_fuel(SAMPLE_FUEL).map_err(|_| Stop::Damaged)?;
+            call.call(&mut *store, ()).map_err(|e| stop_of(&e))
+        })?;
+        match said {
+            _ if said < 0 => Ok(None),
+            0..=63 => Ok(u32::try_from(said).ok()),
+            _ => Err(Stop::Nonsense),
         }
     }
 

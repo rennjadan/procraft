@@ -22,11 +22,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Instant;
 
-/// The log, and the run before's, in the app's own folder.
-const LOG: &str = "procraft.log";
-const PREVIOUS_LOG: &str = "procraft-previous.log";
+/// The log, and the run before's, in the app's own folder (the desktop app's own log has the same
+/// names).
+pub(crate) const LOG: &str = "procraft.log";
+pub(crate) const PREVIOUS_LOG: &str = "procraft-previous.log";
 /// The log of a run that closed while it opened an artwork, kept while the open marks name it.
-const CRASHED_LOG: &str = "procraft-crashed.log";
+pub(crate) const CRASHED_LOG: &str = "procraft-crashed.log";
 
 /// How large a log grows, bytes.
 const MOST: usize = 1 << 20;
@@ -163,15 +164,26 @@ pub fn write_log_to_share(dir: String, to: String) -> bool {
     crate::storage::write(to, text).map_err(|e| log::warn!("the log to share: {e}")).is_ok()
 }
 
-/// The line a log begins with: the run (process) it is of.
-fn process_line(run: u32) -> String {
+/// The line a log begins with: the run (process) it is of. (The desktop app's log has one where
+/// each run's part begins: a start it makes itself goes on in the same log.)
+pub fn process_line(run: u32) -> String {
     format!("process {run}\n")
 }
 
 /// The run a log is of, by its first line; none for a log from before logs said.
 fn process_of(log: &[u8]) -> Option<u32> {
     let first = log.split(|&b| b == b'\n').next()?;
-    std::str::from_utf8(first).ok()?.trim().strip_prefix("process ")?.parse().ok()
+    process_in(std::str::from_utf8(first).ok()?)
+}
+
+/// The run (process) `line` names, if it is the line a run's part of a log begins with.
+pub(crate) fn process_in(line: &str) -> Option<u32> {
+    line.trim().strip_prefix("process ")?.parse().ok()
+}
+
+/// The runs a log is of, by the lines their parts begin with.
+pub(crate) fn processes_of(log: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    log.split(|&b| b == b'\n').filter_map(|line| process_in(std::str::from_utf8(line).ok()?))
 }
 
 /// Keeps the run before's log apart as [`CRASHED_LOG`] when that run closed while it opened an
@@ -185,10 +197,11 @@ pub(crate) fn keep_log_of_ended_runs(ended: &[u32]) {
     }
 }
 
-fn keep_ended_in(dir: &Path, ended: &[u32]) {
+/// [`keep_log_of_ended_runs`] for the logs in `dir`, any of whose runs may be one that closed.
+pub(crate) fn keep_ended_in(dir: &Path, ended: &[u32]) {
     let crashed = dir.join(CRASHED_LOG);
     if let Ok(before) = fs::read(dir.join(PREVIOUS_LOG))
-        && process_of(&before).is_some_and(|run| ended.contains(&run))
+        && processes_of(&before).any(|run| ended.contains(&run))
     {
         let written = crate::project::write_atomically(&crashed, |p| {
             crate::storage::write(p, &before).map_err(|e| crate::project::file_error("keeping the log", e))
@@ -198,7 +211,11 @@ fn keep_ended_in(dir: &Path, ended: &[u32]) {
         }
         return;
     }
-    if fs::read(&crashed).ok().and_then(|log| process_of(&log)).is_some_and(|run| !ended.contains(&run)) {
+    let not_named = |log: &[u8]| {
+        let mut runs = processes_of(log).peekable();
+        runs.peek().is_some() && !runs.any(|run| ended.contains(&run))
+    };
+    if fs::read(&crashed).is_ok_and(|log| not_named(&log)) {
         let _ = fs::remove_file(&crashed);
     }
 }
@@ -894,6 +911,25 @@ mod tests {
         // a log from before logs said their run is never taken for one that closed
         fs::write(dir.join(PREVIOUS_LOG), "no process line\n").unwrap();
         keep_ended_in(&dir, &[7]);
+        assert!(!dir.join(CRASHED_LOG).exists());
+        fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+    }
+
+    /// The desktop's log goes on in the same file after a start the app made itself, each run's
+    /// part beginning with its process: kept apart as well when a later run in it closed.
+    #[test]
+    fn a_log_whose_later_run_closed_opening_an_artwork_is_kept_too() {
+        let dir = folder("crashed-again");
+        fs::write(dir.join(PREVIOUS_LOG), "process 7\nthe first start\nprocess 8\nopening the artwork\n").unwrap();
+        keep_ended_in(&dir, &[8]);
+        assert_eq!(fs::read(dir.join(CRASHED_LOG)).unwrap(), fs::read(dir.join(PREVIOUS_LOG)).unwrap());
+        assert_eq!(processes_of(&fs::read(dir.join(CRASHED_LOG)).unwrap()).collect::<Vec<_>>(), [7, 8]);
+        // a start later, no longer the run before's but still named: kept
+        fs::write(dir.join(PREVIOUS_LOG), "process 9\n").unwrap();
+        keep_ended_in(&dir, &[8]);
+        assert!(dir.join(CRASHED_LOG).exists());
+        // its artwork opened since: it goes
+        keep_ended_in(&dir, &[]);
         assert!(!dir.join(CRASHED_LOG).exists());
         fs::remove_dir_all(dir.parent().unwrap()).unwrap();
     }

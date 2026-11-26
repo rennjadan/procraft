@@ -21,6 +21,16 @@ const STACK: &str = "Stack";
 /// The stack the gallery's recovery puts what it finds in.
 const RECOVERED: &str = "Recovered Artworks";
 
+/// Held while the gallery's order or its folders are changed, or its order read to be kept, by any
+/// store in the app (the gallery's, and the home screen widget's reading it at the same moment):
+/// one never writes over what another just kept with an older copy, nor takes away a stack another
+/// is putting an artwork in. A thread holding it may take it again.
+static KEEPING: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
+
+fn keeping() -> parking_lot::ReentrantMutexGuard<'static, ()> {
+    KEEPING.lock()
+}
+
 /// A saved artwork: its folder, its name and size, when it was last changed (milliseconds since
 /// 1970), and how many quarter turns clockwise it shows turned by (its thumbnail is kept so), as
 /// its canvas was left.
@@ -352,9 +362,21 @@ impl Importing {
     }
 
     /// The import is whole: its folder is an artwork. (One that fails leaves its note: its folder
-    /// is taken away by the app, or else when the gallery next opens.)
+    /// is taken away by the app, or else when the gallery next opens.) A note that can't be taken
+    /// away at once (something else reading it a moment) is tried again: left, the folder would
+    /// be hidden, then taken away.
     pub(crate) fn done(self) {
-        let _ = fs::remove_file(&self.0);
+        let mut waits = [10, 50, 200].into_iter();
+        loop {
+            match fs::remove_file(&self.0) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    log::warn!("an import's note: {e}");
+                    let Some(ms) = waits.next() else { return };
+                    std::thread::sleep(std::time::Duration::from_millis(ms));
+                }
+                _ => return,
+            }
+        }
     }
 }
 
@@ -430,17 +452,22 @@ fn copy_dir(from: &Path, to: &Path, last: Option<&str>) -> std::io::Result<()> {
 }
 
 /// The artwork in `from` copied to `to`, its own file last (a copy half made isn't an artwork in
-/// the gallery yet) and as recent as the original's (not worked on yet).
+/// the gallery yet) and as recent as the original's (not worked on yet). Noted as being made until
+/// it is whole, as an import is: one the app stopped during is taken away when the gallery next
+/// opens, not left taking room.
 fn copy_artwork(from: &Path, to: &Path) -> std::io::Result<()> {
+    let making = Importing::begin(to);
     // a copy that couldn't be finished (the storage full) goes whole: it would only take room
     copy_dir(from, to, Some(ARTWORK_FILE)).inspect_err(|e| {
         log::warn!("copying an artwork: {e}");
         let _ = fs::remove_dir_all(to);
     })?;
+    crate::project::cut_short::step();
     let when = fs::metadata(from.join(ARTWORK_FILE)).and_then(|m| m.modified());
     if let (Ok(when), Ok(file)) = (when, fs::File::options().write(true).open(to.join(ARTWORK_FILE))) {
         let _ = file.set_modified(when);
     }
+    making.done();
     Ok(())
 }
 
@@ -463,11 +490,18 @@ fn read_artwork(dir: &Path) -> Option<GalleryArtwork> {
     })
 }
 
+/// A first save of the artwork in `dir` cut short once all of it was written, put in place (see
+/// `project::finish_first_save`): not one being imported. True if it was.
+fn finish_first_save(dir: &Path) -> bool {
+    let _keeping = keeping();
+    !dir.join(IMPORTING).exists() && crate::project::finish_first_save(dir)
+}
+
 /// Mends an artwork folder whose artwork file is gone or unreadable from a whole copy a save cut
 /// short left beside it (`artwork.<n>.tmp`, the newest that reads), the unreadable one kept as
 /// `artwork.json.damaged`. True if it reads now.
 fn mend_artwork(dir: &Path) -> bool {
-    if read_artwork(dir).is_some() {
+    if read_artwork(dir).is_some() || (finish_first_save(dir) && read_artwork(dir).is_some()) {
         return true;
     }
     let whole = |p: &Path| {
@@ -497,22 +531,39 @@ fn mend_artwork(dir: &Path) -> bool {
     fs::rename(&left, &file).is_ok() && read_artwork(dir).is_some()
 }
 
+/// Keeps the order of what is in `at`, whole or not at all: each write beside the file under a name
+/// of its own, so two written at once (the gallery and the home screen's widget each reading it)
+/// can't cut each other's short or take the order away; one that fails leaves it as it was.
 fn write_order(at: &Path, order: &[String]) {
-    let file = at.join(ORDER_FILE);
-    let next = at.join(format!("{ORDER_FILE}.new"));
     let text: String = order.iter().map(|n| format!("{n}\n")).collect();
-    if crate::storage::write(&next, text).is_ok() && fs::rename(&next, &file).is_err() {
-        let _ = fs::remove_file(&file);
-        let _ = fs::rename(&next, &file);
+    let kept = crate::project::write_atomically(&at.join(ORDER_FILE), |p| {
+        crate::storage::write(p, &text).map_err(|e| crate::project::file_error("keeping the order", e))
+    });
+    if let Err(e) = kept {
+        log::warn!("{e}");
     }
 }
 
-fn write_stack_name(dir: &Path, name: &str) {
+/// Names the stack in `dir` (written whole); false if it couldn't be.
+fn write_stack_name(dir: &Path, name: &str) -> bool {
     let name = if name.trim().is_empty() { STACK } else { name.trim() };
     let text = serde_json::json!({ "name": name }).to_string();
-    let _ = crate::project::write_atomically(&dir.join(STACK_FILE), |p| {
+    let named = crate::project::write_atomically(&dir.join(STACK_FILE), |p| {
         crate::storage::write(p, &text).map_err(|e| crate::project::file_error("naming the stack", e))
     });
+    named.inspect_err(|e| log::warn!("{e}")).is_ok()
+}
+
+/// A folder in the gallery that is neither an artwork nor a stack but holds artworks: a stack
+/// whose name file went (or never came: the storage full as it was made). Named again, so they
+/// show; not one being made (a copy of a stack, noted until it is whole).
+fn stack_lost_its_name(dir: &Path) -> bool {
+    let _keeping = keeping();
+    !dir.join(STACK_FILE).exists()
+        && !dir.join(ARTWORK_FILE).exists()
+        && !dir.join(IMPORTING).exists()
+        && folders(dir).iter().any(|d| read_artwork(d).is_some())
+        && write_stack_name(dir, STACK)
 }
 
 /// The artworks in the app's own storage.
@@ -543,9 +594,13 @@ impl ArtworkStore {
                 GalleryEntry::Stack { .. } => None,
             })
             .collect();
-        // an empty stack goes away
         if artworks.is_empty() {
-            let _ = fs::remove_dir_all(dir);
+            // an empty stack goes away; not one holding an artwork being made (its folder would come
+            // back without the stack's name file, hidden) or one that can't be read (recovery's)
+            let _keeping = keeping();
+            if folders(dir).is_empty() {
+                let _ = fs::remove_dir_all(dir);
+            }
             return None;
         }
         let json: Option<serde_json::Value> = fs::read(&file).ok().and_then(|b| serde_json::from_slice(&b).ok());
@@ -553,16 +608,31 @@ impl ArtworkStore {
         Some(GalleryEntry::Stack { dir: dir.to_string_lossy().into_owned(), name: name.to_owned(), artworks })
     }
 
-    /// What is in `at` in its order; in the gallery, stacks too.
+    /// What is in `at` in its order; in the gallery, stacks too. What a run of the app that ended
+    /// left whole but hidden is shown again: an artwork whose first save was cut short once all of
+    /// it was written, and a stack whose name file went.
     fn entries(&self, at: &Path) -> Vec<GalleryEntry> {
         let dirs = folders(at);
         let top = at == self.root;
         let read: Vec<GalleryEntry> = dirs
             .iter()
             .filter_map(|d| {
-                read_artwork(d)
-                    .map(|artwork| GalleryEntry::Artwork { artwork })
-                    .or_else(|| if top { self.read_stack(d) } else { None })
+                if let Some(artwork) = read_artwork(d) {
+                    return Some(GalleryEntry::Artwork { artwork });
+                }
+                if top && let Some(stack) = self.read_stack(d) {
+                    return Some(stack);
+                }
+                // (a stack with nothing to show is all it is)
+                if d.join(STACK_FILE).is_file() {
+                    return None;
+                }
+                if finish_first_save(d)
+                    && let Some(artwork) = read_artwork(d)
+                {
+                    return Some(GalleryEntry::Artwork { artwork });
+                }
+                if top && stack_lost_its_name(d) { self.read_stack(d) } else { None }
             })
             .collect();
         let order = Self::order_with(at, &dirs, &read);
@@ -579,6 +649,7 @@ impl ArtworkStore {
 
     /// The order of the folders `dirs` in `at` (`read` those read), kept up to date on disk.
     fn order_with(at: &Path, dirs: &[PathBuf], read: &[GalleryEntry]) -> Vec<String> {
+        let _keeping = keeping();
         let saved: Vec<String> = fs::read_to_string(at.join(ORDER_FILE))
             .map(|t| t.lines().filter(|l| !l.trim().is_empty()).map(str::to_owned).collect())
             .unwrap_or_default();
@@ -605,9 +676,21 @@ impl ArtworkStore {
         order
     }
 
+    /// The artwork folder `new` takes the place of `old` in their folder's order (the two side by
+    /// side, `old` about to go): an artwork brought up to date from a plugin's folder stays where it
+    /// was in the gallery.
+    pub(crate) fn put_in_place_of(&self, old: &Path, new: &Path) {
+        let at = self.parent_of(old);
+        let (old, new) = (name_of(old), name_of(new));
+        let order: Vec<String> =
+            self.order(&at).into_iter().filter(|n| *n != new).map(|n| if n == old { new.clone() } else { n }).collect();
+        write_order(&at, &order);
+    }
+
     /// A new stack in `at` holding `artworks` (moved into it), where `place` was: by default the
     /// first of them, and they keep the gallery's order; with `place`, in the order given.
     fn make_stack(&self, artworks: &[PathBuf], place: Option<&Path>) -> PathBuf {
+        let _keeping = keeping();
         let before = self.order(&self.root);
         let names: Vec<String> = artworks.iter().map(|a| name_of(a)).collect();
         let inside: Vec<String> = if place.is_some() {
@@ -618,8 +701,12 @@ impl ArtworkStore {
         let first = place.map(name_of).or_else(|| inside.first().cloned());
         let at = first.and_then(|f| before.iter().position(|n| *n == f)).unwrap_or(0);
         let dir = self.root.join(fresh_name());
-        let _ = fs::create_dir_all(&dir);
-        write_stack_name(&dir, STACK);
+        // named first: artworks moved into a folder without its name file would be out of sight
+        // (the storage full: no stack, the artworks left where they are)
+        if fs::create_dir_all(&dir).is_err() || !write_stack_name(&dir, STACK) {
+            let _ = fs::remove_dir_all(&dir);
+            return dir;
+        }
         for a in artworks {
             let _ = fs::rename(a, dir.join(name_of(a)));
         }
@@ -664,9 +751,13 @@ impl ArtworkStore {
             .max_by_key(|a| a.modified_ms)
     }
 
-    /// A new, empty folder for an artwork in `folder` (a stack's, or none for the gallery).
+    /// A new, empty folder for an artwork in `folder` (a stack's, or none for the gallery). A stack
+    /// gone meanwhile (emptied, deleted, the app holding on to it) isn't made again without its
+    /// name file, which would hide the artwork: it goes in the gallery.
     pub fn new_folder(&self, folder: Option<String>) -> String {
-        let dir = self.at(folder).join(fresh_name());
+        let _keeping = keeping();
+        let at = self.at(folder.filter(|f| Path::new(f).join(STACK_FILE).is_file()));
+        let dir = at.join(fresh_name());
         let _ = fs::create_dir_all(&dir);
         dir.to_string_lossy().into_owned()
     }
@@ -681,12 +772,12 @@ impl ArtworkStore {
     pub fn duplicate(&self, dir: String) -> String {
         let dir = PathBuf::from(dir);
         let at = self.parent_of(&dir);
-        let before = self.order(&at);
         let copy = at.join(fresh_name());
         if dir.join(STACK_FILE).is_file() {
             // each artwork in a folder of its own name, so no two in the gallery share one; the
-            // stack's own file last: a copy half made isn't a stack in the gallery yet
-            let _ = fs::create_dir_all(&copy);
+            // stack's own file last, and noted as being made until then: a copy half made isn't a
+            // stack in the gallery yet (one the app stopped during is taken away when it next opens)
+            let making = Importing::begin(&copy);
             let inside: Vec<String> = self
                 .order(&dir)
                 .iter()
@@ -697,18 +788,32 @@ impl ArtworkStore {
                 })
                 .collect();
             write_order(&copy, &inside);
-            let _ = fs::copy(dir.join(STACK_FILE), copy.join(STACK_FILE));
-            // none of them copied (the storage full): no empty stack left
-            if inside.is_empty() && !self.order(&dir).is_empty() {
+            let named = || {
+                let file =
+                    fs::read(dir.join(STACK_FILE)).map_err(|e| crate::project::file_error("naming the stack", e));
+                file.and_then(|bytes| {
+                    crate::project::write_atomically(&copy.join(STACK_FILE), |p| {
+                        crate::storage::write(p, &bytes).map_err(|e| crate::project::file_error("naming the stack", e))
+                    })
+                })
+                .inspect_err(|e| log::warn!("{e}"))
+                .is_ok()
+            };
+            // none of them copied, or its name not kept (the storage full): no copy left
+            if inside.is_empty() || !named() {
                 let _ = fs::remove_dir_all(&copy);
                 return copy.to_string_lossy().into_owned();
             }
+            crate::project::cut_short::step();
+            making.done();
         } else if copy_artwork(&dir, &copy).is_err() {
             return copy.to_string_lossy().into_owned();
         }
-        let place = before.iter().position(|n| *n == name_of(&dir)).map_or(0, |i| i + 1);
-        let mut order = before;
-        order.push(name_of(&copy));
+        // right after the original, in the order as it is now (not as it was before the copy, which
+        // a long copy would write over what was kept meanwhile)
+        let _keeping = keeping();
+        let order: Vec<String> = self.order(&at).into_iter().filter(|n| *n != name_of(&copy)).collect();
+        let place = order.iter().position(|n| *n == name_of(&dir)).map_or(0, |i| i + 1);
         write_order(&at, &moved(&order, &name_of(&copy), place as i64));
         copy.to_string_lossy().into_owned()
     }
@@ -717,6 +822,7 @@ impl ArtworkStore {
     /// `into`: the gallery (none) or a stack's folder, by default the one it is in; from a stack
     /// to the gallery, it is taken out of it.
     pub fn move_entry(&self, dir: String, to: i64, into: Option<String>) {
+        let _keeping = keeping();
         let dir = PathBuf::from(dir);
         let into = into.map_or_else(|| self.parent_of(&dir), PathBuf::from);
         if dir.parent() != Some(into.as_path()) && fs::rename(&dir, into.join(name_of(&dir))).is_err() {
@@ -728,6 +834,7 @@ impl ArtworkStore {
     /// The artwork in `dir` (from the gallery) dropped onto `onto`: an artwork makes a stack with
     /// it there, this one first; a stack takes it in first.
     pub fn put_onto(&self, dir: String, onto: String) {
+        let _keeping = keeping();
         let (dir, onto) = (PathBuf::from(dir), PathBuf::from(onto));
         if !onto.join(STACK_FILE).is_file() {
             self.make_stack(&[dir, onto.clone()], Some(&onto));
@@ -772,6 +879,7 @@ impl ArtworkStore {
     /// in the rest and keeps its name; the others go once emptied. With no stack picked it is a
     /// new stack, as `stack` makes. Returns its folder.
     pub fn stack_picked(&self, dirs: Vec<String>) -> String {
+        let _keeping = keeping();
         let order = self.order(&self.root);
         let wanted: Vec<String> =
             dirs.iter().map(PathBuf::from).filter(|d| self.parent_of(d) == self.root).map(|d| name_of(&d)).collect();
@@ -820,6 +928,7 @@ impl ArtworkStore {
     /// artworks whose file is gone or unreadable but which keep a whole one from a save cut short.
     /// Returns how many it found.
     pub fn recover_lost_artworks(&self) -> u32 {
+        let _keeping = keeping();
         let shown: Vec<PathBuf> = self
             .list(None)
             .iter()
@@ -845,10 +954,11 @@ impl ArtworkStore {
             return 0;
         }
         let stack = self.root.join(fresh_name());
-        if fs::create_dir_all(&stack).is_err() {
+        // named first: moved into a folder without its name file, they would be lost again
+        if fs::create_dir_all(&stack).is_err() || !write_stack_name(&stack, RECOVERED) {
+            let _ = fs::remove_dir_all(&stack);
             return 0;
         }
-        write_stack_name(&stack, RECOVERED);
         let moved = lost.iter().filter(|a| fs::rename(a, stack.join(name_of(a))).is_ok()).count();
         // first in the gallery
         let order: Vec<String> = std::iter::once(name_of(&stack)).chain(self.order(&self.root)).collect();
@@ -1101,6 +1211,25 @@ mod tests {
             .collect()
     }
 
+    /// [`shown`] with each stack's artworks in name order (two made in the same moment have no
+    /// order of their own), the entries too.
+    fn shown_sorted(store: &ArtworkStore) -> Vec<String> {
+        let mut entries: Vec<String> = store
+            .list(None)
+            .into_iter()
+            .map(|e| match e {
+                GalleryEntry::Artwork { artwork } => artwork.name,
+                GalleryEntry::Stack { name, artworks, .. } => {
+                    let mut names: Vec<&str> = artworks.iter().map(|a| a.name.as_str()).collect();
+                    names.sort_unstable();
+                    format!("{name}[{}]", names.join(","))
+                }
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
     #[test]
     fn recovery_stacks_artworks_the_gallery_cannot_show() {
         let root = std::env::temp_dir().join(format!("procraft-recover-{}-{}", std::process::id(), fresh_name()));
@@ -1109,32 +1238,45 @@ mod tests {
         // nothing lost: nothing done
         assert_eq!(store.recover_lost_artworks(), 0);
         assert_eq!(shown(&store, None), ["Shown"]);
-        // a stack that lost its name file
+        // whole but hidden, they show again with no recovery: a stack that lost its name file, and
+        // a first save cut short (no artwork file, a whole one beside it all it left)
         let stack = store.stack(vec![artwork(&store, "A", None), artwork(&store, "B", None)]);
         fs::remove_file(Path::new(&stack).join(STACK_FILE)).unwrap();
-        // one kept inside a stack's artwork, too deep to be shown
-        let kept = store.stack(vec![artwork(&store, "Outer", None)]);
-        let outer = store.list(Some(kept.clone()))[0].dir().to_owned();
-        artwork(&store, "Deep", Some(outer));
-        // a first save cut short: no artwork file, a whole one left beside it
         let cut = store.new_folder(None);
         let json = serde_json::json!({ "name": "Cut", "document": { "width": 8, "height": 8 } });
         fs::write(Path::new(&cut).join("artwork.3.tmp"), json.to_string()).unwrap();
+        // one kept inside a stack's artwork, too deep to be shown
+        let kept = store.stack(vec![artwork(&store, "Outer", None)]);
+        let outer = store.list(Some(kept.clone()))[0].dir().to_owned();
+        // (made there by hand: the store makes new folders only in the gallery and its stacks)
+        let deep = Path::new(&outer).join(fresh_name());
+        fs::create_dir_all(&deep).unwrap();
+        let json = serde_json::json!({ "name": "Deep", "document": { "width": 8, "height": 8 } });
+        fs::write(deep.join(ARTWORK_FILE), json.to_string()).unwrap();
+        // one whose artwork file can't be read, a whole one from a save cut short beside it
+        let damaged = artwork(&store, "Damaged", None);
+        let whole = fs::read(Path::new(&damaged).join(ARTWORK_FILE)).unwrap();
+        fs::write(Path::new(&damaged).join("artwork.json.7.tmp"), whole).unwrap();
+        fs::write(Path::new(&damaged).join(ARTWORK_FILE), "{\"name\": \"Dam").unwrap();
         // a save cut short mid-write leaves a part of one: nothing to mend
         let torn = store.new_folder(None);
         fs::write(Path::new(&torn).join("artwork.4.tmp"), "{\"name\": \"Tor").unwrap();
-        let mut before = shown(&store, None);
-        before.sort();
-        assert_eq!(before, ["Shown", "Stack[Outer]"]);
-        assert_eq!(store.recover_lost_artworks(), 4);
+        assert_eq!(shown_sorted(&store), ["Cut", "Shown", "Stack[A,B]", "Stack[Outer]"]);
+        assert_eq!(store.recover_lost_artworks(), 2);
         let after = shown(&store, None);
-        assert_eq!(after.len(), 3);
-        // the stack first, holding them all
+        assert_eq!(after.len(), 5);
+        // the stack first, holding them
         assert!(after[0].starts_with("Recovered Artworks["), "{after:?}");
         let mut found: Vec<&str> =
             after[0].trim_start_matches("Recovered Artworks[").trim_end_matches(']').split(',').collect();
         found.sort_unstable();
-        assert_eq!(found, ["A", "B", "Cut", "Deep"]);
+        assert_eq!(found, ["Damaged", "Deep"]);
+        // the unreadable file kept aside
+        let recovered = store.list(None).into_iter().find_map(|e| match e {
+            GalleryEntry::Stack { artworks, .. } => artworks.into_iter().find(|a| a.name == "Damaged"),
+            GalleryEntry::Artwork { .. } => None,
+        });
+        assert!(Path::new(&recovered.unwrap().dir).join("artwork.json.damaged").is_file());
         assert!(Path::new(&torn).join("artwork.4.tmp").exists());
         let _ = fs::remove_dir_all(&root);
     }

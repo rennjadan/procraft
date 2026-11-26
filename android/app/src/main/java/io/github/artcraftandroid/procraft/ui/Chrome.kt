@@ -97,7 +97,8 @@ private fun Modifier.tap(enabled: Boolean = true, onClick: () -> Unit): Modifier
 /** The bar across the top of the canvas: artwork actions on the left, painting tools on the right. */
 @Composable
 fun TopBar(vm: CanvasViewModel, modifier: Modifier = Modifier) {
-    BoxWithConstraints(modifier.fillMaxWidth().height(Pc.BarHeight).background(Pc.Bar)) {
+    // (a press on the bar between its buttons is the bar's: never a dot on the canvas, nor a colour picked)
+    BoxWithConstraints(modifier.fillMaxWidth().height(Pc.BarHeight).background(Pc.Bar).keepsItsTouches()) {
         val fit = Pc.barFit(maxWidth)
         Row(
             Modifier.align(Alignment.CenterStart).padding(start = fit.margin),
@@ -173,15 +174,57 @@ fun topBarHalfLength(left: Boolean, barWidth: Dp): Dp {
     }
 }
 
+/** How long a moved bar's corners take to turn square or round as it comes to an edge or leaves it. */
+private const val BarCornerMillis = 150
+
 /**
- * Half of the top bar ([left], else the right) where Edit layout moved it: on glass of its own, its buttons in a row,
- * or in a column while [upright] against a side; as long either way ([topBarHalfLength]).
+ * A bar's corners as Edit layout leaves it: [radius] round all round, but square on each side of it against the
+ * window's edges ([sides], the bar's own way up), each easing over as the bar is dragged so none snaps. Top-left,
+ * top-right, bottom-right, bottom-left.
  */
 @Composable
-fun TopBarHalf(vm: CanvasViewModel, left: Boolean, upright: Boolean, barWidth: Dp, modifier: Modifier) {
+internal fun barCorners(sides: io.github.artcraftandroid.procraft.core.BarSides, radius: Dp): List<Dp> {
+    val square = listOf(sides.left || sides.top, sides.top || sides.right, sides.right || sides.bottom, sides.bottom || sides.left)
+    return square.map {
+        androidx.compose.animation.core.animateDpAsState(
+            if (it) 0.dp else radius,
+            androidx.compose.animation.core.tween(BarCornerMillis),
+            label = "bar corner",
+        ).value
+    }
+}
+
+/**
+ * [sides] of a bar as the window has them, as the bar's own: for one drawn lying down by turning it a quarter back
+ * about its top-left (its own left lies at the window's bottom, its top at the left, and so on round).
+ */
+internal fun turnedSides(sides: io.github.artcraftandroid.procraft.core.BarSides): io.github.artcraftandroid.procraft.core.BarSides =
+    io.github.artcraftandroid.procraft.core.BarSides(left = sides.bottom, top = sides.left, right = sides.top, bottom = sides.right)
+
+/** [sides] of a bar against the window's edges as its glass reaches past them, [past] out (none: as a free bar's). */
+internal fun pastEdges(sides: io.github.artcraftandroid.procraft.core.BarSides?, past: Dp, glass: BarGlass): BarGlass =
+    if (sides == null) {
+        glass
+    } else {
+        glass.copy(
+            pastLeft = if (sides.left) past else 0.dp,
+            pastRight = if (sides.right) past else 0.dp,
+            pastBottom = if (sides.bottom) past else 0.dp,
+            pastTop = if (sides.top) past else 0.dp,
+        )
+    }
+
+/**
+ * Half of the top bar ([left], else the right) where Edit layout moved it: on glass of its own, its buttons in a row,
+ * or in a column while [upright] against a side; as long either way ([topBarHalfLength]). Round at its ends, square on
+ * the sides of it against the window's edges ([edges]).
+ */
+@Composable
+fun TopBarHalf(vm: CanvasViewModel, left: Boolean, upright: Boolean, barWidth: Dp, modifier: Modifier, edges: io.github.artcraftandroid.procraft.core.BarSides? = null) {
     val fit = Pc.barFit(barWidth)
     val gap = if (left) fit.actionGap else fit.toolGap
-    val glass = modifier.clip(RoundedCornerShape(Pc.BarHeight / 2)).background(Pc.Bar)
+    val c = barCorners(edges ?: io.github.artcraftandroid.procraft.core.BarSides(left = false, top = false, right = false, bottom = false), Pc.BarHeight / 2)
+    val glass = modifier.clip(RoundedCornerShape(c[0], c[1], c[2], c[3])).background(Pc.Bar).keepsItsTouches()
     if (upright) {
         androidx.compose.foundation.layout.Column(
             glass.size(Pc.BarHeight, topBarHalfLength(left, barWidth)).padding(vertical = TopBarHalfEnd),
@@ -269,10 +312,22 @@ internal fun sideBarBody(width: Float, stretch: Float, right: Boolean): Pair<Flo
  * button, opacity, undo and redo, its tracks [trackHeight] long. On the right everything is
  * mirrored but the glyphs. Stretched [stretch] toward the finger (its modify button dragged out),
  * it is placed that far out by its caller and its glass reaches back as far: its edge side stays
- * against the window's edge (see [sideBarBody]).
+ * against the window's edge (see [sideBarBody]). Moved by Edit layout, it is square only on the sides of it against the
+ * window's edges ([edges], its own way up), and round all round away from them. [turn] slides it into its side or lays
+ * it down: its glass goes with it (what [modifier] does, as it slides out of sight, the glass follows by [shown]).
  */
 @Composable
-fun SideBar(vm: CanvasViewModel, modifier: Modifier = Modifier, right: Boolean = false, trackHeight: Dp = Pc.SliderHeight, shown: Float = 1f, stretch: Dp = 0.dp) {
+fun SideBar(
+    vm: CanvasViewModel,
+    modifier: Modifier = Modifier,
+    turn: Modifier = Modifier,
+    right: Boolean = false,
+    trackHeight: Dp = Pc.SliderHeight,
+    shown: Float = 1f,
+    stretch: Dp = 0.dp,
+    edges: io.github.artcraftandroid.procraft.core.BarSides? = null,
+    glassEdges: io.github.artcraftandroid.procraft.core.BarSides? = edges,
+) {
     // a control's left edge, mirrored on the right
     fun x(left: Dp, width: Dp) = if (right) Pc.SideBarWidth - left - width else left
     // shorter tracks bring what is under each up with them
@@ -284,12 +339,15 @@ fun SideBar(vm: CanvasViewModel, modifier: Modifier = Modifier, right: Boolean =
     // its glass goes past the screen's edge (to take that side's corners off the screen), the
     // further for its stretch
     val past = Pc.SideBarCorner + stretch.coerceAtLeast(0.dp)
-    val body = BarGlass(shown, moved, pastLeft = if (right) 0.dp else past, pastRight = if (right) past else 0.dp)
+    // (its frost by the window's sides it touches: lying down, its own are turned)
+    val body = pastEdges(glassEdges, past, BarGlass(shown, moved, pastLeft = if (right) 0.dp else past, pastRight = if (right) past else 0.dp))
+    val corners = edges?.let { barCorners(it, Pc.SideBarCorner) }
     // the tracks' own thin glass, unless a plugin has them frosted as the bar is (which the bar's
     // glass under them is already)
     val track = BarGlass(shown, moved, window = true).takeIf { Pc.sliderLook.frosted != true }
     Box(
-        Modifier.then(rememberFrost(Pc.SideBarCorner, body)).then(modifier).size(Pc.SideBarWidth, Pc.SideBarHeight - shorter * 2)
+        // (its glass where it is drawn: laid down, across, not standing where it was laid out)
+        turn.then(rememberFrost(Pc.SideBarCorner, body)).then(modifier).size(Pc.SideBarWidth, Pc.SideBarHeight - shorter * 2)
             // a touch on it keeps a slider's panel up
             .onGloballyPositioned { vm.sideBarOnWindow = it.boundsInWindow() }
             .drawBehind {
@@ -306,9 +364,13 @@ fun SideBar(vm: CanvasViewModel, modifier: Modifier = Modifier, right: Boolean =
                     // square against the screen's edge, reaching back to it however it is stretched
                     val (left, rightSide) = sideBarBody(size.width, stretch.toPx(), right)
                     val (edge, outer) = CornerRadius.Zero to CornerRadius(r)
+                    val each = corners?.map { CornerRadius(it.toPx()) }
                     addRoundRect(
-                        if (right) RoundRect(left, 0f, rightSide, size.height, outer, edge, edge, outer)
-                        else RoundRect(left, 0f, rightSide, size.height, edge, outer, outer, edge),
+                        when {
+                            each != null -> RoundRect(left, 0f, rightSide, size.height, each[0], each[1], each[2], each[3])
+                            right -> RoundRect(left, 0f, rightSide, size.height, outer, edge, edge, outer)
+                            else -> RoundRect(left, 0f, rightSide, size.height, edge, outer, outer, edge)
+                        },
                     )
                     windows.forEach { addRoundRect(it) }
                 }

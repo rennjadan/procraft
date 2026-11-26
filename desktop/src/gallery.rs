@@ -220,6 +220,8 @@ pub struct Gallery {
     pub store: Arc<ArtworkStore>,
     /// The page dragged and flicked by a finger or the pen, as on a tablet.
     glide: Glide,
+    /// What a plugin brings in from its folder as the gallery opens, brought on a thread of its own.
+    bringing: Option<std::thread::JoinHandle<procraft_core::FolderBroughtIn>>,
     entries: Vec<GalleryEntry>,
     /// The stack open: its folder and name.
     stack: Option<(String, String)>,
@@ -391,6 +393,7 @@ impl Gallery {
         let presets = presets_from_json(std::fs::read_to_string(presets_path()).ok());
         let mut gallery = Gallery {
             store,
+            bringing: None,
             entries: Vec::new(),
             stack: None,
             thumbs: HashMap::new(),
@@ -445,6 +448,40 @@ impl Gallery {
         };
         gallery.refresh();
         gallery
+    }
+
+    /// The gallery shows: what a plugin brings in from its folder comes in, on a thread of its own
+    /// (one at a time). With no plugin bringing anything in, nothing happens.
+    pub fn bring_in(&mut self, plugins: &Arc<procraft_core::Plugins>) {
+        if self.bringing.is_some() {
+            return;
+        }
+        let (plugins, store) = (Arc::clone(plugins), Arc::clone(&self.store));
+        let started =
+            std::thread::Builder::new().name("bringing in".into()).spawn(move || plugins.gallery_opened(store));
+        match started {
+            Ok(thread) => self.bringing = Some(thread),
+            Err(e) => log::error!("bringing artworks in from a folder: {e}"),
+        }
+    }
+
+    /// Whether artworks are being brought in from a plugin's folder (the gallery looks again soon).
+    pub fn bringing_in(&self) -> bool {
+        self.bringing.is_some()
+    }
+
+    /// Once what a plugin brought in from its folder is in: the gallery read again if anything came,
+    /// and what to tell once (a folder out of reach).
+    pub fn brought(&mut self) -> Option<String> {
+        if !self.bringing.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {
+            return None;
+        }
+        let brought = self.bringing.take()?.join().ok()?;
+        if brought.added + brought.updated + brought.copies > 0 {
+            self.thumbs.clear();
+            self.refresh();
+        }
+        brought.notice
     }
 
     /// Reads what is in the gallery (or the stack open) again.

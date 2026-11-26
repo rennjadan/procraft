@@ -8,8 +8,9 @@ use egui::{Align2, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui
 use std::sync::Arc;
 
 use procraft_core::{
-    CanvasSession, ColourHistory, ColourModel, ColourPlace, HueControl, Palettes, Plugins, SLIDER_HUES, colours_in_p3,
-    harmony_wheel, hue_at, hue_position, oklab_of, oklab_slid, oklab_to_rgb, oklab_tracks, p3_hsv_of, p3_hsv_to_rgb,
+    CanvasSession, ColourHistory, ColourModel, ColourPlace, HueControl, KeptColours, Palettes, Plugins, SLIDER_HUES,
+    colours_in_p3, harmony_wheel, hue_at, hue_position, oklab_of, oklab_slid, oklab_to_rgb, oklab_tracks, p3_hsv_of,
+    p3_hsv_to_rgb,
 };
 
 use crate::colour_drop::{ColourDrop, Touch};
@@ -251,6 +252,9 @@ pub struct Colours {
     pub secondary: [f32; 3],
     /// The colours painted with lately, kept by the shared core (each canvas adds to it).
     pub history: Arc<ColourHistory>,
+    /// The brush colour, the masks' and the second colour as last left, kept by the shared core in
+    /// their file as they change (see [`Colours::keep`]).
+    kept: Arc<KeptColours>,
     /// The palettes, kept by the shared core (the default one shows here).
     pub palettes: Arc<Palettes>,
     pickers: Pickers,
@@ -318,13 +322,21 @@ pub struct Colours {
 
 impl Default for Colours {
     fn default() -> Colours {
-        let kept = crate::files::kept_colours().unwrap_or(([0.59, 1.0, 1.0], [0.0; 3]));
+        // kept from one run to the next (a test's colours leave the file be)
+        let kept = if cfg!(test) {
+            KeptColours::new()
+        } else {
+            KeptColours::open(crate::files::app_dir().join("colour").to_string_lossy().into_owned())
+        };
+        let three = |c: Vec<f32>| <[f32; 3]>::try_from(c).ok();
         Colours {
             // as last left, else the blue a first start has (as Android's)
-            hsv: kept.0,
-            other: kept.1,
+            hsv: three(kept.brush()).unwrap_or(procraft_core::FIRST_BRUSH_COLOUR),
+            other: three(kept.mask()).unwrap_or(procraft_core::FIRST_MASK_COLOUR),
+            // as last left, else white (a first start's)
+            secondary: three(kept.second()).unwrap_or(procraft_core::FIRST_SECOND_COLOUR),
+            kept,
             on_mask: false,
-            secondary: [1.0, 1.0, 1.0],
             // kept from one run to the next, as the palettes are (a test's strokes leave the
             // file be)
             history: if cfg!(test) {
@@ -638,6 +650,15 @@ impl Colours {
     /// The brush colour and masks', whichever is in use.
     pub fn brush_and_mask(&self) -> ([f32; 3], [f32; 3]) {
         if self.on_mask { (self.other, self.hsv) } else { (self.hsv, self.other) }
+    }
+
+    /// The brush colour, the masks' and the second colour kept for the next start, told every
+    /// frame: the core writes them as they change (soon, off this thread), so a run ended any way
+    /// at all keeps them.
+    pub fn keep(&self) {
+        let (brush, mask) = self.brush_and_mask();
+        self.kept.keep(brush.to_vec(), mask.to_vec());
+        self.kept.keep_second(self.secondary.to_vec());
     }
 
     pub fn send(&self, session: &CanvasSession) {
@@ -2498,6 +2519,22 @@ mod tests {
             let back = hue_at(HueControl::Slider, hue_position(HueControl::Slider, hue));
             assert!((back - hue).abs() < 1e-3, "{hue} came back {back}");
         }
+    }
+
+    #[test]
+    fn the_second_colour_swapped_in_is_kept_for_the_next_start() {
+        let session = CanvasSession::new(64, 64);
+        let mut colours = Colours::default();
+        assert_eq!(colours.secondary, [1.0, 1.0, 1.0], "white at first");
+        colours.set_rgb(&session, 0xFF0000);
+        colours.swap(&session);
+        assert_eq!(colours.secondary, [1.0, 0.0, 0.0]);
+        // told with the others each frame
+        colours.keep();
+        assert_eq!(colours.kept.second(), vec![1.0, 0.0, 0.0]);
+        colours.swap(&session);
+        colours.keep();
+        assert_eq!(colours.kept.second(), vec![1.0, 1.0, 1.0]);
     }
 
     #[test]

@@ -204,6 +204,18 @@ fn every_shader_translates_for_opengl_es_3_1_and_3_2() {
     assert!(too_many.is_empty(), "more storage buffers than OpenGL ES has:\n{}", too_many.join("\n"));
 }
 
+/// The shaders copies are drawn with where they are (see `stale.rs`), of floats and of unsigned
+/// integers, translate for GLSL ES 3.10 and 3.20 as well.
+#[test]
+fn the_drawn_copies_shaders_translate_for_opengl_es_3_1_and_3_2() {
+    let mut all = translate("drawn copy of floats", &crate::stale::drawn_copy_source(false));
+    all.extend(translate("drawn copy of unsigned integers", &crate::stale::drawn_copy_source(true)));
+    assert_eq!(all.len(), 4, "two entry points each");
+    let failed: Vec<String> =
+        all.iter().flat_map(|t| t.failed.iter().map(move |why| format!("{}: {why}", t.entry))).collect();
+    assert!(failed.is_empty(), "failed for OpenGL ES:\n{}", failed.join("\n"));
+}
+
 /// The canvases' pipelines on a device held to the storage buffers an OpenGL ES device has (8 a
 /// stage) are made without an error, compute passes and all (a layout asking for more fails).
 #[test]

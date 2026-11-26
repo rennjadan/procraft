@@ -158,8 +158,8 @@ final class HeldLayers: NSObject, UIGestureRecognizerDelegate {
 }
 
 /// Sees every touch on the window without taking any: which are down and where, and the moves and
-/// ends of each, for the one holding layers.
-private final class TouchWatcher: UIGestureRecognizer {
+/// ends of each, for the one holding layers (or dragging brushes in the library).
+final class TouchWatcher: UIGestureRecognizer {
     private var down: [UITouch] = []
     var onMove: (UITouch) -> Void = { _ in }
     var onEnd: (UITouch, Bool) -> Void = { _, _ in }

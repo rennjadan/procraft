@@ -11,7 +11,7 @@ use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, TextureHandle,
 use procraft_core::{
     CanvasSession, ReferenceShows, ReferenceSizes, ReferenceView, ReferenceWindowState, ThumbnailImage,
     reference_canvas_side, reference_picture_point, reference_picture_rect, reference_picture_size,
-    reference_view_pinched, reference_window_fitted, reference_window_size,
+    reference_view_pinched, reference_window_first_size, reference_window_fitted, reference_window_size,
 };
 
 use crate::icons;
@@ -40,9 +40,11 @@ const BARS_SLIDE: f32 = 0.3;
 const SECOND_CLICK: Duration = Duration::from_millis(300);
 /// How many pixels a picture's longer side has as the bars' glass: drawn back up, that's its blur.
 const GLASS_SIDE: usize = 24;
-/// Its picture's size at first, and how far up from the screen's bottom it first sits.
+/// Its picture's size before an artwork gives it its first (see `reference_window_first_size`), and
+/// how far above the screen's bottom its top first is, whatever the canvas's shape: where a
+/// screen-shaped canvas's (532 tall with its bars) has it, 50 above the bottom.
 const START: Vec2 = Vec2 { x: 350.0, y: 423.0 };
-const ABOVE_BOTTOM: f32 = 50.0;
+const FIRST_TOP: f32 = 50.0 + 532.0;
 /// How far down and right of the window it is opened from another window opens (points).
 const ANOTHER_STEP: f32 = 24.0;
 /// The canvas is read again at most this often while it changes (at the size the window shows it:
@@ -196,6 +198,9 @@ pub struct Reference {
     /// Where the window is (its top left, points), once placed, and its picture's size.
     at: Option<Pos2>,
     size: Vec2,
+    /// Its picture's size until it is sized: 350 wide, the whole window the canvas's shape, so the
+    /// canvas fills it (the core's).
+    first: Vec2,
     /// The canvas as last read (and its edits then, and when), and the picture imported.
     canvas: Option<TextureHandle>,
     /// The same picture shown magnified, its pixels crisp as on the canvas: when it is the canvas
@@ -239,6 +244,7 @@ impl Default for Reference {
             turn_from: None,
             at: None,
             size: START,
+            first: START,
             canvas: None,
             canvas_crisp: None,
             canvas_edits: None,
@@ -267,8 +273,11 @@ impl Reference {
     /// one).
     pub fn restore(&mut self, session: &CanvasSession) {
         let index = self.index;
+        let info = session.info();
+        let first = reference_window_first_size(info.width, info.height);
+        let first = vec2(first.width, first.height);
         let Some(w) = session.reference_window_at(index) else {
-            *self = Reference { index, ..Reference::default() };
+            *self = Reference { index, size: first, first, ..Reference::default() };
             return;
         };
         *self = Reference {
@@ -281,7 +290,8 @@ impl Reference {
                 ReferenceShows::Model => Mode::Model,
             },
             at: w.placed.then(|| pos2(w.x, w.y)),
-            size: if w.sized { vec2(w.width, w.height) } else { START },
+            size: if w.sized { vec2(w.width, w.height) } else { first },
+            first,
             canvas_view: w.canvas_view,
             image_view: w.image_view,
             kept: Some(w),
@@ -323,7 +333,7 @@ impl Reference {
                 Mode::Image => ReferenceShows::Image,
                 Mode::Model => ReferenceShows::Model,
             },
-            sized: self.size != START,
+            sized: self.size != self.first,
             width: self.size.x,
             height: self.size.y,
             placed: self.at.is_some(),
@@ -508,11 +518,13 @@ impl Reference {
         {
             self.take_picture(ctx, &kept_picture(picture));
         }
-        // the first time: in the middle near the bottom of the screen; then where it was put, all
-        // of it on the screen (an artwork may have left it on a screen of another shape, or the
+        // the first time: in the middle, in the lower half of the screen; then where it was put,
+        // all of it on the screen (an artwork may have left it on a screen of another shape, or the
         // window may have shrunk)
-        let first =
-            || pos2(screen.center().x - size.x / 2.0, (screen.bottom() - ABOVE_BOTTOM - tall).max(screen.top()));
+        let first = || {
+            let top = (screen.bottom() - FIRST_TOP).min(screen.bottom() - tall);
+            pos2(screen.center().x - size.x / 2.0, top.max(screen.top()))
+        };
         let at = on_screen(*self.at.get_or_insert_with(first), vec2(size.x, tall), screen);
         let window = Rect::from_min_size(at, vec2(size.x, tall));
         // room round it for the handles, which reach past its corners

@@ -167,7 +167,8 @@ final class GalleryZoomer {
         galleryShown = 1
         zoom = z
         withAnimation(Motion.galleryOpen) { at = 1 }
-        Task { @MainActor [self] in
+        // (the session looked at, not held: an artwork left before its zoom ends lets it go)
+        Task { @MainActor [self, weak session] in
             try? await Task.sleep(for: openFadeAfter)
             guard zoom?.id == z.id else { return }
             if await Self.drawn(session) {
@@ -241,10 +242,11 @@ final class GalleryZoomer {
         galleryShown = 1
     }
 
-    /// Whether the canvas of `session` has drawn a frame (or can't), asked off the main thread: its
-    /// first frame may hold the session a while.
-    private static func drawn(_ session: CanvasSession) async -> Bool {
-        await withCheckedContinuation { done in
+    /// Whether the canvas of `session` has drawn a frame (or can't, or is gone), asked off the main
+    /// thread: its first frame may hold the session a while.
+    private static func drawn(_ session: CanvasSession?) async -> Bool {
+        guard let session else { return true }
+        return await withCheckedContinuation { done in
             DispatchQueue.global(qos: .userInitiated).async {
                 let info = session.info()
                 done.resume(returning: info.frames > 0 || info.error != nil)

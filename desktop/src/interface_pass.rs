@@ -56,6 +56,34 @@ pub fn record(
     Some(uploads)
 }
 
+/// Sends egui's change `delta` to texture `id` up to the GPU. Where new textures start stale (Iris
+/// Xe on Direct3D 12, see `procraft_gpu::StaleTextures`), each clear texel goes up as black of the
+/// least alpha there is: the driver leaves out of a copy the blocks of 4 by 4 texels it would write
+/// all zero, and egui's textures are copies the whole of them, so those blocks showed what the
+/// memory last held, boxes of red and other colours in the icons and the layers' and brushes'
+/// pictures (#386). At most a level of 255 darker, where it shows at all.
+pub fn upload(renderer: &mut egui_wgpu::Renderer, gpu: &Gpu, id: egui::TextureId, delta: &egui::epaint::ImageDelta) {
+    let guarded = if gpu.textures_start_stale() { without_clear_texels(delta) } else { None };
+    renderer.update_texture(&gpu.device, &gpu.queue, id, guarded.as_ref().unwrap_or(delta));
+}
+
+/// `delta` with each clear texel black of the least alpha there is (see [`upload`]); none where it
+/// has no clear texel.
+pub fn without_clear_texels(delta: &egui::epaint::ImageDelta) -> Option<egui::epaint::ImageDelta> {
+    let egui::ImageData::Color(image) = &delta.image;
+    if !image.pixels.contains(&egui::Color32::TRANSPARENT) {
+        return None;
+    }
+    let least = egui::Color32::from_rgba_premultiplied(0, 0, 0, 1);
+    let mut guarded = (**image).clone();
+    for p in &mut guarded.pixels {
+        if *p == egui::Color32::TRANSPARENT {
+            *p = least;
+        }
+    }
+    Some(egui::epaint::ImageDelta { image: egui::ImageData::Color(std::sync::Arc::new(guarded)), ..delta.clone() })
+}
+
 std::thread_local! {
     /// The device taken as not lost when it is, so that egui-wgpu is asked all the same (and
     /// panics): for the tests, to go the way an out-of-memory that loses no device goes.
@@ -122,7 +150,7 @@ mod tests {
         let (jobs, mut textures) = frame(ctx);
         for (id, deltas) in &textures.set {
             for delta in deltas {
-                renderer.update_texture(&gpu.device, &gpu.queue, *id, delta);
+                upload(renderer, gpu, *id, delta);
             }
         }
         textures.clear();
@@ -142,6 +170,40 @@ mod tests {
         let clear = wgpu::LoadOp::Clear(wgpu::Color::BLACK);
         let uploads = record(renderer, gpu, &mut encoder, &view, clear, &jobs, &screen)?;
         Some((target, uploads.into_iter().chain([encoder.finish()]).collect()))
+    }
+
+    /// Where new textures start stale (Iris Xe on Direct3D 12), the clear texels of what egui
+    /// sends up go as black of the least alpha, so no block of 4 by 4 of it is all zero and none
+    /// is left out holding what the memory held (#386); the rest as egui gives it, where it goes
+    /// and how. Elsewhere egui's textures go up as they are. The interface draws the same.
+    #[test]
+    fn clear_texels_go_up_as_black_of_the_least_alpha_where_new_textures_start_stale() {
+        use egui::epaint::{ImageData, ImageDelta};
+        let some = egui::Color32::from_rgba_premultiplied(10, 20, 30, 40);
+        let least = egui::Color32::from_rgba_premultiplied(0, 0, 0, 1);
+        let clear = egui::Color32::TRANSPARENT;
+        let image = egui::ColorImage::new([3, 1], vec![clear, some, clear]);
+        let delta = ImageDelta { pos: Some([5, 6]), ..ImageDelta::full(image, egui::TextureOptions::NEAREST) };
+        let guarded = without_clear_texels(&delta).unwrap();
+        let ImageData::Color(texels) = &guarded.image;
+        assert_eq!(texels.pixels, [least, some, least]);
+        assert_eq!((guarded.pos, guarded.options, texels.size), (delta.pos, delta.options, [3, 1]));
+        let opaque = ImageDelta::full(egui::ColorImage::new([1, 1], vec![some]), egui::TextureOptions::NEAREST);
+        assert!(without_clear_texels(&opaque).is_none(), "nothing clear, nothing to change");
+        // the interface drawn on a GPU as a stale one: as on any other
+        let Ok(gpu) = Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        gpu.emulate_stale_textures(procraft_gpu::StaleTextures::Cleared);
+        let ctx = egui::Context::default();
+        let format = wgpu::TextureFormat::Rgba8Unorm;
+        let mut renderer = egui_wgpu::Renderer::new(&gpu.device, format, egui_wgpu::RendererOptions::default());
+        let (target, commands) = drawn(&gpu, &mut renderer, &ctx).unwrap();
+        gpu.queue.submit(commands);
+        let pixels = procraft_gpu::read_texture(&gpu, &target, 64, 64).unwrap();
+        let at = |x: usize, y: usize| pixels[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4].to_vec();
+        assert_eq!(at(32, 32), [255, 255, 255, 255]);
+        assert_eq!(at(4, 4), [0, 0, 0, 255]);
+        gpu.emulate_stale_textures(procraft_gpu::StaleTextures::Fresh);
+        assert_eq!(gpu.errors(), 0);
     }
 
     #[test]

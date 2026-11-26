@@ -65,9 +65,10 @@ final class AppSettings {
     /// The pressure curve: x, y pairs, 0..1.
     var inputCurve: [Float] { didSet { kept.set(inputCurve, forKey: Key.inputCurve) } }
 
-    // the brush colour and the masks' (hue, saturation, brightness), as they were last left
-    var brushColor: [Float] { didSet { kept.set(brushColor, forKey: Key.brushColor) } }
-    var maskColor: [Float] { didSet { kept.set(maskColor, forKey: Key.maskColor) } }
+    // the brush colour and the masks' (hue, saturation, brightness) as earlier versions kept them
+    // here, read once to carry them over (the core keeps them now: CanvasModel.keptColours)
+    let brushColor: [Float]
+    let maskColor: [Float]
 
     /// The light interface: light grey panels and bars with dark text.
     var lightInterface: Bool {

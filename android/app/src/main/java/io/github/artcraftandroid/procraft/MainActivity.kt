@@ -160,7 +160,12 @@ class MainActivity : ComponentActivity() {
         projection = null
     }
 
-    /** The system short of memory, or the app out of sight: the canvas lets go of what it keeps only to be quicker. */
+    /**
+     * The system short of memory, or the app out of sight: the canvas lets go of what it keeps only to be quicker.
+     * From Android 14 an app in front is never told the system is short (only that it went out of sight), so the
+     * library looks for itself: its strokes' canvas goes as it closes or a moment after the last stroke, and is
+     * kept for none where memory is short, and the pictures it keeps go by what is available as each comes.
+     */
     @Suppress("DEPRECATION")
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)

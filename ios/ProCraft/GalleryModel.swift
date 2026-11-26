@@ -168,6 +168,25 @@ final class GalleryModel {
         version += 1
     }
 
+    /// The gallery shows: what a plugin brings in from its folder comes in, off the main thread, and
+    /// the gallery is read again if anything came; a folder out of reach is told once. With no plugin
+    /// bringing anything in, nothing happens.
+    func bringIn() {
+        work.async { [weak self] in
+            // (bringing an artwork in goes deep into the core)
+            let brought = onBigStack { PluginsModel.shared.store.galleryOpened(store: Gallery.store) }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if brought.added + brought.updated + brought.copies > 0 {
+                    self.artworkSaved()
+                }
+                if let notice = brought.notice {
+                    self.message = notice
+                }
+            }
+        }
+    }
+
     /// Runs `change` on the store off the main thread, the gallery read again after it.
     private func changing(_ change: @escaping () -> Void) {
         work.async { [weak self] in
@@ -294,10 +313,13 @@ final class GalleryModel {
             let ended = !anyway && openingEndedApp(dir: a.dir)
             var session: CanvasSession?
             if !ended {
-                session = try? CanvasSession.open(dir: a.dir)
-                // a plugin's own artwork goes to its plugin (on); else it shows what it last drew
-                if let session, session.pluginKind() != nil {
-                    _ = session.openPluginArtwork(plugins: PluginsModel.shared.store)
+                session = onBigStack {
+                    let session = try? CanvasSession.open(dir: a.dir)
+                    // a plugin's own artwork goes to its plugin (on); else it shows what it last drew
+                    if let session, session.pluginKind() != nil {
+                        _ = session.openPluginArtwork(plugins: PluginsModel.shared.store)
+                    }
+                    return session
                 }
             }
             DispatchQueue.main.async {
@@ -344,11 +366,13 @@ final class GalleryModel {
         let turns = Self.screenTurns()
         let plugins = PluginsModel.shared.store
         work.async { [weak self] in
-            let session = CanvasSession(width: max(width, 1), height: max(height, 1))
-            session.madeWithScreenTurned(turns: turns)
-            _ = session.setNewProfile(name: p3Name)
-            let canvas = plugins.openCanvas(kind: kind, width: max(width, 1), height: max(height, 1), data: nil)
-            let made = canvas.map { session.attachPluginCanvas(kind: kind, canvas: $0) } == true
+            let (session, made) = onBigStack {
+                let session = CanvasSession(width: max(width, 1), height: max(height, 1))
+                session.madeWithScreenTurned(turns: turns)
+                _ = session.setNewProfile(name: p3Name)
+                let canvas = plugins.openCanvas(kind: kind, width: max(width, 1), height: max(height, 1), data: nil)
+                return (session, canvas.map { session.attachPluginCanvas(kind: kind, canvas: $0) } == true)
+            }
             DispatchQueue.main.async {
                 guard let self else { return }
                 if made {
@@ -482,7 +506,7 @@ final class GalleryModel {
         }
         let dir = Gallery.store.newFolder(folder: folder)
         work.async { [weak self] in
-            let session = Self.session(of: data, title: "Untitled Artwork")
+            let session = onBigStack { Self.session(of: data, title: "Untitled Artwork") }
             DispatchQueue.main.async {
                 guard let self else { return }
                 if let session {
@@ -512,7 +536,7 @@ final class GalleryModel {
             }
             for url in models.isEmpty ? urls : models {
                 guard let self, !self.cancelled else { break }
-                self.importOne(url, folder: folder, open: only, companions: companions)
+                onBigStack { self.importOne(url, folder: folder, open: only, companions: companions) }
             }
             DispatchQueue.main.async {
                 self?.creep?.invalidate()
@@ -891,7 +915,7 @@ final class GalleryModel {
         let name = exportFileName(name: a.name, package: false) + Self.fileExtension(format)
         let url = Sharing.exportsDir.appendingPathComponent(name)
         work.async {
-            done(Self.write(a, format: format, to: url, quality: PdfQuality.best) ? url : nil)
+            done(onBigStack { Self.write(a, format: format, to: url, quality: PdfQuality.best) } ? url : nil)
         }
     }
 
@@ -930,7 +954,7 @@ final class GalleryModel {
             var files: [URL] = []
             if format == "PDF", list.count >= 2 {
                 let url = dir.appendingPathComponent(exportFileName(name: group, package: false) + suffix)
-                if self?.book(list, to: url, quality: quality) == true {
+                if onBigStack({ self?.book(list, to: url, quality: quality) }) == true {
                     files.append(url)
                 }
                 DispatchQueue.main.async { self?.exported(files, from: from) }
@@ -946,7 +970,7 @@ final class GalleryModel {
                     n += 1
                 }
                 let url = dir.appendingPathComponent(name + suffix)
-                if Self.write(a, format: format, to: url, quality: quality) {
+                if onBigStack({ Self.write(a, format: format, to: url, quality: quality) }) {
                     files.append(url)
                 }
                 let progress = Float(i + 1) / Float(max(list.count, 1))

@@ -98,7 +98,8 @@ private struct ChoiceGroup: View {
     }
 }
 
-/// A slider row: the name and value on top, the bar under them; drag or tap along it.
+/// A slider row: the name and value on top, the bar under them; drag or tap along it. Rows are
+/// 65 apart, their words' capitals 13.5 under a row's top, as measured.
 private struct SlideRow: View {
     let label: String
     let value: String
@@ -106,7 +107,7 @@ private struct SlideRow: View {
     let onChange: (Float) -> Void
 
     private let inset: CGFloat = 16
-    private let tall: CGFloat = 64
+    private let tall: CGFloat = 65
 
     var body: some View {
         GeometryReader { g in
@@ -135,7 +136,7 @@ private struct SlideRow: View {
                 .lineLimit(1)
                 .padding(.leading, 16)
                 .padding(.trailing, 19)
-                .padding(.top, 9)
+                .padding(.top, 10)
             }
             .frame(width: w, height: tall, alignment: .topLeading)
             .contentShape(Rectangle())
@@ -196,7 +197,9 @@ struct PressurePage: View {
     var body: some View {
         let settings = AppSettings.shared
         VStack(alignment: .leading, spacing: 0) {
+            // its title lower than the other pages', as measured
             PageHeader(title: "Pressure & Smoothing", onBack: onBack)
+                .padding(.top, 8)
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     group {
@@ -204,7 +207,7 @@ struct PressurePage: View {
                         slide("Motion Filtering", settings.inputMotionFiltering) { settings.inputMotionFiltering = $0 }
                         slide("Motion Filtering Expression", settings.inputMotionExpression) { settings.inputMotionExpression = $0 }
                     }
-                    Color.clear.frame(height: 16)
+                    Color.clear.frame(height: 15)
                     // with no filtering it has nothing to do
                     group {
                         RowView(row: .toggle(
@@ -215,12 +218,14 @@ struct PressurePage: View {
                             } : nil
                         ))
                     }
-                    Color.clear.frame(height: 24)
+                    Color.clear.frame(height: 17)
                     Text(verbatim: "App Pressure Sensitivity")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(Pc.slideLabel)
                         .frame(height: 19)
                         .padding(.leading, 13)
+                    // the curve 22 under the name's capitals, as measured
+                    Color.clear.frame(height: 7)
                     PressureCurve(
                         points: curve,
                         grid: themed(0xFF35_3535, 0xFFCA_CACA),

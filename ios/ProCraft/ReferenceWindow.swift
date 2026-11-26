@@ -4,7 +4,8 @@ import SwiftUI
 import UIKit
 
 // the dark bars are glass, like the panels: what the picture has under them shows through, blurred
-private var barFill: Color { Look.shared.light ? Color(argb: 0xFFED_EDED) : Color(argb: 0xDE1E_1E1E) }
+// (33 over the window's own grey, 57 over a white canvas, as measured)
+private var barFill: Color { Look.shared.light ? Color(argb: 0xFFED_EDED) : Pc.onDarkFrost(0xDE1E_1E1E) }
 private var pictureFill: Color { Look.shared.light ? Color(argb: 0xFFF0_F0F0) : Color(argb: 0xFF33_3333) }
 private var grabLine: Color { Look.shared.light ? Color(argb: 0xFF90_9090) : Color(argb: 0x80BF_BFBF) }
 private var titleInk: Color { Look.shared.light ? Color(argb: 0xFF3A_3A3A) : Color(argb: 0xFFC5_C5C5) }
@@ -22,10 +23,9 @@ private let windowCorner: CGFloat = 24
 private let handleSide: CGFloat = 60
 /// How far down from the window's top a drag moves it, the bars shown or not.
 private let grabHeight: CGFloat = 16
-/// The picture's size until the window is sized (the core's least and most then hold it).
-private let firstSize = CGSize(width: 350, height: 423)
-/// How far above the screen's foot it starts.
-private let firstBottom: CGFloat = 50
+/// How far above the screen's foot a window first has its top, whatever the canvas's shape: where
+/// a screen-shaped canvas's (532 tall with its bars) has it, 50 above the foot, as measured.
+private let firstTop: CGFloat = 50 + 532
 private let bars = topBarHeight + bottomBarHeight
 /// The side a model's picture is read at for the window.
 private let modelPixels: UInt32 = 720
@@ -145,7 +145,10 @@ final class ReferencePane: Identifiable {
     private(set) var imageView = ReferenceView(zoom: 1, x: 0, y: 0)
     /// Where the window is, none until it is first placed; and the size of its picture.
     private(set) var offset: CGPoint?
-    private(set) var size = firstSize
+    private(set) var size = CGSize(width: 350, height: 423)
+    /// The size of its picture until it is sized: 350 wide, the whole window the canvas's shape, so
+    /// the canvas fills it (the core's).
+    private let first: CGSize
     /// The window's bars are slid out of the way.
     private(set) var barsHidden = false
     /// The screen the window was last laid out on, none before it first is.
@@ -159,6 +162,10 @@ final class ReferencePane: Identifiable {
     init(model: CanvasModel, index: UInt32) {
         self.model = model
         self.index = index
+        let info = model.session.info()
+        let first = referenceWindowFirstSize(canvasWidth: info.width, canvasHeight: info.height)
+        self.first = CGSize(width: CGFloat(first.width), height: CGFloat(first.height))
+        size = self.first
         restore()
     }
 
@@ -202,7 +209,7 @@ final class ReferencePane: Identifiable {
         case .model: .model
         }
         return ReferenceWindowState(
-            shown: on, shows: shows, sized: size != firstSize,
+            shown: on, shows: shows, sized: size != first,
             width: Float(size.width), height: Float(size.height),
             placed: offset != nil, x: Float(offset?.x ?? 0), y: Float(offset?.y ?? 0),
             canvasView: canvasView, imageView: imageView
@@ -275,8 +282,8 @@ final class ReferencePane: Identifiable {
         refresh()
     }
 
-    /// The window laid out on `screen`: the first time in the middle, near the bottom; then where it
-    /// was put, all of it on the screen (an artwork may have left it on a screen of another shape,
+    /// The window laid out on `screen`: the first time in the middle, in the lower half; then where
+    /// it was put, all of it on the screen (an artwork may have left it on a screen of another shape,
     /// or the screen turned or split). What the artwork keeps changes only as it is moved or sized.
     func place(on screen: CGSize) {
         if room != screen {
@@ -284,7 +291,8 @@ final class ReferencePane: Identifiable {
         }
         guard let at = offset else {
             let shown = shownSize
-            offset = CGPoint(x: (screen.width - shown.width) / 2, y: max(screen.height - firstBottom - shown.height - bars, 0))
+            let tall = shown.height + bars
+            offset = CGPoint(x: (screen.width - shown.width) / 2, y: max(min(screen.height - firstTop, screen.height - tall), 0))
             return
         }
         let kept = onScreen(at)
@@ -578,7 +586,9 @@ struct ReferenceWindow: View {
 
     private var glass: some View {
         ZStack {
+            // the interface's frost whatever the system's appearance, as the panels'
             Rectangle().fill(.ultraThinMaterial)
+                .environment(\.colorScheme, Look.shared.light ? .light : .dark)
             barFill
         }
     }

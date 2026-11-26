@@ -8,7 +8,7 @@ use procraft_gpu::{Gpu, wgpu};
 
 use crate::Shared;
 use crate::frame::{configure, configure_with, screen_profile};
-use crate::frame_loop::Acquired;
+use crate::frame_loop::{Acquired, Ended};
 
 /// The window drawn into: Android's native window, or the iPad app's `CAMetalLayer`.
 #[cfg(target_os = "android")]
@@ -17,13 +17,44 @@ type Window = ndk::native_window::NativeWindow;
 type Window = crate::layer::Layer;
 
 pub(crate) fn run(shared: Arc<Shared>, window: Window) {
+    // a device lost while drawing: the lost canvas let go, a new device made (perhaps on OpenGL ES,
+    // see `device::lost`), and the artwork reopened on it from its last save
+    let mut reopening = false;
+    loop {
+        match draw_into(&shared, &window, reopening) {
+            Ended::Stopped => break,
+            Ended::Lost => {
+                reopening = crate::device::recover(&shared);
+                if !reopening {
+                    // nothing it held draws again: there is only the window's stop to wait for
+                    let mut st = shared.lock();
+                    while !st.stop {
+                        shared.wake.wait(&mut st);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    drop(window);
+}
+
+/// Draws into `window` until the session stops or its device is lost: on the session's device, or
+/// the app's, or one made for the window (`reopening`: after the session's was lost, the artwork
+/// then reopened on it).
+fn draw_into(shared: &Arc<Shared>, window: &Window, reopening: bool) -> Ended {
+    // the session's own device lost (perhaps while the app was away): a new one first
+    if shared.lock().gpu.as_ref().is_some_and(Gpu::is_lost) {
+        return Ended::Lost;
+    }
     let own = shared.lock().gpu.as_ref().map(|g| g.instance.clone());
     // the app's device (waited for while it is being made), else one made for this window and
     // kept for every artwork after
     let mut kept = crate::device::kept();
     // one lost holds and draws nothing: this artwork makes a new one, and opens as last saved
     if kept.as_ref().is_some_and(Gpu::is_lost) {
-        log::warn!("the GPU device was lost: making a new one");
+        let count = kept.as_ref().map_or(0, crate::device::lost);
+        log::warn!("the GPU device was lost ({count} lost this run): making a new one");
         *kept = None;
     }
     // where to make a device from, if there is none to draw with
@@ -42,12 +73,12 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
     let choosing = own.is_none() && kept.is_none();
     let mut tries = 0;
     let mut surface = loop {
-        match crate::window::create_surface(&instance, &window) {
+        match crate::window::create_surface(&instance, window) {
             Ok(s) => break s,
             Err(e) => {
                 let next =
                     (choosing && tries + 1 < count).then(|| Gpu::instance_after((from + tries + 1) % count)).flatten();
-                let Some(next) = next else { return fail(&shared, e) };
+                let Some(next) = next else { return fail(shared, e) };
                 log::warn!("the window's surface: {e}; trying the next backend");
                 tries += 1;
                 instance = next;
@@ -63,6 +94,9 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
         // window (see `Gpu::instance_after`, `device::first_backend`)
         loop {
             let backend = (from + tries) % count;
+            if reopening {
+                log::warn!("making a new GPU device on {}", Gpu::backend_name(backend));
+            }
             crate::device::trying(backend);
             match Gpu::for_surface(instance.clone(), &surface) {
                 Ok(gpu) => {
@@ -79,12 +113,12 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
                         let next = if tries < count { Gpu::instance_after((from + tries) % count) } else { None };
                         let Some(next) = next else { break None };
                         log::warn!("{why}; trying the next backend");
-                        match crate::window::create_surface(&next, &window) {
+                        match crate::window::create_surface(&next, window) {
                             Ok(s) => break Some((next, s)),
                             Err(e) => why = format!("the window's surface: {e}"),
                         }
                     };
-                    let Some((next, s)) = made else { return fail(&shared, why) };
+                    let Some((next, s)) = made else { return fail(shared, why) };
                     surface = s;
                     instance = next;
                 }
@@ -92,9 +126,23 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
         }
     };
     drop(kept);
-    if let Some(gpu) = device {
-        // it holds the session's layers from now on
-        shared.lock().gpu.get_or_insert(gpu);
+    // (reopening on one made meanwhile for the session, as an export's)
+    let device = device.or_else(|| reopening.then(|| shared.lock().gpu.clone()).flatten());
+    match device {
+        // the session's canvas let go with its lost device: the artwork reopened from its last save
+        // on the new one (which it holds from then on)
+        Some(gpu) if reopening => {
+            let backend = gpu.backend();
+            match shared.reopen_after_loss(gpu) {
+                Ok(()) => log::warn!("the artwork reopened from its last save on the new GPU device ({backend:?})"),
+                Err(e) => return fail(shared, e.to_string()),
+            }
+        }
+        Some(gpu) => {
+            // it holds the session's layers from now on
+            shared.lock().gpu.get_or_insert(gpu);
+        }
+        None => {}
     }
     shared.make_canvas();
     let queue = {
@@ -103,7 +151,7 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
         st.needs_frame = true;
         st.gpu.as_ref().map(|g| (g.queue.clone(), g.clone()))
     };
-    let Some((queue, gpu)) = queue else { return };
+    let Some((queue, gpu)) = queue else { return Ended::Stopped };
 
     let mut screen = WindowScreen {
         surface,
@@ -115,14 +163,15 @@ pub(crate) fn run(shared: Arc<Shared>, window: Window) {
         refreshes: crate::window::Refreshes::start(),
     };
     let mut pipelines_kept = false;
-    crate::frame_loop::draw_loop(&shared, &mut screen, || {
+    let ended = crate::frame_loop::draw_loop(shared, &mut screen, || {
         showing.shown();
         if !std::mem::replace(&mut pipelines_kept, true) {
-            keep_pipelines(&shared);
+            keep_pipelines(shared);
         }
     });
+    // (the window's surface let go before another is made on it)
     drop(screen);
-    drop(window);
+    ended
 }
 
 /// The window's surface, as the render loop draws into it: its capabilities asked once (they last
@@ -212,7 +261,10 @@ pub(crate) fn project(shared: Arc<Shared>, window: Window) {
     };
     let surface = match crate::window::create_surface(&instance, &window) {
         Ok(s) => s,
-        Err(e) => return fail(&shared, e),
+        Err(e) => {
+            fail(&shared, e);
+            return;
+        }
     };
     let Some(queue) = shared.lock().gpu.as_ref().map(|g| g.queue.clone()) else { return };
     let mut config: Option<wgpu::SurfaceConfiguration> = None;
@@ -307,7 +359,8 @@ pub(crate) fn project(shared: Arc<Shared>, window: Window) {
     drop(window);
 }
 
-fn fail(shared: &Shared, reason: String) {
+fn fail(shared: &Shared, reason: String) -> Ended {
     log::error!("render thread: {reason}");
     shared.lock().error = Some(reason);
+    Ended::Stopped
 }

@@ -46,7 +46,7 @@ pub(crate) struct Shown {
 
 /// The canvas the sharp picture is made on, kept for the next.
 pub(crate) struct SharpCanvas {
-    canvas: Canvas,
+    canvas: Box<Canvas>,
     /// Its layers, as the artwork's were when it was made.
     layers: Vec<LayerId>,
 }
@@ -55,7 +55,7 @@ pub(crate) struct SharpCanvas {
 /// while items are laid on it) and document, and how far along it is.
 pub(crate) struct Making {
     key: Shown,
-    canvas: Option<Canvas>,
+    canvas: Option<Box<Canvas>>,
     layers: Vec<LayerId>,
     doc: Document,
     /// Canvas pixels to the sharp canvas's, and back.
@@ -294,7 +294,7 @@ impl State {
             None => match Canvas::new(&gpu, &doc) {
                 Ok(canvas) => {
                     self.sharp.canvases += 1;
-                    canvas
+                    Box::new(canvas)
                 }
                 Err(e) => {
                     log::warn!("the sharp picture's canvas: {e}");
@@ -340,7 +340,7 @@ impl State {
         let slice = self.sharp.slice();
         let done = self.make_sharp(&mut making, slice);
         // the canvas's layers read for it were brought up to date: as it is now, it goes on
-        let composites = self.canvas.as_ref().map_or(0, Canvas::composites);
+        let composites = self.canvas.as_deref().map_or(0, Canvas::composites);
         making.key.composites = composites;
         match done {
             Some(false) => {

@@ -9,3 +9,24 @@ package io.github.artcraftandroid.procraft.canvas
  */
 internal fun pastesSystemPicture(ours: Boolean, systemAt: Long, ownCopy: Boolean, ownAt: Long, ownPutAt: Long?): Boolean =
     !ours && (!ownCopy || systemAt > maxOf(ownAt, ownPutAt ?: Long.MIN_VALUE))
+
+/**
+ * The extra that marks a clip sensitive: the system shows no preview of it, and keyboards leave it
+ * out of their clipboards and suggestions. Android 13 named it `ClipDescription.EXTRA_IS_SENSITIVE`;
+ * earlier systems and keyboards read the same key, so it is written out here for every version.
+ */
+internal const val CLIP_IS_SENSITIVE = "android.content.extra.IS_SENSITIVE"
+
+/** The extras a picture cut or copied here goes on the system's clipboard with (see [CLIP_IS_SENSITIVE]). */
+internal val PICTURE_CLIP_EXTRAS: Map<String, Boolean> = mapOf(CLIP_IS_SENSITIVE to true)
+
+/**
+ * [clip] marked as a picture cut or copied here: kept out of the keyboard's clipboard, which showed
+ * each cut there to be deleted by hand (#403). Paste takes it as before, here and in other apps.
+ */
+internal fun markedAsPictureCopy(clip: android.content.ClipData): android.content.ClipData {
+    clip.description.extras = android.os.PersistableBundle().apply {
+        PICTURE_CLIP_EXTRAS.forEach { (key, on) -> putBoolean(key, on) }
+    }
+    return clip
+}

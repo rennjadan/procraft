@@ -158,6 +158,7 @@ pub fn tab(ctx: &egui::Context, look: &mut Look, shown: PieceShown, title: &str,
     let mut touch = TabTouch::default();
     egui::Area::new(id).fixed_pos(window.min).order(egui::Order::Middle).show(ctx, |ui| {
         crate::panel::floating_panel_frame(ui, look, "floating tab", window, backdrops);
+        crate::screen::claim(ui, window);
         let held = ui.interact(window, ui.scope_id().with("tab"), Sense::click_and_drag());
         touch.pressed = held.drag_started();
         touch.unfold = held.clicked();

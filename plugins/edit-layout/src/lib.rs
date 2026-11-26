@@ -5,7 +5,9 @@
 //! the canvas (`panel_layout`, interface 20). All panels float lets every other panel float too (the
 //! same hook's numbers from 2, interface 20). Panels stay open leaves panels open while one paints
 //! (`pin_panels`). Its feature Edit layout lets the interface's bars be moved anywhere, from Edit
-//! Layout in the Canvas tab (the same hook's part 3). It's a plugin, not part of the app:
+//! Layout in the Canvas tab (the same hook's part 3). Its feature Collapse to edge has a bar or a
+//! window against a side slide into it at a button's tap, a tab left there (part 5). It's a plugin,
+//! not part of the app:
 //! `tools/pack_plugin.py` makes a `.procraft-plugin` file of it.
 //!
 //! The app does the rest: the windows, the snapping, the tabs, the room, and keeping each panel's
@@ -14,8 +16,8 @@
 
 /// The controls by their place in the manifest, as they start: the features off, both panels
 /// allowed to float, snapping within 16 points, folding, no room made, panels closing as usual.
-const STARTS: [f32; 10] = [0.0, 1.0, 1.0, 1.0, 16.0, 1.0, 0.0, 0.0, 0.0, 0.0];
-static CONTROLS: kit::Controls<10> = kit::Controls::new(STARTS);
+const STARTS: [f32; 12] = [0.0, 1.0, 1.0, 1.0, 16.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+static CONTROLS: kit::Controls<12> = kit::Controls::new(STARTS);
 kit::controls!(CONTROLS);
 
 /// Movable panels' switch, then its own: whether the Layers panel and the brush library may float,
@@ -30,8 +32,10 @@ pub const FOLD: usize = 5;
 pub const MAKE_ROOM: usize = 6;
 pub const ALL_PANELS: usize = 7;
 pub const PIN_PANELS: usize = 8;
-/// Edit layout's switch.
-pub const EDIT_LAYOUT: usize = 9;
+/// Tool Belt's switch, then Edit layout's, then Collapse to edge's.
+pub const TOOL_BELT: usize = 9;
+pub const EDIT_LAYOUT: usize = 10;
+pub const COLLAPSE_EDGE: usize = 11;
 
 /// The farthest the app lets panels snap from (points).
 const MOST_SNAP: f32 = 64.0;
@@ -61,12 +65,21 @@ kit::yes!(procraft_pin_panels, || CONTROLS.on(PIN_PANELS));
 
 /// How the floating panels are laid out, `part` by part: how near they snap (0, points; 0 with
 /// snapping off), whether they fold to a tab (1) and whether those docked make room (2), 1 or 0,
-/// while Movable panels is on; and whether the bars may be moved (3), while Edit layout is. Below 0
-/// for a part it doesn't know, or with its feature off: as the app has it.
+/// while Movable panels is on; whether the bars may be moved (3), while Edit layout is; whether the
+/// Tool Belt shows (4) and whether bars and windows collapse into the window's sides (5), each by its
+/// own feature. Below 0 for a part it doesn't know, or with its feature off: as the app has it.
 #[unsafe(no_mangle)]
 pub extern "C" fn procraft_panel_layout(part: i32) -> f32 {
     if part == 3 {
         return if CONTROLS.on(EDIT_LAYOUT) { 1.0 } else { -1.0 };
+    }
+    // the Tool Belt, by its own feature
+    if part == 4 {
+        return if CONTROLS.on(TOOL_BELT) { 1.0 } else { -1.0 };
+    }
+    // Collapse to edge, by its own feature
+    if part == 5 {
+        return if CONTROLS.on(COLLAPSE_EDGE) { 1.0 } else { -1.0 };
     }
     if !CONTROLS.on(MOVABLE_PANELS) {
         return -1.0;
@@ -162,6 +175,33 @@ mod tests {
         assert_eq!(said(), (0, 0));
         // panels it doesn't know
         assert_eq!((procraft_floating_panel(-1), procraft_floating_panel(8)), (0, 0));
+    }
+
+    #[test]
+    fn the_tool_belt_shows_while_its_feature_is_on_whatever_the_others_say() {
+        let _turn = fresh();
+        assert_eq!(procraft_panel_layout(4), -1.0);
+        procraft_control(TOOL_BELT as i32, 1.0);
+        procraft_control(MOVABLE_PANELS as i32, 0.0);
+        assert_eq!(procraft_panel_layout(4), 1.0);
+        assert_eq!(layout(), [-1.0; 4]);
+        procraft_control(TOOL_BELT as i32, 0.0);
+        assert_eq!(procraft_panel_layout(4), -1.0);
+    }
+
+    #[test]
+    fn bars_and_windows_collapse_into_the_sides_while_collapse_to_edge_is_on_whatever_the_others_say() {
+        let _turn = fresh();
+        // off as it starts: nothing said, as the app has it
+        assert_eq!(procraft_panel_layout(5), -1.0);
+        // on (in a copy of its own, the others told off there)
+        procraft_control(COLLAPSE_EDGE as i32, 1.0);
+        procraft_control(MOVABLE_PANELS as i32, 0.0);
+        assert_eq!(procraft_panel_layout(5), 1.0);
+        assert_eq!(layout(), [-1.0; 4]);
+        assert_eq!(procraft_panel_layout(4), -1.0);
+        procraft_control(COLLAPSE_EDGE as i32, 0.0);
+        assert_eq!(procraft_panel_layout(5), -1.0);
     }
 
     #[test]

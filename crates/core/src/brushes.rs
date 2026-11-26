@@ -53,10 +53,106 @@ const PREVIEW_CANVAS_BYTES: u64 = 128 << 20;
 /// Whether the sample strokes' canvas let go for want of memory has been said in the log.
 static PREVIEW_SHORT_SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// How long the canvas the sample strokes are drawn on is kept after the last is drawn: through a
+/// set looked through, its rows asking for their strokes a few at a time as they come into sight,
+/// and no longer. Kept until the system said it was short (which, from Android 14, it never says to
+/// an app in front), a heavy set's left 130 MB and more of the GPU's memory held while the artwork
+/// stayed open, and a phone of 4 GB closed the app as its Gouache and Oils opened.
+const PREVIEW_CANVAS_KEPT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What each buffer the sample strokes' canvas grew for a stroke's work may keep of it for the
+/// next, bytes (see `Canvas::let_go_of_work_past`): a light brush's stroke needs no more, and a wet
+/// one's left eight lists of tiles of 8 MB.
+const PREVIEW_WORK_KEPT: u64 = 1 << 20;
+
+/// Milliseconds into the run (from the first time this is asked).
+fn run_ms() -> u64 {
+    static STARTED: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
+    u64::try_from(STARTED.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+/// How often the thread waiting to let go of the sample strokes' canvas looks again while one is
+/// waiting for its turn or being drawn.
+const PREVIEW_PENDING_LOOK: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A sample stroke asked for, from its wait for its turn to its end: the canvas the strokes are
+/// drawn on stays while any is (another's stroke drawn first took seconds on a weak GPU), and
+/// goes [`PREVIEW_CANVAS_KEPT`] after the last has ended (see [`watch_previews`]).
+struct PreviewPending<'a>(&'a crate::Shared);
+
+impl<'a> PreviewPending<'a> {
+    fn new(shared: &'a crate::Shared) -> PreviewPending<'a> {
+        shared.previews_pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        PreviewPending(shared)
+    }
+}
+
+impl Drop for PreviewPending<'_> {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.0.preview_drawn_at.store(run_ms(), SeqCst);
+        self.0.previews_drawn.fetch_add(1, SeqCst);
+        self.0.previews_pending.fetch_sub(1, SeqCst);
+    }
+}
+
+/// Lets go of the canvas the sample strokes are drawn on, kept for the next, once none has been
+/// asked for or drawn for [`PREVIEW_CANVAS_KEPT`]: one thread a session waits for that, as long as
+/// strokes are drawn now and then.
+fn watch_previews(shared: &std::sync::Arc<crate::Shared>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    // (counted before the thread is asked for: one ending as this comes sees it, below)
+    shared.previews_drawn.fetch_add(1, SeqCst);
+    if shared.previews_watched.swap(true, SeqCst) {
+        return;
+    }
+    let weak = std::sync::Arc::downgrade(shared);
+    let kept = u64::try_from(PREVIEW_CANVAS_KEPT.as_millis()).unwrap_or(u64::MAX);
+    let watch = move || {
+        loop {
+            let Some(shared) = weak.upgrade() else { return };
+            let seen = shared.previews_drawn.load(SeqCst);
+            let due = shared.preview_drawn_at.load(SeqCst).saturating_add(kept);
+            let now = run_ms();
+            let wait = if shared.previews_pending.load(SeqCst) > 0 {
+                Some(PREVIEW_PENDING_LOOK)
+            } else {
+                (now < due).then(|| std::time::Duration::from_millis(due - now))
+            };
+            if let Some(wait) = wait {
+                drop(shared);
+                std::thread::sleep(wait);
+                continue;
+            }
+            // none asked for since, as the lock it is kept under says (one drawn holds it till
+            // then, and is still asked for as it is kept)
+            let canvas = {
+                let mut st = shared.lock();
+                let idle = shared.previews_drawn.load(SeqCst) == seen && shared.previews_pending.load(SeqCst) == 0;
+                if !idle {
+                    continue;
+                }
+                st.preview.take()
+            };
+            drop(canvas);
+            shared.previews_watched.store(false, SeqCst);
+            // one kept meanwhile, which found this still watching, is watched on here
+            if shared.previews_drawn.load(SeqCst) == seen || shared.previews_watched.swap(true, SeqCst) {
+                return;
+            }
+        }
+    };
+    let thread = std::thread::Builder::new().name("procraft-previews-kept".to_owned());
+    if let Err(e) = thread.spawn(watch) {
+        shared.previews_watched.store(false, SeqCst);
+        log::warn!("the sample strokes' canvas is kept until the library closes: {e}");
+    }
+}
+
 /// Draws the pictures `brushes` stand in with that are still to be drawn (each brush's shape and
 /// grain, and its second's), on a thread of their own: a brush chosen is ready by its first stroke,
-/// which otherwise waits for them under the canvas's lock. What a stroke or preview wants first is
-/// drawn once, by whichever gets to it first.
+/// which otherwise waits for them (see [`pictures_to_draw`]). What a stroke or preview wants first
+/// is drawn once, by whichever gets to it first.
 pub(crate) fn warm_pictures<'a>(brushes: impl IntoIterator<Item = &'a procraft_engine::brush::Brush>) {
     let waiting = undrawn(brushes);
     if waiting.is_empty() {
@@ -68,9 +164,76 @@ pub(crate) fn warm_pictures<'a>(brushes: impl IntoIterator<Item = &'a procraft_e
     }
 }
 
+/// `brush` (the library's brush, cloned for its sample stroke) made to draw its shape and grain
+/// pictures not yet drawn as twins (see `Pixels::twin`), one for each of the library's own, kept
+/// in `st` until the library closes. A sample stroke drew the library's own pictures, and every
+/// brush held them for the rest of the run (60 MB once all the stock library's strokes were drawn,
+/// the library closed or not); now they go as it closes. The strokes stay kept, so it opens again
+/// drawing none; pictures drawn already (a tool's brush's) are drawn with as they are.
+fn preview_twins(st: &mut crate::State, brush: &mut procraft_engine::brush::Brush) {
+    use procraft_engine::brush::Pixels;
+    let twins = &mut st.preview_pictures;
+    each_source(brush, &mut |source| {
+        if source.pixels.is_drawn() {
+            return;
+        }
+        let twin = match twins.iter().find(|(own, _)| Pixels::same(own, &source.pixels)) {
+            Some((_, twin)) => twin.clone(),
+            None => {
+                let Some(twin) = source.pixels.twin() else { return };
+                twins.push((source.pixels.clone(), twin.clone()));
+                twin
+            }
+        };
+        source.pixels = twin;
+    });
+}
+
+/// Brush `at` of the library, just chosen, takes for its own the pictures its sample stroke drew
+/// (see [`preview_twins`]): ready for its first stroke, as before they were let go.
+fn adopt_preview_pictures(st: &mut crate::State, (set, index): (usize, usize)) {
+    use procraft_engine::brush::Pixels;
+    let twins = std::mem::take(&mut st.preview_pictures);
+    if let Some(brush) = st.library.get_mut(set).and_then(|s| s.brushes.get_mut(index)) {
+        each_source(brush, &mut |source| {
+            if let Some((_, twin)) =
+                twins.iter().find(|(own, twin)| twin.is_drawn() && Pixels::same(own, &source.pixels))
+            {
+                source.pixels = twin.clone();
+            }
+        });
+    }
+    st.preview_pictures = twins;
+}
+
+/// Each shape and grain picture of `brush` and of its second.
+fn each_source(brush: &mut procraft_engine::brush::Brush, f: &mut impl FnMut(&mut procraft_engine::brush::Source)) {
+    for source in [&mut brush.shape.source, &mut brush.grain.source].into_iter().flatten() {
+        f(source);
+    }
+    if let Some(second) = brush.secondary.as_deref_mut() {
+        each_source(second, f);
+    }
+}
+
 /// Draws `brush`'s pictures still to be drawn now, side by side (see [`warm_pictures`]).
 pub(crate) fn draw_pictures(brush: &procraft_engine::brush::Brush) {
     draw_side_by_side(&undrawn([brush]));
+}
+
+/// `brush`'s pictures still to be drawn (its shape and grain, and its second's), to draw with
+/// [`draw_these`] before the canvas is held: a stroke begun just after its brush was chosen drew
+/// them under the canvas's lock, the frames held up meanwhile (35 to 140 ms for a dual brush's
+/// four).
+pub(crate) fn pictures_to_draw(brush: &procraft_engine::brush::Brush) -> Vec<procraft_engine::brush::Pixels> {
+    undrawn([brush])
+}
+
+/// Draws `pictures` now, side by side (each once, whoever else draws it meanwhile).
+pub(crate) fn draw_these(pictures: &[procraft_engine::brush::Pixels]) {
+    if !pictures.is_empty() {
+        draw_side_by_side(pictures);
+    }
 }
 
 /// The pictures of `brushes` (each one's shape and grain, and its second's) still to be drawn.
@@ -399,6 +562,7 @@ impl CanvasSession {
             crate::ToolKind::Smudge => st.smudge_brush = (set, index),
         }
         st.note_choice((set, index));
+        adopt_preview_pictures(&mut st, (set, index));
         warm_pictures([st.brush(st.tool)]);
         st.load_brush_pictures();
         // a brush a plugin's brush engine draws: its look made now, on a thread of its own, for its
@@ -409,13 +573,15 @@ impl CanvasSession {
         true
     }
 
-    /// The brush last chosen in `set`, if one has been and it is still there. A set opened in the
-    /// library makes it the current tool's brush at once, so the brush shown highlighted is always
-    /// the one in use.
+    /// The brush last chosen in `set`, or its first brush if none has been or that one is gone;
+    /// none for a set with no brushes. A set opened in the library, tapped or rested on by a dragged
+    /// brush, makes it the current tool's brush at once, so the brush shown highlighted is always
+    /// the one in use (as the original keeps one brush per set, the first until one is chosen).
     pub fn brush_set_choice(&self, set: u32) -> Option<BrushInfo> {
         let st = self.shared.lock();
-        let index = st.set_choice(set as usize)?;
-        let brush = st.library.get(set as usize)?.brushes.get(index)?;
+        let brushes = &st.library.get(set as usize)?.brushes;
+        let index = st.set_choice(set as usize).filter(|&i| i < brushes.len()).unwrap_or(0);
+        let brush = brushes.get(index)?;
         Some(BrushInfo { set, index: index as u32, name: brush.name.clone() })
     }
 
@@ -436,7 +602,7 @@ impl CanvasSession {
     /// A sample stroke drawn with the brush, white on transparent, fitted into `width` × `height`
     /// pixels.
     pub fn brush_preview(&self, set: u32, index: u32, width: u32, height: u32) -> Option<ThumbnailImage> {
-        let brush = self.shared.lock().library.get(set as usize)?.brushes.get(index as usize)?.clone();
+        let brush = self.library_brush_to_preview(set, index)?;
         self.drawn_preview(brush, width, height)
     }
 
@@ -450,7 +616,7 @@ impl CanvasSession {
         width: u32,
         height: u32,
     ) -> Option<ThumbnailImage> {
-        let brush = self.shared.lock().library.get(set as usize)?.brushes.get(index as usize)?.clone();
+        let brush = self.library_brush_to_preview(set, index)?;
         self.sample_stroke(brush, width, height, false)
     }
 
@@ -478,6 +644,39 @@ impl CanvasSession {
     pub fn studio_part_preview(&self, second: bool, width: u32, height: u32) -> Option<ThumbnailImage> {
         let brush = self.shared.lock().studio_part(second)?;
         self.sample_stroke(brush, width, height, false)
+    }
+
+    /// Lets go of the canvas the brushes' sample strokes are drawn on, with all it holds (100 MB
+    /// and more of the GPU's memory after a heavy set's): for when the brush library closes. The
+    /// strokes drawn stay kept; the next one drawn makes another canvas. It goes by itself a
+    /// moment after the last stroke drawn on it as well, and with the artwork's canvas. The shape
+    /// and grain pictures drawn for the strokes go too (see `preview_twins`).
+    pub fn let_go_of_previews(&self) {
+        let gone = {
+            let mut st = self.shared.lock();
+            (st.preview.take(), std::mem::take(&mut st.preview_pictures))
+        };
+        // (64 KB a picture, let go of with the lock let go)
+        drop(gone);
+    }
+}
+
+impl CanvasSession {
+    /// Brush `index` of `set`, to draw its sample stroke with (see [`preview_twins`]).
+    fn library_brush_to_preview(&self, set: u32, index: u32) -> Option<procraft_engine::brush::Brush> {
+        let mut st = self.shared.lock();
+        let mut brush = st.library.get(set as usize)?.brushes.get(index as usize)?.clone();
+        preview_twins(&mut st, &mut brush);
+        Some(brush)
+    }
+
+    /// What the canvas the sample strokes are drawn on holds, while it is kept: its textures, the
+    /// buffers made for its strokes' work, and of those its lists of tiles, bytes. For tests.
+    #[doc(hidden)]
+    pub fn preview_canvas_bytes(&self) -> Option<[u64; 3]> {
+        let st = self.shared.lock();
+        let (canvas, _) = st.preview.as_ref()?;
+        Some([canvas.texture_bytes(), canvas.work_buffer_bytes(), canvas.rule_list_bytes()])
     }
 }
 
@@ -633,7 +832,8 @@ impl CanvasSession {
         }
         // one at a time, on the canvas kept for them: drawn side by side, each took a canvas of its
         // own, its shape and grain arrays made again with it (a library's card asks for a dozen
-        // strokes at once)
+        // strokes at once); the canvas staying while it waits
+        let _pending = PreviewPending::new(&self.shared);
         let _drawing = PREVIEWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // (drawn meanwhile, by an ask for it made before this one)
         if let Some(kept) = kept_stroke(key) {
@@ -669,7 +869,7 @@ impl CanvasSession {
                 None => {
                     let mut doc = Document::new(cw, ch);
                     doc.background_visible = false;
-                    let mut canvas = Canvas::new(&gpu, &doc).ok()?;
+                    let mut canvas = Box::new(Canvas::new(&gpu, &doc).ok()?);
                     // drawn beside the window's frames: its work goes to the GPU a short piece at
                     // a time, each waited for (a weak GPU took seconds over a wet brush's stroke,
                     // and the frame that queued behind it held the canvas all that while)
@@ -687,13 +887,26 @@ impl CanvasSession {
             }
             None
         };
-        let (rgba, whole, canvas, doc) = match drawn {
+        let (rgba, whole, mut canvas, doc) = match drawn {
             Ok(drawn) => drawn?,
             Err(e) => return failed(&e.to_string()),
         };
-        // kept for the next (one drawn meanwhile elsewhere already is), unless memory is short
+        // kept for the next (one drawn meanwhile elsewhere already is), unless memory is short or
+        // the artwork's canvas has gone meanwhile; with no more of what its work grew to than a
+        // light stroke wants, and only for a moment after the last
         if !short {
-            self.shared.lock().preview.get_or_insert((canvas, doc));
+            canvas.let_go_of_work_past(&gpu, PREVIEW_WORK_KEPT);
+            let kept = {
+                let mut st = self.shared.lock();
+                let open = !st.closed;
+                if open {
+                    st.preview.get_or_insert((canvas, doc));
+                }
+                open
+            };
+            if kept {
+                watch_previews(&self.shared);
+            }
         }
         if !whole {
             return failed("part of it was left out");
@@ -926,5 +1139,42 @@ mod tests {
         let preview = s.drawn_preview(brush, 240, 60).expect("a preview");
         let painted = preview.rgba.as_chunks::<4>().0.iter().filter(|p| p[3] > 0).count();
         assert!(painted > 100, "{painted} pixels");
+    }
+
+    /// The canvas the sample strokes are drawn on stays while a stroke waits for its turn behind
+    /// another's (another artwork's here, held longer than the canvas is kept with none asked for),
+    /// and goes a moment after the last has ended: let go of while one waited, the next was drawn
+    /// on a canvas made again.
+    #[test]
+    fn the_strokes_canvas_stays_while_a_stroke_waits_its_turn() {
+        use std::time::{Duration, Instant};
+        let s = CanvasSession::new(64, 64);
+        if !s.prepare_offscreen() {
+            return;
+        }
+        let kept = |s: &CanvasSession| s.shared.lock().preview.is_some();
+        assert!(s.drawn_preview(Brush::round_pen(), 106, 32).is_some());
+        assert!(kept(&s), "kept for the next");
+        let (stayed, drawn) = {
+            let turn = super::PREVIEWS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let asking = std::thread::spawn({
+                let s = Arc::clone(&s);
+                // (another look: drawn, not found kept)
+                move || s.drawn_preview(Brush { hardness: 0.5, ..Brush::round_pen() }, 106, 32).is_some()
+            });
+            std::thread::sleep(super::PREVIEW_CANVAS_KEPT + Duration::from_secs(1));
+            let stayed = kept(&s);
+            drop(turn);
+            (stayed, asking.join().unwrap_or(false))
+        };
+        let ended = Instant::now();
+        assert!(stayed, "let go of while a stroke waited its turn");
+        assert!(drawn, "drawn once its turn came");
+        while kept(&s) {
+            assert!(ended.elapsed() < Duration::from_secs(30), "still kept after {:?}", ended.elapsed());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // (from its end, a moment after the turn came)
+        assert!(ended.elapsed() >= Duration::from_millis(1500), "let go of after {:?}", ended.elapsed());
     }
 }

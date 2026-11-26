@@ -776,20 +776,24 @@ private struct StudioNameHeading: View {
 
 /// The drawing pad's settings: preview size, the pad's colour, and clearing or resetting. It opens
 /// under the Drawing Pad button, centred on it but kept 14 in from the screen's sides (`width`),
-/// its arrow pointing up at the button.
+/// its arrow pointing up at the button. The colour chosen tapped again closes it.
 private struct PadMenu: View {
     let studio: StudioModel
     let width: CGFloat
 
     private let fill = Color(argb: 0xFFC1_C1C1)
-    private let group = Color(argb: 0xFFD3_D3D3)
+    private let group = Color(argb: 0xFFCD_CDCD)
     private let ink = Color(argb: 0xFF39_3939)
-    private let rule = Color(argb: 0xFFBD_BDBD)
+    /// The line between a group's rows: 2 thick, as measured.
+    private let rule = Color(argb: 0xFFC0_C0C0)
+    private let ruleThick: CGFloat = 2
     /// A switch's track when off, on the light menu.
     private let switchOff = Color(argb: 0xFFC1_C0C4)
     /// The body's top, below the screen's, and its corners.
-    private let top: CGFloat = 78
+    private let top: CGFloat = 77
     private let corner: CGFloat = 26
+    /// The ring round the colour chosen: wider than a colour's place, as measured.
+    private let chosenRing: CGFloat = 44
 
     /// The pencil the pad's strokes stand for: the newest this iPad's system knows.
     private var pencil: String {
@@ -822,7 +826,7 @@ private struct PadMenu: View {
                 .foregroundStyle(ink)
                 .lineLimit(1)
                 .padding(.leading, 12)
-            Color.clear.frame(height: 18)
+            Color.clear.frame(height: 28.5)
             HStack(spacing: 0) {
                 Text(verbatim: "Preview size")
                 Spacer(minLength: 0)
@@ -833,30 +837,38 @@ private struct PadMenu: View {
             .lineLimit(1)
             .padding(.horizontal, 10)
             PadSizeSlider(value: size) { studio.set("preview_size", $0) }
-            Color.clear.frame(height: 18)
+            Color.clear.frame(height: 15.5)
             HStack(spacing: 0) {
                 ForEach(Array(padColors.enumerated()), id: \.offset) { i, c in
                     if i > 0 {
                         Spacer(minLength: 0)
                     }
                     ZStack {
+                        // the ring reaches past the colour's place, into the room between them
                         Circle().fill(studio.padColor == i ? Color(argb: 0xFFEB_EBEB) : Color.clear)
+                            .frame(width: chosenRing, height: chosenRing)
                         Circle().fill(CanvasSpace.shared.color(c)).frame(width: 19, height: 19)
                     }
                     .frame(width: 37, height: 37)
                     .contentShape(Circle())
-                    .onTapGesture { studio.choosePadColor(i) }
+                    .onTapGesture {
+                        if studio.padColor == i {
+                            studio.padMenuOpen = false
+                        } else {
+                            studio.choosePadColor(i)
+                        }
+                    }
                 }
             }
-            Color.clear.frame(height: 18)
+            Color.clear.frame(height: 20)
             VStack(spacing: 0) {
                 Text(verbatim: pencil)
                     .font(.system(size: 17))
                     .foregroundStyle(ink)
                     .lineLimit(1)
                     .padding(.leading, 16)
-                    .frame(maxWidth: .infinity, minHeight: 45, maxHeight: 45, alignment: .leading)
-                rule.frame(height: 1)
+                    .frame(maxWidth: .infinity, minHeight: 44, maxHeight: 44, alignment: .leading)
+                rule.frame(height: ruleThick)
                 HStack(spacing: 0) {
                     Text(verbatim: "3D preview")
                         .font(.system(size: 17))
@@ -867,22 +879,22 @@ private struct PadMenu: View {
                 }
                 .padding(.leading, 16)
                 .padding(.trailing, 8)
-                .frame(height: 45)
+                .frame(height: 44)
                 .contentShape(Rectangle())
                 .onTapGesture { settings.pad3d.toggle() }
             }
             .background(RoundedRectangle(cornerRadius: 16, style: .circular).fill(group))
             Color.clear.frame(height: 10)
             VStack(spacing: 0) {
-                row("Clear drawing pad", height: 41) { studio.clearPad() }
-                rule.frame(height: 1)
-                row("Reset all brush settings", height: 41) { studio.reset() }
+                row("Clear drawing pad", height: 40) { studio.clearPad() }
+                rule.frame(height: ruleThick)
+                row("Reset all brush settings", height: 40) { studio.reset() }
             }
             .background(RoundedRectangle(cornerRadius: 16, style: .circular).fill(group))
         }
         .padding(.horizontal, 10)
-        .padding(.top, 17)
-        .padding(.bottom, 10)
+        .padding(.top, 22)
+        .padding(.bottom, 11.5)
         .frame(width: 320)
         .padding(.top, Pc.arrowHeight)
         .background(PopoverShape(side: .top, arrowX: arrowX, corner: corner).fill(fill))
@@ -921,7 +933,8 @@ private struct PadSizeSlider: View {
                 onChange(Float(min(max(drag.location.x / max(w, 1), 0), 1)))
             })
         }
-        .frame(height: 28)
+        // its line 27.5 under the words' capitals above it, as measured
+        .frame(height: 23)
         .padding(.horizontal, 10)
     }
 }

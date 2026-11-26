@@ -29,8 +29,9 @@ pub struct Pixels(Arc<PixelCell>);
 
 struct PixelCell {
     drawn: std::sync::OnceLock<Arc<Vec<u8>>>,
-    /// Draws them at a side (`TEXTURE_SIZE`, or up to `most`).
-    draw: Option<Box<DrawAt>>,
+    /// Draws them at a side (`TEXTURE_SIZE`, or up to `most`); shared with a twin (see
+    /// [`Pixels::twin`]).
+    draw: Option<Arc<DrawAt>>,
     most: usize,
 }
 
@@ -54,7 +55,17 @@ impl Pixels {
     /// up to `most` (a power of two) for [`Pixels::sharper`].
     pub fn later_at(most: usize, draw: impl Fn(usize) -> Option<Vec<u8>> + Send + Sync + 'static) -> Pixels {
         let most = if most.is_power_of_two() { most.max(TEXTURE_SIZE) } else { TEXTURE_SIZE };
-        Pixels(Arc::new(PixelCell { drawn: std::sync::OnceLock::new(), draw: Some(Box::new(draw)), most }))
+        Pixels(Arc::new(PixelCell { drawn: std::sync::OnceLock::new(), draw: Some(Arc::new(draw)), most }))
+    }
+
+    /// The same picture held apart, not drawn yet, if it is one drawn when first read (a
+    /// stand-in): drawn the first time it is read as these are, and kept only as long as it is held,
+    /// these left as they are. The library's sample strokes draw with twins, so the pictures
+    /// drawn for them (64 KB each) go with them rather than staying with every brush for the run.
+    pub fn twin(&self) -> Option<Pixels> {
+        let draw = self.0.draw.as_ref()?;
+        let most = self.0.most;
+        Some(Pixels(Arc::new(PixelCell { drawn: std::sync::OnceLock::new(), draw: Some(Arc::clone(draw)), most })))
     }
 
     /// The most pixels a side they can be drawn at: `TEXTURE_SIZE` for any but a stand-in drawn
@@ -1070,6 +1081,33 @@ impl Brush {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stand-in's twin draws the same picture, held apart: drawing it leaves the stand-in
+    /// undrawn, and its pixels go once the twin does; a picture of the user's own has none
+    /// (nothing to draw it again from).
+    #[test]
+    fn a_stand_in_s_twin_draws_the_same_picture_held_apart() {
+        let draws = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counted = Arc::clone(&draws);
+        let pixels = Pixels::later(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Some((0..TEXTURE_SIZE * TEXTURE_SIZE).map(|i| (i % 251) as u8).collect())
+        });
+        let twin = pixels.twin().expect("a twin");
+        assert!(!Pixels::same(&twin, &pixels));
+        assert_eq!(twin[TEXTURE_SIZE + 3], ((TEXTURE_SIZE + 3) % 251) as u8, "the same picture");
+        assert!(twin.is_drawn() && !pixels.is_drawn(), "drawn apart");
+        assert_eq!(draws.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(twin.most_side(), TEXTURE_SIZE);
+        // let go of: its pixels go with it
+        let weak = Arc::downgrade(&twin.shared());
+        drop(twin);
+        assert!(weak.upgrade().is_none(), "the twin's pixels let go");
+        // a drawn one's twin draws again; the user's own picture has none
+        assert_eq!(pixels.shared().len(), TEXTURE_SIZE * TEXTURE_SIZE);
+        assert!(pixels.twin().is_some_and(|t| !t.is_drawn()));
+        assert!(Pixels::drawn(Arc::new(vec![7; TEXTURE_SIZE * TEXTURE_SIZE])).twin().is_none());
+    }
 
     #[test]
     fn a_second_s_grain_goes_on_stamp_by_stamp() {

@@ -690,3 +690,1063 @@ fn heavy_pipelined() {
         }
     }
 }
+
+/// The first frames of a few strokes (`HEAVY_STROKES`, 4) of each brush `HEAVY_BRUSHES` (Verbena)
+/// at the size sliders `HEAVY_SIZES` (1.0), on a `HEAVY_W` × `HEAVY_H` canvas (2560 × 1600) shown
+/// whole in a window its size: the pen put down and held still `HEAVY_STILL` frames (0), then
+/// moved `HEAVY_STEP` pixels a sample (6), `HEAVY_PER_FRAME` samples a frame (2), as a stylus or
+/// (`HEAVY_POINTER` mouse) a mouse at full pressure. Each of a stroke's first `HEAVY_FIRST` frames
+/// (12): what it took to record and send, then for the GPU (waited for), and the slowest.
+#[test]
+#[ignore]
+fn heavy_stroke_starts() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let names = env("HEAVY_BRUSHES", "Verbena");
+    let sizes: Vec<f32> = env("HEAVY_SIZES", "1.0").split(',').filter_map(|s| s.parse().ok()).collect();
+    let strokes: usize = env("HEAVY_STROKES", "4").parse().unwrap_or(4);
+    let (width, height): (u32, u32) =
+        (env("HEAVY_W", "2560").parse().unwrap_or(2560), env("HEAVY_H", "1600").parse().unwrap_or(1600));
+    let still: usize = env("HEAVY_STILL", "0").parse().unwrap_or(0);
+    let step: f32 = env("HEAVY_STEP", "6").parse().unwrap_or(6.0);
+    let per_frame: usize = env("HEAVY_PER_FRAME", "2").parse().unwrap_or(2);
+    let first: usize = env("HEAVY_FIRST", "12").parse().unwrap_or(12);
+    let mouse = env("HEAVY_POINTER", "stylus") == "mouse";
+    crate::big_pictures::ASIDE.with(|a| a.set(true));
+    let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+    let s = crate::CanvasSession::new(width, height);
+    {
+        let mut st = s.shared.lock();
+        st.window_size = (width, height);
+        st.view = Some(View::fit((width, height), (width, height)));
+        st.gpu = Some(gpu);
+        st.ensure_canvas();
+    }
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = s.shared.lock().gpu.as_ref().unwrap().device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("window"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let started = Instant::now();
+    let frame = || {
+        let t = Instant::now();
+        s.shared.lock().draw_frame(&view, format, (width, height), procraft_engine::profile::Profile::Srgb, started);
+        let cpu = ms(t);
+        let t = Instant::now();
+        gpu.flush();
+        (cpu, ms(t))
+    };
+    let pointer = if mouse { PointerKind::Mouse } else { PointerKind::Stylus };
+    let library = s.brush_library();
+    let info = gpu.adapter.get_info();
+    println!(
+        "{} ({:?}), canvas {width}x{height}, still {still}, step {step}, {per_frame} a frame, {pointer:?}",
+        info.name, info.backend
+    );
+    // (`HEAVY_BETWEEN`: a brush chosen before each stroke, and the stroke's own chosen again after
+    // it; `HEAVY_WAIT_MS`: frames drawn this long after each choice, as the window draws them)
+    let between = env("HEAVY_BETWEEN", "");
+    let wait_ms: u64 = env("HEAVY_WAIT_MS", "0").parse().unwrap_or(0);
+    let find = |name: &str| library.iter().flat_map(|set| set.brushes.iter()).find(|b| b.name == name).cloned();
+    let idle = |for_ms: u64| {
+        let t = Instant::now();
+        frame();
+        while t.elapsed().as_millis() < u128::from(for_ms) {
+            frame();
+            std::thread::sleep(std::time::Duration::from_millis(8));
+        }
+    };
+    idle(200);
+    for name in names.split(',') {
+        let Some(b) = find(name) else { continue };
+        s.select_brush(b.set, b.index);
+        crate::big_pictures::wait_for_big_pictures(std::time::Duration::from_secs(60));
+        idle(wait_ms);
+        for &size in &sizes {
+            s.set_brush_size(size);
+            for n in 0..strokes {
+                if let Some(other) = find(&between) {
+                    s.select_brush(other.set, other.index);
+                    idle(wait_ms);
+                    s.select_brush(b.set, b.index);
+                    s.set_brush_size(size);
+                    idle(wait_ms);
+                }
+                let y = height as f32 * (0.25 + 0.5 * n as f32 / strokes.max(1) as f32);
+                let mut k = 0usize;
+                let sample = |k: usize| PenSample {
+                    x: width as f32 * 0.2 + k as f32 * step,
+                    y: y + (k as f32 * 0.05).sin() * 20.0,
+                    pressure: if mouse { 1.0 } else { 0.35 + 0.6 * (k as f32 * 0.02).sin().abs() },
+                    tilt: 0.0,
+                    orientation: 0.0,
+                    time_ms: k as f64 * 1000.0 / (60.0 * per_frame as f64) + n as f64 * 10_000.0,
+                    roll: 0.0,
+                };
+                let t = Instant::now();
+                s.stroke_begin(pointer, vec![sample(0)]);
+                let begin = ms(t);
+                let mut times = Vec::new();
+                for f in 0..first.max(1) + 40 {
+                    let t = Instant::now();
+                    if f >= still {
+                        let samples: Vec<PenSample> = (0..per_frame)
+                            .map(|_| {
+                                k += 1;
+                                sample(k)
+                            })
+                            .collect();
+                        s.stroke_add(samples);
+                    }
+                    let add = ms(t);
+                    let (cpu, gpu_ms) = frame();
+                    times.push((add, cpu, gpu_ms));
+                }
+                s.stroke_end(vec![]);
+                for _ in 0..6 {
+                    frame();
+                }
+                let (worst, at) = times
+                    .iter()
+                    .enumerate()
+                    .take(first)
+                    .map(|(i, (a, c, g))| (a + c + g, i))
+                    .fold((0.0, 0), |m, x| if x.0 > m.0 { x } else { m });
+                let rest = times.iter().skip(first).map(|(a, c, g)| a + c + g).fold(0.0, f64::max);
+                println!(
+                    "{name} {size} stroke {}: begin {begin:.1} ms; first frames (add+cpu+gpu) {}; worst {worst:.1} ms at frame {}; later frames at most {rest:.1}",
+                    n + 1,
+                    times.iter().take(first).map(|(a, c, g)| format!("{:.1}", a + c + g)).collect::<Vec<_>>().join(" "),
+                    at + 1,
+                );
+                if env("HEAVY_PARTS", "0") == "1" {
+                    println!(
+                        "    parts {}",
+                        times
+                            .iter()
+                            .take(first)
+                            .map(|(a, c, g)| format!("{a:.1}/{c:.1}/{g:.1}"))
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A session with one brush, as a long one in the app: `HEAVY_BRUSHES` (Verbena) at the size slider
+/// `HEAVY_SIZE` (1.0), `HEAVY_STROKES` (40) strokes of `HEAVY_STROKE_MS` (900) ms each, back and forth
+/// over a `HEAVY_W` × `HEAVY_H` canvas (2560 × 1600) shown whole, two pen samples a frame, the GPU
+/// waited for after each frame. Per stroke: its frames' median and slowest, its lift, and what the
+/// canvas holds (its textures, the undo history's, and the GPU allocator's where it tells).
+#[test]
+#[ignore]
+fn heavy_session() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let name = env("HEAVY_BRUSHES", "Verbena");
+    let size: f32 = env("HEAVY_SIZE", "1.0").parse().unwrap_or(1.0);
+    let strokes: usize = env("HEAVY_STROKES", "40").parse().unwrap_or(40);
+    let stroke_ms: f64 = env("HEAVY_STROKE_MS", "900").parse().unwrap_or(900.0);
+    let (width, height): (u32, u32) =
+        (env("HEAVY_W", "2560").parse().unwrap_or(2560), env("HEAVY_H", "1600").parse().unwrap_or(1600));
+    crate::big_pictures::ASIDE.with(|a| a.set(true));
+    let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+    let s = crate::CanvasSession::new(width, height);
+    {
+        let mut st = s.shared.lock();
+        st.window_size = (width, height);
+        st.view = Some(View::fit((width, height), (width, height)));
+        st.gpu = Some(gpu);
+        st.ensure_canvas();
+    }
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let target = s.shared.lock().gpu.as_ref().unwrap().device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("window"),
+        size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = target.create_view(&Default::default());
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let started = Instant::now();
+    let frame = || {
+        let t = Instant::now();
+        let more = {
+            let mut st = s.shared.lock();
+            st.draw_frame(&view, format, (width, height), procraft_engine::profile::Profile::Srgb, started);
+            st.needs_frame || st.canvas.as_ref().is_some_and(|c| c.lays_over_frames())
+        };
+        gpu.flush();
+        (ms(t), more)
+    };
+    let library = s.brush_library();
+    let Some(b) = library.iter().flat_map(|set| set.brushes.iter()).find(|b| b.name == name) else { return };
+    s.select_brush(b.set, b.index);
+    crate::big_pictures::wait_for_big_pictures(std::time::Duration::from_secs(60));
+    s.set_brush_size(size);
+    let info = gpu.adapter.get_info();
+    println!(
+        "{} ({:?}), canvas {width}x{height}, {name} at {size}, {strokes} strokes of {stroke_ms} ms",
+        info.name, info.backend
+    );
+    let mb = |b: u64| b as f64 / f64::from(1u32 << 20);
+    let samples = (stroke_ms / 1000.0 * 240.0) as usize;
+    let mut t_ms = 0.0f64;
+    for n in 0..strokes {
+        // back and forth across the canvas, a band lower each stroke
+        let y0 = height as f32 * (0.15 + 0.1 * (n % 8) as f32);
+        let point = |k: usize, t_ms: f64| {
+            let along = k as f32 / samples.max(1) as f32;
+            let x = width as f32 * if n.is_multiple_of(2) { 0.1 + 0.8 * along } else { 0.9 - 0.8 * along };
+            PenSample {
+                x,
+                y: y0 + (along * 9.0).sin() * height as f32 * 0.05,
+                pressure: 0.5 + 0.45 * (along * 7.0).sin().abs(),
+                tilt: 0.0,
+                orientation: 0.0,
+                time_ms: t_ms + k as f64 * 1000.0 / 240.0,
+                roll: 0.0,
+            }
+        };
+        let began = Instant::now();
+        s.stroke_begin(PointerKind::Stylus, vec![point(0, t_ms)]);
+        let mut frames = Vec::new();
+        let mut k = 0;
+        while k + 2 < samples {
+            s.stroke_add(vec![point(k + 1, t_ms), point(k + 2, t_ms)]);
+            k += 2;
+            frames.push(frame().0);
+        }
+        let lifted = Instant::now();
+        s.stroke_end(vec![point(samples, t_ms)]);
+        let mut lift = Vec::new();
+        for _ in 0..30 {
+            let (took, more) = frame();
+            lift.push(took);
+            if !more {
+                break;
+            }
+        }
+        let lift_ms = ms(lifted);
+        t_ms += stroke_ms + 400.0;
+        frames.sort_by(f64::total_cmp);
+        let (textures, history, packed, count) = {
+            let st = s.shared.lock();
+            let c = st.canvas.as_ref().unwrap();
+            (c.texture_bytes(), c.history_bytes(), c.history_packed_bytes(), c.textures().len())
+        };
+        let report = gpu.device.generate_allocator_report().map(|r| (r.total_allocated_bytes, r.total_reserved_bytes));
+        println!(
+            "stroke {:2}: frames med {:5.1} max {:6.1} ms, lift {:6.1} ms in {} frames (worst {:5.1}); {:5.0} ms in all | textures {:6.0} MB ({count}), undo {:5.0} MB, packed {:4.0} MB{}",
+            n + 1,
+            frames.get(frames.len() / 2).copied().unwrap_or(0.0),
+            frames.last().copied().unwrap_or(0.0),
+            lift_ms,
+            lift.len(),
+            lift.iter().copied().fold(0.0, f64::max),
+            ms(began),
+            mb(textures),
+            mb(history),
+            mb(packed),
+            report.map_or(String::new(), |(a, r)| format!(", GPU allocated {:.0} MB, reserved {:.0} MB", mb(a), mb(r))),
+        );
+    }
+}
+
+/// As [`heavy_session`], the frames drawn as the app draws them: on a thread of their own every
+/// 8 ms (the GPU waited for after each, as a window's one image in flight is), the pen's samples
+/// coming in real time (`HEAVY_RATE`, 120 a second) on another. Per stroke: its slowest frames (from
+/// the draw's start to its GPU work done) and how many took over 100 ms, as the app logs them.
+#[test]
+#[ignore]
+fn heavy_realtime() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let name = env("HEAVY_BRUSHES", "Verbena");
+    let size: f32 = env("HEAVY_SIZE", "1.0").parse().unwrap_or(1.0);
+    let strokes: usize = env("HEAVY_STROKES", "40").parse().unwrap_or(40);
+    let stroke_ms: f64 = env("HEAVY_STROKE_MS", "900").parse().unwrap_or(900.0);
+    let rate: f64 = env("HEAVY_RATE", "120").parse().unwrap_or(120.0);
+    let (width, height): (u32, u32) =
+        (env("HEAVY_W", "2560").parse().unwrap_or(2560), env("HEAVY_H", "1600").parse().unwrap_or(1600));
+    crate::big_pictures::ASIDE.with(|a| a.set(true));
+    let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+    let s = crate::CanvasSession::new(width, height);
+    {
+        let mut st = s.shared.lock();
+        st.window_size = (width, height);
+        st.view = Some(View::fit((width, height), (width, height)));
+        st.gpu = Some(gpu);
+        // (`HEAVY_P3`: the canvas in Display P3, as a Screen Size one is made)
+        if env("HEAVY_P3", "0") == "1" {
+            st.doc.assign_profile(procraft_engine::profile::Profile::DisplayP3, None);
+        }
+        st.ensure_canvas();
+    }
+    let library = s.brush_library();
+    let Some(b) = library.iter().flat_map(|set| set.brushes.iter()).find(|b| b.name == name) else { return };
+    s.select_brush(b.set, b.index);
+    crate::big_pictures::wait_for_big_pictures(std::time::Duration::from_secs(60));
+    s.set_brush_size(size);
+    let stop = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+    let frames = {
+        let (s, stop) = (s.clone(), stop.clone());
+        std::thread::spawn(move || {
+            let gpu = s.shared.lock().gpu.clone().unwrap();
+            let format = wgpu::TextureFormat::Rgba8Unorm;
+            let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("window"),
+                size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let mut taken = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                let queued = s.shared.lock().canvas.as_ref().map(|c| c.queued_work()).unwrap_or_default();
+                let t = Instant::now();
+                match s.shared.state.try_lock_for(Duration::from_millis(40)) {
+                    Some(guard) => drop(guard),
+                    None => {
+                        println!("  frame waits for the canvas: {}", s.shared.holder.said());
+                        drop(s.shared.lock());
+                    }
+                }
+                let locked = ms(t);
+                let d = Instant::now();
+                s.draw(&view, format, (width, height), procraft_engine::profile::Profile::Srgb, started);
+                let drew = ms(d);
+                let f = Instant::now();
+                gpu.flush();
+                let flushed = ms(f);
+                let at = t.duration_since(started).as_secs_f64() * 1e3;
+                if ms(t) > 50.0 {
+                    println!(
+                        "  slow frame at {at:.0} ms: lock {locked:.1}, draw {drew:.1}, GPU {flushed:.1} | queued: {queued}"
+                    );
+                }
+                taken.push((at, ms(t), flushed));
+                std::thread::sleep(Duration::from_millis(8).saturating_sub(t.elapsed()));
+            }
+            taken
+        })
+    };
+    let info = s.shared.lock().gpu.as_ref().map(|g| g.adapter.get_info());
+    println!(
+        "{:?}, canvas {width}x{height}, {name} at {size}, {strokes} strokes of {stroke_ms} ms at {rate} samples a second",
+        info.map(|i| i.name)
+    );
+    // (`HEAVY_SAVE`: saved into a folder of its own and kept saved as the app keeps an artwork,
+    // its time-lapse with it)
+    if env("HEAVY_SAVE", "0") == "1" {
+        let dir = std::env::temp_dir().join(format!("procraft-heavy-realtime-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.to_string_lossy().into_owned();
+        s.save(path.clone()).unwrap();
+        Arc::clone(&s).keep_saved(path, Duration::from_millis(3000), Duration::from_millis(250));
+        println!("kept saved in {}", dir.display());
+    }
+    let samples = (stroke_ms / 1000.0 * rate) as usize;
+    // (`HEAVY_POINTER` mouse or finger: at full pressure; `HEAVY_PATH` desk: strokes as the desktop pass posted
+    // them, a wave, a line or a zigzag between random points, the window's pixels a sixth smaller)
+    let pointer = match env("HEAVY_POINTER", "stylus").as_str() {
+        "mouse" => PointerKind::Mouse,
+        "finger" => PointerKind::Finger,
+        _ => PointerKind::Stylus,
+    };
+    let mouse = pointer != PointerKind::Stylus;
+    let desk = env("HEAVY_PATH", "bands") == "desk";
+    let mut seed: u64 = 7;
+    let mut random = |from: f32, to: f32| {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        from + (to - from) * ((seed >> 33) as f32 / (1u64 << 31) as f32)
+    };
+    let mut spans = Vec::new();
+    for n in 0..strokes {
+        let y0 = height as f32 * (0.15 + 0.1 * (n % 8) as f32);
+        let k_window = width as f32 / 2160.0;
+        let (dx0, dy0, dx1, dy1) =
+            (random(150.0, 900.0), random(200.0, 1250.0), random(1200.0, 2080.0), random(200.0, 1250.0));
+        let kind = (random(0.0, 3.0) as usize).min(2);
+        let begun = Instant::now();
+        let t0 = begun.duration_since(started).as_secs_f64() * 1e3;
+        let point = |k: usize| {
+            let along = k as f32 / samples.max(1) as f32;
+            let (x, y) = if desk {
+                let (x, mut y) = (dx0 + (dx1 - dx0) * along, dy0 + (dy1 - dy0) * along);
+                let reach = (dy1 - dy0).abs().max(0.0) + 200.0;
+                match kind {
+                    0 => y += (along * std::f32::consts::PI * 4.0).sin() * 0.35 * reach.max(80.0),
+                    2 => {
+                        let side = if ((along * 8.0) as usize).is_multiple_of(2) { -1.0 } else { 1.0 };
+                        y += side * 0.25 * reach.max(80.0) * (along * 8.0).fract();
+                    }
+                    _ => {}
+                }
+                (x * k_window, y * k_window)
+            } else {
+                let x = width as f32 * if n.is_multiple_of(2) { 0.1 + 0.8 * along } else { 0.9 - 0.8 * along };
+                (x, y0 + (along * 9.0).sin() * height as f32 * 0.05)
+            };
+            PenSample {
+                x,
+                y,
+                pressure: if mouse { 1.0 } else { 0.5 + 0.45 * (along * 7.0).sin().abs() },
+                tilt: 0.0,
+                orientation: 0.0,
+                time_ms: t0 + k as f64 * 1000.0 / rate,
+                roll: 0.0,
+            }
+        };
+        println!("  stroke {} begins at {t0:.0} ms", n + 1);
+        s.stroke_begin(pointer, vec![point(0)]);
+        for k in 1..samples {
+            let due = Duration::from_secs_f64(k as f64 / rate);
+            std::thread::sleep(due.saturating_sub(begun.elapsed()));
+            s.stroke_add(vec![point(k)]);
+        }
+        let lift = Instant::now();
+        s.stroke_end(vec![point(samples)]);
+        println!(
+            "  stroke {} ends at {:.0} ms (stroke_end {:.1} ms)",
+            n + 1,
+            lift.duration_since(started).as_secs_f64() * 1e3,
+            ms(lift)
+        );
+        std::thread::sleep(Duration::from_millis(400));
+        spans.push((t0, started.elapsed().as_secs_f64() * 1e3));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let taken = frames.join().unwrap_or_default();
+    for (n, (from, to)) in spans.iter().enumerate() {
+        let mut these: Vec<f64> = taken.iter().filter(|(at, ..)| at >= from && at < to).map(|(_, t, _)| *t).collect();
+        these.sort_by(f64::total_cmp);
+        let slow = these.iter().filter(|&&t| t > 100.0).count();
+        let gpu_most = taken.iter().filter(|(at, ..)| at >= from && at < to).map(|(.., g)| *g).fold(0.0, f64::max);
+        println!(
+            "stroke {:2}: {} frames, med {:5.1} p95 {:6.1} max {:6.1} ms, GPU at most {gpu_most:6.1} ms, over 100 ms {slow}",
+            n + 1,
+            these.len(),
+            these.get(these.len() / 2).copied().unwrap_or(0.0),
+            these.get(these.len() * 95 / 100).copied().unwrap_or(0.0),
+            these.last().copied().unwrap_or(0.0),
+        );
+    }
+}
+
+/// How far behind the pen a brush's stroke shows while drawn: a straight stroke across the canvas
+/// at `TIP_SPEED` screen pixels a second (2000), a pen's samples at `TIP_RATE` (200) a second, a
+/// frame drawn every `TIP_FRAME_MS` (16.7) of them with what runs ahead; after each, the furthest
+/// the stroke's ink reaches along its line, against where the pen is. Per brush (`TIP_BRUSHES`)
+/// and smoothing (none; the app's stabilisation 60%; its motion filtering 30%; the brush's
+/// StreamLine 50%): the median gap in pixels and in milliseconds.
+#[test]
+#[ignore]
+fn heavy_tip_lag() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let speed: f32 = env("TIP_SPEED", "2000").parse().unwrap_or(2000.0);
+    let rate: f64 = env("TIP_RATE", "200").parse().unwrap_or(200.0);
+    let frame_ms: f64 = env("TIP_FRAME_MS", "16.7").parse().unwrap_or(16.7);
+    let names = env("TIP_BRUSHES", "Ibis,Pangolin");
+    let side = 1200u32;
+    let Some(s) = session(side, side) else { return };
+    let zoom = s.shared.lock().view.map_or(1.0, |v| v.zoom());
+    println!("zoom {zoom}, {speed} px/s, {rate} Hz, a frame every {frame_ms} ms");
+    let y = side as f32 / 2.0;
+    // each frame drawn into a window, as the app draws them
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let window = s.shared.lock().gpu.as_ref().unwrap().device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("window"),
+        size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let view = window.create_view(&Default::default());
+    let started = Instant::now();
+    for name in names.split(',') {
+        let found = {
+            let st = s.shared.lock();
+            st.library.iter().enumerate().find_map(|(set, entry)| {
+                let at = entry.brushes.iter().position(|b| b.name == name)?;
+                Some((set as u32, at as u32))
+            })
+        };
+        let Some((set, index)) = found else {
+            println!("{name}: not in the library");
+            continue;
+        };
+        for (label, smoothing) in [
+            ("none", [0.0f32; 3]),
+            ("app stab 60%", [0.6, 0.0, 0.0]),
+            ("app motion 30%", [0.0, 0.3, 0.0]),
+            ("streamline 50%", [0.0, 0.0, 0.5]),
+        ] {
+            s.select_brush(set, index);
+            s.set_brush_size(0.3);
+            s.set_input_settings(smoothing[0], smoothing[1], 0.0, 0.0, true, Vec::new());
+            if smoothing[2] > 0.0 {
+                s.studio_begin();
+                s.set_studio_setting("streamline".to_owned(), smoothing[2]);
+                s.studio_end(true);
+            }
+            let x0 = 60.0f32;
+            let at = |k: usize| {
+                let t = k as f64 * 1000.0 / rate;
+                PenSample {
+                    x: x0 + speed * (t / 1000.0) as f32,
+                    y,
+                    pressure: 0.6,
+                    tilt: 0.0,
+                    orientation: 0.0,
+                    time_ms: t,
+                    roll: 0.0,
+                }
+            };
+            let total = ((side as f32 - 2.0 * x0) / speed * rate as f32) as usize;
+            // the canvas before the stroke, to tell its ink by (a quick stroke of a pencil is faint)
+            let blank = {
+                let mut guard = s.shared.lock();
+                let st = &mut *guard;
+                st.draw_frame(&view, format, (side, side), procraft_engine::profile::Profile::Srgb, started);
+                let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+                canvas.read_composite(gpu).unwrap()
+            };
+            s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+            let mut gaps = Vec::new();
+            let mut next_frame = frame_ms;
+            for k in 1..total {
+                s.stroke_add(vec![at(k)]);
+                let t = k as f64 * 1000.0 / rate;
+                if t < next_frame {
+                    continue;
+                }
+                next_frame += frame_ms;
+                let pixels = {
+                    let mut guard = s.shared.lock();
+                    let st = &mut *guard;
+                    st.draw_frame(&view, format, (side, side), procraft_engine::profile::Profile::Srgb, started);
+                    let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+                    canvas.read_composite(gpu).unwrap()
+                };
+                // the furthest inked column within a band about the line (canvas pixels)
+                let row = |yy: u32| (yy * side) as usize * 4;
+                let mut reach = 0u32;
+                for yy in (y as u32 - 30)..(y as u32 + 30) {
+                    for x in (reach + 1)..side {
+                        let i = row(yy) + x as usize * 4;
+                        let (p, b) = (&pixels[i..i + 3], &blank[i..i + 3]);
+                        if p.iter().zip(b).any(|(&c, &d)| c.abs_diff(d) > 1) {
+                            reach = x;
+                        }
+                    }
+                }
+                let pen = at(k).x / zoom;
+                if t > 150.0 {
+                    gaps.push((pen - reach as f32) * zoom);
+                }
+            }
+            s.stroke_end(vec![at(total)]);
+            {
+                let mut guard = s.shared.lock();
+                let st = &mut *guard;
+                let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+                canvas.render(gpu, &mut st.doc, None);
+            }
+            s.undo();
+            gaps.sort_by(f32::total_cmp);
+            let med = gaps.get(gaps.len() / 2).copied().unwrap_or(f32::NAN);
+            println!(
+                "{name:12} {label:16} gap med {med:6.1} px = {:5.1} ms (min {:6.1}, max {:6.1}; {} frames)",
+                med / speed * 1000.0,
+                gaps.first().copied().unwrap_or(f32::NAN),
+                gaps.last().copied().unwrap_or(f32::NAN),
+                gaps.len()
+            );
+        }
+    }
+}
+
+/// Every library brush's stroke, how far its stamps placed for good trail the pen (a straight
+/// stroke at 2000 screen pixels a second, a pen's samples at 240 a second, 0.6 s long), and whether
+/// the canvas shows anything ahead of them (a tip or a prediction): a stroke that shows nothing
+/// ahead shows that far behind the pen. With the app's motion filtering at `SETTLED_MOTION` and
+/// stabilisation at `SETTLED_STAB` (none).
+#[test]
+#[ignore]
+fn heavy_settled_lag() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let motion: f32 = env("SETTLED_MOTION", "0").parse().unwrap_or(0.0);
+    let stab: f32 = env("SETTLED_STAB", "0").parse().unwrap_or(0.0);
+    let side = 1600u32;
+    let Some(s) = session(side, side) else { return };
+    s.set_input_settings(stab, motion, 0.0, 0.0, true, Vec::new());
+    let zoom = s.shared.lock().view.map_or(1.0, |v| v.zoom());
+    let speed = 2000.0f32;
+    let rate = 240.0f64;
+    let names: Vec<(u32, u32, String, String)> = {
+        let st = s.shared.lock();
+        st.library
+            .iter()
+            .enumerate()
+            .flat_map(|(set, entry)| {
+                entry
+                    .brushes
+                    .iter()
+                    .enumerate()
+                    .map(move |(i, b)| (set as u32, i as u32, entry.name.clone(), b.name.clone()))
+            })
+            .collect()
+    };
+    let (mut ahead_none, mut lagging) = (0, 0);
+    println!("set\tbrush\tshows ahead\tdual\tin place\tlag ms\tsecond lag ms");
+    for (set, index, set_name, name) in names {
+        if !s.select_brush(set, index) {
+            continue;
+        }
+        let y = side as f32 / 2.0;
+        let at = |k: usize| {
+            let t = k as f64 * 1000.0 / rate;
+            PenSample {
+                x: 100.0 + speed * (t / 1000.0) as f32,
+                y,
+                pressure: 0.6,
+                tilt: 0.0,
+                orientation: 0.0,
+                time_ms: t,
+                roll: 0.0,
+            }
+        };
+        let n = (0.6 * rate) as usize;
+        s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+        for k in 1..n {
+            s.stroke_add(vec![at(k)]);
+        }
+        let (ahead, dual, in_place, lag, second_lag) = {
+            let st = s.shared.lock();
+            let pen = at(n - 1).x / zoom;
+            let lag = |b: Option<&procraft_engine::stroke::StrokeBuilder>| {
+                b.and_then(|b| b.placed_stamps().last().map(|p| (pen - p.center.x) / (speed / zoom) * 1000.0))
+            };
+            let canvas = st.canvas.as_ref();
+            let shows_tip = canvas.is_some_and(|c| c.shows_tip() || c.shows_dual_tip());
+            // (no tip: paint laid in place, a dual brush's too)
+            let in_place = !shows_tip;
+            (shows_tip, st.second.is_some(), in_place, lag(st.stroke.as_deref()), lag(st.second.as_deref()))
+        };
+        s.stroke_end(vec![at(n)]);
+        s.undo();
+        let lag = lag.unwrap_or(f32::NAN);
+        if !ahead {
+            ahead_none += 1;
+            if lag > 30.0 {
+                lagging += 1;
+            }
+        }
+        if !ahead || lag > 30.0 {
+            println!(
+                "{set_name}\t{name}\t{ahead}\t{dual}\t{in_place}\t{lag:.0}\t{}",
+                second_lag.map_or("-".to_owned(), |l| format!("{l:.0}"))
+            );
+        }
+    }
+    println!(
+        "{ahead_none} brushes show nothing ahead of what they lay; {lagging} of them lay it over 30 ms behind the pen"
+    );
+}
+
+/// What a brush painting in place would cost a frame to show its tip exactly: the stroke's tail
+/// that smoothing holds back (`TAIL_HOLD_MS`, 162: the app's motion filtering at 30%) laid in place
+/// again each frame. A stroke at 2000 screen pixels a second, a pen's samples at 240 a second, a
+/// frame every 4 of them (60 a second), a 2048 square canvas fitted in a 2560 × 1600 window; every
+/// 8th frame lays the held-back tail's samples too, all at once. Per brush (`TAIL_BRUSHES`) and
+/// size (`TAIL_SIZES`): the median frame's GPU time and stamps, and the tail frame's. Run with
+/// `WGPU_POWER_PREF=low` for a laptop's built-in GPU.
+#[test]
+#[ignore]
+fn heavy_in_place_tail() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let names = env("TAIL_BRUSHES", "Ibis,Pangolin");
+    let sizes: Vec<f32> = env("TAIL_SIZES", "0.1,0.3").split(',').filter_map(|s| s.parse().ok()).collect();
+    let hold_ms: f64 = env("TAIL_HOLD_MS", "162").parse().unwrap_or(162.0);
+    let (side, width, height) = (2048u32, 2560u32, 1600u32);
+    let Some(s) = session(side, width) else { return };
+    s.resize_window(width, height);
+    s.set_display_scale(2.0);
+    let zoom = {
+        let mut st = s.shared.lock();
+        st.view = Some(View::fit((side, side), (width, height)));
+        let gpu = st.gpu.as_ref().unwrap();
+        let info = gpu.adapter.get_info();
+        println!("{} ({:?}), canvas {side} square in {width}x{height}, tail {hold_ms} ms", info.name, info.backend);
+        st.view.map_or(1.0, |v| v.zoom())
+    };
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let rate = 240.0f64;
+    let speed = 2000.0f32;
+    let tail = (hold_ms * rate / 1000.0).round() as usize;
+    let at = |k: usize| {
+        let t = k as f64 * 1000.0 / rate;
+        let along = speed * (t / 1000.0) as f32;
+        // back and forth across the canvas on screen
+        let span = side as f32 * zoom - 200.0;
+        let line = (along / span) as usize;
+        let into = along % span;
+        let left = (width as f32 - side as f32 * zoom) / 2.0 + 100.0;
+        let x = if line.is_multiple_of(2) { left + into } else { left + span - into };
+        let y = height as f32 / 2.0 + (along * 0.004).sin() * 300.0;
+        PenSample { x, y, pressure: 0.6, tilt: 0.0, orientation: 0.0, time_ms: t, roll: 0.0 }
+    };
+    let med = |v: &mut Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied().unwrap_or(f64::NAN)
+    };
+    for name in names.split(',') {
+        let found = {
+            let st = s.shared.lock();
+            st.library.iter().enumerate().find_map(|(set, entry)| {
+                let at = entry.brushes.iter().position(|b| b.name == name)?;
+                Some((set as u32, at as u32))
+            })
+        };
+        let Some((set, index)) = found else { continue };
+        for &size in &sizes {
+            s.select_brush(set, index);
+            crate::big_pictures::wait_for_big_pictures(std::time::Duration::from_secs(60));
+            s.set_brush_size(size);
+            // (all of a frame's work laid in it, to be timed)
+            if let Some(c) = s.shared.lock().canvas.as_mut() {
+                c.set_in_place_paced(false);
+                c.set_dry_paced(false, None);
+            }
+            let queued = || s.shared.lock().canvas.as_ref().map_or(0, |c| c.stamps_queued());
+            let frame = || {
+                let t = Instant::now();
+                {
+                    let mut st = s.shared.lock();
+                    let st = &mut *st;
+                    st.draw_ahead();
+                    if let (Some(c), Some(g)) = (st.canvas.as_mut(), st.gpu.as_ref()) {
+                        c.render(g, &mut st.doc, None);
+                    }
+                }
+                gpu.flush();
+                ms(t)
+            };
+            let (mut plain, mut tails, mut plain_stamps, mut tail_stamps) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut k = 0usize;
+            s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+            frame();
+            for f in 0..96 {
+                let n = if f % 8 == 7 { tail } else { 4 };
+                let before = queued();
+                let samples: Vec<PenSample> = (k + 1..=k + n).map(at).collect();
+                k += n;
+                s.stroke_add(samples);
+                let stamps = queued() - before;
+                let took = frame();
+                if f < 8 {
+                    continue;
+                }
+                if n == 4 {
+                    plain.push(took);
+                    plain_stamps.push(stamps as f64);
+                } else {
+                    tails.push(took);
+                    tail_stamps.push(stamps as f64);
+                }
+            }
+            s.stroke_end(vec![at(k + 1)]);
+            frame();
+            s.undo();
+            frame();
+            println!(
+                "{name:10} size {size:4.2}: a frame {:5.2} ms ({:4.0} stamps); laying the {tail}-sample tail too {:6.2} ms ({:4.0} stamps)",
+                med(&mut plain),
+                med(&mut plain_stamps),
+                med(&mut tails),
+                med(&mut tail_stamps),
+            );
+        }
+    }
+}
+
+/// What showing a stroke's tip whole costs a frame: a stroke at 2000 screen pixels a second, a
+/// pen's samples at 240 a second, a frame drawn into a 2560 × 1600 window every 4 of them (a 2048
+/// square canvas fitted in it), the GPU waited for after each (so that the tips are given all the
+/// work they take, see the canvas's `TIP_WORK_FIRST`); with its tip and without, the app's motion
+/// filtering at 0 and at 30% (`TIP_MOTION`, `,` between). Per brush (`TIP_BRUSHES`) and size
+/// (`TIP_SIZES`): the median and 95th percentile frame (CPU and GPU) and the stamps given a frame.
+/// Whether frames drawn as the screen takes them keep on time is [`heavy_tip_paced`]'s. Run with
+/// `WGPU_POWER_PREF=low` for a laptop's built-in GPU.
+#[test]
+#[ignore]
+fn heavy_tip_frames() {
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let names = env("TIP_BRUSHES", "Ibis,Pangolin,Highmoor,Copperwing,Garnet Rose");
+    let sizes: Vec<f32> = env("TIP_SIZES", "0.1,0.3").split(',').filter_map(|s| s.parse().ok()).collect();
+    let motions: Vec<f32> = env("TIP_MOTION", "0,0.3").split(',').filter_map(|s| s.parse().ok()).collect();
+    let (side, width, height) = (2048u32, 2560u32, 1600u32);
+    crate::big_pictures::ASIDE.with(|a| a.set(true));
+    let Some(s) = session(side, width) else { return };
+    s.resize_window(width, height);
+    s.set_display_scale(2.0);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let (window, zoom) = {
+        let mut st = s.shared.lock();
+        st.view = Some(View::fit((side, side), (width, height)));
+        let gpu = st.gpu.as_ref().unwrap();
+        let info = gpu.adapter.get_info();
+        println!("{} ({:?}), canvas {side} square in {width}x{height}", info.name, info.backend);
+        let window = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        (window, st.view.map_or(1.0, |v| v.zoom()))
+    };
+    let view = window.create_view(&Default::default());
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let started = Instant::now();
+    let rate = 240.0f64;
+    let speed = 2000.0f32;
+    let at = |k: usize| {
+        let t = k as f64 * 1000.0 / rate;
+        let along = speed * (t / 1000.0) as f32;
+        let span = side as f32 * zoom - 200.0;
+        let line = (along / span) as usize;
+        let into = along % span;
+        let left = (width as f32 - side as f32 * zoom) / 2.0 + 100.0;
+        let x = if line.is_multiple_of(2) { left + into } else { left + span - into };
+        let y = height as f32 / 2.0 + (along * 0.004).sin() * 300.0;
+        PenSample { x, y, pressure: 0.6, tilt: 0.0, orientation: 0.0, time_ms: t, roll: 0.0 }
+    };
+    let q = |v: &mut Vec<f64>, at: f64| {
+        v.sort_by(f64::total_cmp);
+        v.get(((v.len().max(1) - 1) as f64 * at).round() as usize).copied().unwrap_or(f64::NAN)
+    };
+    for name in names.split(',') {
+        let found = {
+            let st = s.shared.lock();
+            st.library.iter().enumerate().find_map(|(set, entry)| {
+                let at = entry.brushes.iter().position(|b| b.name == name)?;
+                Some((set as u32, at as u32))
+            })
+        };
+        let Some((set, index)) = found else { continue };
+        for &size in &sizes {
+            for &motion in &motions {
+                let mut row = format!("{name:12} size {size:4.2} motion {:3.0}%:", motion * 100.0);
+                for tips in [false, true] {
+                    s.select_brush(set, index);
+                    crate::big_pictures::wait_for_big_pictures(std::time::Duration::from_secs(60));
+                    s.set_brush_size(size);
+                    s.set_input_settings(0.0, motion, 0.0, 0.0, true, Vec::new());
+                    if let Some(c) = s.shared.lock().canvas.as_mut() {
+                        c.set_tips_ahead(tips);
+                    }
+                    let queued = || s.shared.lock().canvas.as_ref().map_or(0, |c| c.stamps_queued());
+                    let frame = || {
+                        let t = Instant::now();
+                        s.shared.lock().draw_frame(
+                            &view,
+                            format,
+                            (width, height),
+                            procraft_engine::profile::Profile::Srgb,
+                            started,
+                        );
+                        gpu.flush();
+                        ms(t)
+                    };
+                    let (mut frames, mut stamps) = (Vec::new(), Vec::new());
+                    s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+                    frame();
+                    for f in 0..120usize {
+                        let before = queued();
+                        s.stroke_add((f * 4 + 1..=f * 4 + 4).map(at).collect());
+                        let took = frame();
+                        if f >= 10 {
+                            frames.push(took);
+                            stamps.push((queued() - before) as f64);
+                        }
+                    }
+                    s.stroke_end(vec![at(481)]);
+                    frame();
+                    s.undo();
+                    frame();
+                    let (med, p95) = (q(&mut frames, 0.5), q(&mut frames, 0.95));
+                    row += &format!(
+                        "  {}: {med:5.2} / p95 {p95:5.2} ms, {:4.0} stamps",
+                        if tips { "tip" } else { "none" },
+                        q(&mut stamps, 0.5)
+                    );
+                }
+                println!("{row}");
+            }
+        }
+    }
+}
+
+/// Whether a stroke's tip keeps its frames on time, frames drawn as the screen takes them: every
+/// 16.7 ms by the clock, the GPU not waited for (the tips given work as it keeps up, see the canvas's
+/// `TIP_WORK_FIRST`); a stroke at 2000 screen pixels a second, a pen's samples at 240 a second, a 2048
+/// square canvas fitted in a 2560 × 1600 window; with its tip and without, the app's motion filtering
+/// at 0 and at 30% (`TIP_MOTION`). Per brush (`TIP_BRUSHES`) and size (`TIP_SIZES`): the frames the
+/// GPU hadn't done by the next one's time, and of the tips' stamps those laid. The frames late with
+/// tips at most `TIP_LATE_MORE` (5) in a hundred more than without, or it fails. Run with
+/// `WGPU_POWER_PREF=low` for a laptop's built-in GPU.
+#[test]
+#[ignore]
+fn heavy_tip_paced() {
+    use std::time::Duration;
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let names = env("TIP_BRUSHES", "Ibis,Pangolin,Highmoor,Copperwing,Garnet Rose");
+    let sizes: Vec<f32> = env("TIP_SIZES", "0.1,0.3,1.0").split(',').filter_map(|s| s.parse().ok()).collect();
+    let motions: Vec<f32> = env("TIP_MOTION", "0,0.3").split(',').filter_map(|s| s.parse().ok()).collect();
+    let more: f64 = env("TIP_LATE_MORE", "5").parse().unwrap_or(5.0);
+    let (side, width, height) = (2048u32, 2560u32, 1600u32);
+    crate::big_pictures::ASIDE.with(|a| a.set(true));
+    let Some(s) = session(side, width) else { return };
+    s.resize_window(width, height);
+    s.set_display_scale(2.0);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let (window, zoom) = {
+        let mut st = s.shared.lock();
+        st.view = Some(View::fit((side, side), (width, height)));
+        let gpu = st.gpu.as_ref().unwrap();
+        let info = gpu.adapter.get_info();
+        println!("{} ({:?}), canvas {side} square in {width}x{height}, a frame every 16.7 ms", info.name, info.backend);
+        let window = gpu.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("window"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        (window, st.view.map_or(1.0, |v| v.zoom()))
+    };
+    let view = window.create_view(&Default::default());
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let started = Instant::now();
+    let rate = 240.0f64;
+    let speed = 2000.0f32;
+    let at = |k: usize| {
+        let t = k as f64 * 1000.0 / rate;
+        let along = speed * (t / 1000.0) as f32;
+        let span = side as f32 * zoom - 200.0;
+        let line = (along / span) as usize;
+        let into = along % span;
+        let left = (width as f32 - side as f32 * zoom) / 2.0 + 100.0;
+        let x = if line.is_multiple_of(2) { left + into } else { left + span - into };
+        let y = height as f32 / 2.0 + (along * 0.004).sin() * 300.0;
+        PenSample { x, y, pressure: 0.6, tilt: 0.0, orientation: 0.0, time_ms: t, roll: 0.0 }
+    };
+    let period = Duration::from_micros(16_667);
+    let mut failed = Vec::new();
+    for name in names.split(',') {
+        let found = {
+            let st = s.shared.lock();
+            st.library.iter().enumerate().find_map(|(set, entry)| {
+                let at = entry.brushes.iter().position(|b| b.name == name)?;
+                Some((set as u32, at as u32))
+            })
+        };
+        let Some((set, index)) = found else { continue };
+        for &size in &sizes {
+            for &motion in &motions {
+                let mut row = format!("{name:12} size {size:4.2} motion {:3.0}%:", motion * 100.0);
+                let mut late_without = 0.0;
+                for tips in [false, true] {
+                    s.select_brush(set, index);
+                    crate::big_pictures::wait_for_big_pictures(Duration::from_secs(60));
+                    s.set_brush_size(size);
+                    s.set_input_settings(0.0, motion, 0.0, 0.0, true, Vec::new());
+                    if let Some(c) = s.shared.lock().canvas.as_mut() {
+                        c.set_tips_ahead(tips);
+                    }
+                    let work = || s.shared.lock().canvas.as_ref().map_or((0, (0, 0)), |c| c.tip_work());
+                    let draw = || {
+                        s.shared.lock().draw_frame(
+                            &view,
+                            format,
+                            (width, height),
+                            procraft_engine::profile::Profile::Srgb,
+                            started,
+                        );
+                    };
+                    s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+                    draw();
+                    gpu.flush();
+                    let (_, (given0, laid0)) = work();
+                    let (mut late, mut frames) = (0usize, 0usize);
+                    let mut last = work().0;
+                    let mut next = Instant::now() + period;
+                    for f in 0..180usize {
+                        s.stroke_add((f * 4 + 1..=f * 4 + 4).map(at).collect());
+                        draw();
+                        // (the work the tips are given halves where the frame before wasn't done)
+                        let now = work().0;
+                        if f >= 10 {
+                            frames += 1;
+                            late += usize::from(now < last);
+                        }
+                        last = now;
+                        std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                        next += period;
+                    }
+                    let (_, (given1, laid1)) = work();
+                    s.stroke_end(vec![at(721)]);
+                    draw();
+                    gpu.flush();
+                    s.undo();
+                    draw();
+                    gpu.flush();
+                    let late_share = late as f64 * 100.0 / frames.max(1) as f64;
+                    if tips {
+                        let laid = (laid1 - laid0) as f64 * 100.0 / (given1 - given0).max(1) as f64;
+                        row += &format!("  tip: {late_share:4.1}% late, {laid:5.1}% of its stamps laid");
+                        if late_share > late_without + more {
+                            failed.push(format!("{name} {size} {motion}: {late_share:.1}% late with its tip"));
+                        }
+                    } else {
+                        late_without = late_share;
+                        row += &format!("  none: {late_share:4.1}% late");
+                    }
+                }
+                println!("{row}");
+            }
+        }
+    }
+    assert!(failed.is_empty(), "frames late with tips: {failed:?}");
+}

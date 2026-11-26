@@ -44,6 +44,8 @@ struct AlertView: View {
     var onExtra: () -> Void = {}
     /// The left button is a choice of its own (blue), not Cancel.
     var onFirst: (() -> Void)?
+    /// A field for a name under the title (a layout saved or renamed), when there is one.
+    var field: Binding<String>?
 
     /// The last one shown, kept while it goes.
     @State private var shown: AlertContent?
@@ -87,7 +89,17 @@ struct AlertView: View {
                     .lineLimit(1)
             }
             .frame(height: 31)
-            if c.message.isEmpty {
+            if let field {
+                // the name, in a rounded field as the panels' fields are
+                TextField("", text: field)
+                    .font(.system(size: 17))
+                    .foregroundStyle(ink)
+                    .padding(.horizontal, 12)
+                    .frame(height: 40)
+                    .background(RoundedRectangle(cornerRadius: 10, style: .circular).fill(cancelFill))
+                    .padding(.top, 14)
+                    .padding(.horizontal, textSide - side)
+            } else if c.message.isEmpty {
                 Spacer().frame(height: 13)
             } else {
                 Text(verbatim: c.message)

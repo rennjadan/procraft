@@ -98,9 +98,23 @@ const RETRY_MOST: Duration = Duration::from_millis(250);
 /// A frame that holds the canvas longer than this is logged: touches wait on it.
 const SLOW_FRAME: Duration = Duration::from_millis(200);
 
-/// Draws frames into `screen` as they are asked for until the session says stop; `presented` is
-/// called after each frame is shown.
-pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presented: impl FnMut()) {
+/// How often an image kept while frames are held looks whether they still are (their end wakes
+/// it sooner).
+const HOLD_LOOK_EVERY: Duration = Duration::from_millis(50);
+
+/// Why the render loop ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Ended {
+    /// The session said stop (the window is going).
+    Stopped,
+    /// The GPU device was lost while the canvas showed: nothing it holds draws again, so the
+    /// render thread makes a new one (see `render.rs`).
+    Lost,
+}
+
+/// Draws frames into `screen` as they are asked for until the session says stop, or its device is
+/// lost while the canvas shows; `presented` is called after each frame is shown.
+pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presented: impl FnMut()) -> Ended {
     // the format and colours the surface was last configured for, and whether it asked for wide
     // colour
     let mut configured: Option<(wgpu::TextureFormat, Profile)> = None;
@@ -124,11 +138,16 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
             let mut st = shared.lock();
             loop {
                 // nothing is drawn while the app is away, and a device lost draws nothing again:
-                // there is only its stopping to wait for
+                // shown, it is handed back to be made anew; away, there is only the app's return or
+                // the window's stop to wait for
                 // (pen input waiting for the canvas asks for one; none while frames are held, the
                 // canvas being redrawn a stroke at a time: its end asks for one)
                 let wanted = |st: &crate::State| !st.holding_frames && (st.needs_frame || shared.input_waiting());
-                while !st.stop && (st.hidden || !wanted(&st) || st.gpu.as_ref().is_some_and(Gpu::is_lost)) {
+                let lost = |st: &crate::State| st.gpu.as_ref().is_some_and(Gpu::is_lost);
+                while !st.stop && (st.hidden || !wanted(&st) || lost(&st)) {
+                    if !st.hidden && lost(&st) {
+                        return Ended::Lost;
+                    }
                     // the GPU's end of the last frame looked for first, a little while at most
                     if let Some(again) = look_at_gpu(screen, &mut pacer, Instant::now(), None) {
                         _ = shared.wake.wait_until(&mut st, again);
@@ -170,7 +189,7 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
                 // and on a slow GPU it would hold up the one that is. What comes meanwhile goes in
                 // it. (Work done a part a render, remaking the caches, goes on as fast as it can
                 // then; timed to the refreshes, a part each.)
-                let working = st.canvas.as_ref().is_some_and(procraft_gpu::Canvas::wants_render);
+                let working = st.canvas.as_deref().is_some_and(procraft_gpu::Canvas::wants_render);
                 let spacing = st.frame_spacing.filter(|_| !working);
                 let next = match planned {
                     Some((_, plan)) => Some(plan.begin),
@@ -197,7 +216,7 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
             last_frame = Some(Instant::now());
             shared.took_back();
             if st.stop {
-                break;
+                return Ended::Stopped;
             }
             (st.window_size, std::mem::replace(&mut st.reconfigure, false), st.wide_colour())
         };
@@ -205,7 +224,7 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
         // changed, or the app's setting)
         if reconfigure || configured.is_none() || wants_wide != wide {
             let st = shared.lock();
-            let Some(gpu) = st.gpu.as_ref() else { break };
+            let Some(gpu) = st.gpu.as_ref() else { return Ended::Stopped };
             configured = screen.configure(gpu, size, wants_wide);
             wide = wants_wide;
         }
@@ -237,17 +256,30 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
         let view = screen.view(&image);
         {
             let mut guard = shared.lock();
+            // frames held since the image was asked for (the brush studio's pad being drawn again
+            // as its brush changes): the image is kept until they are let go, then drawn and shown,
+            // so the canvas never shows half redrawn. (It went unshown: a Vulkan swapchain never
+            // gets such an image back, wgpu's discard doing nothing, and a pad out of images showed
+            // nothing more, its strokes nor its clearing, until it was opened again: #404.)
+            if guard.holding_frames {
+                guard.frame_held = true;
+                while guard.holding_frames && !guard.stop {
+                    // (looked at again now and then, should its end come unannounced)
+                    _ = shared.wake.wait_for(&mut guard, HOLD_LOOK_EVERY);
+                }
+                if guard.stop {
+                    return Ended::Stopped;
+                }
+                // drawn when the hold ends, not to the plan made before it
+                planned = None;
+            }
             let st = &mut *guard;
             let held = Instant::now();
             // the window changed size while the image was awaited (the device turned): the view is
             // already for the new size, so this image is let go and the surface configured again
+            // (which alone gives a Vulkan swapchain the image back)
             if st.window_size != size {
-                continue;
-            }
-            // frames held since the image was asked for (the brush studio's pad being drawn again
-            // as its brush changes): the image goes unshown, and the canvas half redrawn with it
-            if st.holding_frames {
-                st.frame_held = true;
+                st.reconfigure = true;
                 continue;
             }
             // the pen input that came while the canvas was held goes in this frame

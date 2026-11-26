@@ -364,6 +364,8 @@ pub(super) struct Fragments {
     pub(super) rule_lists: Vec<RuleList>,
     rule_next: usize,
     tip_backup: Option<wgpu::Texture>,
+    /// The build-up under a dual brush's tip in its second.
+    second_tip_backup: Option<wgpu::Texture>,
     spares: Option<Spares>,
 }
 
@@ -392,7 +394,14 @@ impl Fragments {
     pub(super) fn textures(&self) -> Vec<&wgpu::Texture> {
         let outs = self.rule_out.iter().flat_map(|pair| pair.iter().map(|(t, _)| t));
         let lists = self.rule_lists.iter().map(|l| &l.tiles.texture);
-        self.built.iter().map(|b| &b.texture).chain(outs).chain(lists).chain(self.tip_backup.as_ref()).collect()
+        self.built
+            .iter()
+            .map(|b| &b.texture)
+            .chain(outs)
+            .chain(lists)
+            .chain(self.tip_backup.as_ref())
+            .chain(self.second_tip_backup.as_ref())
+            .collect()
     }
 
     /// A render begins: the rule's lists free for its work again, as many kept as are to be.
@@ -400,11 +409,33 @@ impl Fragments {
         self.rule_lists.truncate(RULE_LISTS_KEPT);
         self.rule_next = 0;
     }
+
+    /// Lets go of the rule's lists that take more than `most` bytes (see
+    /// `Canvas::let_go_of_work_past`), and the bind groups of those kept, which hold what they
+    /// bind.
+    pub(super) fn let_go_of_lists_past(&mut self, most: u64) {
+        self.rule_lists.retain(|list| list.bytes() <= most);
+        for list in &mut self.rule_lists {
+            list.bind = None;
+        }
+    }
+
+    /// What the rule's lists take, bytes.
+    pub(super) fn list_bytes(&self) -> u64 {
+        self.rule_lists.iter().map(RuleList::bytes).sum()
+    }
+}
+
+impl RuleList {
+    /// What it takes, bytes: its words' texture and its stamps' buffer.
+    fn bytes(&self) -> u64 {
+        super::textures_bytes(std::slice::from_ref(&self.tiles.texture)) + self.stamps.size()
+    }
 }
 
 impl Canvas {
     /// The build-up of the stroke texture `of` (see [`BuiltUp`]), made (clear) if it has none.
-    fn built_up(&mut self, device: &wgpu::Device, of: &wgpu::Texture) -> Option<&BuiltUp> {
+    fn built_up(&mut self, gpu: &Gpu, of: &wgpu::Texture) -> Option<&BuiltUp> {
         let kept = &mut self.fragments.built;
         let fits = |b: &BuiltUp| b.of == *of && b.texture.size() == of.size();
         if let Some(i) = kept.iter().position(fits) {
@@ -416,7 +447,7 @@ impl Canvas {
             if kept.len() >= BUILT_KEPT {
                 kept.remove(0);
             }
-            let texture = texture(device, "stroke built up", of.width(), of.height(), BUILT_FORMAT);
+            let texture = texture(gpu, "stroke built up", of.width(), of.height(), BUILT_FORMAT);
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             kept.push(BuiltUp { of: of.clone(), texture, view });
         }
@@ -437,7 +468,7 @@ impl Canvas {
     }
 
     /// Keeps the stroke's build-up under `rect`, as the stroke's own is kept under its tip.
-    pub(super) fn save_tip_built_up(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder, rect: IRect) {
+    pub(super) fn save_tip_built_up(&mut self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, rect: IRect) {
         let Some(built) = self.fragments.built.iter().find(|b| b.of == self.stroke) else { return };
         let (width, height) = (rect.width(), rect.height());
         let roomy = self.fragments.tip_backup.as_ref().is_some_and(|b| b.width() >= width && b.height() >= height);
@@ -445,10 +476,11 @@ impl Canvas {
             let room = |n: u32, most: u32| n.max(1).next_multiple_of(256).min(most);
             let (w, h) = self.fragments.tip_backup.as_ref().map_or((0, 0), |b| (b.width(), b.height()));
             let size = (room(width.max(w), self.width), room(height.max(h), self.height));
-            self.fragments.tip_backup = Some(texture(device, "tip built up", size.0, size.1, BUILT_FORMAT));
+            self.fragments.tip_backup = Some(texture(gpu, "tip built up", size.0, size.1, BUILT_FORMAT));
         }
         if let Some(backup) = &self.fragments.tip_backup {
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(&built.texture, rect.x0, rect.y0),
                 copy_at(backup, 0, 0),
                 extent(width, height),
@@ -456,11 +488,65 @@ impl Canvas {
         }
     }
 
+    /// Keeps the build-up of a dual brush's second (`of`) under `rect`, as the second is kept under
+    /// its tip (see [`Canvas::set_dual_tip`]). Made first where the second has none yet (as cleared,
+    /// as the second is before its first stamps), so that the tip's comes off with it.
+    pub(super) fn save_second_tip_built_up(
+        &mut self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        of: &wgpu::Texture,
+        rect: IRect,
+    ) {
+        if self.pipelines.fragments.is_none() {
+            return;
+        }
+        let (width, height) = (rect.width(), rect.height());
+        let roomy =
+            self.fragments.second_tip_backup.as_ref().is_some_and(|b| b.width() >= width && b.height() >= height);
+        if !roomy {
+            let room = |n: u32, most: u32| n.max(1).next_multiple_of(256).min(most);
+            let (w, h) = self.fragments.second_tip_backup.as_ref().map_or((0, 0), |b| (b.width(), b.height()));
+            let size = (room(width.max(w), self.width), room(height.max(h), self.height));
+            self.fragments.second_tip_backup = Some(texture(gpu, "second tip built up", size.0, size.1, BUILT_FORMAT));
+        }
+        let Some(built) = self.built_up(gpu, of).map(|b| b.texture.clone()) else { return };
+        if let Some(backup) = &self.fragments.second_tip_backup {
+            gpu.copy_texture_to_texture(
+                encoder,
+                copy_at(&built, rect.x0, rect.y0),
+                copy_at(backup, 0, 0),
+                extent(width, height),
+            );
+        }
+    }
+
+    /// Puts the build-up of a dual brush's second (`of`) under `rect` back as it was kept (see
+    /// [`Canvas::save_second_tip_built_up`]).
+    pub(super) fn untip_second_built_up(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        of: &wgpu::Texture,
+        rect: IRect,
+    ) {
+        let Some(built) = self.fragments.built.iter().find(|b| b.of == *of) else { return };
+        if let Some(backup) = &self.fragments.second_tip_backup {
+            gpu.copy_texture_to_texture(
+                encoder,
+                copy_at(backup, 0, 0),
+                copy_at(&built.texture, rect.x0, rect.y0),
+                extent(rect.width(), rect.height()),
+            );
+        }
+    }
+
     /// Puts the stroke's build-up under `rect` back as it was kept (see [`Canvas::save_tip_built_up`]).
-    pub(super) fn untip_built_up(&self, encoder: &mut wgpu::CommandEncoder, rect: IRect) {
+    pub(super) fn untip_built_up(&self, gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, rect: IRect) {
         let Some(built) = self.fragments.built.iter().find(|b| b.of == self.stroke) else { return };
         if let Some(backup) = &self.fragments.tip_backup {
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 copy_at(backup, 0, 0),
                 copy_at(&built.texture, rect.x0, rect.y0),
                 extent(rect.width(), rect.height()),
@@ -500,7 +586,7 @@ impl Canvas {
         let part = super::RULE_PART;
         let outs = self.fragments.rule_out.get_or_insert_with(|| {
             [fragments.stroke_format, BUILT_FORMAT].map(|format| {
-                let t = super::texture(device, "stamp rule", part, part, format);
+                let t = super::texture(gpu, "stamp rule", part, part, format);
                 let v = t.create_view(&wgpu::TextureViewDescriptor::default());
                 (t, v)
             })
@@ -509,12 +595,12 @@ impl Canvas {
         // its half floats beside it, where it is in 8 bits (else a stand-in, not read)
         let eight = fragments.stroke_format == LAYER_FORMAT;
         let built = if eight {
-            let Some(built) = self.built_up(device, texture) else { return };
+            let Some(built) = self.built_up(gpu, texture) else { return };
             Some((built.texture.clone(), built.view.clone()))
         } else {
             None
         };
-        let spare = self.spares(device).word.view.clone();
+        let spare = self.spares(gpu).word.view.clone();
         let binds = RuleBinds {
             uniforms: self.uniform_buffer.clone(),
             shown: shown.clone(),
@@ -567,9 +653,15 @@ impl Canvas {
                         pass.draw(0..3, 0..1);
                         drop(pass);
                         let size = extent(rect.width(), rect.height());
-                        encoder.copy_texture_to_texture(copy_at(&out8, 0, 0), copy_at(texture, rect.x0, rect.y0), size);
+                        gpu.copy_texture_to_texture(
+                            encoder,
+                            copy_at(&out8, 0, 0),
+                            copy_at(texture, rect.x0, rect.y0),
+                            size,
+                        );
                         if let Some((built, _)) = &built {
-                            encoder.copy_texture_to_texture(
+                            gpu.copy_texture_to_texture(
+                                encoder,
                                 copy_at(&out16, 0, 0),
                                 copy_at(built, rect.x0, rect.y0),
                                 size,
@@ -602,7 +694,7 @@ impl Canvas {
             let tall =
                 rows.next_power_of_two().max(RULE_ROWS_LEAST).min(device.limits().max_texture_dimension_2d).max(rows);
             let list = self.made_or_told(device, |device| RuleList {
-                tiles: Tex::new(device, "stamp rule tiles", RULE_ROW, tall, wgpu::TextureFormat::R32Uint),
+                tiles: Tex::new(gpu, "stamp rule tiles", RULE_ROW, tall, wgpu::TextureFormat::R32Uint),
                 stamps: device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("stamp rule stamps"),
                     size: RULE_STAMPS_BYTES,
@@ -620,7 +712,7 @@ impl Canvas {
         let list = self.fragments.rule_lists.get_mut(at)?;
         let mut padded = words.to_vec();
         padded.resize((rows * RULE_ROW) as usize, 0);
-        gpu.queue.write_texture(
+        gpu.write_texture(
             copy_at(&list.tiles.texture, 0, 0),
             bytemuck::cast_slice(&padded),
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(RULE_ROW * 4), rows_per_image: Some(rows) },
@@ -666,8 +758,8 @@ pub(super) struct Tex {
 }
 
 impl Tex {
-    pub(super) fn new(device: &wgpu::Device, label: &str, width: u32, height: u32, format: wgpu::TextureFormat) -> Tex {
-        let texture = texture(device, label, width, height, format);
+    pub(super) fn new(gpu: &Gpu, label: &str, width: u32, height: u32, format: wgpu::TextureFormat) -> Tex {
+        let texture = texture(gpu, label, width, height, format);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         Tex { texture, view }
     }
@@ -688,19 +780,19 @@ pub(super) enum Held {
 }
 
 impl Held {
-    pub(super) fn new(device: &wgpu::Device, wet_paint: bool) -> Held {
+    pub(super) fn new(gpu: &Gpu, wet_paint: bool) -> Held {
         if wet_paint {
-            let carried = |label| Tex::new(device, label, CARRIED_ROW, CARRIED_ROW, CARRY_FORMAT);
+            let carried = |label| Tex::new(gpu, label, CARRIED_ROW, CARRIED_ROW, CARRY_FORMAT);
             let rows = (WET_PLOTS_TEXELS as u32).div_ceil(PLOTS_ROW);
             Held::Wet {
                 carried: [carried("wet carried"), carried("wet carried")],
-                plots: Tex::new(device, "wet plots", PLOTS_ROW, rows, CARRY_FORMAT),
+                plots: Tex::new(gpu, "wet plots", PLOTS_ROW, rows, CARRY_FORMAT),
             }
         } else {
             Held::Smudge {
-                carry: Tex::new(device, "smudge carry", SMUDGE_GRID, 3 * SMUDGE_GRID, CARRY_FORMAT),
-                scratch: Tex::new(device, "smudge carry scratch", SMUDGE_GRID, SMUDGE_GRID, CARRY_FORMAT),
-                dull: Tex::new(device, "smudge dull", 2 * DULL_PARTS, 1, CARRY_FORMAT),
+                carry: Tex::new(gpu, "smudge carry", SMUDGE_GRID, 3 * SMUDGE_GRID, CARRY_FORMAT),
+                scratch: Tex::new(gpu, "smudge carry scratch", SMUDGE_GRID, SMUDGE_GRID, CARRY_FORMAT),
+                dull: Tex::new(gpu, "smudge dull", 2 * DULL_PARTS, 1, CARRY_FORMAT),
             }
         }
     }
@@ -716,6 +808,7 @@ impl Held {
 /// Hands the stroke's carry textures `held` from copy `out` (what of its carry is kept goes aside) to
 /// copy `into` (what of its carry its piece reads comes back), as `smudge::hand_over` does buffers.
 fn hand_over(
+    gpu: &Gpu,
     encoder: &mut wgpu::CommandEncoder,
     held: &Held,
     carries: &[Carry],
@@ -742,10 +835,10 @@ fn hand_over(
     if let Some((copy, kept)) = out
         && let (Some(aside), Some((tex, rect))) = (aside(copy), kept_in(kept))
     {
-        copy_rect(encoder, tex, aside, rect, 0);
+        copy_rect(gpu, encoder, tex, aside, rect, 0);
     }
     if let (Some(aside), Some((tex, rect))) = (aside(into), kept_in(needs)) {
-        copy_rect(encoder, aside, tex, rect, 0);
+        copy_rect(gpu, encoder, aside, tex, rect, 0);
     }
 }
 
@@ -766,14 +859,14 @@ pub(super) struct FragWindow {
 }
 
 impl FragWindow {
-    fn new(device: &wgpu::Device, (width, height): (u32, u32), keeps: smudge::Keeps) -> FragWindow {
-        let pair = |label, format| [0, 1].map(|_| Tex::new(device, label, width, height, format));
+    fn new(gpu: &Gpu, (width, height): (u32, u32), keeps: smudge::Keeps) -> FragWindow {
+        let pair = |label, format| [0, 1].map(|_| Tex::new(gpu, label, width, height, format));
         FragWindow {
             work: pair("smudge layer", LAYER_FORMAT),
             grained: keeps.grained.then(|| pair("smudge grained", LAYER_FORMAT)),
             amount: keeps.amount.then(|| pair("smudge amount", AMOUNT_FORMAT)),
             shown: keeps.shown.then(|| pair("smudge shown", AMOUNT_FORMAT)),
-            before: Tex::new(device, "smudge window", width, height, LAYER_FORMAT),
+            before: Tex::new(gpu, "smudge window", width, height, LAYER_FORMAT),
         }
     }
 
@@ -836,11 +929,12 @@ fn draw_in(
 }
 
 /// `rect` of `from` copied into `to` at the same place, moved down by `down` rows there.
-fn copy_rect(encoder: &mut wgpu::CommandEncoder, from: &Tex, to: &Tex, rect: IRect, down: i32) {
+fn copy_rect(gpu: &Gpu, encoder: &mut wgpu::CommandEncoder, from: &Tex, to: &Tex, rect: IRect, down: i32) {
     if rect.is_empty() {
         return;
     }
-    encoder.copy_texture_to_texture(
+    gpu.copy_texture_to_texture(
+        encoder,
         copy_at(&from.texture, rect.x0, rect.y0),
         copy_at(&to.texture, rect.x0, rect.y0 + down),
         extent(rect.width(), rect.height()),
@@ -862,11 +956,11 @@ fn part_corners(part: u32) -> [u32; 4] {
 
 impl Canvas {
     /// The stand-ins bound where a pass reads nothing, made the first time.
-    fn spares(&mut self, device: &wgpu::Device) -> &Spares {
+    fn spares(&mut self, gpu: &Gpu) -> &Spares {
         self.fragments.spares.get_or_insert_with(|| Spares {
-            eight: Tex::new(device, "spare", 1, 1, LAYER_FORMAT),
-            word: Tex::new(device, "spare", 1, 1, AMOUNT_FORMAT),
-            words: Tex::new(device, "spare", 1, 1, CARRY_FORMAT),
+            eight: Tex::new(gpu, "spare", 1, 1, LAYER_FORMAT),
+            word: Tex::new(gpu, "spare", 1, 1, AMOUNT_FORMAT),
+            words: Tex::new(gpu, "spare", 1, 1, CARRY_FORMAT),
         })
     }
 
@@ -906,7 +1000,7 @@ impl Canvas {
         let from_image = pieces.iter().any(|p| p.uniforms.iter().any(|u| u.source_image == 1));
         let pipelines = std::sync::Arc::clone(&self.pipelines);
         let Some(f) = pipelines.fragments.as_ref() else { return false };
-        let spares = self.spares(device);
+        let spares = self.spares(gpu);
         let (spare8, spare_word, spare_words) =
             (spares.eight.view.clone(), spares.word.view.clone(), spares.words.view.clone());
         let Some(smudge) = self.smudge.as_ref() else { return false };
@@ -980,7 +1074,7 @@ impl Canvas {
         let grid = SMUDGE_GRID as i32;
         for (k, piece) in pieces.iter().enumerate() {
             if let Some((_, out, into)) = overs.next_if(|o| o.0 == k) {
-                hand_over(encoder, held, &smudge.carries, out, into);
+                hand_over(gpu, encoder, held, &smudge.carries, out, into);
             }
             let laid: Vec<(u32, SmudgeUniform)> = piece
                 .uniforms
@@ -998,14 +1092,14 @@ impl Canvas {
                     (smudge::Pipe::Carry, Held::Smudge { carry, scratch, .. }) => {
                         let rect = cells(u.half, part_corners(u.part));
                         draw_in(encoder, "smudge carry", &f.carry, &[Some(&scratch.view)], rect, binds(&main));
-                        copy_rect(encoder, scratch, carry, rect, 0);
+                        copy_rect(gpu, encoder, scratch, carry, rect, 0);
                     }
                     (smudge::Pipe::Dull, Held::Smudge { carry, scratch, dull }) => {
                         let parts = IRect::new(0, 0, 2 * DULL_PARTS as i32, 1);
                         draw_in(encoder, "smudge dull part", &f.dull_part, &[Some(&dull.view)], parts, binds(&parted));
                         let one = IRect::new(0, 0, 1, 1);
                         draw_in(encoder, "smudge dull", &f.dull, &[Some(&scratch.view)], one, binds(&main));
-                        copy_rect(encoder, scratch, carry, one, 2 * grid);
+                        copy_rect(gpu, encoder, scratch, carry, one, 2 * grid);
                     }
                     (smudge::Pipe::BlurDown | smudge::Pipe::BlurAcross, Held::Smudge { carry, scratch, .. }) => {
                         let rect = cells(u.half, part_corners(smudge::WHOLE));
@@ -1014,7 +1108,7 @@ impl Canvas {
                             _ => (&f.blur_across, 2 * grid),
                         };
                         draw_in(encoder, "smudge blur", pipeline, &[Some(&scratch.view)], rect, binds(&main));
-                        copy_rect(encoder, scratch, carry, rect, down);
+                        copy_rect(gpu, encoder, scratch, carry, rect, down);
                     }
                     (smudge::Pipe::Deposit | smudge::Pipe::DepositRun, _) => {
                         let rect = in_window(bbox);
@@ -1033,16 +1127,16 @@ impl Canvas {
                         };
                         let targets = [Some(&next.view), amount.map(|[_, n]| &n.view), shown.map(|[_, n]| &n.view)];
                         draw_in(encoder, "smudge deposit", pipeline, &targets, rect, binds(&main));
-                        copy_rect(encoder, next, was, rect, 0);
+                        copy_rect(gpu, encoder, next, was, rect, 0);
                         for [was, next] in [amount, shown].into_iter().flatten() {
-                            copy_rect(encoder, next, was, rect, 0);
+                            copy_rect(gpu, encoder, next, was, rect, 0);
                         }
                     }
                     (smudge::Pipe::Synthesize, _) => {
                         let rect = in_window(bbox);
                         let [was, next] = &window.work;
                         draw_in(encoder, "smudge synthesize", &f.synthesize, &[Some(&next.view)], rect, binds(&main));
-                        copy_rect(encoder, next, was, rect, 0);
+                        copy_rect(gpu, encoder, next, was, rect, 0);
                     }
                     (smudge::Pipe::WetPlots, Held::Wet { carried, plots }) => {
                         let Some(from) = plots_from.as_ref().and_then(|p| p.get(u.index as usize)) else { continue };
@@ -1076,7 +1170,7 @@ impl Canvas {
         if let Some(smudge) = self.smudge.as_mut() {
             smudge.resident = resident;
         }
-        self.window_out_fragments(encoder, reach, writes, (work, kept));
+        self.window_out_fragments(gpu, encoder, reach, writes, (work, kept));
         true
     }
 
@@ -1117,8 +1211,8 @@ impl Canvas {
             let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
             // grown in steps, so a stroke that reaches further doesn't make them every frame
             let side = |n: u32, of: u32| n.next_multiple_of(256).min(of).max(n);
-            let window = small.then(|| FragWindow::new(device, (side(width, canvas_w), side(height, canvas_h)), keeps));
-            let tile = |label, format| texture(device, label, tile_side, tile_side, format);
+            let window = small.then(|| FragWindow::new(gpu, (side(width, canvas_w), side(height, canvas_h)), keeps));
+            let tile = |label, format| texture(gpu, label, tile_side, tile_side, format);
             let made: Vec<((u32, u32), smudge::Tile)> = missing
                 .iter()
                 .map(|&at| {
@@ -1154,7 +1248,8 @@ impl Canvas {
                     .chain(tile.grained.iter().map(|g| (&layer.texture, g)))
                     .chain(also.iter().copied().zip(&tile.more));
                 for (from, into) in kept {
-                    encoder.copy_texture_to_texture(
+                    gpu.copy_texture_to_texture(
+                        encoder,
                         copy_at(from, r.x0, r.y0),
                         copy_at(into, 0, 0),
                         extent(r.width(), r.height()),
@@ -1169,7 +1264,7 @@ impl Canvas {
         // the layer as the stroke has left it, and as it was where the stroke hasn't been
         let from_layer = copy_at(&layer.texture, reach.x0, reach.y0);
         let mut from_layer_into =
-            |to: &Tex| encoder.copy_texture_to_texture(from_layer, copy_at(&to.texture, 0, 0), size);
+            |to: &Tex| gpu.copy_texture_to_texture(encoder, from_layer, copy_at(&to.texture, 0, 0), size);
         from_layer_into(&window.work[0]);
         if before {
             from_layer_into(&window.before);
@@ -1196,7 +1291,8 @@ impl Canvas {
             let (x, y, size) = (r.x0 - t.x0, r.y0 - t.y0, extent(r.width(), r.height()));
             let (wx, wy) = (r.x0 - reach.x0, r.y0 - reach.y0);
             if before {
-                encoder.copy_texture_to_texture(
+                gpu.copy_texture_to_texture(
+                    encoder,
                     copy_at(&tile.before, x, y),
                     copy_at(&window.before.texture, wx, wy),
                     size,
@@ -1205,7 +1301,7 @@ impl Canvas {
             let kept = [(&tile.grained, &window.grained), (&tile.amount, &window.amount), (&tile.shown, &window.shown)];
             for (kept, pair) in kept {
                 if let (Some(kept), Some([to, _])) = (kept, pair) {
-                    encoder.copy_texture_to_texture(copy_at(kept, x, y), copy_at(&to.texture, wx, wy), size);
+                    gpu.copy_texture_to_texture(encoder, copy_at(kept, x, y), copy_at(&to.texture, wx, wy), size);
                 }
             }
         }
@@ -1217,6 +1313,7 @@ impl Canvas {
     /// into the stroke's tiles if they changed what it keeps (`kept`).
     fn window_out_fragments(
         &mut self,
+        gpu: &Gpu,
         encoder: &mut wgpu::CommandEncoder,
         reach: IRect,
         changed: IRect,
@@ -1231,7 +1328,8 @@ impl Canvas {
             copy_at(&w.texture, r.x0 - reach.x0, r.y0 - reach.y0)
         }
         if work {
-            encoder.copy_texture_to_texture(
+            gpu.copy_texture_to_texture(
+                encoder,
                 from(&window.work[0], changed, reach),
                 copy_at(&layer.texture, changed.x0, changed.y0),
                 extent(changed.width(), changed.height()),
@@ -1252,7 +1350,7 @@ impl Canvas {
             let kept = [(&tile.grained, &window.grained), (&tile.amount, &window.amount), (&tile.shown, &window.shown)];
             for (kept, pair) in kept {
                 if let (Some(kept), Some([w, _])) = (kept, pair) {
-                    encoder.copy_texture_to_texture(from(w, r, reach), copy_at(kept, x, y), size);
+                    gpu.copy_texture_to_texture(encoder, from(w, r, reach), copy_at(kept, x, y), size);
                 }
             }
         }
@@ -1333,12 +1431,12 @@ impl Canvas {
                 // each way up to the next size a little over, to do this seldom
                 let wide = old.as_ref().map_or(0, |s| s.width).max(area_w.next_multiple_of(128)).min(width);
                 let high = old.as_ref().map_or(0, |s| s.height).max(area_h.next_multiple_of(128)).min(height);
-                let sums = |_| Tex::new(device, "liquify sums", wide, high, LIQUIFY_SUMS_FORMAT);
+                let sums = |_| Tex::new(gpu, "liquify sums", wide, high, LIQUIFY_SUMS_FORMAT);
                 LiquifyBitsScratch {
                     width: wide,
                     height: high,
                     sums: [0, 1].map(sums),
-                    next: Tex::new(device, "liquify step", wide, high, LIQUIFY_FIELD_FORMAT),
+                    next: Tex::new(gpu, "liquify step", wide, high, LIQUIFY_FIELD_FORMAT),
                 }
             }
         };
@@ -1398,7 +1496,8 @@ impl Canvas {
             ],
         });
         pass(encoder, "liquify step", &bits.step, &scratch.next, &reads);
-        encoder.copy_texture_to_texture(
+        gpu.copy_texture_to_texture(
+            encoder,
             scratch.next.texture.as_image_copy(),
             wgpu::TexelCopyTextureInfo {
                 texture: &field.texture,

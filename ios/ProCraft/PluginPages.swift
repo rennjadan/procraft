@@ -143,6 +143,11 @@ private struct PluginCard: View {
             about
             // a filter's own controls are on its panel; what the card shows comes with the list
             if plugin.on, plugin.problem == nil, !plugin.features.isEmpty {
+                // its own, under none of its features (a folder of the whole plugin's)
+                ForEach(plugin.top.indices, id: \.self) { i in
+                    line
+                    control(plugin.top[i])
+                }
                 // made of features: each a heading with its switch, what comes under it while it is on
                 ForEach(plugin.features.indices, id: \.self) { f in
                     let feature = plugin.features[f]
@@ -233,6 +238,53 @@ struct PluginFileRow: View {
             } else {
                 PluginsModel.shared.pickSound(file.key, from: url, told: told)
             }
+        }
+    }
+}
+
+/// A folder control on a card: its label, then the folder's name and Clear, or Choose; a tap on the
+/// row picks another with the document picker.
+struct PluginFolderRow: View {
+    let folder: PluginFolder
+    let told: (String) -> Void
+
+    @State private var picking = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Text(verbatim: folder.label)
+                .font(.system(size: 17))
+                .foregroundStyle(Pc.actionsRow)
+                .lineLimit(1)
+            Spacer(minLength: 0)
+            if let chosen = folder.chosen {
+                Text(verbatim: chosen)
+                    .font(.system(size: 15))
+                    .foregroundStyle(Pc.slideValue)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.leading, 12)
+                Text(verbatim: "Clear")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Pc.accent)
+                    .lineLimit(1)
+                    .padding(.leading, 12)
+                    .contentShape(Rectangle())
+                    .onTapGesture { PluginsModel.shared.clearFile(folder.key) }
+            } else {
+                Text(verbatim: "Choose")
+                    .font(.system(size: 17))
+                    .foregroundStyle(Pc.accent)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 44)
+        .contentShape(Rectangle())
+        .onTapGesture { picking = true }
+        .fileImporter(isPresented: $picking, allowedContentTypes: [UTType.folder]) { result in
+            guard case let .success(url) = result else { return }
+            PluginsModel.shared.pickFolder(folder.key, from: url, told: told)
         }
     }
 }

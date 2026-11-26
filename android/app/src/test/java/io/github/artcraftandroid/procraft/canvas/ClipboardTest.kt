@@ -32,4 +32,12 @@ class ClipboardTest {
         // an earlier copy of ours went there, this one didn't
         assertEquals(false, pastesSystemPicture(false, systemAt = 800, ownCopy = true, ownAt = 1_000, ownPutAt = 800))
     }
+
+    @Test
+    @Suppress("InlinedApi")
+    fun aPictureCutOrCopiedHereGoesOnTheClipboardMarkedSensitive() {
+        // the key the system and keyboards read (named from Android 13; the same key before it)
+        assertEquals(android.content.ClipDescription.EXTRA_IS_SENSITIVE, CLIP_IS_SENSITIVE)
+        assertEquals(mapOf("android.content.extra.IS_SENSITIVE" to true), PICTURE_CLIP_EXTRAS)
+    }
 }

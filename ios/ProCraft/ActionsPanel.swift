@@ -175,7 +175,8 @@ struct ActionsPanel: View {
                         .background(measured(.cursor))
                         .transition(pushed)
                 case .pressure:
-                    PressurePage(model: model, most: room - pageHead) { back() }
+                    // its title sits 8 lower than the other pages'
+                    PressurePage(model: model, most: room - pageHead - 8) { back() }
                         .fixedSize(horizontal: false, vertical: true)
                         .background(measured(.pressure))
                         .transition(pushed)

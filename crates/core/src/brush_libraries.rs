@@ -733,7 +733,13 @@ impl CanvasSession {
         let dir = self.shared.lock().libraries.dir.clone()?;
         let mut sets: Vec<LibrarySet> = sets
             .into_iter()
-            .map(|(name, icon, brushes)| LibrarySet { origins: vec![None; brushes.len()], name, brushes, icon })
+            .map(|(name, icon, brushes)| LibrarySet {
+                origins: vec![None; brushes.len()],
+                name,
+                brushes,
+                icon,
+                plugin: None,
+            })
             .collect();
         {
             // their grains at their own size into the grains' files, as brushes brought in have

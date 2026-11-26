@@ -986,7 +986,7 @@ mod tests {
             let held = held_in(&shared().lock());
             let (shapes, grains) = {
                 let st = s.shared.lock();
-                st.canvas.as_ref().map(procraft_gpu::Canvas::full_images_held).unwrap_or_default()
+                st.canvas.as_deref().map(procraft_gpu::Canvas::full_images_held).unwrap_or_default()
             };
             eprintln!(
                 "{}: {} MB held in memory, {shapes} shapes and {grains} grains on the GPU",

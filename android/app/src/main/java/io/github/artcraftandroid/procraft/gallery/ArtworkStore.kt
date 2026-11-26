@@ -60,6 +60,9 @@ class ArtworkStore(val root: File) {
 
     fun newFolder(at: File = root): File = File(core.newFolder(folder(at)))
 
+    /** What the [plugins] bring in from a folder of theirs as the gallery opens (a long call, not for the main thread). */
+    fun bringIn(plugins: io.github.artcraftandroid.procraft.core.Plugins): io.github.artcraftandroid.procraft.core.FolderBroughtIn = plugins.galleryOpened(core)
+
     fun delete(a: Artwork) = core.delete(a.dir.path)
 
     /** A copy under the same name, right after the original. */

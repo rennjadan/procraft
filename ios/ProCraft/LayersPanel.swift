@@ -1010,14 +1010,15 @@ private struct LayersMenus: View {
     }
 
     /// Under the title: Select All; Group and Merge (with layers picked); Share and Duplicate;
-    /// Delete. Mostly over the panel, whose rows the canvas's frosting doesn't blur: nearly solid.
+    /// Delete. Shaped as the system's own menus are: frosted, the panel showing through blurred,
+    /// its lines 11 clear of the rows.
     private var titleMenu: some View {
-        GlassMenu(overPanel: true) {
+        GlassMenu(system: true) {
             MenuRow(icon: PcIcons.menuSelectAll, label: "Select All") {
                 closeAll()
                 model.pickAllLayers()
             }
-            MenuLine()
+            MenuLine(gap: 11)
             if model.anyPicked {
                 MenuRow(icon: PcIcons.menuGroup, label: "Group") {
                     closeAll()
@@ -1027,7 +1028,7 @@ private struct LayersMenus: View {
                     closeAll()
                     model.mergePicked()
                 }
-                MenuLine()
+                MenuLine(gap: 11)
             }
             MenuRow(icon: PcIcons.menuShare, label: "Share") {
                 closeAll()
@@ -1037,7 +1038,7 @@ private struct LayersMenus: View {
                 closeAll()
                 model.duplicatePicked()
             }
-            MenuLine()
+            MenuLine(gap: 11)
             MenuRow(icon: PcIcons.menuTrash, label: "Delete", ink: Pc.menuDanger) {
                 closeAll()
                 model.question = Question(title: "Delete these layers?", message: "Undo brings them back.") {

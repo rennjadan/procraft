@@ -20,7 +20,6 @@ use procraft_engine::stroke::StrokeBuilder;
 use procraft_engine::studio::MAX_GRAIN_SCALE;
 use procraft_engine::usd::{read_usd, read_usdc, read_usdz};
 use procraft_engine::view::View;
-use procraft_gpu::wgpu::util::DeviceExt as _;
 use procraft_gpu::{
     Canvas, Gpu, Light, Lighting, MOST_LIGHTS, MeshView, Orbit, SharedStroke, ShownSelection, StrokeStyle, StrokeTool,
     wgpu,
@@ -116,7 +115,7 @@ impl CanvasSession {
             c.record_outside_change(name);
         }
         st.flush();
-        let step = st.canvas.as_ref().and_then(Canvas::undo_step);
+        let step = st.canvas.as_deref().and_then(Canvas::undo_step);
         if let (Some(step), Some(scene)) = (step, st.scene.as_mut()) {
             if scene.look_steps.len() >= MOST_JOINT_STEPS {
                 scene.look_steps.remove(0);
@@ -132,7 +131,7 @@ impl CanvasSession {
 /// has been drawn, and until then the pixels it was opened with.
 pub(crate) struct TextureSet {
     doc: Document,
-    canvas: Option<Canvas>,
+    canvas: Option<Box<Canvas>>,
     pending: Pixels,
     /// A layer to fill with one colour (premultiplied RGBA8) when its canvas is made, unless
     /// pixels wait for it: a new set's Base Layer, with what the model's material gives.
@@ -453,7 +452,7 @@ pub(crate) struct Scene {
     /// Each texture set's side (pixels).
     texture_size: u32,
     /// The stroke as drawn on the screen: a canvas the window's size, and what it covers.
-    screen: Option<(Document, Canvas)>,
+    screen: Option<(Document, Box<Canvas>)>,
     bounds: IRect,
     /// Each set's picture as last shown on the model: its canvas's composite count, and whether
     /// it was the session's canvas then (its levels are made again when either changes).
@@ -906,7 +905,7 @@ impl Scene {
         let (doc, screen) = self.screen.as_mut()?;
         let view = self.view.as_mut()?;
         screen.render(gpu, doc, None);
-        let seen = gpu.device.create_texture(&wgpu::TextureDescriptor {
+        let seen = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("layer as seen"),
             size: wgpu::Extent3d { width: size.0.max(1), height: size.1.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
@@ -1027,13 +1026,13 @@ impl CanvasSession {
             }
         }
         let session = CanvasSession::with_document(empty_texture(side), name, own);
-        session.shared.lock().scene = Some(scene);
+        session.shared.lock().scene = Some(Box::new(scene));
         Ok(session)
     }
 
     /// The model painted on, if this is one.
     pub fn model_info(&self) -> Option<ModelInfo> {
-        self.shared.lock().scene.as_ref().map(ModelInfo::of)
+        self.shared.lock().scene.as_deref().map(ModelInfo::of)
     }
 
     /// Each texture set's layers, in order, whichever is painted on; none unless a model is open.
@@ -1080,8 +1079,7 @@ impl CanvasSession {
         let (Some(gpu), Some(scene), Some(canvas)) = (st.gpu.as_ref(), st.scene.as_mut(), st.canvas.as_mut()) else {
             return false;
         };
-        let texture = gpu.device.create_texture_with_data(
-            &gpu.queue,
+        let texture = gpu.texture_with_data(
             &wgpu::TextureDescriptor {
                 label: Some("picture placed on the model"),
                 size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
@@ -1092,7 +1090,6 @@ impl CanvasSession {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
-            wgpu::util::TextureDataOrder::LayerMajor,
             &image.rgba,
         );
         let first = PicturePlace::first((w, h), size);
@@ -2328,7 +2325,7 @@ fn waiting_picture(gpu: &Gpu, set: &mut TextureSet, stroke: &SharedStroke) -> Re
 /// strokes carried onto the model, drawing them in `stroke`, and goes without brush images.
 fn set_canvas(gpu: &Gpu, set: &mut TextureSet, stroke: &SharedStroke) -> Result<(), String> {
     if set.canvas.is_none() {
-        let mut c = Canvas::for_drawn_strokes(gpu, &set.doc, stroke).map_err(|e| e.to_string())?;
+        let mut c = Box::new(Canvas::for_drawn_strokes(gpu, &set.doc, stroke).map_err(|e| e.to_string())?);
         for (id, pixels) in set.take_pending() {
             if let Err(e) = c.upload_layer(gpu, id, &pixels) {
                 log::error!("opening a texture set's layer: {e}");
@@ -2850,7 +2847,7 @@ impl State {
             c.record_outside_change(name);
             self.flush();
             if let Some(s) = steps.get_mut(to.0) {
-                *s = self.canvas.as_ref().and_then(Canvas::undo_step);
+                *s = self.canvas.as_deref().and_then(Canvas::undo_step);
             }
         }
         let Some(scene) = self.scene.as_mut() else { return };
@@ -3027,7 +3024,7 @@ impl State {
     /// The selection as fills take it: on a model, kept to the meshes picked.
     pub(crate) fn reach_selection(&mut self) -> Option<procraft_engine::selection::Mask> {
         let selection = self.selection.clone();
-        let Some(reach) = self.scene.as_mut().and_then(Scene::reach) else { return selection };
+        let Some(reach) = self.scene.as_deref_mut().and_then(Scene::reach) else { return selection };
         let Some(mut within) = selection else { return Some(reach) };
         for (c, r) in within.data.iter_mut().zip(&reach.data) {
             *c = ((u16::from(*c) * u16::from(*r) + 127) / 255) as u8;
@@ -3038,7 +3035,7 @@ impl State {
     /// An adjustment opens: on a model with meshes picked, it keeps to them, as it does to a
     /// selection, until [`State::scene_selection_back`].
     pub(crate) fn scene_selection_for_adjustment(&mut self) {
-        if self.scene.as_mut().and_then(Scene::reach).is_none() {
+        if self.scene.as_deref_mut().and_then(Scene::reach).is_none() {
             return;
         }
         let narrowed = self.reach_selection();
@@ -3063,7 +3060,7 @@ impl State {
 
     /// How the selection shows on the model from now on, if there is one.
     pub(crate) fn scene_selection_look(&mut self, look: Option<procraft_gpu::SelectionLook>) {
-        let mask = self.canvas.as_ref().and_then(Canvas::selection_view).cloned();
+        let mask = self.canvas.as_deref().and_then(Canvas::selection_view).cloned();
         let Some(scene) = self.scene.as_mut() else { return };
         let part = scene.current;
         let Some(view) = scene.view.as_mut() else { return };
@@ -3095,7 +3092,7 @@ impl State {
 
     /// Why a stroke on the model can't land, if it can't.
     pub(crate) fn scene_blocked(&self) -> Option<crate::layers::Blocked> {
-        self.scene.as_ref().filter(|_| self.scene_shown()).and_then(Scene::why_blocked)
+        self.scene.as_deref().filter(|_| self.scene_shown()).and_then(Scene::why_blocked)
     }
 
     /// The texel of the texture set painted on under window point (`x`, `y`), on a shown model:
@@ -3215,7 +3212,7 @@ impl State {
         if stale {
             let doc = Document::new(size.0.max(1), size.1.max(1));
             match Canvas::new(gpu, &doc) {
-                Ok(c) => scene.screen = Some((doc, c)),
+                Ok(c) => scene.screen = Some((doc, Box::new(c))),
                 Err(e) => return log::error!("3D stroke canvas: {e}"),
             }
         }
@@ -3270,7 +3267,7 @@ impl State {
                 canvas.set_stroke_grain(&gpu.device, grain);
             }
         }
-        self.stroke = Some(builder);
+        self.stroke = Some(Box::new(builder));
         if !laid {
             self.begin_material_strokes(&brush, canvas_style, current);
         }
@@ -3647,14 +3644,14 @@ impl State {
             for k in 1..=2usize {
                 let session_own = part == scene.current && scene.channel == k;
                 let canvas = if session_own {
-                    self.canvas.as_ref()
+                    self.canvas.as_deref()
                 } else {
                     scene
                         .channels
                         .get(part)
                         .and_then(|c| c.get(k - 1))
                         .and_then(|s| s.as_ref())
-                        .and_then(|s| s.canvas.as_ref())
+                        .and_then(|s| s.canvas.as_deref())
                 };
                 let key = canvas.map(|c| (c.composites(), session_own));
                 let Some(shown) = scene.channel_shown.get_mut(part).and_then(|c| c.get_mut(k - 1)) else { continue };

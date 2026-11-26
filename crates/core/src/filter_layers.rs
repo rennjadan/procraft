@@ -184,7 +184,7 @@ impl State {
     /// has stays while it is offered: the work queued as its layer went (merged down into the layer
     /// below) runs it yet.
     pub(crate) fn give_layer_filters(&mut self) {
-        let (Some(gpu), Some(canvas_id)) = (self.gpu.clone(), self.canvas.as_ref().map(procraft_gpu::Canvas::id))
+        let (Some(gpu), Some(canvas_id)) = (self.gpu.clone(), self.canvas.as_deref().map(procraft_gpu::Canvas::id))
         else {
             return;
         };
@@ -334,7 +334,7 @@ fn set_number(control: &mut PluginControl, value: f32) {
     match control {
         PluginControl::Switch { control } => control.on = value >= 0.5,
         PluginControl::Slider { control } => control.value = control.stepped(value),
-        PluginControl::File { .. } | PluginControl::Texture { .. } => {}
+        PluginControl::File { .. } | PluginControl::Texture { .. } | PluginControl::Folder { .. } => {}
     }
 }
 

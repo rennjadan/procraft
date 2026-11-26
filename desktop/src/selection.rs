@@ -136,16 +136,21 @@ impl Selection {
         self.look(session);
     }
 
-    /// The touches select as the tool is set: selecting by colour always adds.
+    /// The touches select as the tool is set: selecting by colour always adds, and so does anything
+    /// with nothing selected yet.
     fn touches(&self, session: &CanvasSession) {
-        let join =
-            if self.removes && self.kind != SelectKind::Automatic { SelectionJoin::Remove } else { SelectionJoin::Add };
+        let removes = self.removes && self.kind != SelectKind::Automatic && self.has;
+        let join = if removes { SelectionJoin::Remove } else { SelectionJoin::Add };
         session.set_touch_selecting(Some(SelectTouch { kind: self.kind, join, threshold: self.threshold }));
     }
 
     /// The selection shows covered by the colour with Color Fill on, else tinted while selecting
-    /// by colour, else striped.
+    /// by colour, else striped; and while the tool is open the touches are set again, what is
+    /// selected having perhaps changed.
     fn look(&self, session: &CanvasSession) {
+        if self.on {
+            self.touches(session);
+        }
         let display = if self.on && self.color_fill {
             SelectionDisplay::ColourFill
         } else if self.on && self.kind == SelectKind::Automatic {
@@ -221,6 +226,8 @@ impl Selection {
         self.overlay(ctx, session, bar_top);
         let drawing = !session.freehand_path().is_empty();
         let (has, joins) = (self.has, self.kind != SelectKind::Automatic);
+        // only the other ways than by colour can remove, and only from a selection there is
+        let removable = joins && has;
         let segments: Vec<(&icons::Icon, &str, bool)> = KINDS
             .iter()
             .map(|&k| {
@@ -234,8 +241,8 @@ impl Selection {
             })
             .collect();
         let mut buttons = vec![
-            Button::new(&icons::SELECT_ADD, "Add", 44.0).active(!joins || !self.removes),
-            Button::new(&icons::SELECT_REMOVE, "Remove", 44.0).active(joins && self.removes).enabled(joins),
+            Button::new(&icons::SELECT_ADD, "Add", 44.0).active(!removable || !self.removes),
+            Button::new(&icons::SELECT_REMOVE, "Remove", 44.0).active(removable && self.removes).enabled(removable),
             Button::new(&icons::INVERT, "Invert", 44.0).enabled(has),
             Button::new(&icons::SELECT_COPY_PASTE, "Copy & Paste", 44.0).enabled(has || drawing),
             Button::new(&icons::FEATHER, "Feather", 44.0).active(self.popup == Popup::Feather).enabled(has || drawing),

@@ -15,6 +15,7 @@ mod lighting;
 mod placed;
 mod scene;
 mod sphere;
+mod stale;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -31,13 +32,14 @@ pub use canvas::{
     Thumbnail, TipKind, VEIL_GRID, VeilCell, VeilCells, grey_levels, most_resident, read_texture, start_reading,
     textures_bytes,
 };
-pub use canvas::{CanvasPaper, GREY_LOOK, ViewLook};
-pub use kept::keep_pipelines_in;
+pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, ViewLook};
+pub use kept::{forget_kept_pipelines, keep_pipelines_for, keep_pipelines_in};
 pub use lighting::Lighting;
 pub use scene::{
     GrainLook, Light, MOST_LIGHTS, MaterialLook, MeshView, Orbit, ShownSelection, SurfaceMap, material_source,
 };
 pub use sphere::{SphereLook, SpherePreview, preview_environment};
+pub use stale::{STALE, StaleTextures, draws_copies, starts_stale};
 pub use wgpu;
 
 #[cfg(windows)]
@@ -297,6 +299,10 @@ pub struct Gpu {
     errors: Arc<AtomicU64>,
     /// Whether the device has been lost (its driver reset or stopped).
     lost: Arc<AtomicBool>,
+    /// When it was lost, as the driver told it (see [`Gpu::lost_at`]).
+    lost_at: Arc<OnceLock<std::time::Instant>>,
+    /// Whether its loss has been taken into account (see [`Gpu::take_loss`]).
+    loss_taken: Arc<AtomicBool>,
     /// The canvases' pipelines, once the first canvas has made them.
     canvas_pipelines: Arc<OnceLock<Arc<canvas::Pipelines>>>,
     /// The pipeline cache kept between runs (see [`kept`]), once the canvases' pipelines are made
@@ -310,6 +316,11 @@ pub struct Gpu {
     /// Whether its copies are made as Direct3D 12 without unrestricted copy pitches makes them
     /// (see [`Gpu::emulate_placed_copies`]).
     placed: Arc<placed::Placed>,
+    /// Whether its new textures start stale, so each is cleared as it is made (see `stale.rs`).
+    stale: Arc<stale::Stale>,
+    /// Whether a dual brush's parts laid by their rule are carried from lot to lot here: checked
+    /// before the first stroke that would carry one (see `canvas/carry_check.rs`).
+    carry: Arc<canvas::CarryCheck>,
 }
 
 /// Elsewhere there's no Direct3D 12 to choose a shader compiler for.
@@ -579,6 +590,15 @@ impl Gpu {
         if weak_gpu(&info.name, info.device_type) {
             log::info!("a weak GPU: the frosted glass is blurred from a smaller picture");
         }
+        let stale = starts_stale(&info);
+        if stale {
+            log::info!("new textures start stale on this GPU: each is cleared as it is made");
+        }
+        // (`PROCRAFT_DRAWN_COPIES`: as such a GPU, for running the tests so)
+        let drawn = draws_copies(&info) || std::env::var_os("PROCRAFT_DRAWN_COPIES").is_some();
+        if drawn {
+            log::info!("texture copies drawn on this GPU (PowerVR GL)");
+        }
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("procraft"),
             // where the GPU has it: the pipelines' compiled form to keep between runs
@@ -620,8 +640,10 @@ impl Gpu {
         }));
         // a device lost keeps nothing it held: what its textures had is gone
         let lost = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&lost);
+        let lost_at = Arc::new(OnceLock::new());
+        let (flag, when) = (Arc::clone(&lost), Arc::clone(&lost_at));
         device.set_device_lost_callback(move |reason, message| {
+            let _ = when.set(std::time::Instant::now());
             flag.store(true, Ordering::Relaxed);
             log::error!("GPU lost ({reason:?}): {message}");
         });
@@ -632,11 +654,15 @@ impl Gpu {
             queue,
             errors,
             lost,
+            lost_at,
+            loss_taken: Arc::default(),
             canvas_pipelines: Arc::default(),
             kept: Arc::default(),
             readbacks: Arc::default(),
             old,
             placed: Arc::default(),
+            stale: Arc::new(stale::Stale::new(stale, drawn)),
+            carry: Arc::default(),
         };
         // what an old GPU can't do, and what the canvas does without it (in the shared log)
         for lack in gpu.lacks() {
@@ -693,6 +719,23 @@ impl Gpu {
         self.lost.load(Ordering::Relaxed)
     }
 
+    /// When the device was lost, if it has been (as its driver told it, which can be before the
+    /// app first finds out).
+    pub fn lost_at(&self) -> Option<std::time::Instant> {
+        self.lost_at.get().copied()
+    }
+
+    /// The backend the device was made from.
+    pub fn backend(&self) -> wgpu::Backend {
+        self.adapter.get_info().backend
+    }
+
+    /// Whether the device is lost and this is the first time that is asked (by any of its clones):
+    /// so each loss is counted once, whoever finds it.
+    pub fn take_loss(&self) -> bool {
+        self.is_lost() && !self.loss_taken.swap(true, Ordering::Relaxed)
+    }
+
     /// Runs `work`, waits for what it sent the GPU, and says whether any of it went wrong: a
     /// texture or buffer there was no memory for (made all the same, but holding nothing), work
     /// that used one (left undone: a copy into it copies nothing), the device lost meanwhile, or
@@ -739,9 +782,9 @@ impl Gpu {
     /// compiled form kept by an earlier run, where there is one (see [`keep_pipelines_in`]).
     pub(crate) fn canvas_pipelines(&self) -> Arc<canvas::Pipelines> {
         Arc::clone(self.canvas_pipelines.get_or_init(|| {
-            let kept = self
-                .kept
-                .get_or_init(|| kept::folder().and_then(|dir| kept::Kept::open(&self.device, &self.adapter, &dir)));
+            let kept = self.kept.get_or_init(|| {
+                kept::folder().and_then(|(dir, build)| kept::Kept::open(&self.device, &self.adapter, &dir, &build))
+            });
             let abilities = canvas::Abilities::of(self);
             let pipelines = canvas::Pipelines::new(&self.device, abilities, kept.as_ref().map(|k| k.cache.clone()));
             if let Some(kept) = kept {

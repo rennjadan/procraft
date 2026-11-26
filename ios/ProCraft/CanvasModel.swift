@@ -81,8 +81,9 @@ final class CanvasModel {
         set { AppSettings.shared.colorMode = ColorMode.allCases.firstIndex(of: newValue) ?? 0 }
     }
     /// The second colour (0xRRGGBB), beside the current one in the colour panel: swapped with it,
-    /// and mixed in by brushes whose colour dynamics say so.
-    private(set) var secondaryRgb: UInt32 = 0xFFFFFF
+    /// and mixed in by brushes whose colour dynamics say so. Kept for the next start with the
+    /// others (white at first).
+    private(set) var secondaryRgb: UInt32 = CanvasModel.rgb(ofKept: CanvasModel.keptColours.second())
     /// The paint colour as hue (0..1), saturation and brightness.
     private(set) var hue: Float = 0
     private(set) var saturation: Float = 0
@@ -104,7 +105,7 @@ final class CanvasModel {
     /// PanelLayoutModel.swift); how the plugins lay them out, as last asked; and what goes up as the
     /// layout changes, for what shows it to show it again.
     @ObservationIgnored let panelLayout = PanelLayout()
-    var layoutLook = PanelLayoutLook(on: false, snap: 0, fold: false, makeRoom: false, edit: false)
+    var layoutLook = PanelLayoutLook(on: false, snap: 0, fold: false, makeRoom: false, edit: false, belt: false, collapse: false)
     /// The interface's bars as Edit layout moves them (see PanelLayoutModel.swift), whether it is
     /// on, and what goes up as a bar moves.
     @ObservationIgnored let barLayout = BarLayout()
@@ -113,6 +114,10 @@ final class CanvasModel {
     var namedChanges = 0
     var editingLayout = false
     var barChanges = 0
+    /// Where the bar or window piece held was pressed (interface points): the finger is there plus
+    /// the drag, which decides where a bar turns and goes, and where a window is let go (a tab, a
+    /// park on the Tool Belt).
+    @ObservationIgnored var heldAt = CGPoint.zero
     @ObservationIgnored var barsLandscape: Bool?
     var layoutChanges = 0
     /// The colour panel's grabber is being dragged out: the panel stays, unseen, until let go.
@@ -163,14 +168,12 @@ final class CanvasModel {
     @ObservationIgnored private var onMask = false
     /// The colour not in use (hue, saturation, brightness): masks' while a layer of another kind is
     /// current, the brush's while a mask is.
-    @ObservationIgnored private var otherColour: [Float] = AppSettings.shared.maskColor
+    @ObservationIgnored private var otherColour: [Float] = CanvasModel.keptColours.mask()
     /// What is drawn over the canvas follows the view while it moves into place.
     @ObservationIgnored private var settling: Timer?
     /// A save failed and was told of: the next isn't, until one succeeds again.
     @ObservationIgnored private var saveFailing = false
     @ObservationIgnored private var saveWatch: Timer?
-    /// When time on the artwork last started counting; none while away.
-    @ObservationIgnored private var activeSince: Date?
 
     /// The colour history, kept across artworks and, in its file, from one run of the app to the
     /// next: each canvas's paint strokes add to it.
@@ -179,6 +182,21 @@ final class CanvasModel {
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
         return ColourHistory.open(path: support.appendingPathComponent("colour-history.json").path)
+    }()
+
+    /// The brush colour, the masks' and the second colour, kept by the shared core in their file as
+    /// each changes, so the next start finds them however this run ends (killed, nothing runs on
+    /// the way out).
+    static let keptColours: KeptColours = {
+        let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        try? FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        let kept = KeptColours.open(path: support.appendingPathComponent("colour").path)
+        // the colours earlier versions kept in the app's settings, once
+        if !kept.wasKept() {
+            kept.keep(brush: AppSettings.shared.brushColor, mask: AppSettings.shared.maskColor)
+        }
+        return kept
     }()
 
     /// The modify button was pressed: the next touch on the canvas picks a colour (the touches
@@ -398,8 +416,10 @@ final class CanvasModel {
     init(session: CanvasSession, dir: String) {
         self.session = session
         self.dir = dir
+        CanvasLife.made(.model)
         // the artwork open: where layers held out of another's layers panel land
         HeldLayers.shared.canvas = self
+        CanvasLife.follow(self)
         _ = session.openBrushes(dir: Self.brushesDir)
         // the plugins on first: their brush engines make brushes of the files waiting too
         applyPlugins()
@@ -420,9 +440,10 @@ final class CanvasModel {
         history = Self.colourHistory.colours()
         refreshPalettes()
         // the colour as it was last left
-        hue = settings.brushColor[0]
-        saturation = settings.brushColor[1]
-        brightness = settings.brushColor[2]
+        let brush = Self.keptColours.brush()
+        hue = brush.first ?? AppSettings.defaultHue
+        saturation = brush.dropFirst().first ?? 1
+        brightness = brush.dropFirst(2).first ?? 1
         applyColor()
         tool = session.info().tool
         currentBrush = session.currentBrush()
@@ -434,8 +455,15 @@ final class CanvasModel {
         pushSecondary()
         // a model is lit, and its meshes read, as it opens
         scene.start()
-        activeSince = Date()
+        // time on it counts from now (the core counts it, and each save keeps what has counted)
+        session.setTracking(on: true)
         watchSaves()
+    }
+
+    deinit {
+        CanvasLife.gone(.model)
+        // (one left: the log says how long after)
+        CanvasLife.modelGone(ObjectIdentifier(self))
     }
 
     /// Where the brush library and the brushes in use are kept.
@@ -680,16 +708,14 @@ final class CanvasModel {
         }
     }
 
-    /// `brushes` (of one set) dragged together and let go at place `index` of set `set`: along
-    /// their own set they move there, the first taking it and the rest after it; onto another set
-    /// they are copied there, those dragged staying where they were (the core's rule).
-    func dropBrushes(_ brushes: [BrushInfo], set: Int, index: Int) {
+    /// `brushes` (of one set) dragged together and let go `over` a set's row, a brush of the set
+    /// shown (its upper or lower half) or its list: along their own set they move there, the first
+    /// there and the rest after it; onto another set they are copied there, those dragged staying
+    /// where they were (the core's `brushDropPlace` says where).
+    func dropBrushesOver(_ brushes: [BrushInfo], over: BrushDropOver) {
         guard let first = brushes.first else { return }
-        if brushes.count == 1, set == Int(first.set), index == Int(first.index) {
-            return
-        }
         let indices = brushes.filter { $0.set == first.set }.map(\.index)
-        if session.dropBrushes(set: first.set, indices: indices, toSet: UInt32(set), toIndex: UInt32(index)) {
+        if session.dropBrushesOver(set: first.set, indices: indices, over: over) {
             libraryChanged()
         }
     }
@@ -1123,6 +1149,14 @@ final class CanvasModel {
                 self?.keepPreview(key, image, shaded: under)
             }
         }
+    }
+
+    /// The library closed: the core lets go of the canvas its sample strokes are drawn on (100 MB
+    /// and more of the GPU's memory after a heavy set), made again for the next. The pictures stay,
+    /// so it opens again at once.
+    func libraryClosed() {
+        let session = session
+        DispatchQueue.global(qos: .utility).async { session.letGoOfPreviews() }
     }
 
     /// `image` kept as brush `key`'s sample stroke, the oldest let go past the most kept.
@@ -2168,12 +2202,21 @@ final class CanvasModel {
         setRgb(secondaryRgb)
         secondaryRgb = current
         pushSecondary()
+        let c = secondaryRgb
+        Self.keptColours.keepSecond(second: [16, 8, 0].map { Float((c >> UInt32($0)) & 0xFF) / 255 })
     }
 
     private func pushSecondary() {
         let c = secondaryRgb
         let channel = { (shift: UInt32) in Float((c >> shift) & 0xFF) / 255 }
         session.setSecondaryColor(r: channel(16), g: channel(8), b: channel(0))
+    }
+
+    /// The second colour (0xRRGGBB) from the red, green and blue (0..1) the core keeps it as; white
+    /// for anything that isn't three numbers.
+    static func rgb(ofKept kept: [Float]) -> UInt32 {
+        guard kept.count == 3, kept.allSatisfy({ $0.isFinite }) else { return 0xFFFFFF }
+        return kept.reduce(UInt32(0)) { ($0 << 8) | UInt32((min(max($1, 0), 1) * 255).rounded()) }
     }
 
     private func applyColor() {
@@ -2192,11 +2235,11 @@ final class CanvasModel {
         keepColour()
     }
 
-    /// Keeps the brush colour and the masks' for the next session.
+    /// Keeps the brush colour and the masks' for the next start (the core writes them soon, off
+    /// this thread).
     private func keepColour() {
         let now = [hue, saturation, brightness]
-        AppSettings.shared.brushColor = onMask ? otherColour : now
-        AppSettings.shared.maskColor = onMask ? now : otherColour
+        Self.keptColours.keep(brush: onMask ? otherColour : now, mask: onMask ? now : otherColour)
     }
 
     /// A mask became current, or stopped being: the colour trades places with the other kind's, as
@@ -2638,14 +2681,24 @@ final class CanvasModel {
     /// from any touch: a plugin or a smudge the GPU had no memory for, or its device lost. A plugin's
     /// card says so too, once its page reads the list again.
     private func watchSaves() {
-        let session = session
-        saveWatch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+        // (the session reached through the model, never held: a repeating timer stays until it is
+        // stopped, and with the session in it the artwork's memory would stay with it)
+        saveWatch = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] timer in
+            guard let session = self?.session else {
+                timer.invalidate()
+                return
+            }
             // off the main thread: a big artwork's first frame holds the session a while
             DispatchQueue.global(qos: .utility).async {
                 let reason = session.takeSaveFailure()
+                // opened again from its folder after the graphics stopped (counted)
+                let reopened = session.reopenedAfterLoss()
                 let failure = session.takeFailure()
-                guard reason != nil || failure != nil else { return }
+                guard reason != nil || failure != nil || reopened > 0 else { return }
                 DispatchQueue.main.async {
+                    if let self, reopened != self.reopenedSeen {
+                        self.reopenedAgain(reopened)
+                    }
                     if let reason {
                         self?.saveFailed(reason)
                     }
@@ -2656,6 +2709,20 @@ final class CanvasModel {
                 }
             }
         }
+    }
+
+    /// How many times the artwork was opened again after the graphics stopped, as last read.
+    @ObservationIgnored private var reopenedSeen: UInt64 = 0
+
+    /// The artwork was opened again from its folder after the graphics stopped (`count` times): its
+    /// layers, their thumbnails and the undo buttons read again.
+    private func reopenedAgain(_ count: UInt64) {
+        reopenedSeen = count
+        thumbnails.removeAll()
+        thumbnailVersions.removeAll()
+        refresh()
+        refreshView()
+        refreshThumbnails()
     }
 
     /// A save failed, for `reason`: said the first time since one last succeeded (the storage full
@@ -2676,17 +2743,13 @@ final class CanvasModel {
 
     /// Time on the artwork stops counting and goes on its record.
     func noteTime() {
-        if let since = activeSince {
-            session.addTrackedTime(ms: UInt64(max(Date().timeIntervalSince(since), 0) * 1000))
-        }
-        activeSince = nil
+        session.setTracking(on: false)
     }
 
-    /// The app is back in front: time on the artwork counts again.
+    /// The app is active again: time on the artwork counts again (from when it first did, if it
+    /// still is).
     func resumeTracking() {
-        if activeSince == nil {
-            activeSince = Date()
-        }
+        session.setTracking(on: true)
     }
 
     /// The artwork is being left: nothing goes on watching it.

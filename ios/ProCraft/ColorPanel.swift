@@ -1216,7 +1216,7 @@ private struct HexPad: View {
     private let keyInk = Color(argb: 0xFFEE_EEEE)
     /// Frosted, as measured: a grey tint at 77% over the blur (what is behind shows through), the
     /// keys white at 7% over it.
-    private let padTint = Color(argb: 0xC53C_3C3C)
+    private let padTint = Pc.onDarkFrost(0xC53C_3C3C)
     private let keyFill = Color.white.opacity(0.07)
 
     private func key<Label: View>(width: CGFloat, action: @escaping () -> Void, @ViewBuilder label: () -> Label) -> some View {
@@ -2578,7 +2578,7 @@ struct FloatingColors: View {
                 shown: tab,
                 title: model.colorMode == .palettes ? "Palettes" : "Colors",
                 onUnfold: { model.foldColours(false) },
-                onDrag: { model.moveColours(by: $0, from: .zero) },
+                onDrag: { _, by in model.moveColours(by: by, from: .zero) },
                 onLetGo: { model.letGoColours() }
             )
             .frame(width: screen.width, height: screen.height, alignment: .topLeading)

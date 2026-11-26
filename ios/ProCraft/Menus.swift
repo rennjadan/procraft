@@ -5,10 +5,24 @@ let glassMenuWidth: CGFloat = 253
 private let menuEdge = Color(argb: 0xFF5A_5D5F)
 private let menuRule = Color(argb: 0xFF3F_4347)
 
+private struct MenuTextKey: EnvironmentKey {
+    static let defaultValue: CGFloat = 17
+}
+
+extension EnvironmentValues {
+    /// How big a menu row's words are: smaller in a menu shaped as the system's own are.
+    var menuText: CGFloat {
+        get { self[MenuTextKey.self] }
+        set { self[MenuTextKey.self] = newValue }
+    }
+}
+
 /// A small menu: frosted over the canvas, nearly solid over a panel, with a light edge; its rows
-/// 40 high.
+/// 40 high. One shaped as the system's own menus are (`system`) is frosted wherever it is, the
+/// panel under it showing through blurred, its words 15 and a soft shadow round it, as measured.
 struct GlassMenu<Content: View>: View {
     var overPanel = false
+    var system = false
     var width: CGFloat = glassMenuWidth
     @ViewBuilder let content: () -> Content
 
@@ -17,11 +31,12 @@ struct GlassMenu<Content: View>: View {
         VStack(spacing: 0) {
             content()
         }
+        .environment(\.menuText, system ? 15 : 17)
         .padding(.vertical, 7)
         .frame(width: width)
         .background {
             ZStack {
-                if overPanel {
+                if overPanel, !system {
                     shape.fill(Pc.glassMenuOverPanel)
                 } else {
                     shape.fill(.ultraThinMaterial)
@@ -32,6 +47,7 @@ struct GlassMenu<Content: View>: View {
         }
         .overlay(shape.strokeBorder(menuEdge, lineWidth: 1))
         .clipShape(shape)
+        .shadow(color: system ? Color.black.opacity(0.14) : Color.clear, radius: system ? 15 : 0, y: system ? 6 : 0)
     }
 }
 
@@ -45,17 +61,20 @@ struct MenuRow: View {
     var iconSize: CGFloat = 40
     let action: () -> Void
 
+    @Environment(\.menuText) private var textSize
+
     var body: some View {
         let ink = ink ?? Pc.menuInk
         HStack(spacing: 0) {
             PcIconView(icon, size: iconSize, color: ink)
                 .frame(width: 40, height: 40)
                 .padding(.leading, 9.5)
+            // the smaller words a little further left, as measured
             Text(verbatim: label)
-                .font(.system(size: 17))
+                .font(.system(size: textSize))
                 .foregroundStyle(ink)
                 .lineLimit(1)
-                .padding(.leading, 2.5)
+                .padding(.leading, textSize < 17 ? 1 : 2.5)
             Spacer(minLength: 0)
             if let trailing {
                 PcIconView(trailing, size: 40, color: ink)

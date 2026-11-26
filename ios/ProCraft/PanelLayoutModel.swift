@@ -56,6 +56,8 @@ extension CanvasModel {
     func followLayout() {
         panelLayout.follow(plugins: PluginsModel.shared.store)
         layoutLook = panelLayout.look()
+        // (Collapse to edge turned on or off: the bars know at once, not only once they are told again)
+        barLayout.setCollapsing(on: layoutLook.collapse)
         // the bars back where they always are as no plugin lets them move: no handles
         if !layoutLook.edit, editingLayout {
             doneEditLayout()
@@ -100,12 +102,109 @@ extension CanvasModel {
         return barLayout.shown(bar: bar)
     }
 
+    /// Which sides of `bar` lie against the window's edges where it shows now, as it is dragged too:
+    /// square there, round elsewhere.
+    func barTouching(_ bar: LayoutBar) -> BarSides? {
+        _ = barChanges
+        return barLayout.touching(bar: bar)
+    }
+
+    /// Collapse to edge: `bar` collapsed into its side (the side, its tab there, how far it slid),
+    /// while it is.
+    func barCollapsed(_ bar: LayoutBar) -> EdgeCollapse? {
+        _ = barChanges
+        return barLayout.collapsed(bar: bar)
+    }
+
+    /// Where `bar` goes when it collapses, collapsed or not (to slide it there and back); none while
+    /// it can't.
+    func barCollapsePlace(_ bar: LayoutBar) -> EdgeCollapse? {
+        _ = barChanges
+        return barLayout.collapsePlace(bar: bar)
+    }
+
+    /// Where `bar`'s collapse button goes, while it has one (interface points).
+    func barCollapseButton(_ bar: LayoutBar) -> LayoutRect? {
+        _ = barChanges
+        return barLayout.collapseButton(bar: bar)
+    }
+
+    /// `bar` collapsed into its side, or brought back out, kept.
+    func collapseBar(_ bar: LayoutBar, _ collapsed: Bool) {
+        if barLayout.setCollapsed(bar: bar, collapsed: collapsed) {
+            UserDefaults.standard.set(barLayout.kept(), forKey: barLayoutKey())
+        }
+        barChanges += 1
+    }
+
+    /// A drag from collapsed `bar`'s tab, `by` so far: out of the side far enough, it comes back out.
+    func pullBarTab(_ bar: LayoutBar, by: CGSize) {
+        if barLayout.pullTab(bar: bar, dx: Float(by.width), dy: Float(by.height)) {
+            UserDefaults.standard.set(barLayout.kept(), forKey: barLayoutKey())
+            barChanges += 1
+        }
+    }
+
+    /// `piece`'s window collapsed into its side, while it is.
+    func pieceCollapsed(_ piece: LayoutPiece) -> EdgeCollapse? {
+        _ = layoutChanges
+        return panelLayout.pieceCollapsed(piece: piece)
+    }
+
+    /// Where `piece`'s window goes when it collapses, collapsed or not; none while it can't.
+    func pieceCollapsePlace(_ piece: LayoutPiece) -> EdgeCollapse? {
+        _ = layoutChanges
+        return panelLayout.pieceCollapsePlace(piece: piece)
+    }
+
+    /// The side `piece`'s window goes into at its collapse button, while it may.
+    func pieceCollapseEdge(_ piece: LayoutPiece) -> WindowEdge? {
+        _ = layoutChanges
+        return panelLayout.pieceCollapseEdge(piece: piece)
+    }
+
+    /// `piece`'s window collapsed into its side, or brought back out, kept.
+    func collapsePiece(_ piece: LayoutPiece, _ collapsed: Bool) {
+        if panelLayout.setPieceCollapsed(piece: piece, collapsed: collapsed) {
+            keepLayout()
+        }
+        layoutChanged()
+    }
+
+    /// A drag from collapsed `piece`'s tab, `by` so far: out of the side far enough, it comes back out.
+    func pullPieceTab(_ piece: LayoutPiece, by: CGSize) {
+        if panelLayout.pullPieceTab(piece: piece, dx: Float(by.width), dy: Float(by.height)) {
+            keepLayout()
+            layoutChanged()
+        }
+    }
+
+    /// Whether any bar or window is collapsed into its side.
+    func anyCollapsed() -> Bool {
+        _ = barChanges
+        _ = layoutChanges
+        return barLayout.anyCollapsed() || panelLayout.anyCollapsed()
+    }
+
+    /// Collapse All (`collapsed`) or Open All: every bar and window against a side, kept.
+    func collapseAll(_ collapsed: Bool) {
+        if barLayout.setAllCollapsed(collapsed: collapsed) {
+            UserDefaults.standard.set(barLayout.kept(), forKey: barLayoutKey())
+        }
+        barChanges += 1
+        if panelLayout.setAllCollapsed(collapsed: collapsed) {
+            keepLayout()
+        }
+        layoutChanged()
+    }
+
     /// The bars where they always are as `key` says, told to Edit layout to move them from.
     func tellBars(_ key: BarsKey) {
         let size = key.size
         let (w, h) = (Float(size.width), Float(size.height))
         let landscape = size.width >= size.height
         barLayout.setWindow(width: w, height: h, snap: max(layoutLook.snap, 16))
+        barLayout.setCollapsing(on: layoutLook.collapse)
         // the top bar's halves as big as it shows: laid out at its own points across the window
         let kb = key.topBar
         let gaps = Pc.barGaps(size.width / kb)
@@ -196,12 +295,13 @@ extension CanvasModel {
         applyFitInsets()
     }
 
-    /// `bar` dragged by its handle, `by` all told since it was pressed (interface points).
-    func dragBar(_ bar: LayoutBar, by: CGSize) {
+    /// `bar` dragged by its handle, pressed `from` and `by` all told since (interface points).
+    func dragBar(_ bar: LayoutBar, from: CGPoint, by: CGSize) {
         if barLayout.editing(), barLayout.holding() != bar {
-            _ = barLayout.hold(bar: bar, x: 0, y: 0)
+            heldAt = from
+            _ = barLayout.hold(bar: bar, x: Float(from.x), y: Float(from.y))
         }
-        _ = barLayout.drag(x: Float(by.width), y: Float(by.height))
+        _ = barLayout.drag(x: Float(heldAt.x + by.width), y: Float(heldAt.y + by.height))
         barChanges += 1
     }
 
@@ -251,13 +351,14 @@ extension CanvasModel {
 
     /// `piece`'s strip or tab (or, `sizing`, its corner) pressed: it moves (or is sized) with the
     /// finger until let go.
-    func holdPiece(_ piece: LayoutPiece, sizing: Bool) {
-        _ = panelLayout.hold(piece: piece, sizing: sizing, x: 0, y: 0)
+    func holdPiece(_ piece: LayoutPiece, sizing: Bool, at: CGPoint) {
+        heldAt = at
+        _ = panelLayout.hold(piece: piece, sizing: sizing, x: Float(at.x), y: Float(at.y))
     }
 
     /// The piece held dragged `by` all told since it was pressed (interface points).
     func dragPiece(by: CGSize) {
-        _ = panelLayout.drag(x: Float(by.width), y: Float(by.height))
+        _ = panelLayout.drag(x: Float(heldAt.x + by.width), y: Float(heldAt.y + by.height))
         layoutChanged()
     }
 
@@ -363,6 +464,66 @@ extension CanvasModel {
         layoutChanged()
     }
 
+    /// The panels `piece`'s window holds as tabs, the first holding its place; none while alone.
+    func tabsOf(_ piece: LayoutPiece) -> [LayoutPiece] {
+        _ = layoutChanges
+        return panelLayout.tabsOf(piece: piece)
+    }
+
+    /// `piece`, a tab of its window, shown there.
+    func pickTab(_ piece: LayoutPiece) {
+        panelLayout.setActiveTab(piece: piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /// `piece`, a tab of its window, torn out with the finger `at` (interface points): it follows
+    /// the finger.
+    func tearTab(_ piece: LayoutPiece, at: CGPoint) {
+        _ = panelLayout.tearTab(piece: piece, x: Float(at.x), y: Float(at.y), grab: Float(floatingGrabY))
+        layoutChanged()
+    }
+
+    /// The tab torn out follows the finger `at` (interface points).
+    func followTorn(_ at: CGPoint) {
+        _ = panelLayout.drag(x: Float(at.x), y: Float(at.y))
+        layoutChanged()
+    }
+
+    /// The Tool Belt as it shows, while a plugin says so.
+    func beltShown() -> BeltShown? {
+        _ = layoutChanges
+        return panelLayout.beltShown()
+    }
+
+    /// Where the Tool Belt shows (interface points): moved where Edit layout left it (a bar), else
+    /// where `belt` says; told to the layout, which parks what is let go on it.
+    func beltPlace(_ belt: BeltShown) -> BarPlace {
+        let k = belt.scale
+        let (length, thickness) = (belt.width * k, belt.height * k)
+        let own = BarPlace(x: belt.x, y: belt.y, vertical: false)
+        barLayout.setBar(bar: .belt, own: own, length: length, thickness: thickness)
+        _ = barChanges
+        let place = barLayout.shown(bar: .belt) ?? own
+        let (w, h) = place.vertical ? (thickness, length) : (length, thickness)
+        panelLayout.setBeltPlace(rect: LayoutRect(x: place.x, y: place.y, width: w, height: h))
+        return place
+    }
+
+    /// `piece`, parked on the Tool Belt, taken off: back where it was.
+    func unparkPiece(_ piece: LayoutPiece) {
+        _ = panelLayout.unpark(piece: piece)
+        keepLayout()
+        layoutChanged()
+    }
+
+    /// `piece`, parked on the Tool Belt, dragged off with the finger `at` (interface points): it
+    /// follows the finger.
+    func unparkAt(_ piece: LayoutPiece, at: CGPoint) {
+        _ = panelLayout.unparkAt(piece: piece, x: Float(at.x), y: Float(at.y), grab: Float(floatingGrabY))
+        layoutChanged()
+    }
+
     /// The floating windows in the order they are drawn, from the bottom up.
     func pieceOrder() -> [LayoutPiece] {
         _ = layoutChanges
@@ -460,6 +621,7 @@ extension CanvasModel {
 /// Fold: a disc with a bar across it, the panel going to its tab.
 struct FloatingFold: View {
     let onFold: () -> Void
+    var height: CGFloat = 40
 
     var body: some View {
         Canvas { context, size in
@@ -471,7 +633,7 @@ struct FloatingFold: View {
             bar.addLine(to: CGPoint(x: o.x + 3.6, y: o.y))
             context.stroke(bar, with: .color(.black.opacity(0.3)), lineWidth: 1.3)
         }
-        .frame(width: 40, height: 40)
+        .frame(width: 40, height: height)
         .contentShape(Rectangle())
         .onTapGesture(perform: onFold)
         .accessibilityLabel("Fold")
@@ -484,7 +646,8 @@ struct FloatingTab: View {
     let shown: PieceShown
     let title: String
     let onUnfold: () -> Void
-    let onDrag: (CGSize) -> Void
+    /// Dragged: pressed at a point, and moved all told since (interface points).
+    let onDrag: (CGPoint, CGSize) -> Void
     let onLetGo: () -> Void
 
     var body: some View {
@@ -515,7 +678,8 @@ struct FloatingTab: View {
             DragGesture(minimumDistance: 1, coordinateSpace: .global)
                 .onChanged { drag in
                     let k = Interface.shared.scale
-                    onDrag(CGSize(width: drag.translation.width / k, height: drag.translation.height / k))
+                    let from = Interface.shared.point(drag.startLocation)
+                    onDrag(from, CGSize(width: drag.translation.width / k, height: drag.translation.height / k))
                 }
                 .onEnded { _ in onLetGo() }
         )
@@ -578,30 +742,19 @@ struct EditLayoutHandles: View {
     var body: some View {
         let _ = model.barChanges
         ZStack(alignment: .topLeading) {
-            ForEach([LayoutBar.topLeft, .topRight, .sideBar], id: \.self) { bar in
-                if let r = model.barLayout.rect(bar: bar) {
-                    RoundedRectangle(cornerRadius: 12, style: .circular)
-                        .strokeBorder(Pc.accent, lineWidth: 2)
-                        .contentShape(Rectangle())
-                        .frame(width: CGFloat(r.width), height: CGFloat(r.height))
-                        .gesture(
-                            DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                                .onChanged { drag in
-                                    let k = Interface.shared.scale
-                                    model.dragBar(bar, by: CGSize(width: drag.translation.width / k, height: drag.translation.height / k))
-                                }
-                                .onEnded { _ in model.letGoBar() }
-                        )
-                        .onTapGesture {}
-                        .accessibilityLabel("Move")
-                        .offset(x: CGFloat(r.x), y: CGFloat(r.y))
-                }
+            // (the Tool Belt's while it shows)
+            ForEach([LayoutBar.topLeft, .topRight, .sideBar] + (model.beltShown() == nil ? [] : [.belt]), id: \.self) { bar in
+                BarOutline(model: model, bar: bar)
             }
             HStack(spacing: 0) {
                 layouts
                 // the windows hidden from their menus come back by Show Hidden
                 let hidden: [(String, () -> Void)] = model.hiddenPieces().isEmpty ? [] : [("Show Hidden", { model.showHiddenPieces() })]
-                ForEach(hidden + [("Reset", { model.resetLayout() }), ("Done", { model.doneEditLayout() })], id: \.0) { label, act in
+                // Collapse to edge: every bar and window against a side into it, or back out
+                let any = model.anyCollapsed()
+                let collapse: [(String, () -> Void)] =
+                    model.layoutLook.collapse ? [(any ? "Open All" : "Collapse All", { model.collapseAll(!any) })] : []
+                ForEach(hidden + collapse + [("Reset", { model.resetLayout() }), ("Done", { model.doneEditLayout() })], id: \.0) { label, act in
                     Text(verbatim: label)
                         .font(.system(size: 17))
                         .foregroundStyle(Pc.accent)
@@ -616,16 +769,54 @@ struct EditLayoutHandles: View {
             .frame(width: screen.width, height: screen.height - 28, alignment: .bottom)
         }
         .frame(width: screen.width, height: screen.height, alignment: .topLeading)
-        .alert(renaming == nil ? "Save Layout" : "Rename Layout", isPresented: $asking) {
-            TextField("Name", text: $name)
-            Button(renaming == nil ? "Save" : "Rename") {
-                if let from = renaming {
-                    model.renameLayout(from, name)
-                } else {
-                    model.saveLayout(name)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
+        // the name asked for in the app's own alert
+        .overlay {
+            AlertView(
+                content: asking
+                    ? AlertContent(title: renaming == nil ? "Save Layout" : "Rename Layout", action: renaming == nil ? "Save" : "Rename", destructive: false)
+                    : nil,
+                onCancel: { asking = false },
+                onAction: {
+                    if let from = renaming {
+                        model.renameLayout(from, name)
+                    } else {
+                        model.saveLayout(name)
+                    }
+                    asking = false
+                },
+                field: $name
+            )
+        }
+    }
+}
+
+/// A bar's outline while Edit layout is on, where the bar is now (it follows each step of a drag,
+/// and Reset): dragged, it moves the bar.
+private struct BarOutline: View {
+    let model: CanvasModel
+    let bar: LayoutBar
+
+    var body: some View {
+        // (read here, so each outline shows again as its bar moves)
+        let _ = model.barChanges
+        if let r = model.barLayout.rect(bar: bar) {
+            RoundedRectangle(cornerRadius: 12, style: .circular)
+                .strokeBorder(Pc.accent, lineWidth: 2)
+                .contentShape(Rectangle())
+                .frame(width: CGFloat(r.width), height: CGFloat(r.height))
+                .gesture(
+                    DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { drag in
+                            let k = Interface.shared.scale
+                            // the finger's place: where the bar turns and goes decides by it
+                            let from = Interface.shared.point(drag.startLocation)
+                            model.dragBar(bar, from: from, by: CGSize(width: drag.translation.width / k, height: drag.translation.height / k))
+                        }
+                        .onEnded { _ in model.letGoBar() }
+                )
+                .onTapGesture {}
+                .accessibilityLabel("Move")
+                .offset(x: CGFloat(r.x), y: CGFloat(r.y))
         }
     }
 }

@@ -54,13 +54,15 @@ once was: `colour-tools`, `interface-look`, `view-tools`, `brush-extras`, `layer
 - `edit-layout`: Movable panels answers the `floating_panels` hook for the Layers panel and the
   brush library and the `panel_layout` hook's snapping, folding and room (interface 20); All panels
   float answers the `floating_panels` hook for every other panel (off as it starts); Panels stay open
-  answers the `pin_panels` hook; and Edit
-  layout the `panel_layout` hook's bars. It took Floating panels and Panels stay open from Interface
-  look, with what was set for them.
+  answers the `pin_panels` hook; Tool Belt the `panel_layout` hook's part 4 (off as it starts); Edit
+  layout the `panel_layout` hook's bars; and Collapse to edge its part 5 (off as it starts). It took
+  Floating panels and Panels stay open from Interface look, with what was set for them.
 
 `keyboard-shortcuts` rebinds keys from a panel of its own and keeps what it binds, and
 `pop-up-palette` has an action a pen's button runs, which shows a ring of the recent colours and
-brushes where the pen is.
+brushes where the pen is. `storage-folder` has a [folder](#folders) at the top of its card and three
+features, each naming it on a hook of its own (interface 22): its artworks kept there, the time-lapse
+videos exported put there too, and what changed there brought into the gallery.
 
 ## What you write
 
@@ -113,7 +115,8 @@ picture, actions in the Layers panel, `set_control` and the `colour_panel` hook 
 `view_dim_others` hook 13, a set of brushes 14, `texture` controls, panels' rows of a control and
 the `paper` hook's grain 15, [features](#features), a row in the brush studio kept as a plugin it
 takes the place of kept it, and the marks of one it takes the place of 16, a feature taken from a
-plugin that stays and a set of brushes under a switch 19, and the `panel_layout` hook 20.
+plugin that stays and a set of brushes under a switch 19, the `panel_layout` hook 20, and
+[`folder` controls](#folders) and the `artwork_saved`, `video_exported` and `gallery_opened` hooks 22.
 
 ### Brushes it comes with
 
@@ -250,6 +253,26 @@ clears that file control. The plugin is told a grain by its number in the Source
 there (a picture cleared) is still told as it was set, for the plugin to see that none is picked
 there. `starts` is a grain's number, 0 by default. It can't be in the Canvas tab, nor keep a
 setting the app used to have.
+
+### Folders
+
+A `folder` control (interface 22) is a folder someone picks outside the app, for the app to keep files
+in or bring them from as the plugin's [folder hooks](#artwork_saved-video_exported-and-gallery_opened)
+say. The plugin never reaches the folder itself: it only says which of its folders a hook means.
+
+```json
+{ "key": "folder", "type": "folder", "label": "Folder" }
+```
+
+- Its card shows Choose, or the folder's name and Clear. Choose opens the system's folder picker
+  (Android's document tree, with its permission kept; a folder dialog on a computer; the iPad's
+  document picker), and the folder is kept with the plugin. Clear lets it go; what is in it stays.
+- The plugin is told 1 while a folder is picked and 0 while none is.
+- It has no `starts`, `place`, `press`, `artwork` or `keeps`, and only code may have one. It counts
+  among the eight `file` controls.
+- In a plugin of [features](#features) it may come under none of them: it is then the whole
+  plugin's, shown at the top of its card before its features while the plugin is on, and told to
+  every copy of its code. Under a feature, it shows under that feature as any control.
 
 ### In the Canvas tab, on a key, and with each artwork
 
@@ -985,6 +1008,8 @@ procraft_panel_layout(part: i32) -> f32
 | 1 | Whether each floating panel has a fold button beside its Close, folding it to a tab (1) or not (0) |
 | 2 | Whether the panels docked against the window's edges take that room from the drawing area (1) or not (0) |
 | 3 | Whether the interface's bars may be moved (1) or not (0): Edit Layout, below |
+| 4 | Whether the Tool Belt shows (1) or not (0): below |
+| 5 | Whether bars and windows against a side collapse into it (1) or not (0): Collapse to edge, below |
 
 Answer below 0 to leave a part as the app has it, as for one you don't know: more may come. A snap
 past 64, a yes or no past 1, or an answer that isn't a number, stops the plugin. It's asked as the
@@ -1013,6 +1038,12 @@ layout keeps it, as the panels the [`floating_panels`](#floating_panels) hook le
   each device by itself, as a share of the window: a window sized differently has it in the same
   place in proportion (one docked stays against its edge). A way it was never placed in starts
   from the other's. The Reference window's place stays the artwork's.
+- **Tabs.** A floating panel (the Layers panel, the library, the Actions panel or the Adjustments
+  menu) moved and let go with the middle of its top within 40 points of another's top, over it,
+  becomes a tab of that window, showing; a window holds up to four. Its tabs take the grabber's
+  place on its strip: a tap shows one, and one dragged out more than 26 points floats again as a
+  window of its own. The window is where its first tab's place is, and moves with its tabs; Close
+  closes the tab showing, and Reset Position takes it out of the window.
 - **Each window's menu.** A floating panel's strip has a menu: **Fold**; **Hide**, which leaves it
   open but unseen until its button is pressed or **Show Hidden** in Edit Layout brings it back;
   **Pin to Top**, which keeps it over every window that isn't pinned (the others go over each other
@@ -1031,6 +1062,27 @@ button of a moved bar hangs from that button: under a bar in the window's upper 
 its lower half, and beside one standing upright, its arrow pointing at the button. Each way the
 screen turns keeps its own places. With no plugin saying so, every bar is where it always is,
 wherever it was left.
+
+While a plugin says part 4, the **Tool Belt** shows: a strip 36 points tall at the bottom left of the
+window, 12 points in, a chip 120 points wide for each panel parked on it (one chip wide, saying what
+it is, while none is). A floating panel (the Layers panel, the library, the Actions panel or the
+Adjustments menu) dragged by its strip and let go with the pointer on the belt (within 40 points) is
+parked there, kept where it was when it was pressed; a tap on its chip puts it back there, and its
+chip dragged out more than 26 points floats it under the finger. In Edit Layout the belt moves as the
+bars do, lying along the top or the bottom and standing upright against a side, its place kept for
+each way the screen turns and in named layouts. What was parked shows as a window again once no
+plugin says part 4.
+
+While a plugin says part 5, **Collapse to edge**: a bar (either half of the top bar, the side bar, the
+Tool Belt) against a side of the window, and a floating window against the left or right side, has a
+small button (24 points across, 6 points past the bar's end, on a window's strip) that slides it
+into that side in 0.2 seconds, easing out. A tab 56 points long and 14 thick is left on the side,
+across from its middle; a tap on the tab, or a drag of 14 points out of the side, slides it back
+out. A bar standing upright goes into the side it stands against, one lying down into the top or the
+bottom it lies against. While collapsed it gives its room back: the panels and the other bars may go
+where it was, and a docked window makes no room. **Collapse All** (or **Open All** while any is
+collapsed) in Edit Layout's row and in each window's menu does them all. What is collapsed is kept for
+each way the screen turns and in named layouts; with no plugin saying part 5, everything shows.
 
 Edit Layout's **Layouts** keeps layouts under names of the painter's: **Save Layout** saves the bars
 and the floating panels where they are (for each way the screen turns, and which windows are open,
@@ -1310,6 +1362,50 @@ while pressed and the spray can while it moves, its ball rattling when the pen i
 forth above the canvas. Its controls set the volume, one sound for every brush, whether erasing makes
 a sound and which, and a recording for any of the six; its row in the brush studio gives a brush its
 own sound, or none. All of it is in the plugin, made sample by sample with a few filters.
+
+### `artwork_saved`, `video_exported` and `gallery_opened`
+
+The folder hooks (interface 22). Each asks which of the plugin's [folders](#folders) the app is to
+use for something, by its place in `controls`: -1 (anything below 0) for none, as with no folder
+picked. A place past 63 stops the plugin; one that is no `folder` control, or one with no folder
+picked, does nothing. With several plugins on a hook, the first by id that names a folder is used.
+
+```
+procraft_artwork_saved() -> i32
+procraft_video_exported() -> i32
+procraft_gallery_opened() -> i32
+```
+
+All the rest is the app's, the same on every platform:
+
+- **`artwork_saved`**, asked after an artwork is saved (the autosave too): the folder it is kept in.
+  Once its saves stop for 10 seconds (or 2 minutes after the first, if they go on), or 5 seconds after
+  it is left, the app writes it there as one package, the file Share makes (`.procraft`), from a
+  thread of its own: from the artwork while it is open and nothing is under way on it (a stroke, a
+  transform; never cutting one short), else from its folder. It is written beside its name and put
+  in its place only once whole, so a write cut short leaves the last one. It is named after the
+  artwork as Share names it (`Dragon.procraft`, then `Dragon_2.procraft` for another of that name),
+  under its new name once renamed. A file there that changed since the app wrote it (another device
+  wrote it), or that the app never wrote, is never written over: the artwork goes under a name of its
+  own beside it. Its time-lapse goes in as far as it is made into videos.
+- **`video_exported`**, asked after a time-lapse video is exported: the folder a copy goes into too,
+  as `Dragon time-lapse.mp4`, over the one the app put there before if that is as it was, else beside
+  it (`Dragon time-lapse 2.mp4`).
+- **`gallery_opened`**, asked as the gallery opens: the folder whose packages (`.procraft`, and the
+  layered packages the app imports) come into the gallery. One that changed there since the app last
+  wrote or read it comes in over the gallery's copy, in its place, if that copy didn't change here
+  meanwhile and isn't open; if both changed, the gallery's stays as it is and what came is added
+  beside it as a copy, `Dragon (from folder)`. One the app never had comes in as a new artwork, and
+  one deleted from the gallery comes back only once it changes there.
+
+Nothing in a folder is ever taken away by the app. What it wrote there and read from there is noted
+with the plugin (beside the folder picked, and forgotten with it). A folder that can't be reached, as
+when it is gone or the app's permission to it was taken back, is told once, on the canvas or as the
+gallery opens, until it can be again; meanwhile the app goes on as usual. With no plugin on these
+hooks the app asks nothing and writes nothing.
+
+Storage folder, which the app comes with, names its folder on each hook while that feature is on:
+Keep artworks in a folder, Save time-lapse videos there and Bring in changes from the folder.
 
 ### Limits
 
@@ -1876,7 +1972,10 @@ procraft_brush_under(stroke: i32, len: i32) -> i32   // optional: the colours un
   canvas).
 - `procraft_brush_add` is handed samples, at most four at a time, 32 bytes each as layers' items
   hold them: x, y (canvas pixels), pressure (through the app's pressure curve), tilt, azimuth and
-  roll (radians), then the milliseconds since the stroke's first sample as a 64-bit float.
+  roll (radians), then the milliseconds since the stroke's first sample as a 64-bit float. They are
+  the path as the app's Pressure and Smoothing settles it (its stabilisation, motion filtering and
+  pressure smoothing; none of the brush's own, whose studio is the engine's), each timed as the
+  sample it came of, the last where the pen lifted.
 - Dabs come back 96 bytes each, twenty-four 32-bit numbers: x, y, its diameter (the longer side of its
   tip, canvas pixels), its angle (radians, clockwise), its squash (0..1 across its angle, laid at
   0.05 at the least), its opacity and flow (0..1), its tip (u32), flags (u32: 1 mirrored across, 2
@@ -2208,7 +2307,10 @@ other, with the same card, Turn on and Remove.
 - The app writes down in its plugin folder (`added`) each one it added, so one that's removed stays
   removed, through restarts and updates. Importing its file brings it back, as any import.
 - A later version of the app adds any it never added before, and puts a newer file in place of an
-  older one that's there, keeping what was set, as an import of it would.
+  older one that's there, keeping what was set, as an import of it would. Newer goes by the version
+  alone, so a plugin packed again with anything changed gets a newer version:
+  `python tools/check_bundled_versions.py` fails for one packed anew since the last release (or
+  `--since` another commit) whose version isn't newer.
 - One imported before the app came with it is left as it is, but for a newer file.
 - A setting the app used to have and a plugin now `keeps` (Colour tools' ColorDrop gap, Interface
   look's size, Layer tools' eyedropper and paste switches) starts the plugin the app added on with it,
@@ -2316,7 +2418,9 @@ the brush studio kept as a plugin it takes the place of kept it (`from`), and th
 files of a plugin it takes the place of, interface 17 filter layers, interface 18 filter
 layers' editors, interface 19 a feature taken from a plugin that stays (`takes`), a set of
 brushes under a switch and given as a plugin's it takes the place of (`brushes`), and an artwork's
-values kept for one it takes the place of, and interface 20 the `panel_layout` hook. What comes under a switch at the top of the list (a menu and
+values kept for one it takes the place of, interface 20 the `panel_layout` hook, and interface 22
+`folder` controls (one the whole plugin's, in a plugin of features) and the `artwork_saved`,
+`video_exported` and `gallery_opened` hooks. What comes under a switch at the top of the list (a menu and
 a row in the brush studio too), taking the place of other plugins, a menu of its own, and controls in
 the Canvas tab, on a key or kept with each artwork need no newer interface: an older app shows every
 control, leaves the others where they are, shows no menu and keeps every control with the plugin. What a

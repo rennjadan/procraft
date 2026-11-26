@@ -104,8 +104,26 @@ impl Gpu {
     }
 
     /// `encoder.copy_buffer_to_texture`, made as Direct3D 12 without unrestricted copy pitches
-    /// makes it where a test asks (see [`Gpu::emulate_placed_copies`]).
+    /// makes it where a test asks (see [`Gpu::emulate_placed_copies`]), and as the driver of a GPU
+    /// whose new textures start stale (see [`Gpu::emulate_stale_textures`]).
     pub(crate) fn copy_buffer_to_texture(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        from: wgpu::TexelCopyBufferInfo<'_>,
+        into: wgpu::TexelCopyTextureInfo<'_>,
+        size: wgpu::Extent3d,
+    ) {
+        if let Some((stale, copied)) = self.stale_after_buffer_copy(&into, size) {
+            self.copy_buffer_to_texture_placed(encoder, from, copied.as_image_copy(), size);
+            self.copy_as_the_driver(encoder, &copied, into, size, &stale);
+            return;
+        }
+        self.copy_buffer_to_texture_placed(encoder, from, into, size);
+    }
+
+    /// [`Gpu::copy_buffer_to_texture`] as Direct3D 12 without unrestricted copy pitches makes it,
+    /// whatever the texture held before.
+    fn copy_buffer_to_texture_placed(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         from: wgpu::TexelCopyBufferInfo<'_>,

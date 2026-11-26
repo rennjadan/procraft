@@ -70,12 +70,15 @@ fn halves(c: vec4<f32>) -> vec4<f32> {
 }
 
 // The paint at canvas pixel `px`, part pixel `at`, once the stamps over its tile are laid on
-// `paint` by the part's rule (1: gradual, 2: towards the transfer; where every stroke is laid so,
-// 0: over, 3: the strongest).
-fn rule_laid(paint_in: vec4<f32>, px: vec2<i32>, at: vec2<u32>) -> vec4<f32> {
+// `paint` by the part's `rule` (1: gradual, 2: towards the transfer; where every stroke is laid
+// so, 0: over, 3: the strongest). A compute pass takes the rule as a constant, one pass made for
+// each (see stamp_rule_compute.wgsl), so that its choice is made as the pass is compiled and not
+// stamp by stamp: read from the part's list inside the loop, the Adreno 750's compiler (Vulkan and
+// OpenGL ES alike) got it wrong, a stroke going towards its transfer laid as the strongest and a
+// gradual one fainter or stronger by turns, in the plain pass and the carried one each its own way.
+fn rule_laid(paint_in: vec4<f32>, px: vec2<i32>, at: vec2<u32>, rule: u32) -> vec4<f32> {
     let tile = at / RULE_TILE;
     let across = rule_word(2u);
-    let rule = rule_word(3u);
     let entry = 4u + 2u * (tile.y * across + tile.x);
     let first = rule_word(entry);
     let count = rule_word(entry + 1u);

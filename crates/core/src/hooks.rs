@@ -27,6 +27,11 @@ pub(crate) const LAYOUT_SNAP: i32 = 0;
 pub(crate) const LAYOUT_FOLD: i32 = 1;
 pub(crate) const LAYOUT_ROOM: i32 = 2;
 pub(crate) const LAYOUT_EDIT: i32 = 3;
+/// The panel layout hook's part 4: whether the Tool Belt shows (see [`crate::PanelLayout::belt_shown`]).
+pub(crate) const LAYOUT_BELT: i32 = 4;
+/// The panel layout hook's part 5: Collapse to edge (see [`crate::BarLayout::collapsed`] and
+/// [`crate::PanelLayout::piece_collapsed`]).
+pub(crate) const LAYOUT_COLLAPSE: i32 = 5;
 
 /// The role of the colour hook's that is the area round the canvas (interface 11).
 pub(crate) const SURROUND_ROLE: i32 = 1;
@@ -842,6 +847,27 @@ impl Hooks {
         whose
     }
 
+    /// The folder hooks (interface 22: [`Hook::ArtworkSaved`], [`Hook::VideoExported`],
+    /// [`Hook::GalleryOpened`]): whose `folder` control, by its place in that plugin's controls, the
+    /// first plugin by id on `hook` that names one names; none for none.
+    pub(crate) fn folder(&self, hook: Hook) -> Option<(String, u32)> {
+        if !self.has(hook) {
+            return None;
+        }
+        let mut whose = None;
+        self.through_by_id(hook, false, |id, running, found| {
+            if found {
+                return Ok(true);
+            }
+            let said = running.folder(hook)?;
+            if let Some(at) = said {
+                whose = Some((id.to_owned(), at));
+            }
+            Ok(said.is_some())
+        });
+        whose
+    }
+
     /// The layer label's hook: the colour (0xRRGGBB) the row of a layer keeping `marks` (by
     /// plugin id) shows, as the first plugin by id on it that keeps a mark there says; none for none.
     /// Each is told only its own mark.
@@ -1264,11 +1290,13 @@ impl CanvasSession {
                 colour: p.colour.map(|rgb| [16, 8, 0].map(|shift| ((rgb >> shift) & 0xFF) as f32 / 255.0)),
             })
         });
+        // each save told to the folders the plugins name (interface 22)
+        *self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()) = Some(plugins.folders());
         let mut st = self.shared.lock();
         st.paper_picture = paper_picture;
         st.offer_layer_filters(layer_filters);
         st.hooks = Some(hooks);
-        st.plugin_sets = sets;
+        st.plugin_sets = Some(sets);
         let mut changed = false;
         if st.plugin_look != look {
             st.plugin_look = look;

@@ -3,6 +3,7 @@ package io.github.artcraftandroid.procraft.ui
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -65,5 +66,32 @@ class PanelWidthTest {
                 assertEquals(1f, frames % 2f, 0.001f)
             }
         }
+    }
+
+    @Test
+    fun theAnimationSettingsFindTheirPlaceOverEveryBar() {
+        // a phone's 360 window upright, a 16:9 canvas: three frames, a bar 245 wide, narrower than
+        // the 290 popover; placed as it was, opening Settings threw
+        val bar = animationBarWidth(360.dp, 360.dp, framePitch(16f / 9f))
+        assertEquals(73.dp * 3 + 26.dp, bar)
+        assertThrows(IllegalArgumentException::class.java) { (200.dp - 145.dp).coerceIn(0.dp, bar - 290.dp) }
+        assertEquals(0.dp, settingsPopoverLeft(200.dp, bar))
+        // the 446 bar of a 744 window: under Settings' middle, kept within the bar
+        assertEquals(136.5.dp, settingsPopoverLeft(281.5.dp, 446.dp))
+        assertEquals(156.dp, settingsPopoverLeft(400.dp, 446.dp))
+        assertEquals(0.dp, settingsPopoverLeft(100.dp, 446.dp))
+        // every window and canvas shape, Settings anywhere along the bar
+        var narrow = 0
+        for (window in (240..2000).map { it.dp }) {
+            for (aspect in listOf(0.25f, 0.5625f, 0.657f, 1f, 4f / 3f, 1.5f, 1.6f, 16f / 9f, 2f)) {
+                val width = animationBarWidth(window, maxOf(window, 1133.dp), framePitch(aspect))
+                if (width < 290.dp) narrow++
+                for (settingsAt in listOf(0.dp, width / 2, width - 60.dp, width)) {
+                    val left = settingsPopoverLeft(settingsAt, width)
+                    assertTrue("$window $aspect $settingsAt: $left", left >= 0.dp && left <= maxOf(width - 290.dp, 0.dp))
+                }
+            }
+        }
+        assertTrue("$narrow", narrow > 0)
     }
 }

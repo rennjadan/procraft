@@ -245,6 +245,39 @@ fn checked_disc(painter: &egui::Painter, c: egui::Pos2, r: f32) {
 /// buttons (the bar's own points).
 pub const HALF_END: f32 = 10.0;
 
+/// How long (seconds) a moved bar's corners take to turn square or round as it comes to an edge or
+/// leaves it.
+const BAR_CORNER_TIME: f32 = 0.15;
+
+/// A bar's corners as Edit layout leaves it: `radius` round all round, but square on each side of it
+/// against the window's edges (`sides`), each easing over as the bar is dragged so none snaps (under
+/// `id`). Top-left, top-right, bottom-right, bottom-left.
+pub fn bar_corners(ctx: &egui::Context, id: Id, sides: procraft_core::BarSides, radius: f32) -> [f32; 4] {
+    let square =
+        [sides.left || sides.top, sides.top || sides.right, sides.right || sides.bottom, sides.bottom || sides.left];
+    let mut corners = [0.0; 4];
+    for (i, (corner, square)) in corners.iter_mut().zip(square).enumerate() {
+        *corner = ctx.animate_value_with_time(id.with(i), if square { 0.0 } else { radius }, BAR_CORNER_TIME);
+    }
+    corners
+}
+
+/// [`bar_corners`] as egui rounds a rect's (top-left, top-right, bottom-right, bottom-left).
+pub fn corner_radius(corners: [f32; 4]) -> egui::CornerRadius {
+    let r = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    egui::CornerRadius { nw: r(corners[0]), ne: r(corners[1]), se: r(corners[2]), sw: r(corners[3]) }
+}
+
+/// `rect` reaching `past` further out on each of `sides` (those against the window's edges): its
+/// frost, so those corners go off the window and only the free ones round.
+pub fn past_edges(rect: Rect, sides: procraft_core::BarSides, past: f32) -> Rect {
+    let by = |on: bool| if on { past } else { 0.0 };
+    Rect::from_min_max(
+        rect.min - vec2(by(sides.left), by(sides.top)),
+        rect.max + vec2(by(sides.right), by(sides.bottom)),
+    )
+}
+
 /// How long half of the top bar is (`left`, else the right) laid in a row, its gaps those of a bar
 /// `width` wide (its own points): its buttons, gaps and ends.
 pub fn half_length(left: bool, width: f32) -> f32 {
@@ -256,10 +289,12 @@ pub fn half_length(left: bool, width: f32) -> f32 {
     }
 }
 
-/// The top bar's halves where Edit layout moved them (`places`, the left's then the right's: its
-/// top-left in the window, and whether it stands upright), each on glass of its own, which goes into
+/// The top bar's halves where Edit layout moved them, or as they slide into a side or out of it
+/// (`places`, the left's then the right's: its top-left in the window, and whether it stands upright;
+/// one `gone` into its side not drawn), each on glass of its own, which goes into
 /// `glass`; as [`top_bar`] draws them, at the size a plugin gives the top bar, its buttons where they
-/// show. Upright, each button stands in a column, Gallery's word reading up it.
+/// show. Upright, each button stands in a column, Gallery's word reading up it. Round at its ends,
+/// each is square on its sides against the window's edges (`edges`, as `places`).
 #[allow(clippy::too_many_arguments)]
 pub fn top_bar_halves(
     ctx: &egui::Context,
@@ -269,13 +304,19 @@ pub fn top_bar_halves(
     brightness: f32,
     lit: &Lit,
     places: [procraft_core::BarPlace; 2],
+    edges: [procraft_core::BarSides; 2],
+    gone: [bool; 2],
     glass: &mut Vec<f32>,
 ) -> Bar {
     let mut bar = Bar::default();
     let k = crate::panel::part_scale(ctx, InterfacePart::TopBar);
     let width = ctx.content_rect().width() / k;
     let (tool_gap, action_gap) = pc::bar_gaps(width);
-    for (left, place) in [true, false].into_iter().zip(places) {
+    for (((left, place), sides), gone) in [true, false].into_iter().zip(places).zip(edges).zip(gone) {
+        // (collapsed into its side: out of sight, its tab there instead)
+        if gone {
+            continue;
+        }
         let at = pos2(place.x, place.y);
         let length = half_length(left, width);
         let r = Rect::from_min_size(
@@ -283,13 +324,16 @@ pub fn top_bar_halves(
             if place.vertical { vec2(pc::BAR_HEIGHT, length) } else { vec2(length, pc::BAR_HEIGHT) },
         );
         let to_window = scaled_from(at, k);
-        frost(glass, to_window.mul_rect(r), pc::BAR_HEIGHT / 2.0 * k, ctx.pixels_per_point());
+        let round = pc::BAR_HEIGHT / 2.0;
+        let corners = bar_corners(ctx, Id::unique("top bar half corners").with(left), sides, round);
+        frost(glass, to_window.mul_rect(past_edges(r, sides, round)), round * k, ctx.pixels_per_point());
         let gap = if left { action_gap } else { tool_gap };
         let mut erase_at = None;
         egui::Area::new(Id::unique("top bar half").with(left)).fixed_pos(at).order(Order::Middle).show(ctx, |ui| {
             ui.ctx().set_transform_layer(ui.layer_id(), to_window);
             look.set_zoom(ui.layer_id(), k);
-            ui.painter().rect_filled(r, pc::BAR_HEIGHT / 2.0, argb(pc::BAR));
+            ui.painter().rect_filled(r, corner_radius(corners), argb(pc::BAR));
+            crate::screen::claim(ui, r);
             let mut along = HALF_END;
             let mut next = |w: f32| {
                 let rect = if place.vertical {
@@ -490,6 +534,8 @@ pub struct SideBar {
     /// Where Edit layout moved it (its top-left in the window), standing upright there; none while
     /// it is against its edge.
     pub moved: Option<Pos2>,
+    /// Moved, its sides against the window's edges (square; the rest round).
+    pub edges: Option<procraft_core::BarSides>,
 }
 
 /// The modify button pressed: the bar's drag, and where the bar shows as it goes.
@@ -596,10 +642,17 @@ impl SideBar {
         // its frost goes past the window's edge, so that side's corners are square
         let ppp = ctx.pixels_per_point();
         let body = side_bar_body(bar, stretch, right);
-        let past = if right {
-            body.with_max_x(body.right() + pc::SIDE_BAR_CORNER)
-        } else {
-            body.with_min_x(body.left() - pc::SIDE_BAR_CORNER)
+        // (moved by Edit layout: square only on its sides against the window's edges)
+        let c = pc::SIDE_BAR_CORNER;
+        let corners = match self.edges {
+            Some(sides) => bar_corners(&ctx, Id::unique("side bar corners"), sides, c),
+            None if right => [c, 0.0, 0.0, c],
+            None => [0.0, c, c, 0.0],
+        };
+        let past = match self.edges {
+            Some(sides) => past_edges(body, sides, c),
+            None if right => body.with_max_x(body.right() + c),
+            None => body.with_min_x(body.left() - c),
         };
         frost(backdrops, to_window.mul_rect(past), pc::SIDE_BAR_CORNER * scale, ppp);
         // the tracks' thin glass, unless a plugin has them frosted as the bar's glass under them is
@@ -619,10 +672,9 @@ impl SideBar {
             // translucent, with windows where the slider tracks are: they show what is behind;
             // square against the window's edge, reaching back to it however it is stretched
             let inset = bar.left() - body.left();
-            look.shape(ui, "side bar", (right, track_height.to_bits(), stretch.to_bits()), body, |pixmap, t| {
+            let key = (right, track_height.to_bits(), stretch.to_bits(), corners.map(f32::to_bits));
+            look.shape(ui, "side bar", key, body, |pixmap, t| {
                 let mut pb = tiny_skia::PathBuilder::new();
-                let c = pc::SIDE_BAR_CORNER;
-                let corners = if right { [c, 0.0, 0.0, c] } else { [0.0, c, c, 0.0] };
                 round_rect(&mut pb, Rect::from_min_size(pos2(0.0, 0.0), body.size()), corners);
                 let windows = tracks.map(|(_, y, _)| {
                     let left = x(SLIDER_LEFT, pc::SLIDER_WIDTH) + inset;

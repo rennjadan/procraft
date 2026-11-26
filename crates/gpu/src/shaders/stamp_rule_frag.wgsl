@@ -61,7 +61,7 @@ fn fs_stamp_rule(@builtin(position) pos: vec4<f32>) -> RuleOut {
         start = select(shown, built, same);
     }
     // (rounded to half floats here, as they are kept)
-    let paint = halves(rule_laid(start, px, at));
+    let paint = halves(rule_laid(start, px, at, rule_word(3u)));
     var out: RuleOut;
     out.halves = vec2<u32>(pack2x16float(paint.rg), pack2x16float(paint.ba));
     out.eight = paint;

@@ -146,6 +146,11 @@ windows = { version = "0.62", features = [
 # version arboard already brings in)
 clipboard-win = "5.4"
 
+# A crash in native code logged with its signal and frames (signal handlers, dladdr, the system's
+# unwinder; the version the workspace already has)
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # A tablet's pen under X11, which winit gives as the mouse: its pressure, lean and eraser end from
 # its own XInput 2 events
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]

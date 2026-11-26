@@ -355,7 +355,7 @@ impl CanvasSession {
             canvas.flip_layers(ids, horizontal);
         }
         st.flush();
-        if let Some(made) = st.canvas.as_ref().and_then(procraft_gpu::Canvas::undo_step) {
+        if let Some(made) = st.canvas.as_deref().and_then(procraft_gpu::Canvas::undo_step) {
             st.note_moved_data(made, moved);
         }
         st.revision += 1;

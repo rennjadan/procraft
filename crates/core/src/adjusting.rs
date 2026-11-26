@@ -216,6 +216,12 @@ impl Default for Adjusting {
 }
 
 impl Adjusting {
+    /// None open and every value as a new artwork has them, but with the gradients the app gave
+    /// (theirs, not the artwork's): for an artwork opened again in place (see `lost.rs`).
+    pub(crate) fn keeping_library(&self) -> Adjusting {
+        Adjusting { gradients: self.gradients.clone(), ..Adjusting::default() }
+    }
+
     /// The adjustment open, and whether it is painted on (Pencil).
     pub(crate) fn open(&self) -> Option<(Adjustment, bool)> {
         self.open.map(|a| (a, self.pencil))

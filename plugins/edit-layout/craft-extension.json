@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "io.github.artcraftandroid.edit-layout",
   "name": "Edit layout",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "holds": ["hooks"],
   "publisher": {"name": "ProCraft"},
   "description": "Panels that float, snap to the edges and to each other, fold to a tab and make room for the canvas, and bars you move anywhere, kept for each way the screen turns.",
@@ -19,7 +19,9 @@
     {"key": "make_room", "type": "switch", "label": "Docked panels make room", "starts": false, "under": "movable_panels"},
     {"key": "all_panels", "type": "feature", "label": "All panels float", "description": "Every other panel tears off and floats too: Actions, Adjustments, each adjustment's controls and the Selection, Transform and Liquify bars, each window with Fold, Hide, Pin to Top and Reset Position.", "hooks": ["floating_panels"]},
     {"key": "pin_panels", "type": "feature", "label": "Panels stay open", "description": "A touch on the canvas with a panel open paints at once and leaves the panel open; the panel's own button closes it.", "hooks": ["pin_panels"]},
-    {"key": "edit_layout", "type": "feature", "label": "Edit layout", "description": "Edit Layout in the Canvas tab: drag the top bar's two halves and the side bar anywhere, a bar against a side standing upright; panels open from where their buttons went. Reset puts them back.", "hooks": ["panel_layout"]}
+    {"key": "tool_belt", "type": "feature", "label": "Tool Belt", "description": "A belt at the bottom left where floating panels park: let one go on it to park it as a chip, tap a chip to put it back, or drag it off anywhere.", "hooks": ["panel_layout"]},
+    {"key": "edit_layout", "type": "feature", "label": "Edit layout", "description": "Edit Layout in the Canvas tab: drag the top bar's two halves and the side bar anywhere, a bar against a side standing upright; panels open from where their buttons went. Reset puts them back.", "hooks": ["panel_layout"]},
+    {"key": "collapse_edge", "type": "feature", "label": "Collapse to edge", "description": "A bar or window against a side gets a button that slides it into that side, leaving a slim tab: tap the tab or pull it out to bring it back. Collapse All in Edit Layout and each window's menu.", "hooks": ["panel_layout"]}
   ],
   "takes": [
     {"id": "io.github.artcraftandroid.interface-look", "feature": "floating_panels", "switch": "movable_panels", "controls": {"float_layers": "float_layers", "float_brushes": "float_brushes"}},

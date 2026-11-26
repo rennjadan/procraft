@@ -28,8 +28,8 @@ pub const FLOATING_TOP: f32 = 24.0;
 pub const FLOATING_BOTTOM: f32 = 20.0;
 const GRABBER: Themed = Themed(0x7AC6C6C6, 0xFFB0B0B0);
 /// Close: a disc of white over the window with its cross cut out of it (drawn darker).
-const CLOSE_DISC: u32 = 0x26FFFFFF;
-const CLOSE_CROSS: u32 = 0x4D000000;
+pub const CLOSE_DISC: u32 = 0x26FFFFFF;
+pub const CLOSE_CROSS: u32 = 0x4D000000;
 
 /// Where a panel shows: hanging from its button (where the button shows, in the panels' space),
 /// or floating in a window of its own at this rect (in its own space, see
@@ -51,6 +51,95 @@ pub struct FloatingChrome {
     pub folded: bool,
     /// What its menu chose.
     pub act: Option<WindowAct>,
+    /// Holding several panels: the tab tapped, or the one torn out and where the pointer is.
+    pub pick: Option<procraft_core::LayoutPiece>,
+    pub tear: Option<(procraft_core::LayoutPiece, Pos2)>,
+    /// Its collapse button tapped (Collapse to edge).
+    pub collapse: bool,
+}
+
+/// The side the window drawn next goes into at its collapse button's tap (Collapse to edge), if it
+/// may; and whether Collapse All in its menu reads Open All (some window or bar is collapsed), or
+/// none with Collapse to edge off.
+pub fn window_collapse(ctx: &egui::Context, edge: Option<procraft_core::WindowEdge>, all: Option<bool>) {
+    ctx.data_mut(|d| {
+        d.insert_temp(egui::Id::unique("window collapse edge"), edge);
+        d.insert_temp(egui::Id::unique("window collapse all"), all);
+    });
+}
+
+fn collapse_edge(ctx: &egui::Context) -> Option<procraft_core::WindowEdge> {
+    ctx.data(|d| d.get_temp::<Option<procraft_core::WindowEdge>>(egui::Id::unique("window collapse edge"))).flatten()
+}
+
+fn collapse_all(ctx: &egui::Context) -> Option<bool> {
+    ctx.data(|d| d.get_temp::<Option<bool>>(egui::Id::unique("window collapse all"))).flatten()
+}
+
+/// The tabs of the window drawn next, while it holds several panels: each, its name, and whether
+/// it shows; none for a window holding one.
+pub fn window_tabs(ctx: &egui::Context, tabs: Vec<(procraft_core::LayoutPiece, &'static str, bool)>) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("window tabs"), tabs));
+}
+
+/// How far a tab is dragged before it is torn out of its window.
+const TAB_TEAR: f32 = 26.0;
+
+/// Where `count` tabs go across the strip of a window at `window`: between its menu button on the
+/// left and Close (and `buttons` more beside it: Fold, Collapse to edge's) on the right, each up to
+/// 90 wide, narrower as more share the room.
+pub(crate) fn tab_cells(window: Rect, count: usize, buttons: usize) -> Vec<Rect> {
+    // (the menu's 40 and Close's, and each 40 beside it, 14 in from the window's side, and 4 clear)
+    let (left, right) = (window.left() + 58.0, window.right() - 58.0 - 40.0 * buttons as f32);
+    let room = (right - left).max(0.0);
+    let width = if count == 0 { 0.0 } else { (room / count as f32).min(90.0) };
+    let start = (left + right) / 2.0 - width * count as f32 / 2.0;
+    (0..count)
+        .map(|i| {
+            Rect::from_min_size(
+                pos2(start + width * i as f32 + 2.0, window.top() + 1.0),
+                egui::vec2((width - 4.0).max(0.0), 22.0),
+            )
+        })
+        .collect()
+}
+
+/// The tabs across a window's strip at `window` (see [`window_tabs`]): the one tapped, and the one
+/// torn out with where the pointer is (the window's points).
+fn strip_tabs(
+    ui: &Ui,
+    window: Rect,
+    buttons: usize,
+) -> (Option<procraft_core::LayoutPiece>, Option<(procraft_core::LayoutPiece, Pos2)>) {
+    let tabs = ui
+        .ctx()
+        .data(|d| d.get_temp::<Vec<(procraft_core::LayoutPiece, &'static str, bool)>>(egui::Id::unique("window tabs")))
+        .unwrap_or_default();
+    let (mut pick, mut tear) = (None, None);
+    let cells = tab_cells(window, tabs.len(), buttons);
+    for ((piece, title, active), r) in tabs.iter().zip(cells) {
+        if *active {
+            ui.painter().rect_filled(r, 11, Color32::from_rgba_unmultiplied(0, 118, 253, 90));
+        }
+        // (a title longer than its tab cut at its ends)
+        let ink = argb(PANEL_TITLE);
+        text(&ui.painter().with_clip_rect(r), r.center(), Align2::CENTER_CENTER, title, 13.0, Weight::Regular, ink);
+        // (each by its panel, not its place: one torn out, the next sliding into its place isn't
+        // taken for it as the drag goes on)
+        let touched = ui.interact(r, ui.scope_id().with(("window tab", *piece)), Sense::click_and_drag());
+        if touched.clicked() {
+            pick = Some(*piece);
+        }
+        if touched.dragged()
+            && let (Some(p), Some(from)) = (touched.interact_pointer_pos(), ui.input(|i| i.pointer.press_origin()))
+        {
+            let p = to_window(ui.ctx()) * p;
+            if p.distance(from) > TAB_TEAR {
+                tear = Some((*piece, p));
+            }
+        }
+    }
+    (pick, tear)
 }
 
 /// What a floating window's menu chose: fold it, hide it, pin it over the others (or not), or put it
@@ -61,6 +150,8 @@ pub enum WindowAct {
     Hide,
     Pin,
     Reset,
+    /// Collapse All (or Open All): every bar and window against a side into it, or back out.
+    CollapseAll,
 }
 
 /// Whether the window drawn next is pinned over the others (its menu says Unpin).
@@ -94,11 +185,15 @@ pub fn window_menu(ui: &Ui, at: Rect) -> Option<WindowAct> {
         rows.push((WindowAct::Hide, "Hide"));
         rows.push((WindowAct::Pin, if pinned { "Unpin" } else { "Pin to Top" }));
         rows.push((WindowAct::Reset, "Reset Position"));
+        if let Some(any) = collapse_all(&ctx) {
+            rows.push((WindowAct::CollapseAll, if any { "Open All" } else { "Collapse All" }));
+        }
         // in the window's points, over everything
         let origin = to_window(&ctx) * at.left_bottom();
         let menu = Rect::from_min_size(origin, egui::vec2(180.0, 8.0 + 40.0 * rows.len() as f32));
         egui::Area::new(id.with("menu")).fixed_pos(menu.min).order(egui::Order::Tooltip).show(&ctx, |ui| {
             ui.painter().rect_filled(menu, 12, argb(pc::BAR));
+            crate::screen::claim(ui, menu);
             for (i, (choice, label)) in rows.iter().enumerate() {
                 let row = Rect::from_min_size(
                     pos2(menu.left(), menu.top() + 4.0 + 40.0 * i as f32),
@@ -188,10 +283,12 @@ pub fn bottom_rect(ctx: &egui::Context, rect: Rect) -> Rect {
     at.map_or(rect, |p| Rect::from_min_size(p, rect.size()))
 }
 
-/// Where `piece` (a toolbar or an adjustment's controls) always is, if it was drawn this frame.
+/// Where `piece` (a toolbar or an adjustment's controls) always is, if it was drawn this frame or
+/// the one before (the Selection and Transform toolbars are drawn after the windows' strips, which
+/// ask).
 pub fn bottom_home(ctx: &egui::Context, piece: procraft_core::LayoutPiece) -> Option<Rect> {
     let (rect, frame) = ctx.data(|d| d.get_temp::<(Rect, u64)>(egui::Id::unique("bottom home").with(piece)))?;
-    (frame == ctx.cumulative_frame_nr()).then_some(rect)
+    (frame + 1 >= ctx.cumulative_frame_nr()).then_some(rect)
 }
 
 /// Whether the floating panels have a fold button this frame, as the plugins laying them out say.
@@ -202,6 +299,30 @@ pub fn set_panels_fold(ctx: &egui::Context, fold: bool) {
 /// Whether the floating panels have a fold button this frame.
 pub fn panels_fold(ctx: &egui::Context) -> bool {
     ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("panels fold"))).unwrap_or(false)
+}
+
+/// Whether every panel is drawn solid this frame: while a plugin lays the panels out, a window lies
+/// over the bars and the other windows and a panel over a window, and only the canvas blurs behind
+/// the frost (what else is under it would show through sharp).
+pub fn set_panels_solid(ctx: &egui::Context, solid: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::unique("panels solid"), solid));
+}
+
+/// Whether every panel is drawn solid this frame.
+fn panels_solid(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(egui::Id::unique("panels solid"))).unwrap_or(false)
+}
+
+/// A panel's frost: the interface's (what is behind showing through, blurred), or wholly `solid`.
+fn frost_colour(solid: bool) -> Color32 {
+    solid_if(argb(POPOVER_FROST), solid)
+}
+
+/// `frost`, or its tint wholly opaque while `solid`.
+fn solid_if(frost: Color32, solid: bool) -> Color32 {
+    // (its tint as written, not as it is kept, multiplied by how much of it shows)
+    let [r, g, b, _] = frost.to_srgba_unmultiplied();
+    if solid { Color32::from_rgb(r, g, b) } else { frost }
 }
 
 /// Fold: a disc of white with a bar across it, at `rect`'s middle; whether it was tapped.
@@ -245,10 +366,22 @@ pub fn floating_chrome(ui: &Ui, window: Rect) -> FloatingChrome {
 
 /// As [`floating_chrome`], its corner only if it is `sizable`, and its menu at its strip's left.
 fn floating_chrome_of(ui: &Ui, window: Rect, sizable: bool) -> FloatingChrome {
-    let grabber = Rect::from_center_size(pos2(window.center().x, window.top() + 12.0), egui::vec2(40.0, 4.0));
-    ui.painter().rect_filled(grabber, 2, argb(GRABBER));
     let strip = Rect::from_min_size(window.min, egui::vec2(window.width(), FLOATING_TOP));
+    // the whole window, strips and all, the interface's (what it lays out may not reach them)
+    crate::screen::claim(ui, window);
     let moving = ui.interact(strip, ui.scope_id().with("floating strip"), Sense::drag()).drag_started();
+    // holding several panels: their tabs in place of the grabber
+    let several = ui
+        .ctx()
+        .data(|d| d.get_temp::<Vec<(procraft_core::LayoutPiece, &'static str, bool)>>(egui::Id::unique("window tabs")))
+        .is_some_and(|t| t.len() > 1);
+    let (pick, tear) = if several {
+        strip_tabs(ui, window, right_buttons(ui.ctx()))
+    } else {
+        let grabber = Rect::from_center_size(pos2(window.center().x, window.top() + 12.0), egui::vec2(40.0, 4.0));
+        ui.painter().rect_filled(grabber, 2, argb(GRABBER));
+        (None, None)
+    };
     let close = Rect::from_center_size(pos2(window.right() - 14.0 - 20.0, window.top() + 22.0), egui::vec2(40.0, 40.0));
     let c = close.center();
     ui.painter().circle_filled(c, 8.5, argb(CLOSE_DISC));
@@ -258,13 +391,19 @@ fn floating_chrome_of(ui: &Ui, window: Rect, sizable: bool) -> FloatingChrome {
     }
     let closed = ui.interact(close, ui.scope_id().with("floating close"), Sense::click()).clicked();
     // beside Close, while the panels fold
-    let folded = panels_fold(ui.ctx()) && fold_button(ui, close.translate(egui::vec2(-40.0, 0.0)));
+    let fold = panels_fold(ui.ctx());
+    let folded = fold && fold_button(ui, close.translate(egui::vec2(-40.0, 0.0)));
+    // and beside that, Collapse to edge's
+    let collapse = collapse_edge(ui.ctx()).is_some_and(|edge| {
+        let at = close.translate(egui::vec2(if fold { -80.0 } else { -40.0 }, 0.0));
+        crate::collapse::strip_button(ui, at, edge)
+    });
     let act = window_menu(
         ui,
         Rect::from_center_size(pos2(window.left() + 14.0 + 20.0, window.top() + 22.0), egui::vec2(40.0, 40.0)),
     );
     if !sizable {
-        return FloatingChrome { moving, sizing: false, closed, folded, act };
+        return FloatingChrome { moving, sizing: false, closed, folded, act, pick, tear, collapse };
     }
     let corner = Rect::from_min_size(
         pos2(window.right() - 6.0 - 36.0, window.bottom() - FLOATING_BOTTOM),
@@ -276,7 +415,13 @@ fn floating_chrome_of(ui: &Ui, window: Rect, sizable: bool) -> FloatingChrome {
         ui.painter().line_segment([end - egui::vec2(reach, 0.0), end - egui::vec2(0.0, reach)], line);
     }
     let sizing = ui.interact(corner, ui.scope_id().with("floating corner"), Sense::drag()).drag_started();
-    FloatingChrome { moving, sizing, closed, folded, act }
+    FloatingChrome { moving, sizing, closed, folded, act, pick, tear, collapse }
+}
+
+/// How many buttons the strip of the window drawn now has left of Close: Fold, and Collapse to
+/// edge's.
+fn right_buttons(ctx: &egui::Context) -> usize {
+    usize::from(panels_fold(ctx)) + usize::from(collapse_edge(ctx).is_some())
 }
 
 /// The strips of a toolbar or an adjustment's controls floating (`strip` over it, in the window's
@@ -300,6 +445,7 @@ pub fn undock_grabber(ui: &Ui, body: Rect) -> Option<(Pos2, Pos2)> {
     ui.painter().rect_filled(grabber, 2, argb(GRABBER));
     // (narrower than the colour panel's: clear of a title beside it)
     let handle = Rect::from_center_size(pos2(body.center().x, body.top() + 15.0), egui::vec2(100.0, 30.0));
+    crate::screen::claim(ui, handle);
     let held = ui.interact(handle, ui.scope_id().with("undock"), Sense::drag());
     let (pointer, from) = (held.interact_pointer_pos()?, ui.input(|i| i.pointer.press_origin())?);
     held.dragged().then(|| (from, to_window(ui.ctx()) * pointer))
@@ -575,14 +721,15 @@ pub fn frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, arrow_x: 
     };
     ui.painter().add(shadow.as_shape(body, POPOVER_CORNER));
     let size = rect.size();
-    let key = ((arrow_x * 100.0).round() as i32, side.map(|s| s as i32));
+    let solid = panels_solid(ui.ctx());
+    let key = ((arrow_x * 100.0).round() as i32, side.map(|s| s as i32), solid);
     look.shape(ui, slot, key, rect, |pixmap, t| {
         let (half, tip) = (ARROW_HEIGHT, 2.0);
         let near = |from: f32| (from - half - tip).clamp(0.0, POPOVER_CORNER);
         match side {
             Some(HangSide::Left | HangSide::Right) => {
                 let left = side == Some(HangSide::Right);
-                frost(pixmap, side_outline(size, arrow_x, left, POPOVER_CORNER), t);
+                frost(pixmap, side_outline(size, arrow_x, left, POPOVER_CORNER), t, solid);
                 return;
             }
             // its arrow down at the button, under it
@@ -596,7 +743,7 @@ pub fn frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, arrow_x: 
                 pb.quad_to(arrow_x, size.y, arrow_x + tip, size.y - tip);
                 pb.line_to(arrow_x + half + tip, bottom - 0.5);
                 pb.close();
-                frost(pixmap, pb, t);
+                frost(pixmap, pb, t, solid);
                 return;
             }
             Some(HangSide::Below) | None => {}
@@ -612,7 +759,7 @@ pub fn frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, arrow_x: 
         pb.quad_to(arrow_x, 0.0, arrow_x + tip, tip);
         pb.line_to(arrow_x + half + tip, ARROW_HEIGHT + 0.5);
         pb.close();
-        frost(pixmap, pb, t);
+        frost(pixmap, pb, t, solid);
     });
 }
 
@@ -623,7 +770,10 @@ pub fn floating_frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, 
     look.set_zoom(ui.layer_id(), scale);
     let ppp = ui.ctx().pixels_per_point();
     let shown = Rect::from_min_size(rect.min, rect.size() * scale);
-    let edges = [shown.left(), shown.top(), shown.right(), shown.bottom(), POPOVER_CORNER * scale];
+    // (no more than half its height: a folded window's tab, 36 tall, round at its ends, not pinched
+    // to points where corners of 35 would cross)
+    let corner = frame_corner(rect.size());
+    let edges = [shown.left(), shown.top(), shown.right(), shown.bottom(), corner * scale];
     backdrops.extend(edges.map(|v| v * ppp));
     backdrops.push(1.0);
     let shadow = egui::epaint::Shadow {
@@ -632,13 +782,19 @@ pub fn floating_frame(ui: &Ui, look: &mut Look, slot: &'static str, rect: Rect, 
         spread: 0,
         color: argb(POPOVER_SHADOW),
     };
-    ui.painter().add(shadow.as_shape(rect, POPOVER_CORNER));
+    ui.painter().add(shadow.as_shape(rect, corner));
     let size = rect.size();
-    look.shape(ui, slot, (size.y * 10.0).round() as i32, rect, |pixmap, t| {
+    let solid = panels_solid(ui.ctx());
+    look.shape(ui, slot, ((size.y * 10.0).round() as i32, solid), rect, |pixmap, t| {
         let mut pb = tiny_skia::PathBuilder::new();
-        round_rect(&mut pb, Rect::from_min_size(pos2(0.0, 0.0), size), [POPOVER_CORNER; 4]);
-        frost(pixmap, pb, t);
+        round_rect(&mut pb, Rect::from_min_size(pos2(0.0, 0.0), size), [corner; 4]);
+        frost(pixmap, pb, t, solid);
     });
+}
+
+/// The corners of a floating window `size` big: the panels' own, no more than half its narrower side.
+fn frame_corner(size: egui::Vec2) -> f32 {
+    POPOVER_CORNER.min(size.x.min(size.y) / 2.0).max(0.0)
 }
 
 /// Draws a panel at `rect` (arrow included) with its arrow on its `left` side, else its right, the
@@ -667,8 +823,9 @@ pub fn side_frame(
     };
     ui.painter().add(shadow.as_shape(body, corner));
     let size = rect.size();
-    let key = ((arrow_y * 100.0).round() as i32, left, (corner * 10.0) as i32);
-    look.shape(ui, slot, key, rect, |pixmap, t| frost(pixmap, side_outline(size, arrow_y, left, corner), t));
+    let solid = panels_solid(ui.ctx());
+    let key = ((arrow_y * 100.0).round() as i32, left, (corner * 10.0) as i32, solid);
+    look.shape(ui, slot, key, rect, |pixmap, t| frost(pixmap, side_outline(size, arrow_y, left, corner), t, solid));
     body
 }
 
@@ -789,11 +946,11 @@ pub fn solid_frame(
     body
 }
 
-/// A panel's outline filled with its frosted material: the arrow and the body are one shape,
-/// filled as one, without an even-odd seam.
-fn frost(pixmap: &mut tiny_skia::Pixmap, pb: tiny_skia::PathBuilder, t: tiny_skia::Transform) {
+/// A panel's outline filled with its frosted material (wholly `solid`, see [`frost_colour`]): the
+/// arrow and the body are one shape, filled as one, without an even-odd seam.
+fn frost(pixmap: &mut tiny_skia::Pixmap, pb: tiny_skia::PathBuilder, t: tiny_skia::Transform, solid: bool) {
     let mut paint = tiny_skia::Paint::default();
-    let [r, g, b, a] = argb(POPOVER_FROST).to_srgba_unmultiplied();
+    let [r, g, b, a] = frost_colour(solid).to_srgba_unmultiplied();
     paint.set_color_rgba8(r, g, b, a);
     paint.anti_alias = true;
     if let Some(path) = pb.finish() {
@@ -851,8 +1008,58 @@ mod tests {
     use egui::emath::TSTransform;
     use egui::{Pos2, Rect, pos2, vec2};
 
-    use super::{ARROW_SHIFT, POPOVER_GAP, PanelSpace, drawing_panel, place, put_part_scales, side_bar_at};
+    use super::{
+        ARROW_SHIFT, POPOVER_GAP, PanelSpace, drawing_panel, place, put_part_scales, side_bar_at, solid_if, tab_cells,
+    };
     use crate::look::pc;
+
+    /// While a plugin lays the panels out, a panel over a floating window (or a window over another)
+    /// hides it whole: the dark frost (0xDE1E1E1E) let 13% of it through, its text readable, as only
+    /// the canvas blurs behind the frost.
+    #[test]
+    fn a_panel_that_may_lie_over_a_window_hides_it_whole() {
+        let frost = egui::Color32::from_rgba_unmultiplied(0x1E, 0x1E, 0x1E, 0xDE);
+        assert_eq!(solid_if(frost, false), frost);
+        let solid = solid_if(frost, true);
+        // its tint as it is, wholly opaque (not the kept, darker, premultiplied one)
+        assert_eq!(solid.to_array(), [0x1E, 0x1E, 0x1E, 0xFF]);
+        // a window's white text (255) on its ground (30) under it: no level of it shows
+        let through = |c: egui::Color32| f32::from(255 - c.a()) / 255.0 * (255.0 - 30.0);
+        println!("through the frost: {:.1} levels, solid: {:.1}", through(frost), through(solid));
+        assert!(through(frost) > 25.0);
+        assert!(through(solid) < 0.5);
+    }
+
+    /// A window's tabs across its strip keep clear of its menu button, Close and Fold, however many
+    /// it holds: four on the Actions window (389 wide) are 54 wide each, not 86 running under the
+    /// buttons at both ends.
+    #[test]
+    fn a_window_s_tabs_keep_clear_of_its_menu_close_and_fold() {
+        let window = Rect::from_min_size(pos2(100.0, 50.0), vec2(389.0, 500.0));
+        let button = |x: f32| Rect::from_center_size(pos2(x, window.top() + 22.0), vec2(40.0, 40.0));
+        let (menu, close) = (button(window.left() + 34.0), button(window.right() - 34.0));
+        let fold = close.translate(vec2(-40.0, 0.0));
+        for count in 1..=4 {
+            for folds in [false, true] {
+                let cells = tab_cells(window, count, usize::from(folds));
+                assert_eq!(cells.len(), count);
+                for (i, c) in cells.iter().enumerate() {
+                    let clear = !c.intersects(menu) && !c.intersects(close) && !(folds && c.intersects(fold));
+                    assert!(clear, "{count} tabs, fold {folds}: tab {i} at {c:?}");
+                    assert!(c.width() >= 50.0 && c.width() <= 86.0, "{c:?}");
+                    if let Some(next) = cells.get(i + 1) {
+                        assert!(c.right() < next.left(), "{c:?} {next:?}");
+                    }
+                }
+            }
+        }
+        // two fit at their full width, in the middle between the buttons as before
+        let two = tab_cells(window, 2, 0);
+        assert_eq!(two.iter().map(Rect::width).collect::<Vec<_>>(), [86.0, 86.0]);
+        assert!((two[0].left() + two[1].right() - window.left() - window.right()).abs() < 1e-3);
+        let four = tab_cells(window, 4, 1);
+        assert!((four[0].width() - (389.0 - 58.0 - 98.0) / 4.0 + 4.0).abs() < 1e-3, "{four:?}");
+    }
 
     fn near(a: Pos2, b: Pos2) -> bool {
         (a - b).length() < 1e-3

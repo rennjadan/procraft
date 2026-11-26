@@ -1216,7 +1216,10 @@ impl CanvasSession {
         let pending = {
             let mut guard = self.shared.lock();
             let st = &mut *guard;
-            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+            // (a device lost reads back nothing)
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref().filter(|g| !g.is_lost())) else {
+                return None;
+            };
             let private = st.doc.private_layers();
             canvas.start_composite_thumbnail_without(gpu, &mut st.doc, max_side, &private)
         };
@@ -1248,7 +1251,8 @@ impl CanvasSession {
         let keeper = {
             let mut guard = self.shared.lock();
             let st = &mut *guard;
-            if st.canvas.is_none() || st.gpu.is_none() {
+            // (a device lost reads back nothing: no frame, nor an error each change)
+            if st.canvas.is_none() || st.gpu.is_none() || st.lost_device() {
                 return false;
             }
             if st.frames_drawn() {
@@ -1654,6 +1658,11 @@ impl crate::State {
     /// handed to the keeper, never waited for.
     pub(crate) fn take_lapse_picture(&mut self, at_once: bool) {
         if self.lapse_wanted.is_none() {
+            return;
+        }
+        // a device lost reads back nothing: the frame asked for is let go
+        if self.lost_device() {
+            self.lapse_wanted = None;
             return;
         }
         let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return };

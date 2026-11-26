@@ -3,7 +3,6 @@
 //! reflections (each level rougher), and the split-sum table for the reflections' strength.
 
 use procraft_engine::environment::{Equirect, brdf_table, to_half};
-use wgpu::util::DeviceExt;
 
 use crate::Gpu;
 
@@ -60,7 +59,7 @@ impl Lighting {
         {
             levels.push(last.halved());
         }
-        let source = device.create_texture(&wgpu::TextureDescriptor {
+        let source = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("environment panorama"),
             size: wgpu::Extent3d { width: panorama.width, height: panorama.height, depth_or_array_layers: 1 },
             mip_level_count: levels.len() as u32,
@@ -73,7 +72,7 @@ impl Lighting {
         for (level, e) in levels.iter().enumerate() {
             let halves: Vec<u16> =
                 e.pixels.iter().flat_map(|p| [to_half(p[0]), to_half(p[1]), to_half(p[2]), to_half(1.0)]).collect();
-            gpu.queue.write_texture(
+            gpu.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &source,
                     mip_level: level as u32,
@@ -102,7 +101,7 @@ impl Lighting {
 
         // the radiance cube, level by level and face by face
         let cube_format = if gpu.draws_half_floats() { CUBE } else { wgpu::TextureFormat::Rgba8Unorm };
-        let cube = device.create_texture(&wgpu::TextureDescriptor {
+        let cube = gpu.texture(&wgpu::TextureDescriptor {
             label: Some("environment radiance"),
             size: wgpu::Extent3d { width: CUBE_SIDE, height: CUBE_SIDE, depth_or_array_layers: 6 },
             mip_level_count: CUBE_LEVELS,
@@ -242,8 +241,7 @@ impl Lighting {
         let table_data: Vec<u16> =
             brdf_table(TABLE_SIDE, TABLE_SAMPLES).iter().flat_map(|v| [to_half(v[0]), to_half(v[1])]).collect();
         let side = TABLE_SIDE as u32;
-        let table = device.create_texture_with_data(
-            &gpu.queue,
+        let table = gpu.texture_with_data(
             &wgpu::TextureDescriptor {
                 label: Some("brdf table"),
                 size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
@@ -254,7 +252,6 @@ impl Lighting {
                 usage: wgpu::TextureUsages::TEXTURE_BINDING,
                 view_formats: &[],
             },
-            wgpu::util::TextureDataOrder::LayerMajor,
             bytemuck::cast_slice(&table_data),
         );
         let table_view = table.create_view(&wgpu::TextureViewDescriptor::default());

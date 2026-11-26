@@ -51,8 +51,8 @@ fn cropped(
     (sw, sh): (u32, u32),
     budget: u64,
     across: Across,
-) -> Result<Canvas, procraft_gpu::GpuError> {
-    let mut canvas = Canvas::unfilled(gpu, doc)?;
+) -> Result<Box<Canvas>, procraft_gpu::GpuError> {
+    let mut canvas = Box::new(Canvas::unfilled(gpu, doc)?);
     canvas.set_resident_budget(budget);
     for &id in ids {
         let m = c.to_old;
@@ -215,11 +215,11 @@ impl CanvasSession {
                 return Some(crate::project::unreadable_said(&names));
             }
         }
-        if st.gpu.as_ref().is_some_and(Gpu::is_lost) && !std::mem::replace(&mut st.crop_edit.lost_told, true) {
+        if st.lost_device() && !std::mem::replace(&mut st.crop_edit.lost_told, true) {
             st.crop_edit.failure = None;
             return Some(LOST_SAID.to_owned());
         }
-        let refused = st.canvas.as_mut().is_some_and(Canvas::take_smudge_refused);
+        let refused = st.canvas.as_deref_mut().is_some_and(Canvas::take_smudge_refused);
         let failed = st.crop_edit.failure.take().or_else(|| refused.then(|| SMUDGE_SAID.to_owned()));
         let failed = failed.or_else(|| st.filters.take_said());
         if failed.is_some() {
@@ -229,7 +229,12 @@ impl CanvasSession {
         // poll (every few seconds) never holds up a touch meanwhile
         let hooks = st.hooks.clone();
         drop(guard);
-        hooks.and_then(|hooks| hooks.take_said())
+        let said = hooks.and_then(|hooks| hooks.take_said());
+        // a plugin's folder that can't be reached, once (interface 22)
+        said.or_else(|| {
+            let folders = self.shared.folders.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            folders.and_then(|f| f.take_notice())
+        })
     }
 
     /// The canvas's colour profile, by name.
@@ -322,13 +327,13 @@ impl CanvasSession {
         st.settle();
         st.flush();
         if undo {
-            if st.canvas.as_ref().is_none_or(Canvas::can_undo) {
+            if st.canvas.as_deref().is_none_or(Canvas::can_undo) {
                 return false;
             }
             let Some((canvas, doc)) = st.crop_undo.take() else { return false };
             let cropped = st.canvas.replace(canvas);
             let cropped_doc = std::mem::replace(&mut st.doc, doc);
-            let steps = st.canvas.as_ref().map_or(0, Canvas::steps_made);
+            let steps = st.canvas.as_deref().map_or(0, Canvas::steps_made);
             st.crop_redo = cropped.map(|c| (c, cropped_doc, steps));
         } else {
             if !st.crop_redo_ready() {
@@ -575,7 +580,7 @@ mod tests {
             }
             assert!(fits.crop_canvas(x, 10.0, 80.0, 70.0, angle, false, 0, 0));
             assert!(parks.crop_canvas(x, 10.0, 80.0, 70.0, angle, false, 0, 0));
-            assert_eq!(parks.shared.lock().canvas.as_ref().map(procraft_gpu::Canvas::parked_layers), Some(2));
+            assert_eq!(parks.shared.lock().canvas.as_deref().map(procraft_gpu::Canvas::parked_layers), Some(2));
             let ((parked, size), (resident, resident_size)) = (contents(&parks), contents(&fits));
             assert_eq!((parked.len(), size), (resident.len(), resident_size));
             for (a, b) in parked.iter().zip(&resident) {
@@ -610,7 +615,7 @@ mod tests {
             assert!(FAILING.with(|f| f.borrow().is_empty()), "the GPU's way was tried first");
             assert!(gpu_way.crop_canvas(x, 10.0, 80.0, 70.0, angle, false, 0, 0));
             assert_eq!(cpu_way.take_failure(), None);
-            assert_eq!(cpu_way.shared.lock().canvas.as_ref().map(procraft_gpu::Canvas::parked_layers), Some(3));
+            assert_eq!(cpu_way.shared.lock().canvas.as_deref().map(procraft_gpu::Canvas::parked_layers), Some(3));
             alike(&cpu_way, &gpu_way, most);
             assert!(cpu_way.undo().is_some() && gpu_way.undo().is_some());
             assert_eq!(contents(&cpu_way), contents(&gpu_way));
@@ -629,7 +634,7 @@ mod tests {
         crate::device::MEMORY_FREE.with(|f| f.set(None));
         assert!(roomy.crop_canvas(10.0, 10.0, 60.0, 50.0, 0.0, true, 2000, 2000));
         assert_eq!(short.take_failure(), None);
-        assert_eq!(short.shared.lock().canvas.as_ref().map(procraft_gpu::Canvas::parked_layers), Some(3));
+        assert_eq!(short.shared.lock().canvas.as_deref().map(procraft_gpu::Canvas::parked_layers), Some(3));
         alike(&short, &roomy, 1);
     }
 
@@ -720,7 +725,7 @@ mod tests {
             assert!(s.crop_canvas(x, 10.0, 80.0, 70.0, angle, size.is_some(), w, h));
             assert_eq!(s.take_failure(), None);
             // made on the GPU, every layer there: not the way through the CPU kept for when that fails
-            assert_eq!(s.shared.lock().canvas.as_ref().map(procraft_gpu::Canvas::parked_layers), Some(0));
+            assert_eq!(s.shared.lock().canvas.as_deref().map(procraft_gpu::Canvas::parked_layers), Some(0));
             let (after, made) = contents(&s);
             assert_eq!(made, (c.width, c.height));
             for (was, is) in before.0.iter().zip(&after) {

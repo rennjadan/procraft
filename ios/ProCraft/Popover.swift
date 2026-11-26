@@ -87,6 +87,19 @@ struct FloatWindow {
     let sizable: Bool
 }
 
+/// The panels lie on solid ground, not frosted: while a plugin lays them out (see
+/// `Pc.popoverSolid`).
+private struct PanelsSolidKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var panelsSolid: Bool {
+        get { self[PanelsSolidKey.self] }
+        set { self[PanelsSolidKey.self] = newValue }
+    }
+}
+
 private struct FloatWindowKey: EnvironmentKey {
     static let defaultValue: FloatWindow? = nil
 }
@@ -102,7 +115,8 @@ extension EnvironmentValues {
 /// A panel hanging from the top bar, with an arrow pointing up at its button: `arrowX` is the
 /// tip's distance from the panel's left edge (from its top, for an arrow on the `side`).
 /// `popoverPlace` finds where it goes. Without a `fill` of its own it is frosted over the canvas:
-/// translucent, with what is behind it blurred. `width` is the body's: a side arrow adds to it.
+/// translucent, with what is behind it blurred (solid while the panels float: `panelsSolid`).
+/// `width` is the body's: a side arrow adds to it.
 /// Hanging from a button Edit layout moved (`hang`), an arrow that would point up points at it.
 struct Popover<Content: View>: View {
     let width: CGFloat
@@ -113,6 +127,7 @@ struct Popover<Content: View>: View {
     @ViewBuilder let content: () -> Content
     @Environment(\.hang) private var hang
     @Environment(\.floatWindow) private var floatWindow
+    @Environment(\.panelsSolid) private var solid
 
     var body: some View {
         if side == .top, let window = floatWindow {
@@ -145,8 +160,12 @@ struct Popover<Content: View>: View {
                     .shadow(color: Pc.popoverShadow, radius: Pc.popoverShadowRadius / 2)
                 if let fill {
                     shape.fill(fill)
+                } else if solid {
+                    // over another window or a bar, which would show through sharp
+                    shape.fill(Pc.popoverSolid)
                 } else {
                     shape.fill(.ultraThinMaterial)
+                        .environment(\.colorScheme, Look.shared.light ? .light : .dark)
                     shape.fill(Pc.popoverFrost)
                 }
             }
@@ -183,6 +202,9 @@ struct Popover<Content: View>: View {
                     }
                 if let fill {
                     shape.fill(fill)
+                } else if solid {
+                    // a floating window may lie under it, which would show through sharp
+                    shape.fill(Pc.popoverSolid)
                 } else {
                     // the dark frost whatever the system's appearance: a light one shows through
                     // the tint lighter than measured

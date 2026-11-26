@@ -213,6 +213,8 @@ impl Colours {
                         panel::WindowAct::Reset => {
                             layout.reset_place(LayoutPiece::Colours);
                         }
+                        // (not on the colour window's menu: it doesn't go into a side)
+                        panel::WindowAct::CollapseAll => {}
                     }
                     self.layout_changed = true;
                 }

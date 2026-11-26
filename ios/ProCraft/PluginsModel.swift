@@ -108,6 +108,11 @@ final class PluginsModel {
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         // those the app comes with added there first, once, and off
         store = Plugins.withBundled(dir: support.appendingPathComponent("plugins").path)
+        // the folders picked for plugins, reached through their bookmarks; files made for them first
+        // in the app's caches
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        store.useFolderAccess(access: SystemFolders(), work: caches.appendingPathComponent("folders").path)
         kept = UserDefaults.standard.dictionary(forKey: Self.keptKey) as? [String: String] ?? [:]
         for (key, value) in kept {
             store.readKept(key: key, value: value)
@@ -213,7 +218,7 @@ final class PluginsModel {
                 keep(one.key, one.on ? "true" : "false")
             case let .slider(one):
                 keep(one.key, "\(one.value)")
-            case .file:
+            case .file, .folder:
                 break
             case let .texture(one):
                 keep(one.key, "\(one.value)")
@@ -252,6 +257,16 @@ final class PluginsModel {
         if store.clearFile(key: key) {
             changed()
         }
+    }
+
+    /// A folder picked at `url` with the document picker for a plugin's folder control `key`: kept
+    /// with the plugin as a bookmark; `told` if it can't be used.
+    func pickFolder(_ key: String, from url: URL, told: @escaping (String) -> Void) {
+        guard let kept = SystemFolders.kept(url), store.setFolder(key: key, location: kept.location, name: kept.name) else {
+            told("This folder couldn't be used.")
+            return
+        }
+        changed()
     }
 
     /// A plugin's texture control `key` set to `value` (a grain's number in the Source Library, 0

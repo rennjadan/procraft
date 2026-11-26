@@ -1937,6 +1937,107 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The Krita plugin on draws its brushes through the app's Pressure and Smoothing, as the app
+    /// draws any brush: the pressure curve sizes and lightens the dabs (the preset's own pressure
+    /// sensors following what the curve makes of the pen), and stabilisation and motion filtering
+    /// smooth a shaky line's path.
+    #[test]
+    fn a_krita_brush_takes_the_apps_pressure_and_smoothing() {
+        let Ok(gpu) = procraft_gpu::Gpu::headless() else { return };
+        let (w, h) = (400_usize, 160_usize);
+        let s = crate::CanvasSession::new(w as u32, h as u32);
+        {
+            let mut st = s.shared.lock();
+            st.window_size = (w as u32, h as u32);
+            st.view = Some(procraft_engine::view::View::fit((w as u32, h as u32), (w as u32, h as u32)));
+            st.gpu = Some(gpu);
+            st.ensure_canvas();
+        }
+        let dir = std::env::temp_dir().join(format!("procraft-krita-smoothing-{}", std::process::id()));
+        let (plugins, ..) = krita_on(&dir);
+        s.use_plugins(Arc::clone(&plugins));
+        // a soft round tip 20 pixels across, sized and made opaque by the pressure, washed
+        let round = r#"<Brush type="auto_brush" spacing="0.05" useAutoSpacing="0" angle="0" density="1" randomness="0"><MaskGenerator type="circle" id="default" diameter="20" ratio="1" hfade="1" vfade="1" spikes="2" antialiasEdges="1"/></Brush>"#;
+        let more = r#"<param name="PaintOpAction" type="string"><![CDATA[2]]></param><param name="PressureSize" type="string"><![CDATA[true]]></param><param name="SizeSensor" type="string"><![CDATA[<params id="pressure"/>]]></param><param name="PressureOpacity" type="string"><![CDATA[true]]></param><param name="OpacitySensor" type="string"><![CDATA[<params id="pressure"/>]]></param>"#;
+        let brush = preset_png(&format!(
+            r#"<Preset name="Round" paintopid="paintbrush"><param name="brush_definition" type="string"><![CDATA[{round}]]></param>{more}</Preset>"#
+        ));
+        let read = crate::read_brushes(brush, Some("Round.kpp".to_owned())).unwrap();
+        s.make_engine_brushes(Arc::clone(&read), None);
+        let set = s.add_brushes_read(read, 0).unwrap();
+        assert!(s.shared.lock().library[set as usize].brushes[0].engine.is_some(), "made by the engine");
+        assert!(s.select_brush(set, 0));
+        s.wait_for_look();
+        s.set_color(0.0, 0.0, 0.0);
+        // a shaky line along y = 80, 6 pixels off it either way three samples at a time, pressed
+        // from nothing to all the way, at 240 samples a second
+        let draw = |s: &crate::CanvasSession| {
+            let layer = s.add_layer();
+            let at = |i: usize| crate::PenSample {
+                x: 40.0 + 3.0 * i as f32,
+                y: 80.0 + if (i / 3).is_multiple_of(2) { 6.0 } else { -6.0 },
+                pressure: i as f32 / 106.0,
+                tilt: 0.0,
+                orientation: 0.0,
+                time_ms: 1000.0 + i as f64 * 1000.0 / 240.0,
+                roll: 0.0,
+            };
+            s.stroke_begin(crate::PointerKind::Stylus, vec![at(0)]);
+            for i in (1..=106).step_by(4) {
+                s.stroke_add((i..(i + 4).min(107)).map(at).collect());
+            }
+            s.stroke_end(vec![]);
+            s.shared.lock().layer_pixels(procraft_engine::document::LayerId(layer)).unwrap()
+        };
+        // a column's ink: how many pixels across, how far its middle lies off the line (none for a
+        // column without ink), its darkest
+        let column = |rgba: &[u8], x: usize| {
+            let alphas: Vec<f32> = (0..h).map(|y| f32::from(rgba[(y * w + x) * 4 + 3])).collect();
+            let across = alphas.iter().filter(|a| **a > 32.0).count();
+            let total: f32 = alphas.iter().sum();
+            let middle = alphas.iter().enumerate().map(|(y, a)| y as f32 * a).sum::<f32>() / total.max(1.0);
+            let darkest = alphas.iter().fold(0.0_f32, |m, a| m.max(*a));
+            (across, (total > 255.0).then_some((middle - 80.0).abs()), darkest)
+        };
+        // (pressed a fifth of the way at x 110, nearly all the way at 340; the shake measured from
+        // a tenth to two thirds of the way, short of its end, which runs on to where the pen lifted)
+        let measure = |what: &str, rgba: &[u8]| {
+            let off: Vec<f32> = (75..280).filter_map(|x| column(rgba, x).1).collect();
+            let shake = off.iter().sum::<f32>() / off.len().max(1) as f32;
+            let (light, heavy) = (column(rgba, 110), column(rgba, 340));
+            eprintln!(
+                "{what}: {shake:.2} px off the line on average; at a fifth of the pressure {} px across, \
+                 alpha {}; at nearly all {} px across, alpha {}",
+                light.0, light.2, heavy.0, heavy.2
+            );
+            (shake, light, heavy)
+        };
+        let set_input = |stabilization: f32, motion: f32, curve: &[f32]| {
+            s.set_input_settings(stabilization, motion, 0.0, 0.0, true, curve.to_vec());
+        };
+        set_input(0.0, 0.0, &[]);
+        let (raw_shake, raw_light, raw_heavy) = measure("as it comes", &draw(&s));
+        assert!(raw_shake > 1.0, "the shake drawn: {raw_shake}");
+        assert!(raw_light.0 < raw_heavy.0 && raw_light.2 < raw_heavy.2, "size and opacity follow the pressure");
+        // the app's pressure curve: pressed all the way is pressed half as far, the dabs half as big
+        // and half as opaque
+        set_input(0.0, 0.0, &[0.0, 0.0, 1.0, 0.5]);
+        let (_, _, half) = measure("pressure curve to a half", &draw(&s));
+        let (across, dark) = (half.0 as f32 / raw_heavy.0 as f32, half.2 / raw_heavy.2);
+        assert!((0.35..0.7).contains(&across), "{} px across, {} at full", half.0, raw_heavy.0);
+        assert!((0.35..0.7).contains(&dark), "alpha {}, {} at full", half.2, raw_heavy.2);
+        // stabilisation and motion filtering take out the shake, each on its own
+        for (what, stabilization, motion) in [("stabilization 50%", 0.5, 0.0), ("motion filtering 50%", 0.0, 0.5)] {
+            set_input(stabilization, motion, &[]);
+            let (shake, light, heavy) = measure(what, &draw(&s));
+            assert!(shake < raw_shake / 3.0, "{what}: {shake} px off the line, {raw_shake} as it comes");
+            // (the shake no longer widens the light stroke's ink)
+            assert!(light.0 < raw_light.0, "{what}: {} px across, {} as it comes", light.0, raw_light.0);
+            assert!(light.0 < heavy.0 && light.2 < heavy.2, "{what}: size and opacity still follow the pressure");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A Krita colour smudge brush moves the paint it goes over: dragged from red into the clear, it
     /// lays the red where there was nothing, whatever the colour; within a selection, only inside it.
     #[test]
@@ -3065,9 +3166,13 @@ mod tests {
     /// A Krita preset called `name` whose tip is `brush` (a `Brush` element): a PNG with only its
     /// settings in it.
     fn preset_named(name: &str, brush: &str) -> Vec<u8> {
-        let xml = format!(
+        preset_png(&format!(
             r#"<Preset name="{name}" paintopid="paintbrush"><param name="brush_definition" type="string"><![CDATA[{brush}]]></param></Preset>"#
-        );
+        ))
+    }
+
+    /// A Krita preset of settings `xml`, kept as Krita keeps one: a PNG with only them in it.
+    fn preset_png(xml: &str) -> Vec<u8> {
         let chunk = |kind: &[u8], data: &[u8]| {
             let mut c = (data.len() as u32).to_be_bytes().to_vec();
             c.extend_from_slice(kind);

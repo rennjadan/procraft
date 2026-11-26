@@ -1229,7 +1229,7 @@ impl State {
                 crate::close_stroke(canvas, builder, second, &guide);
                 self.flush();
                 // laid where it is laid now, after the rest
-                let ended = self.canvas.as_ref().and_then(procraft_gpu::Canvas::last_stroke);
+                let ended = self.canvas.as_deref().and_then(procraft_gpu::Canvas::last_stroke);
                 if let (Some(mut items), Some((bounds, in_place))) = (laid_before.clone(), ended) {
                     let key = Item::read(&record, &[]).and_then(|i| item_keys(&[i]).first().copied()).unwrap_or(0);
                     Arc::make_mut(&mut items).push(LaidItem { key, bounds, in_place });
@@ -1265,7 +1265,7 @@ impl State {
             }
         };
         self.flush();
-        let made = self.canvas.as_ref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
+        let made = self.canvas.as_deref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
         let after = Some(Arc::new(after));
         self.doc.set_plugin_data(layer, after.clone());
         if let Some(made) = made {
@@ -1631,7 +1631,7 @@ impl State {
         let t = item.transform.unwrap_or(Affine::IDENTITY);
         let to = self.lay_to.map_or(t, |to| t.then(to));
         let (width, height) = (self.doc.width(), self.doc.height());
-        let measuring = self.canvas.as_ref().is_some_and(procraft_gpu::Canvas::measuring);
+        let measuring = self.canvas.as_deref().is_some_and(procraft_gpu::Canvas::measuring);
         let Some((rect, coverage)) = region.coverage(to, width, height) else { return (IRect::EMPTY, false) };
         if !measuring && let Some(canvas) = self.canvas.as_mut() {
             let [r, g, b] = item.colour.map(|c| c.clamp(0.0, 1.0));
@@ -1671,9 +1671,9 @@ impl State {
         self.flush();
         let laid_before = self.laid_items(layer);
         self.laid.remove(&layer);
-        let steps = self.canvas.as_ref().map_or(0, procraft_gpu::Canvas::steps_made);
+        let steps = self.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
         self.lay_items_again(layer, &read_drawn(&list), "Redraw layer");
-        let made = self.canvas.as_ref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
+        let made = self.canvas.as_deref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
         if let Some(made) = made {
             let laid = laid_before.zip(self.laid_items(layer));
             self.note_layer_step(made, layer, data.clone(), data, laid);
@@ -1932,12 +1932,12 @@ impl State {
             Ok(Some((running.layer_save(MOST_DATA)?, running.layer_draw(MOST_DRAWN)?)))
         });
         let Some(Some((after, list))) = answer else { return false };
-        let steps = self.canvas.as_ref().map_or(0, procraft_gpu::Canvas::steps_made);
+        let steps = self.canvas.as_deref().map_or(0, procraft_gpu::Canvas::steps_made);
         self.flush();
         let laid_before = self.laid_items(layer);
         let items = read_drawn(&list);
         self.lay_items_again(layer, &items, name);
-        let made = self.canvas.as_ref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
+        let made = self.canvas.as_deref().filter(|c| c.steps_made() > steps).and_then(procraft_gpu::Canvas::undo_step);
         let after = Arc::new(after);
         // what it draws of its data now, known without asking again
         let generation = self.hooks.as_ref().map_or(0, |hooks| hooks.generation());

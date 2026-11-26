@@ -10,11 +10,15 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.requiredWidth
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.systemGestures
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -35,6 +39,7 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.zIndex
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -76,16 +81,120 @@ private val PanelUndockDrag = 30.dp
  */
 class FloatingFrame(
     val width: Dp,
-    val onHold: (sizing: Boolean) -> Unit,
+    /** Held, sizing or not, the finger at a point (dp of the interface). */
+    val onHold: (sizing: Boolean, at: Offset) -> Unit,
     val onDrag: (Offset) -> Unit,
     val onLetGo: () -> Unit,
     val onClose: () -> Unit,
     val onFold: (() -> Unit)? = null,
     val menu: WindowMenu? = null,
+    val tabs: List<WindowTab> = emptyList(),
+    /** Collapse to edge: the side its collapse button sends it into, and what that does. */
+    val collapseEdge: io.github.artcraftandroid.procraft.core.WindowEdge? = null,
+    val onCollapse: () -> Unit = {},
 )
 
+/**
+ * A tab on a window holding several panels: its name, whether it shows, and what tapping it ([onPick]) and dragging it out
+ * do (torn out at a point, [onTear]; then following the finger, [onTorn]; then [onLetGo]), in dp of the interface.
+ */
+class WindowTab(
+    val title: String,
+    val active: Boolean,
+    val onPick: () -> Unit,
+    val onTear: (Offset) -> Unit,
+    val onTorn: (Offset) -> Unit,
+    val onLetGo: () -> Unit,
+)
+
+/** How far a tab is dragged before it is torn out of its window. */
+private val TabTearDrag = 26.dp
+
+/** [piece]'s window's tabs, while it holds several panels. */
+internal fun windowTabs(vm: CanvasViewModel, piece: LayoutPiece): List<WindowTab> {
+    val tabs = vm.tabsOf(piece)
+    return tabs.map { p ->
+        WindowTab(
+            pieceTitle(p),
+            active = p == piece,
+            onPick = { vm.pickTab(p) },
+            onTear = { at -> vm.tearTab(p, at.x, at.y) },
+            onTorn = { at -> vm.followTorn(at.x, at.y) },
+            onLetGo = { vm.letGoPiece() },
+        )
+    }
+}
+
+/**
+ * The tabs of a window holding several panels, in a row across its strip between its menu button and Close (and the
+ * [buttons] beside it: Fold, Collapse to edge's): narrower, their titles cut short, as more share the room.
+ */
+@Composable
+private fun BoxScope.WindowTabs(tabs: List<WindowTab>, buttons: Int) {
+    val corner = LocalClearance.current.corner
+    // the interface's dp, not the window's: the floating windows may show at a size of their own
+    val dp = LocalDensity.current.density / LocalPartScale.current
+    androidx.compose.foundation.layout.Row(
+        Modifier.align(Alignment.TopCenter).padding(top = 1.dp, start = 54.dp, end = 58.dp + 40.dp * buttons),
+        horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(4.dp, Alignment.CenterHorizontally),
+    ) {
+        for (tab in tabs) {
+            val now by rememberUpdatedState(tab)
+            var origin by remember { mutableStateOf(Offset.Zero) }
+            Box(
+                Modifier.weight(1f, fill = false).height(22.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(11.dp))
+                    .background(if (tab.active) Pc.Accent.copy(alpha = 0.35f) else androidx.compose.ui.graphics.Color.Transparent)
+                    .onGloballyPositioned { origin = it.positionInRoot() - corner }
+                    .pointerInput(Unit) { detectTapGestures { now.onPick() } }
+                    .pointerInput(Unit) {
+                        var total = Offset.Zero
+                        var torn = false
+                        detectDragGestures(
+                            onDragStart = {
+                                total = Offset.Zero
+                                torn = false
+                            },
+                            onDragEnd = { if (torn) now.onLetGo() },
+                            onDragCancel = { if (torn) now.onLetGo() },
+                        ) { change, delta ->
+                            change.consume()
+                            total += delta
+                            val at = (origin + change.position) / dp
+                            when {
+                                torn -> now.onTorn(at)
+                                total.getDistance() > TabTearDrag.toPx() -> {
+                                    torn = true
+                                    now.onTear(at)
+                                }
+                            }
+                        }
+                    }
+                    .padding(horizontal = 10.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                androidx.compose.material3.Text(
+                    tab.title,
+                    color = Pc.PanelTitle,
+                    fontSize = androidx.compose.ui.unit.TextUnit(13f, androidx.compose.ui.unit.TextUnitType.Sp),
+                    maxLines = 1,
+                    overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                )
+            }
+        }
+    }
+}
+
 /** A floating window's menu, from the button on its strip: Fold, Hide, Pin to Top (or Unpin) and Reset Position. */
-class WindowMenu(val pinned: Boolean, val onFold: (() -> Unit)?, val onHide: () -> Unit, val onPin: () -> Unit, val onReset: () -> Unit)
+class WindowMenu(
+    val pinned: Boolean,
+    val onFold: (() -> Unit)?,
+    val onHide: () -> Unit,
+    val onPin: () -> Unit,
+    val onReset: () -> Unit,
+    /** Collapse to edge: Collapse All, or Open All while any bar or window is collapsed; none with it off. */
+    val anyCollapsed: Boolean = false,
+    val onCollapseAll: (() -> Unit)? = null,
+)
 
 /** [piece]'s window menu, as the layout has it now. */
 internal fun windowMenu(vm: CanvasViewModel, piece: LayoutPiece): WindowMenu {
@@ -100,16 +209,30 @@ internal fun windowMenu(vm: CanvasViewModel, piece: LayoutPiece): WindowMenu {
         onHide = { vm.hidePiece(piece) },
         onPin = { vm.pinPiece(piece, !pinned) },
         onReset = { vm.resetPiece(piece) },
+        anyCollapsed = vm.anyCollapsed(),
+        onCollapseAll = if (vm.layoutLook.collapse) {
+            { vm.collapseAll(!vm.anyCollapsed()) }
+        } else {
+            null
+        },
     )
 }
 
-/** A drag, [frame]'s piece held as it starts ([sizing] or not), followed all told, and let go. */
-private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.dragsFrame(frame: () -> FloatingFrame, sizing: Boolean) {
+/**
+ * A drag, [frame]'s piece held as it starts ([sizing] or not) with the finger where it is (what is dragged lies at
+ * [origin], dp of the interface, [px] pixels each), followed all told, and let go.
+ */
+private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.dragsFrame(
+    frame: () -> FloatingFrame,
+    sizing: Boolean,
+    origin: () -> Offset,
+    px: () -> Float,
+) {
     var total = Offset.Zero
     detectDragGestures(
-        onDragStart = {
+        onDragStart = { start ->
             total = Offset.Zero
-            frame().onHold(sizing)
+            frame().onHold(sizing, origin() + start / px())
         },
         onDragEnd = { frame().onLetGo() },
         onDragCancel = { frame().onLetGo() },
@@ -128,10 +251,28 @@ private suspend fun androidx.compose.ui.input.pointer.PointerInputScope.dragsFra
 internal fun FloatingTop(frame: FloatingFrame) {
     // (the window moving under the drag mustn't start it again)
     val now by rememberUpdatedState(frame)
-    Box(Modifier.fillMaxWidth().height(FloatingTopHeight).pointerInput(Unit) { dragsFrame({ now }, sizing = false) }) {
-        Box(Modifier.align(Alignment.TopCenter).padding(top = 10.dp).size(40.dp, 4.dp).clip(CircleShape).background(Pc.Grabber))
+    // where it is (dp of the interface), for the finger's place as it is held
+    val corner = LocalClearance.current.corner
+    val px = LocalDensity.current.density / LocalPartScale.current
+    var origin by remember { mutableStateOf(Offset.Zero) }
+    Box(
+        Modifier.fillMaxWidth().height(FloatingTopHeight)
+            .onGloballyPositioned { origin = (it.positionInRoot() - corner) / px }
+            .pointerInput(Unit) { dragsFrame({ now }, sizing = false, { origin }, { px }) },
+    ) {
+        // holding several panels: their tabs in place of the grabber
+        if (frame.tabs.size > 1) {
+            WindowTabs(frame.tabs, buttons = listOfNotNull(frame.onFold, frame.collapseEdge).size)
+        } else {
+            Box(Modifier.align(Alignment.TopCenter).padding(top = 10.dp).size(40.dp, 4.dp).clip(CircleShape).background(Pc.Grabber))
+        }
         FloatingClose(Modifier.align(Alignment.TopEnd).padding(top = 2.dp, end = 14.dp)) { now.onClose() }
         frame.onFold?.let { fold -> FloatingFold(Modifier.align(Alignment.TopEnd).padding(top = 2.dp, end = 54.dp), fold) }
+        // Collapse to edge's, beside Fold (or Close)
+        frame.collapseEdge?.let { edge ->
+            val end = if (frame.onFold != null) 94.dp else 54.dp
+            FloatingCollapse(Modifier.align(Alignment.TopEnd).padding(top = 2.dp, end = end), edge) { now.onCollapse() }
+        }
         frame.menu?.let { menu -> FloatingMenuButton(Modifier.align(Alignment.TopStart).padding(top = 2.dp, start = 10.dp), menu) }
     }
 }
@@ -150,7 +291,7 @@ internal fun FloatingMenuButton(modifier: Modifier, menu: WindowMenu) {
             },
         )
         val place = remember { MenuPlace { anchor, _ -> IntOffset(anchor.left, anchor.bottom) } }
-        LibraryMenu(open, androidx.compose.ui.graphics.TransformOrigin(0f, 0f), place, onDismiss = { open = false }) {
+        LibraryMenu(open, androidx.compose.ui.graphics.TransformOrigin(0f, 0f), place, onDismiss = { open = false }, overPanel = true) {
             val row: @Composable (String, () -> Unit) -> Unit = { label, act ->
                 MenuItem(label, Pc.MenuInk, null, onClick = {
                     open = false
@@ -161,6 +302,7 @@ internal fun FloatingMenuButton(modifier: Modifier, menu: WindowMenu) {
             row("Hide", menu.onHide)
             row(if (menu.pinned) "Unpin" else "Pin to Top", menu.onPin)
             row("Reset Position", menu.onReset)
+            menu.onCollapseAll?.let { row(if (menu.anyCollapsed) "Open All" else "Collapse All", it) }
         }
     }
 }
@@ -219,13 +361,16 @@ internal fun FloatingTab(vm: CanvasViewModel, piece: LayoutPiece, shown: PieceSh
     val frame = remember(vm, piece, dp) {
         FloatingFrame(
             width = shown.width.dp,
-            onHold = { vm.holdPiece(piece, false) },
+            onHold = { _, at -> vm.holdPiece(piece, false, at) },
             onDrag = { px -> vm.dragPiece(px.x / dp, px.y / dp) },
             onLetGo = { vm.letGoPiece() },
             onClose = {},
         )
     }
     val now by rememberUpdatedState(frame)
+    // (where the tab is, dp of the interface: the finger's place as it is held)
+    val tab = Offset(shown.x, shown.y)
+    val tabNow by rememberUpdatedState(tab)
     PartScaled(InterfacePart.FLOATING) {
         val at = Modifier.offset { IntOffset((shown.x * dp).roundToInt(), (shown.y * dp).roundToInt()) }
         Popover(
@@ -234,7 +379,7 @@ internal fun FloatingTab(vm: CanvasViewModel, piece: LayoutPiece, shown: PieceSh
             at.height(shown.height.dp)
                 .semantics { contentDescription = "$title, folded" }
                 .pointerInput(Unit) { detectTapGestures { vm.foldPiece(piece, false) } }
-                .pointerInput(Unit) { dragsFrame({ now }, sizing = false) },
+                .pointerInput(Unit) { dragsFrame({ now }, sizing = false, { tabNow }, { dp }) },
             side = ArrowSide.NONE,
         ) {
             androidx.compose.foundation.layout.Row(
@@ -274,9 +419,13 @@ internal fun FloatingBottom(@Suppress("UNUSED_PARAMETER") frame: FloatingFrame) 
 private fun FloatingCorner(frame: FloatingFrame, modifier: Modifier) {
     // (the window growing under the drag mustn't start it again)
     val now by rememberUpdatedState(frame)
+    val corner = LocalClearance.current.corner
+    val px = LocalDensity.current.density / LocalPartScale.current
+    var origin by remember { mutableStateOf(Offset.Zero) }
     Box(
         modifier.padding(end = 6.dp).size(36.dp, FloatingBottomHeight)
-            .pointerInput(Unit) { dragsFrame({ now }, sizing = true) }
+            .onGloballyPositioned { origin = (it.positionInRoot() - corner) / px }
+            .pointerInput(Unit) { dragsFrame({ now }, sizing = true, { origin }, { px }) }
             .drawBehind {
                 // two lines across the corner, the nearer shorter
                 val ink = Pc.Grabber
@@ -329,40 +478,73 @@ internal fun BoxScope.PanelGrabber(vm: CanvasViewModel, panel: FloatingPanel) {
 @Composable
 fun FloatingPanels(vm: CanvasViewModel, maxWidth: Dp, maxHeight: Dp) {
     // (the side bar moved off its edge by Edit layout leaves the room whole)
-    val atEdge = vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) == null
+    val atEdge = vm.barMoved(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) == null && vm.barCollapsed(io.github.artcraftandroid.procraft.core.LayoutBar.SIDE_BAR) == null
     val clear = if (vm.showSideBar && atEdge) Pc.sideBarShown + Pc.PopoverGap else 0.dp
+    // (a drag from the top edge's gesture zone is the system's: no strip goes up into it)
+    val gestures = with(LocalDensity.current) { androidx.compose.foundation.layout.WindowInsets.systemGestures.getTop(this).toDp() }
+    val kept = with(LocalDensity.current) { LocalClearance.current.top.toDp() }
+    val top = (gestures - kept).coerceAtLeast(0.dp).value
     val room = if (vm.rightHanded) {
-        FloatingRoom(0f, 0f, (maxWidth - clear).value, maxHeight.value)
+        FloatingRoom(0f, top, (maxWidth - clear).value, maxHeight.value)
     } else {
-        FloatingRoom(clear.value, 0f, maxWidth.value, maxHeight.value)
+        FloatingRoom(clear.value, top, maxWidth.value, maxHeight.value)
     }
     val k = Pc.partScale(InterfacePart.FLOATING)
     val bar = Pc.barShown.value
     SideEffect { vm.layoutRoom(room, maxWidth.value, maxHeight.value, bar, k) }
-    // drawn as they were last pressed, those pinned over the rest
-    for (piece in vm.pieceOrder()) {
-        val panel = when (piece) {
-            LayoutPiece.LAYERS -> FloatingPanel.LAYERS
-            LayoutPiece.BRUSHES -> FloatingPanel.BRUSHES
-            else -> null
-        }
-        val popover = piece == LayoutPiece.ACTIONS || piece == LayoutPiece.ADJUSTMENTS
-        if (panel == null && !popover) continue
-        val window = vm.shownPiece(piece) ?: continue
-        key(piece) {
-            when {
-                window.folded -> FloatingTab(vm, piece, window, pieceTitle(piece))
-                panel != null -> FloatingPanelWindow(vm, panel, window)
-                else -> FloatingPopoverWindow(vm, piece, window)
+    // the Tool Belt, under the windows
+    // (not while a panel hangs open from its button: it would lie over the panel)
+    if (vm.panel == io.github.artcraftandroid.procraft.canvas.Panel.NONE) vm.beltShown()?.let { ToolBelt(vm, it) }
+    // over one another as they were last pressed, those pinned over the rest: each always in the same
+    // place among them, stacked by its order (raised, none moves, so a drag on one goes on)
+    // (in a box of their own, stacked among themselves: under the panels hanging from the bar)
+    val order = vm.pieceOrder()
+    Box(Modifier.size(maxWidth, maxHeight)) {
+        // (each in its slot whether it shows or not: one coming to show before it, as a tab torn out of
+        // its window does, never moves it or composes it anew, which would end the drag on its strip)
+        for ((piece, showing) in floatingWindowSlots(order)) key(piece) {
+            val panel = when (piece) {
+                LayoutPiece.LAYERS -> FloatingPanel.LAYERS
+                LayoutPiece.BRUSHES -> FloatingPanel.BRUSHES
+                else -> null
+            }
+            val window = vm.shownPiece(piece)?.takeIf { showing }
+            if (window != null) {
+                // collapsed into its side (Collapse to edge): sliding there, then gone, its tab there instead
+                val collapsed = vm.pieceCollapsed(piece) != null
+                val slide = collapseSlide(collapsed)
+                if (!(collapsed && slide >= 1f)) {
+                    val px = LocalDensity.current.density
+                    Box(
+                        Modifier.zIndex(order.indexOf(piece).toFloat()).size(maxWidth, maxHeight)
+                            .collapseSlid(vm.pieceCollapsePlace(piece), slide, px),
+                    ) {
+                        when {
+                            window.folded -> FloatingTab(vm, piece, window, pieceTitle(piece))
+                            panel != null -> FloatingPanelWindow(vm, panel, window)
+                            else -> FloatingPopoverWindow(vm, piece, window)
+                        }
+                    }
+                }
             }
         }
     }
 }
 
+/** The pieces drawn in windows by [FloatingPanels]: the Layers panel, the library, the Actions panel and the Adjustments menu. */
+private val FloatingWindowPieces = listOf(LayoutPiece.LAYERS, LayoutPiece.BRUSHES, LayoutPiece.ACTIONS, LayoutPiece.ADJUSTMENTS)
+
+/**
+ * Each piece drawn in a window, always in the same slot (the same place among the others, whichever of them show), and
+ * whether it shows now (it is in [order], the windows showing).
+ */
+internal fun floatingWindowSlots(order: List<LayoutPiece>): List<Pair<LayoutPiece, Boolean>> =
+    FloatingWindowPieces.map { it to (it in order) }
+
 /** A floating piece's name, on its tab. */
 internal fun pieceTitle(piece: LayoutPiece): String = when (piece) {
     LayoutPiece.LAYERS -> "Layers"
-    LayoutPiece.BRUSHES -> "Brush Library"
+    LayoutPiece.BRUSHES -> "Brush library"
     LayoutPiece.COLOURS -> "Colors"
     LayoutPiece.ACTIONS -> "Actions"
     LayoutPiece.ADJUSTMENTS -> "Adjustments"
@@ -379,14 +561,19 @@ private fun FloatingPopoverWindow(vm: CanvasViewModel, piece: LayoutPiece, windo
     val dp = LocalDensity.current.density
     val sizable = io.github.artcraftandroid.procraft.core.pieceSizes(piece).sizable
     val menu = windowMenu(vm, piece)
-    val frame = remember(vm, piece, dp, window.width, menu.pinned, menu.onFold != null) {
+    val tabs = vm.tabsOf(piece)
+    val edge = vm.pieceCollapseEdge(piece)
+    val frame = remember(vm, piece, dp, window.width, menu.pinned, menu.onFold != null, menu.anyCollapsed, tabs, edge) {
         FloatingFrame(
             width = window.width.dp,
-            onHold = { sizing -> vm.holdPiece(piece, sizing) },
+            onHold = { sizing, at -> vm.holdPiece(piece, sizing, at) },
             onDrag = { px -> vm.dragPiece(px.x / dp, px.y / dp) },
             onLetGo = { vm.letGoPiece() },
             onClose = { vm.closePiece(piece) },
             menu = menu,
+            tabs = windowTabs(vm, piece),
+            collapseEdge = edge,
+            onCollapse = { vm.collapsePiece(piece, true) },
         )
     }
     PartScaled(InterfacePart.FLOATING) {
@@ -482,7 +669,7 @@ fun BoxScope.FloatableBottom(
                 val frame = remember(vm, piece, dp, menu.pinned, menu.onFold != null) {
                     FloatingFrame(
                         width = at.width.dp,
-                        onHold = { sizing -> vm.holdPiece(piece, sizing) },
+                        onHold = { sizing, at -> vm.holdPiece(piece, sizing, at) },
                         onDrag = { px -> vm.dragPiece(px.x / dp, px.y / dp) },
                         onLetGo = { vm.letGoPiece() },
                         onClose = { vm.closePiece(piece) },
@@ -521,10 +708,12 @@ private fun FloatingPanelWindow(vm: CanvasViewModel, panel: FloatingPanel, windo
     // the same while the window only moves, so the panel in it isn't composed again for that
     val folds = vm.layoutLook.fold
     val menu = windowMenu(vm, piece)
-    val frame = remember(vm, panel, dp, window.width, folds, menu.pinned) {
+    val tabs = vm.tabsOf(piece)
+    val edge = vm.pieceCollapseEdge(piece)
+    val frame = remember(vm, panel, dp, window.width, folds, menu.pinned, menu.anyCollapsed, tabs, edge) {
         FloatingFrame(
             width = window.width.dp,
-            onHold = { sizing -> vm.holdPiece(piece, sizing) },
+            onHold = { sizing, at -> vm.holdPiece(piece, sizing, at) },
             onDrag = { px -> vm.dragPiece(px.x / dp, px.y / dp) },
             onLetGo = { vm.letGoPiece() },
             onClose = { vm.closeFloating(panel) },
@@ -534,6 +723,9 @@ private fun FloatingPanelWindow(vm: CanvasViewModel, panel: FloatingPanel, windo
                 null
             },
             menu = menu,
+            tabs = windowTabs(vm, piece),
+            collapseEdge = edge,
+            onCollapse = { vm.collapsePiece(piece, true) },
         )
     }
     // laid out at the floating windows' size, placed in the window's pixels
@@ -562,9 +754,30 @@ private fun FloatingPanelWindow(vm: CanvasViewModel, panel: FloatingPanel, windo
 @Composable
 fun BoxScope.EditLayoutHandles(vm: CanvasViewModel) {
     val d = LocalDensity.current.density
+    // the name asked for in the app's own alert, over the whole screen: a new layout's (no from), or one renamed
+    var asking by remember { mutableStateOf<Pair<String?, String>?>(null) }
+    var text by remember(asking) { mutableStateOf(asking?.second ?: "") }
+    Alert(
+        asking,
+        title = { if (it.first == null) "Save Layout" else "Rename Layout" },
+        message = { "" },
+        action = if (asking?.first == null) "Save" else "Rename",
+        onCancel = { asking = null },
+        onAction = { (from, _) ->
+            if (from == null) vm.saveLayout(text) else vm.renameLayout(from, text)
+            asking = null
+        },
+        destructive = false,
+        field = text,
+        onField = { text = it },
+    )
+    // (the Tool Belt's while it shows)
+    val belt = vm.beltShown() != null
     for (bar in io.github.artcraftandroid.procraft.core.LayoutBar.entries) {
+        if (bar == io.github.artcraftandroid.procraft.core.LayoutBar.BELT && !belt) continue
         val r = vm.barChanges.let { vm.barLayout.rect(bar) } ?: continue
         key(bar) {
+            val rNow by rememberUpdatedState(r)
             Box(
                 Modifier.offset { IntOffset((r.x * d).roundToInt(), (r.y * d).roundToInt()) }.size(r.width.dp, r.height.dp)
                     .border(2.dp, Pc.Accent, androidx.compose.foundation.shape.RoundedCornerShape(12.dp))
@@ -572,9 +785,10 @@ fun BoxScope.EditLayoutHandles(vm: CanvasViewModel) {
                     .pointerInput(bar) {
                         var total = Offset.Zero
                         detectDragGestures(
-                            onDragStart = {
+                            onDragStart = { start ->
                                 total = Offset.Zero
-                                vm.holdBar(bar)
+                                // the finger's place in the window (dp): where the bar turns and goes decides by it
+                                vm.holdBar(bar, rNow.x + start.x / d, rNow.y + start.y / d)
                             },
                             onDragEnd = { vm.letGoBar() },
                             onDragCancel = { vm.letGoBar() },
@@ -591,14 +805,19 @@ fun BoxScope.EditLayoutHandles(vm: CanvasViewModel) {
     }
     androidx.compose.foundation.layout.Row(
         Modifier.align(Alignment.BottomCenter).padding(bottom = 28.dp).clip(CircleShape).background(Pc.PopoverFill)
-            .padding(horizontal = 8.dp).height(44.dp),
+            .keepsItsTouches().padding(horizontal = 8.dp).height(44.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         // the named layouts, the windows hidden from their menus (Show Hidden), Reset and Done
         var layouts by remember { mutableStateOf(false) }
-        if (layouts) NamedLayoutsList(vm) { layouts = false }
+        if (layouts) NamedLayoutsList(vm, onAsk = { asking = it }) { layouts = false }
         val rows = mutableListOf<Pair<String, () -> Unit>>("Layouts" to { layouts = !layouts })
         if (vm.hiddenPieces().isNotEmpty()) rows += "Show Hidden" to { vm.showHiddenPieces() }
+        // Collapse to edge: every bar and window against a side into it, or back out
+        if (vm.layoutLook.collapse) {
+            val any = vm.anyCollapsed()
+            rows += (if (any) "Open All" else "Collapse All") to { vm.collapseAll(!any) }
+        }
         rows += "Reset" to { vm.resetLayout() }
         rows += "Done" to { vm.doneEditLayout() }
         for ((label, act) in rows) {
@@ -617,9 +836,7 @@ fun BoxScope.EditLayoutHandles(vm: CanvasViewModel) {
  * from its row, and Save Layout, which saves the bars and panels where they are under a name of the painter's.
  */
 @Composable
-private fun NamedLayoutsList(vm: CanvasViewModel, onClose: () -> Unit) {
-    // the name being asked for: a new layout's (no from), or one renamed
-    var asking by remember { mutableStateOf<Pair<String?, String>?>(null) }
+private fun NamedLayoutsList(vm: CanvasViewModel, onAsk: (Pair<String?, String>) -> Unit, onClose: () -> Unit) {
     val names = vm.layoutNames()
     val chosen = vm.chosenLayout()
     androidx.compose.ui.window.Popup(alignment = Alignment.BottomCenter, offset = IntOffset(0, -260), onDismissRequest = onClose) {
@@ -643,7 +860,7 @@ private fun NamedLayoutsList(vm: CanvasViewModel, onClose: () -> Unit) {
                         "Rename",
                         color = Pc.Accent,
                         fontSize = androidx.compose.ui.unit.TextUnit(15f, androidx.compose.ui.unit.TextUnitType.Sp),
-                        modifier = Modifier.clickable { asking = name to name }.padding(horizontal = 8.dp, vertical = 10.dp),
+                        modifier = Modifier.clickable { onAsk(name to name) }.padding(horizontal = 8.dp, vertical = 10.dp),
                     )
                     androidx.compose.material3.Text(
                         "Delete",
@@ -657,23 +874,93 @@ private fun NamedLayoutsList(vm: CanvasViewModel, onClose: () -> Unit) {
                 "Save Layout",
                 color = Pc.Accent,
                 fontSize = androidx.compose.ui.unit.TextUnit(17f, androidx.compose.ui.unit.TextUnitType.Sp),
-                modifier = Modifier.fillMaxWidth().height(44.dp).clickable { asking = null to vm.nextLayoutName() }.padding(horizontal = 16.dp, vertical = 12.dp),
+                modifier = Modifier.fillMaxWidth().height(44.dp).clickable { onAsk(null to vm.nextLayoutName()) }.padding(horizontal = 16.dp, vertical = 12.dp),
             )
         }
     }
-    asking?.let { (from, start) ->
-        var text by remember(from, start) { mutableStateOf(start) }
-        androidx.compose.material3.AlertDialog(
-            onDismissRequest = { asking = null },
-            title = { androidx.compose.material3.Text(if (from == null) "Save Layout" else "Rename Layout") },
-            text = { androidx.compose.material3.TextField(text, onValueChange = { text = it }, singleLine = true) },
-            confirmButton = {
-                androidx.compose.material3.TextButton(onClick = {
-                    if (from == null) vm.saveLayout(text) else vm.renameLayout(from, text)
-                    asking = null
-                }) { androidx.compose.material3.Text(if (from == null) "Save" else "Rename") }
-            },
-            dismissButton = { androidx.compose.material3.TextButton(onClick = { asking = null }) { androidx.compose.material3.Text("Cancel") } },
+}
+
+/**
+ * The Tool Belt: a chip for each panel parked on it (a window let go on it), at the floating windows' size. A tap puts one
+ * back where it was; dragged off, it floats under the finger until let go. Empty, it says what it is.
+ */
+@Composable
+private fun ToolBelt(vm: CanvasViewModel, belt: io.github.artcraftandroid.procraft.core.BeltShown) {
+    val density = LocalDensity.current.density
+    val corner = LocalClearance.current.corner
+    // where it shows: moved in Edit Layout, upright against a side
+    val place = vm.beltPlace(belt)
+    val upright = place.vertical
+    PartScaled(InterfacePart.FLOATING) {
+        val dp = LocalDensity.current.density / LocalPartScale.current
+        val at = Modifier.offset { IntOffset((place.x * density).roundToInt(), (place.y * density).roundToInt()) }
+        val (w, h) = if (upright) belt.height to belt.width else belt.width to belt.height
+        // round, but square on its sides against the window's edges
+        val c = barCorners(
+            vm.barTouching(io.github.artcraftandroid.procraft.core.LayoutBar.BELT) ?: io.github.artcraftandroid.procraft.core.BarSides(left = false, top = false, right = false, bottom = false),
+            18.dp,
         )
+        val chips: @Composable (@Composable () -> Unit) -> Unit = { content ->
+            val shape = Modifier.size(w.dp, h.dp).clip(androidx.compose.foundation.shape.RoundedCornerShape(c[0], c[1], c[2], c[3])).background(Pc.PopoverFill).keepsItsTouches()
+            if (upright) {
+                androidx.compose.foundation.layout.Column(at.then(shape), horizontalAlignment = Alignment.CenterHorizontally) { content() }
+            } else {
+                androidx.compose.foundation.layout.Row(at.then(shape), verticalAlignment = Alignment.CenterVertically) { content() }
+            }
+        }
+        chips {
+            if (belt.pieces.isEmpty()) {
+                androidx.compose.material3.Text(
+                    "Tool Belt",
+                    color = Pc.PanelTitle.copy(alpha = 0.5f),
+                    fontSize = androidx.compose.ui.unit.TextUnit(13f, androidx.compose.ui.unit.TextUnitType.Sp),
+                    maxLines = 1,
+                    softWrap = false,
+                    modifier = Modifier.padding(horizontal = 16.dp).graphicsLayer { rotationZ = if (upright) -90f else 0f },
+                )
+            }
+            for (piece in belt.pieces) {
+                var origin by remember { mutableStateOf(Offset.Zero) }
+                Box(
+                    (if (upright) Modifier.size(belt.height.dp, 120.dp) else Modifier.width(120.dp).fillMaxHeight())
+                        .onGloballyPositioned { origin = it.positionInRoot() - corner }
+                        .pointerInput(piece) { detectTapGestures { vm.unparkPiece(piece) } }
+                        .pointerInput(piece) {
+                            var total = Offset.Zero
+                            var off = false
+                            detectDragGestures(
+                                onDragStart = {
+                                    total = Offset.Zero
+                                    off = false
+                                },
+                                onDragEnd = { if (off) vm.letGoPiece() },
+                                onDragCancel = { if (off) vm.letGoPiece() },
+                            ) { change, delta ->
+                                change.consume()
+                                total += delta
+                                val p = (origin + change.position) / dp
+                                when {
+                                    off -> vm.followTorn(p.x, p.y)
+                                    total.getDistance() > 26.dp.toPx() -> {
+                                        off = true
+                                        vm.unparkAt(piece, p.x, p.y)
+                                    }
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    androidx.compose.material3.Text(
+                        pieceTitle(piece),
+                        color = Pc.PanelTitle,
+                        fontSize = androidx.compose.ui.unit.TextUnit(13f, androidx.compose.ui.unit.TextUnitType.Sp),
+                        maxLines = 1,
+                        softWrap = false,
+                        modifier = Modifier.requiredWidth(116.dp).graphicsLayer { rotationZ = if (upright) -90f else 0f },
+                        textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                    )
+                }
+            }
+        }
     }
 }

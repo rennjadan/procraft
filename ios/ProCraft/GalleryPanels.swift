@@ -23,10 +23,13 @@ private let renameFrameHeight: CGFloat = 280
 private let renameTop: CGFloat = 20
 private let renameArtMargin: CGFloat = 12
 private let renameFieldGap: CGFloat = 20
-private let renameFieldWidth: CGFloat = 262
+private let renameFieldWidth: CGFloat = 300
 private let renameFieldHeight: CGFloat = 38
 // as measured: 41 over the blur's 30, a 5% white
 private let renameFieldFill = Color(argb: 0x0CFF_FFFF)
+/// The name being edited: grey, a little larger than the gallery's names, as measured.
+private let renameFieldText: CGFloat = 18
+private var renameFieldInk: Color { Look.shared.light ? Color(argb: 0xFF22_2222) : Color(argb: 0xFFC1_C1C1) }
 
 /// The new-canvas list hanging from the + button, 2 from the screen's edge: the screen's size
 /// first, then the presets, each with its colour profile and size; a preset row swiped left shows
@@ -457,7 +460,7 @@ struct MoreOptions: View {
 
 /// Renaming an artwork: it rises from its cell (`from`, on the screen) to the top middle, enlarged,
 /// with its name in a field under it and the keyboard up. Done, or tapped away, it calls `onDone`
-/// with the name.
+/// with the name; so does the keyboard put away.
 struct RenameArtwork: View {
     let renaming: Renaming
     let from: CGRect?
@@ -517,13 +520,19 @@ struct RenameArtwork: View {
             .offset(x: at.minX, y: at.minY)
             .allowsHitTesting(false)
             TextField("", text: $text)
-                .font(.system(size: 17))
-                .foregroundStyle(Pc.text)
+                .font(.system(size: renameFieldText))
+                .foregroundStyle(renameFieldInk)
                 .multilineTextAlignment(.center)
                 .tint(Pc.accent)
                 .submitLabel(.done)
                 .focused($focused)
                 .onSubmit(finish)
+                // the keyboard put away ends the rename, as a tap away does
+                .onChange(of: focused) { was, now in
+                    if was, !now {
+                        finish()
+                    }
+                }
                 .padding(.horizontal, 12)
                 .frame(width: renameFieldWidth, height: renameFieldHeight)
                 .background(RoundedRectangle(cornerRadius: 10, style: .circular).fill(renameFieldFill))

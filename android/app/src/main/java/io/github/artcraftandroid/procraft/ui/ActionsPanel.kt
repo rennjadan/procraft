@@ -798,6 +798,11 @@ private fun PluginCard(plugin: PluginInfo, vm: CanvasViewModel, modifier: Modifi
     Column(modifier.fillMaxWidth().clip(RoundedCornerShape(22.dp)).background(Pc.ActionsGroup)) {
         PluginHead(plugin, modifier = head)
         if (plugin.on && plugin.problem == null && plugin.features.isNotEmpty()) {
+            // its own, under none of its features (a folder of the whole plugin's)
+            for (control in plugin.top) {
+                Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
+                PluginControlRow(control, vm)
+            }
             // made of features: each a heading with its switch, what comes under it while it is on
             for (feature in plugin.features) {
                 Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
@@ -859,6 +864,7 @@ private fun PluginControlRow(control: PluginControl, vm: CanvasViewModel) {
         }
         is PluginControl.File -> PluginFileRow(control.control, vm)
         is PluginControl.Texture -> PluginTextureRow(control.control, vm)
+        is PluginControl.Folder -> PluginFolderRow(control.control, vm)
     }
 }
 
@@ -1058,6 +1064,28 @@ private fun PluginFileRow(file: PluginFile, vm: CanvasViewModel) {
             Text("Clear", color = Pc.Accent, fontSize = 17.sp, maxLines = 1, modifier = Modifier.clickable { vm.clearPluginFile(file.key) }.padding(start = 12.dp))
         } else {
             Text("Import", color = Pc.Accent, fontSize = 17.sp, maxLines = 1)
+        }
+    }
+}
+
+/** A folder picked for a plugin: its label, then Choose, or the folder's name and Clear; a tap opens the system's folder picker. */
+@Composable
+private fun PluginFolderRow(folder: io.github.artcraftandroid.procraft.core.PluginFolder, vm: CanvasViewModel) {
+    val picker = androidx.activity.compose.rememberLauncherForActivityResult(androidx.activity.result.contract.ActivityResultContracts.OpenDocumentTree()) { tree ->
+        tree?.let { vm.pickPluginFolder(folder.key, it) }
+    }
+    Row(
+        Modifier.fillMaxWidth().height(44.dp).clickable { runCatching { picker.launch(null) } }.padding(start = 16.dp, end = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(folder.label, color = Pc.ActionsRow, fontSize = 17.sp, maxLines = 1)
+        Box(Modifier.weight(1f))
+        val chosen = folder.chosen
+        if (chosen != null) {
+            Text(chosen, color = Pc.SlideValue, fontSize = 15.sp, maxLines = 1, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(start = 12.dp).weight(1f, fill = false))
+            Text("Clear", color = Pc.Accent, fontSize = 17.sp, maxLines = 1, modifier = Modifier.clickable { vm.clearPluginFile(folder.key) }.padding(start = 12.dp))
+        } else {
+            Text("Choose", color = Pc.Accent, fontSize = 17.sp, maxLines = 1)
         }
     }
 }

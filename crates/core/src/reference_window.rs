@@ -203,6 +203,16 @@ pub fn reference_window_size(width: f32, height: f32, screen_width: f32, screen_
     ReferenceSize { width, height }
 }
 
+/// The size a window shows at until it is sized, on a canvas `canvas_width` x `canvas_height`
+/// pixels: 350 wide, and as tall with its bars as the canvas's shape makes it, so the canvas fills
+/// it (within the window's least and most); its width and its picture's height between the bars,
+/// points, as [`reference_window_size`] takes them.
+#[uniffi::export]
+pub fn reference_window_first_size(canvas_width: u32, canvas_height: u32) -> ReferenceSize {
+    let [width, height] = procraft_engine::reference_window::first_size([canvas_width, canvas_height]);
+    ReferenceSize { width, height }
+}
+
 /// Where a window `width` x `tall` at (`x`, `y`) goes in a screen `screen_width` x `screen_height`,
 /// so that it can be reached: all of it shown (the top left of it, if it is bigger). An artwork
 /// may have left it on a screen of another shape.

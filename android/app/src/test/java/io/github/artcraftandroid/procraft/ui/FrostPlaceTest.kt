@@ -41,4 +41,19 @@ class FrostPlaceTest {
         // a bar's box taken past its sides and below
         assertArrayEquals(floatArrayOf(-5f, 20f, 45f, 63f, 12f), frostBox(Offset(10f, 20f), 30, 40, 15f, 5f, 3f, 12f), 0f)
     }
+
+    @Test
+    fun aPanelThatMayLieOverAWindowHidesItWhole() {
+        // the dark frost lets 13% of what is behind it through: over the canvas, blurred
+        val frost = 0xDE / 255f
+        assertEquals(frost, frostAlpha(frost, solid = false), 0f)
+        // solid (a floating window, or any panel while the panels float): a window's white text (255) on
+        // its dark ground (30) under it moves its colour by no level at all (0.98, as before, let 4.5
+        // levels through: "Layer 1" and the checkboxes faintly readable through the brush library)
+        val solid = frostAlpha(frost, solid = true)
+        assertEquals(1f, solid, 0f)
+        val through = (1f - solid) * (255 - 30)
+        println("solid panel: $through levels of a window's text through it (was ${(1f - 0.98f) * (255 - 30)})")
+        org.junit.Assert.assertTrue("$through levels show through", through < 0.5f)
+    }
 }

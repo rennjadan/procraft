@@ -172,8 +172,15 @@ It can't be brought back."
     }
 
     /// The replay while it shows, the length alert, and a video being made (named after the
-    /// artwork's `name`); returns a message to show, if any.
-    pub fn show(&mut self, ctx: &egui::Context, look: &mut Look, name: &str) -> Option<&'static str> {
+    /// artwork's `name`; once made, a copy put in the folder a plugin of `plugins` keeps them in,
+    /// if one does); returns a message to show, if any.
+    pub fn show(
+        &mut self,
+        ctx: &egui::Context,
+        look: &mut Look,
+        name: &str,
+        plugins: &procraft_core::Plugins,
+    ) -> Option<&'static str> {
         if let Some(replay) = self.replay.as_mut() {
             let lapse = self.lapse.as_ref().map(|(_, t)| t);
             if replay.show(ctx, look, lapse) {
@@ -199,7 +206,10 @@ It can't be brought back."
                     let cancelled = exporting.cancelled();
                     self.exporting = None;
                     match made {
-                        Ok(path) if !cancelled => self.made = Some(path),
+                        Ok(path) if !cancelled => {
+                            plugins.video_exported(path.to_string_lossy().into_owned(), name.to_owned());
+                            self.made = Some(path);
+                        }
                         Ok(_) => {}
                         Err(e) if !cancelled => {
                             log::warn!("exporting the time-lapse: {e}");
