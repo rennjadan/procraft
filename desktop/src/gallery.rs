@@ -319,6 +319,10 @@ pub struct Gallery {
     /// Where a lifted artwork came to rest, and when: held still there long enough over another,
     /// it goes onto it (a stack) rather than taking its place.
     hover: Option<(Pos2, f64)>,
+    /// Where it would go as last shown while held (and whether on the way back out of a stack):
+    /// a finger lifting has no place of its own (the pointer goes with it), so it goes there.
+    last_target: Option<(Option<String>, usize)>,
+    last_back: bool,
     slid: HashMap<String, Vec2>,
     /// Where each was drawn this frame, slid (by folder).
     shown_at: HashMap<String, Rect>,
@@ -456,6 +460,8 @@ impl Gallery {
             stack_cells: HashMap::new(),
             shuffle: None,
             hover: None,
+            last_target: None,
+            last_back: false,
             slid: HashMap::new(),
             shown_at: HashMap::new(),
             drawn_cells: Vec::new(),
@@ -1739,13 +1745,22 @@ impl Gallery {
         {
             ui.ctx().request_repaint_after(Duration::from_secs_f64((STACK_REST_S - (now_s - since)).max(0.01)));
         }
-        let target = pointer.and_then(|p| Self::drop_at(entries, cells, &dir, p, stacking, rested));
+        let target = match pointer.filter(|_| down) {
+            Some(p) => Self::drop_at(entries, cells, &dir, p, stacking, rested),
+            // let go (a finger takes the pointer with it): where it showed last
+            None => self.last_target.clone(),
+        };
+        if down {
+            self.last_target = target.clone();
+        }
         // held over a place: it takes it, the ones between sliding over by one
         self.shuffle = match (&target, here) {
             (Some((None, to)), Some(at)) => Some((at, *to)),
             _ => None,
         };
-        let back = self.stack.is_some() && pointer.is_some_and(|p| self.back.contains(p));
+        let back =
+            if down { self.stack.is_some() && pointer.is_some_and(|p| self.back.contains(p)) } else { self.last_back };
+        self.last_back = back;
         // what it rests on that opens: the way back, or a stack it would be put in
         let rests_on = if back {
             Some(String::new())
@@ -1837,6 +1852,8 @@ impl Gallery {
         // let go: the gallery takes its new order, each where it now is
         self.shuffle = None;
         self.hover = None;
+        self.last_target = None;
+        self.last_back = false;
         self.slid.clear();
         if back {
             self.store.move_entry(dir, 0, Some(self.store.root()));
@@ -3102,7 +3119,8 @@ mod tests {
         shown.wait_at(pos2(over.x, 60.0), 2.5);
         shown.page(Vec::new());
         shown.wait_at(over, 0.3);
-        shown.page(vec![Event::PointerMoved(over), Shown::button(over, false)]);
+        // a finger lifting: the pointer goes with it, in the same moment
+        shown.page(vec![Shown::button(over, false), Event::PointerGone]);
         shown.page(Vec::new());
         assert_eq!(names(&shown).get(..3), Some(&["1".to_owned(), "2".to_owned(), "0".to_owned()][..]));
         let _ = std::fs::remove_dir_all(&root);
@@ -3128,7 +3146,7 @@ mod tests {
         assert!(shown.gallery.shuffle.is_some(), "taking its place at first");
         shown.wait_at(on, 0.8);
         assert_eq!(shown.gallery.shuffle, None, "resting, the others go back");
-        shown.page(vec![Event::PointerMoved(on), Shown::button(on, false)]);
+        shown.page(vec![Shown::button(on, false), Event::PointerGone]);
         shown.page(Vec::new());
         let stacks = shown.gallery.store.list(None).iter().filter(|e| matches!(e, GalleryEntry::Stack { .. })).count();
         assert_eq!(stacks, 1, "{:?}", names(&shown));
