@@ -60,6 +60,9 @@ struct Drag {
     grip: Grip,
     from: Pos2,
     was: [f32; 4],
+    /// A new shape's drag has moved: the one before it is kept for good (not on the press, so a
+    /// press that becomes a two-finger pinch leaves it as it was).
+    moved: bool,
 }
 
 /// The card the artwork is: its corner radius and bleed, for its cut to snap to and match.
@@ -85,6 +88,9 @@ pub struct Shapes {
     /// The live shape (canvas pixels): left, top, right, bottom (a line's two ends).
     rect: Option<[f32; 4]>,
     drag: Option<Drag>,
+    /// Two fingers are moving the canvas (as the Selection tool's do): no shape is made or changed
+    /// until every finger lifts.
+    pinching: bool,
     /// The guides it snapped to this frame (canvas x, canvas y).
     guides: (Option<f32>, Option<f32>),
     card_open: bool,
@@ -127,6 +133,7 @@ impl Default for Shapes {
             square: false,
             rect: None,
             drag: None,
+            pinching: false,
             guides: (None, None),
             card_open: false,
             tab: Tab::Shapes,
@@ -408,18 +415,50 @@ impl Shapes {
                     && let Some(p) = response.interact_pointer_pos().and_then(to_canvas)
                 {
                     let grip = self.grip_at(m, ppp, response.interact_pointer_pos().unwrap_or_default());
-                    // a new shape: the last one made for good first
-                    if grip == Grip::New && self.rect.is_some() {
-                        said = self.commit(session);
-                    }
                     let was = match grip {
                         Grip::New => [p.x, p.y, p.x, p.y],
                         _ => self.rect.unwrap_or([p.x, p.y, p.x, p.y]),
                     };
-                    self.drag = Some(Drag { grip, from: p, was });
+                    self.drag = Some(Drag { grip, from: p, was, moved: false });
+                }
+                // two fingers move the canvas, as with the Selection tool: what a finger had begun
+                // goes back as it was, and nothing more is done till they all lift
+                let touch = ctx.multi_touch().filter(|t| t.num_touches >= 2);
+                if let Some(t) = touch {
+                    if let Some(drag) = self.drag.take()
+                        && drag.grip != Grip::New
+                    {
+                        self.rect = Some(drag.was);
+                        self.refresh(session);
+                    }
+                    self.guides = (None, None);
+                    self.pinching = true;
+                    let c = t.center_pos;
+                    let pan = t.translation_delta * ppp;
+                    session.view_gesture(c.x * ppp, c.y * ppp, pan.x, pan.y, t.zoom_delta, t.rotation_delta);
+                    ctx.request_repaint();
+                }
+                if self.pinching {
+                    self.drag = None;
+                    if !ui.input(|i| i.any_touches() || i.pointer.any_down()) {
+                        self.pinching = false;
+                    }
+                }
+                // a new shape's drag under way: the last one made is kept for good first
+                if let Some(drag) = self.drag.as_mut()
+                    && drag.grip == Grip::New
+                    && !drag.moved
+                    && response.dragged()
+                    && touch.is_none()
+                {
+                    drag.moved = true;
+                    if self.rect.is_some() {
+                        said = self.commit(session);
+                    }
                 }
                 if let (Some(drag), Some(now)) = (self.drag, at.and_then(to_canvas))
                     && response.dragged()
+                    && (drag.grip != Grip::New || drag.moved)
                     && drag.grip == Grip::Round
                 {
                     // the rounding dot: as far in as it is dragged, less its inset
@@ -430,6 +469,7 @@ impl Shapes {
                     self.matched = false;
                 } else if let (Some(drag), Some(now)) = (self.drag, at.and_then(to_canvas))
                     && response.dragged()
+                    && (drag.grip != Grip::New || drag.moved)
                 {
                     let r = self.dragged(drag, now, shift || self.square);
                     let r = self.snapped(drag.grip, r, cw, ch, &cut, &kept, SNAP * per_point);
@@ -480,15 +520,23 @@ impl Shapes {
                 if let Some(spec) = self.spec(rgb) {
                     let colour = crate::colours::srgb(rgb);
                     let points = outline(&spec);
-                    let line = Stroke::new(2.0, colour);
                     if self.kind == ShapeKind::Line {
                         let w = (self.width / per_point).max(1.0);
                         painter.add(Shape::line(points.clone(), Stroke::new(w, colour)));
                     } else {
-                        painter.add(Shape::closed_line(points.clone(), line));
-                        painter.add(Shape::closed_line(points, Stroke::new(1.0, Color32::from_black_alpha(120))));
+                        // seen on any colour: white with a dark edge, over the shape's own colour
+                        painter
+                            .add(Shape::closed_line(points.clone(), Stroke::new(4.0, Color32::from_black_alpha(150))));
+                        painter.add(Shape::closed_line(points.clone(), Stroke::new(2.0, Color32::WHITE)));
                     }
-                    for h in self.handles(m, ppp) {
+                    // its box, as the Selection tool shows what it holds
+                    if let Some(r) = self.rect.filter(|_| self.kind != ShapeKind::Line) {
+                        let [x0, y0, x1, y1] = normal(r);
+                        let corners: Vec<Pos2> =
+                            [(x0, y0), (x1, y0), (x1, y1), (x0, y1)].map(|(x, y)| to_window(m, ppp, x, y)).to_vec();
+                        painter.add(Shape::closed_line(corners, Stroke::new(1.5, argb(pc::ACCENT))));
+                    }
+                    for (_, h) in self.handles(m, ppp) {
                         painter.circle_filled(h, HANDLE_DOT, Color32::WHITE);
                         painter.circle_stroke(h, HANDLE_DOT, Stroke::new(2.0, argb(pc::ACCENT)));
                     }
@@ -686,7 +734,7 @@ impl Shapes {
             ctx.request_repaint();
         }
         // the shape's size, by its box
-        if let Some(r) = self.rect.filter(|_| self.drag.is_some()) {
+        if let Some(r) = self.rect.filter(|_| self.tab == Tab::Shapes) {
             let [x0, y0, x1, y1] = normal(r);
             let p = to_window(m, ppp, x1, y1) + vec2(12.0, 12.0);
             let painter = ctx.layer_painter(egui::LayerId::new(Order::Tooltip, Id::unique("shape size")));
@@ -913,19 +961,35 @@ impl Shapes {
         (d * 2.0 < (x1 - x0).min(y1 - y0)).then(|| to_window(m, ppp, x0 + d, y0 + d))
     }
 
-    /// Where the handles are (points): the box's corners and edge middles; a line's ends.
-    fn handles(&self, m: [f32; 6], ppp: f32) -> Vec<Pos2> {
+    /// Where the handles are (points), each with its number: the box's corners (0 to 3) and edge
+    /// middles (4 to 7); a line's ends (0 and 2). An edge's middle shows only when the edge is
+    /// long enough on screen to hold it apart from the corners, as the Selection tool's.
+    fn handles(&self, m: [f32; 6], ppp: f32) -> Vec<(u8, Pos2)> {
         let Some(r) = self.rect else { return Vec::new() };
         if self.kind == ShapeKind::Line {
             let [x0, y0, x1, y1] = r;
-            return vec![to_window(m, ppp, x0, y0), to_window(m, ppp, x1, y1)];
+            return vec![(0, to_window(m, ppp, x0, y0)), (2, to_window(m, ppp, x1, y1))];
         }
         let [x0, y0, x1, y1] = normal(r);
         let (mx, my) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
-        [(x0, y0), (x1, y0), (x1, y1), (x0, y1), (mx, y0), (x1, my), (mx, y1), (x0, my)]
-            .into_iter()
-            .map(|(x, y)| to_window(m, ppp, x, y))
-            .collect()
+        let at = |x: f32, y: f32| to_window(m, ppp, x, y);
+        let wide = at(x0, y0).distance(at(x1, y0)) >= HANDLE_REACH * 3.0;
+        let tall = at(x0, y0).distance(at(x0, y1)) >= HANDLE_REACH * 3.0;
+        [
+            (x0, y0, true),
+            (x1, y0, true),
+            (x1, y1, true),
+            (x0, y1, true),
+            (mx, y0, wide),
+            (x1, my, tall),
+            (mx, y1, wide),
+            (x0, my, tall),
+        ]
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (_, _, shown))| *shown)
+        .map(|(i, (x, y, _))| (i as u8, at(x, y)))
+        .collect()
     }
 
     /// What a press at window point `p` (points) takes hold of.
@@ -938,14 +1002,11 @@ impl Shapes {
         let handles = self.handles(m, ppp);
         let nearest = handles
             .iter()
-            .enumerate()
-            .map(|(i, h)| (i, h.distance(p)))
+            .map(|(i, h)| (*i, h.distance(p)))
             .filter(|(_, d)| *d <= HANDLE_REACH)
             .min_by(|a, b| a.1.total_cmp(&b.1));
         if let Some((i, _)) = nearest {
-            // a line's second end is its corner 2
-            let i = if self.kind == ShapeKind::Line && i == 1 { 2 } else { i };
-            return Grip::Handle(i as u8);
+            return Grip::Handle(i);
         }
         let inside = self.rect.is_some_and(|r| {
             let [x0, y0, x1, y1] = normal(r);
