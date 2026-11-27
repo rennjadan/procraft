@@ -91,6 +91,9 @@ pub struct Shapes {
     /// Two fingers are moving the canvas (as the Selection tool's do): no shape is made or changed
     /// until every finger lifts.
     pinching: bool,
+    /// The touches down that are the pen (by the system's id): a pen and a finger or palm aren't
+    /// a pinch.
+    pens_down: Vec<u64>,
     /// The guides it snapped to this frame (canvas x, canvas y).
     guides: (Option<f32>, Option<f32>),
     card_open: bool,
@@ -134,6 +137,7 @@ impl Default for Shapes {
             rect: None,
             drag: None,
             pinching: false,
+            pens_down: Vec::new(),
             guides: (None, None),
             card_open: false,
             tab: Tab::Shapes,
@@ -423,7 +427,30 @@ impl Shapes {
                 }
                 // two fingers move the canvas, as with the Selection tool: what a finger had begun
                 // goes back as it was, and nothing more is done till they all lift
-                let touch = ctx.multi_touch().filter(|t| t.num_touches >= 2);
+                // (not with the pen down, nor while a dot or the shape is held: a palm resting by
+                // the pen isn't a pinch)
+                ui.input(|i| {
+                    for e in &i.events {
+                        if let egui::Event::Touch { id, phase, .. } = e {
+                            match phase {
+                                egui::TouchPhase::Start if crate::pen::is_pen(id.0) == Some(true) => {
+                                    self.pens_down.push(id.0);
+                                }
+                                egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                                    self.pens_down.retain(|p| *p != id.0)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+                if !ui.input(|i| i.any_touches()) {
+                    self.pens_down.clear();
+                }
+                let holding = self.drag.is_some_and(|d| d.grip != Grip::New || d.moved);
+                let touch = ctx
+                    .multi_touch()
+                    .filter(|t| t.num_touches >= 2 && self.pens_down.is_empty() && (self.pinching || !holding));
                 if let Some(t) = touch {
                     if let Some(drag) = self.drag.take()
                         && drag.grip != Grip::New
