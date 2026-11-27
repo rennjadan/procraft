@@ -316,6 +316,9 @@ pub struct Gallery {
     /// shows it: the others there slide over to make room. And how far each has slid (by folder),
     /// easing to where it goes.
     shuffle: Option<(usize, usize)>,
+    /// Where a lifted artwork came to rest, and when: held still there long enough over another,
+    /// it goes onto it (a stack) rather than taking its place.
+    hover: Option<(Pos2, f64)>,
     slid: HashMap<String, Vec2>,
     /// Where each was drawn this frame, slid (by folder).
     shown_at: HashMap<String, Rect>,
@@ -452,6 +455,7 @@ impl Gallery {
             leaving_stack: None,
             stack_cells: HashMap::new(),
             shuffle: None,
+            hover: None,
             slid: HashMap::new(),
             shown_at: HashMap::new(),
             drawn_cells: Vec::new(),
@@ -1647,16 +1651,20 @@ impl Gallery {
         self.leaving_stack = Some(leaving);
     }
 
-    /// Where a point over the grid would put what is dragged: onto another's picture (an
-    /// artwork's thumbnail as it sits in its box, or a stack's box), when it may be stacked; anywhere
-    /// else the slot between cells it is nearest, before a cell's middle or after it.
+    /// Where a lifted artwork (`dragged`) held at `p` goes: the place under it (its index in the
+    /// gallery once it is there), as Procreate moves one into the place it is held over; held
+    /// still a moment over another's picture (`rested`, and `stacking` allowed), onto that one.
     fn drop_at(
         entries: &[GalleryEntry],
         cells: &[(usize, Rect)],
         dragged: &str,
         p: Pos2,
         stacking: bool,
+        rested: bool,
     ) -> Option<(Option<String>, usize)> {
+        let carried = !entries.iter().any(|e| entry_dir(e) == dragged);
+        // the last place it can take: past the end for one carried in
+        let last = if carried { entries.len() } else { entries.len().saturating_sub(1) };
         for &(i, cell) in cells {
             if !cell.contains(p) {
                 continue;
@@ -1667,15 +1675,19 @@ impl Gallery {
                 GalleryEntry::Artwork { artwork } => Self::fitted(frame, artwork),
                 GalleryEntry::Stack { .. } => frame,
             };
-            if stacking && entry_dir(e) != dragged && picture.contains(p) {
+            if stacking && rested && entry_dir(e) != dragged && picture.shrink(picture.width() * 0.15).contains(p) {
                 return Some((Some(entry_dir(e).to_owned()), i));
             }
-            return Some((None, if p.x < cell.center().x { i } else { i + 1 }));
+            // (one carried in from a stack goes before or after the one it's over, by which half)
+            if carried {
+                return Some((None, if p.x < cell.center().x { i } else { i + 1 }));
+            }
+            return Some((None, i.min(last)));
         }
         // past the last cell: last
-        let &(last, cell) = cells.last()?;
+        let &(shown_last, cell) = cells.last()?;
         let past = p.y >= cell.bottom() || (p.y >= cell.top() && p.x >= cell.right());
-        (last + 1 == entries.len() && past).then_some((None, entries.len()))
+        (shown_last + 1 == entries.len() && past).then_some((None, last))
     }
 
     /// Back from the stack open to the gallery, its artworks flying back into its cell.
@@ -1713,10 +1725,24 @@ impl Gallery {
             return;
         }
         let stacking = self.stack.is_none() && matches!(entry, GalleryEntry::Artwork { .. });
-        let target = pointer.and_then(|p| Self::drop_at(entries, cells, &dir, p, stacking));
-        // held over a place: the others make room there
+        // held still a moment (over another, it goes onto it); moving on, it takes places again
+        let now_s = ui.input(|i| i.time);
+        if let Some(p) = pointer
+            && self.hover.is_none_or(|(a, _)| a.distance(p) > STACK_STILL)
+        {
+            self.hover = Some((p, now_s));
+        }
+        let rested = self.hover.is_some_and(|(_, since)| now_s - since >= STACK_REST_S);
+        if down
+            && !rested
+            && let Some((_, since)) = self.hover
+        {
+            ui.ctx().request_repaint_after(Duration::from_secs_f64((STACK_REST_S - (now_s - since)).max(0.01)));
+        }
+        let target = pointer.and_then(|p| Self::drop_at(entries, cells, &dir, p, stacking, rested));
+        // held over a place: it takes it, the ones between sliding over by one
         self.shuffle = match (&target, here) {
-            (Some((None, slot)), Some(at)) => Some((at, if *slot > at { slot - 1 } else { *slot })),
+            (Some((None, to)), Some(at)) => Some((at, *to)),
             _ => None,
         };
         let back = self.stack.is_some() && pointer.is_some_and(|p| self.back.contains(p));
@@ -1810,14 +1836,14 @@ impl Gallery {
         self.rest = DragRest::default();
         // let go: the gallery takes its new order, each where it now is
         self.shuffle = None;
+        self.hover = None;
         self.slid.clear();
         if back {
             self.store.move_entry(dir, 0, Some(self.store.root()));
         } else {
             match (target, here) {
                 (Some((Some(onto), _)), _) => self.store.put_onto(dir, onto),
-                (Some((None, slot)), Some(at)) => {
-                    let to = if slot > at { slot - 1 } else { slot };
+                (Some((None, to)), Some(at)) => {
                     if to != at {
                         self.store.move_entry(dir, to as i64, None);
                     }
@@ -2682,7 +2708,10 @@ const OVER_MOST: f32 = 48.0;
 const EDGE_SCROLL: f32 = 110.0;
 const EDGE_SCROLL_MOST: f32 = 1400.0;
 /// How quickly the others slide over to make room (a second's share).
-const SHUFFLE_EASE: f32 = 16.0;
+const SHUFFLE_EASE: f32 = 14.0;
+/// A lifted artwork held this still (points) this long (seconds) over another goes onto it.
+const STACK_STILL: f32 = 14.0;
+const STACK_REST_S: f64 = 0.75;
 const OVER_SPRING: f32 = 13.0;
 /// How long a flick's speed is measured over (seconds).
 const GLIDE_SPAN: f64 = 0.08;
@@ -3054,14 +3083,14 @@ mod tests {
         };
         let first = cell_of(&shown, "0").unwrap();
         let third = cell_of(&shown, "2").unwrap();
-        // held still, "0" lifts; held over "2"'s left half, the others make room: it would go second
+        // held still, "0" lifts; moved over "2"'s place, it takes it, "1" and "2" sliding back one
         let at = first.center();
         shown.page(vec![Event::PointerMoved(at), Shown::button(at, true)]);
         shown.wait_at(at, HOLD_S + 0.1);
         assert!(shown.gallery.lifted.is_some());
         let over = pos2(third.left() + 10.0, third.center().y);
         shown.wait_at(over, 0.4);
-        assert_eq!(shown.gallery.shuffle, Some((0, 1)));
+        assert_eq!(shown.gallery.shuffle, Some((0, 2)));
         // "1" has slid into "0"'s place
         let slid = shown.gallery.shown_at.get(entry_dir(&shown.gallery.entries[1])).copied().unwrap();
         assert!((slid.min - first.min).length() < 2.0, "{slid:?} vs {first:?}");
@@ -3069,15 +3098,40 @@ mod tests {
         let y_before = shown.gallery.glide.y;
         shown.wait_at(pos2(over.x, shown.size.y - 8.0), 0.8);
         assert!(shown.gallery.glide.y > y_before + 100.0, "scrolled {} → {}", y_before, shown.gallery.glide.y);
-        // back up and let go over "2"'s left half: "0" goes second
+        // back up and let go over the third place (moving, not resting): "0" goes third
         shown.wait_at(pos2(over.x, 60.0), 2.5);
         shown.page(Vec::new());
-        let third = cell_of(&shown, "2").unwrap();
-        let over = pos2(third.left() + 10.0, third.center().y);
         shown.wait_at(over, 0.3);
         shown.page(vec![Event::PointerMoved(over), Shown::button(over, false)]);
         shown.page(Vec::new());
-        assert_eq!(names(&shown).get(..3), Some(&["1".to_owned(), "0".to_owned(), "2".to_owned()][..]));
+        assert_eq!(names(&shown).get(..3), Some(&["1".to_owned(), "2".to_owned(), "0".to_owned()][..]));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_lifted_artwork_rested_on_another_goes_onto_it() {
+        let (mut shown, root) = with_artworks("rest", 6);
+        shown.page(Vec::new());
+        shown.page(Vec::new());
+        let cell_of = |shown: &Shown, name: &str| {
+            shown.gallery.drawn_cells.iter().find_map(|(e, c)| match e {
+                GalleryEntry::Artwork { artwork } if artwork.name == name => Some(*c),
+                _ => None,
+            })
+        };
+        let at = cell_of(&shown, "0").unwrap().center();
+        shown.page(vec![Event::PointerMoved(at), Shown::button(at, true)]);
+        shown.wait_at(at, HOLD_S + 0.1);
+        // held still on "3"'s picture: a moment and it would take its place, longer and it goes onto it
+        let on = Gallery::thumb_box(cell_of(&shown, "3").unwrap()).center();
+        shown.wait_at(on, 0.2);
+        assert!(shown.gallery.shuffle.is_some(), "taking its place at first");
+        shown.wait_at(on, 0.8);
+        assert_eq!(shown.gallery.shuffle, None, "resting, the others go back");
+        shown.page(vec![Event::PointerMoved(on), Shown::button(on, false)]);
+        shown.page(Vec::new());
+        let stacks = shown.gallery.store.list(None).iter().filter(|e| matches!(e, GalleryEntry::Stack { .. })).count();
+        assert_eq!(stacks, 1, "{:?}", names(&shown));
         let _ = std::fs::remove_dir_all(&root);
     }
 
