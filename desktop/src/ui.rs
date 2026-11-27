@@ -5202,6 +5202,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Shapes: a rectangle drawn with the pen, then each of its dots dragged with the pen (the
+    /// top ones too) moves its side or corner.
+    #[test]
+    fn a_shapes_every_dot_drags_with_the_pen() {
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), true) else { return };
+        w.ui.shapes.open();
+        w.frame();
+        w.frame();
+        let paper = w.paper();
+        let (from, to) = (paper.center() + vec2(-150.0, -120.0), paper.center() + vec2(150.0, 120.0));
+        w.pen_stroke(from, to, 12);
+        w.frame();
+        let ppp = w.ctx.pixels_per_point();
+        let (made, dots) = w.ui.shapes.live(&w.session, ppp).expect("a shape made");
+        println!("made {made:?} dots {dots:?}");
+        // the panel at its foot is only its own height: it takes none of the canvas above
+        let (panel, _) = w.area_shown(egui::Order::Foreground, egui::Id::unique("shapes panel")).expect("the panel");
+        assert!(panel.height() <= 200.0, "the panel reaches up to {panel:?}");
+        for (i, _) in dots {
+            let (before, now) = w.ui.shapes.live(&w.session, ppp).expect("still there");
+            let at = now.iter().find(|(j, _)| *j == i).map(|(_, p)| *p).expect("the dot");
+            let to = at + vec2(-25.0, -25.0);
+            w.pen_stroke(at, to, 8);
+            w.frame();
+            let after = w.ui.shapes.live(&w.session, ppp).expect("still there").0;
+            println!("dot {i} at {at:?}: {before:?} -> {after:?}");
+            assert_ne!(before, after, "dot {i} at {at:?} didn't move the shape");
+        }
+        // the rotate dot above it turns it about its middle, a quarter turn round
+        let (deg, dot) = w.ui.shapes.turn(&w.session, ppp);
+        assert_eq!(deg, 0.0);
+        let dot = dot.expect("a rotate dot");
+        let (_, dots) = w.ui.shapes.live(&w.session, ppp).expect("still there");
+        let corner = |n: u8| dots.iter().find(|(i, _)| *i == n).map(|(_, p)| *p).expect("a corner");
+        let middle = corner(0) + (corner(2) - corner(0)) / 2.0;
+        let reach = dot.y - middle.y;
+        w.pen_stroke(dot, pos2(middle.x - reach, middle.y), 16);
+        w.frame();
+        let (deg, _) = w.ui.shapes.turn(&w.session, ppp);
+        assert!((deg - 90.0).abs() < 1.0, "turned {deg}°");
+        // turned, its dots still drag it
+        let (before, dots) = w.ui.shapes.live(&w.session, ppp).expect("still there");
+        let (_, at) = dots.iter().find(|(i, _)| *i == 2).copied().expect("a corner");
+        w.pen_stroke(at, at + vec2(30.0, 30.0), 8);
+        w.frame();
+        let (after, _) = w.ui.shapes.live(&w.session, ppp).expect("still there");
+        assert_ne!(before, after, "a turned shape's corner didn't move it");
+    }
+
     /// Artworks opened and left one after another in the same interface, as the app goes from one
     /// to the next through the gallery: each painted on with its panels shown in turn, a picker
     /// plugin's square drawn from it (the floating colour panel holds its session for that), then

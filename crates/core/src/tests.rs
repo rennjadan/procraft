@@ -23933,6 +23933,7 @@ fn a_rounded_rectangle_shape_is_drawn_kept_to_snap_to_and_undone_as_one_step() {
         r: 0.0,
         g: 0.0,
         b: 1.0,
+        angle: 0.0,
     };
     assert!(s.make_shape(card));
     assert_eq!(alpha(50, 70), 255, "filled inside");

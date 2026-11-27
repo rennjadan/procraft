@@ -50,6 +50,8 @@ pub struct ShapeSpec {
     pub r: f32,
     pub g: f32,
     pub b: f32,
+    /// Turned this far (radians, clockwise as the canvas shows) about its box's middle.
+    pub angle: f32,
 }
 
 /// A rectangle placed (canvas pixels) and its corner radius.
@@ -92,6 +94,27 @@ pub fn holding(placed: &[PlacedShape], card: Option<PlacedShape>, inner: &Placed
 
 /// The shape's outline points in canvas pixels (closed, for showing it while it is placed).
 pub fn shape_outline(spec: &ShapeSpec) -> Vec<f32> {
+    let upright = upright_outline(spec);
+    if spec.angle == 0.0 {
+        return upright;
+    }
+    let turn = turner(spec, spec.angle);
+    upright.as_chunks::<2>().0.iter().flat_map(|[x, y]| turn(*x, *y)).collect()
+}
+
+/// The point (x, y) turned by `angle` about `spec`'s box's middle.
+fn turner(spec: &ShapeSpec, angle: f32) -> impl Fn(f32, f32) -> [f32; 2] {
+    let (x0, y0, x1, y1) = boxed(spec);
+    let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+    let (sin, cos) = angle.sin_cos();
+    move |x, y| {
+        let (dx, dy) = (x - cx, y - cy);
+        [cx + dx * cos - dy * sin, cy + dx * sin + dy * cos]
+    }
+}
+
+/// `spec`'s outline before it is turned.
+fn upright_outline(spec: &ShapeSpec) -> Vec<f32> {
     let (x0, y0, x1, y1) = boxed(spec);
     let (w, h) = (x1 - x0, y1 - y0);
     let mut out = Vec::new();
@@ -218,9 +241,12 @@ fn shape_mask(spec: &ShapeSpec, rect: IRect) -> Vec<u8> {
     let poly: Vec<(f32, f32)> =
         unit_polygon(spec.kind).into_iter().map(|(u, v)| (x0 + u * (x1 - x0), y0 + v * (y1 - y0))).collect();
     let mut out = Vec::with_capacity(rect.width() as usize * rect.height() as usize);
+    // turned: each pixel is read where it was before the turn
+    let back = turner(spec, -spec.angle);
     for y in rect.y0..rect.y1 {
         for x in rect.x0..rect.x1 {
-            let c = coverage(spec, &poly, x as f32 + 0.5, y as f32 + 0.5);
+            let [ux, uy] = back(x as f32 + 0.5, y as f32 + 0.5);
+            let c = coverage(spec, &poly, ux, uy);
             out.push((c * 255.0).round() as u8);
         }
     }
@@ -230,12 +256,25 @@ fn shape_mask(spec: &ShapeSpec, rect: IRect) -> Vec<u8> {
 /// The canvas pixels a shape can touch, within a `w` × `h` canvas; none if it is off it or has no
 /// size.
 fn reach(spec: &ShapeSpec, w: u32, h: u32) -> Option<IRect> {
-    let (x0, y0, x1, y1) = boxed(spec);
+    let sized = spec.kind == ShapeKind::Line || {
+        let (x0, y0, x1, y1) = boxed(spec);
+        x1 - x0 >= 1.0 && y1 - y0 >= 1.0
+    };
+    // turned, the box its turned corners make
+    let (x0, y0, x1, y1) = if spec.angle == 0.0 {
+        boxed(spec)
+    } else {
+        let (x0, y0, x1, y1) = boxed(spec);
+        let turn = turner(spec, spec.angle);
+        let corners = [turn(x0, y0), turn(x1, y0), turn(x1, y1), turn(x0, y1)];
+        corners.iter().fold((f32::MAX, f32::MAX, f32::MIN, f32::MIN), |(a, b, c, d), [x, y]| {
+            (a.min(*x), b.min(*y), c.max(*x), d.max(*y))
+        })
+    };
     let pad = if spec.kind == ShapeKind::Line { spec.width.max(1.0) / 2.0 + 2.0 } else { 2.0 };
     let n = |v: f32| v.clamp(-1.0e6, 1.0e6) as i32;
     let r = IRect::new(n((x0 - pad).floor()), n((y0 - pad).floor()), n((x1 + pad).ceil()), n((y1 + pad).ceil()))
         .intersect(IRect::from_size(w, h));
-    let sized = spec.kind == ShapeKind::Line || (x1 - x0 >= 1.0 && y1 - y0 >= 1.0);
     (!r.is_empty() && sized && [x0, y0, x1, y1].iter().all(|v| v.is_finite())).then_some(r)
 }
 
@@ -419,7 +458,8 @@ impl CanvasSession {
 
 /// A rectangle made kept with the artwork, to snap to (the oldest go past [`MOST_KEPT`]).
 fn keep_rectangle(st: &mut crate::State, spec: &ShapeSpec) {
-    if spec.kind != ShapeKind::Rectangle {
+    // (a turned one isn't kept to snap to: the others are upright)
+    if spec.kind != ShapeKind::Rectangle || spec.angle != 0.0 {
         return;
     }
     let (x0, y0, x1, y1) = boxed(spec);
@@ -456,7 +496,26 @@ mod tests {
 
     fn spec(kind: ShapeKind, make: ShapeMake, b: [f32; 4], corner: f32, width: f32) -> ShapeSpec {
         let [x0, y0, x1, y1] = b;
-        ShapeSpec { kind, make, x0, y0, x1, y1, corner, width, r: 1.0, g: 0.0, b: 0.0 }
+        ShapeSpec { kind, make, x0, y0, x1, y1, corner, width, r: 1.0, g: 0.0, b: 0.0, angle: 0.0 }
+    }
+
+    #[test]
+    fn a_turned_shape_covers_its_turned_place() {
+        // a long thin bar turned a quarter: it stands up
+        let bar = ShapeSpec {
+            angle: std::f32::consts::FRAC_PI_2,
+            ..spec(ShapeKind::Rectangle, ShapeMake::Fill, [0.0, 45.0, 100.0, 55.0], 0.0, 0.0)
+        };
+        let rect = reach(&bar, 200, 200).expect("on the canvas");
+        assert!(rect.height() > 90 && rect.width() < 20, "{rect:?}");
+        let mask = shape_mask(&bar, rect);
+        let at = |x: u32, y: u32| mask[((y - rect.y0 as u32) * rect.width() + (x - rect.x0 as u32)) as usize];
+        assert_eq!(at(50, 10), 255);
+        assert_eq!(at(50, 90), 255);
+        // its outline turns with it
+        let out = shape_outline(&bar);
+        let ys: Vec<f32> = out.iter().skip(1).step_by(2).copied().collect();
+        assert!(ys.iter().copied().fold(f32::MAX, f32::min) < 1.0);
     }
 
     #[test]
