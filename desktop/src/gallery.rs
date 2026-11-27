@@ -270,6 +270,10 @@ pub struct Gallery {
     rename_fading: Option<(GalleryArtwork, String, Instant)>,
     /// The artwork (by folder) whose actions a swipe left shows, and the one asked about deleting.
     swiped: Option<String>,
+    /// Where the swiped one's action pills were last drawn: a press anywhere else puts them away,
+    /// and is nothing more (its tap opens nothing), as in Procreate.
+    pills: Vec<Rect>,
+    putting_away: bool,
     deleting: Option<String>,
     /// How far the drag on a cell has gone.
     dragged: egui::Vec2,
@@ -433,6 +437,8 @@ impl Gallery {
             rename_since: None,
             rename_fading: None,
             swiped: None,
+            pills: Vec::new(),
+            putting_away: false,
             deleting: None,
             dragged: egui::Vec2::ZERO,
             sharing: None,
@@ -583,6 +589,25 @@ impl Gallery {
     /// The gallery's page (its header and grid) over the whole window, `order` deep, shown
     /// `alpha`; `covered`, nothing in it is touched. What a tap in it asked for.
     fn page(&mut self, ctx: &egui::Context, look: &mut Look, order: Order, alpha: f32, covered: bool) -> Option<Asked> {
+        // actions showing: a press off their pills puts them away, and does nothing else
+        let (pressed, down, released, at) = ctx.input(|i| {
+            (i.pointer.any_pressed(), i.pointer.any_down(), i.pointer.any_released(), i.pointer.press_origin())
+        });
+        if pressed
+            && self.swiped.is_some()
+            && let Some(at) = at
+            && !self.pills.iter().any(|r| r.contains(at))
+        {
+            self.swiped = None;
+            self.putting_away = true;
+        }
+        // (kept through the let-go, the frame a tap is seen)
+        if !down && !pressed && !released {
+            self.putting_away = false;
+        }
+        if self.swiped.is_none() {
+            self.pills.clear();
+        }
         let screen = ctx.content_rect();
         // shown at once, not faded in as a new area would be
         egui::Area::new(Id::unique("gallery"))
@@ -645,6 +670,12 @@ impl Gallery {
     }
 
     /// Whether it has settled: shown, and the pictures it asked for read.
+    /// Whether a lifted artwork in a stack held at `p` is taken out of it: on its title, or
+    /// anywhere along the bar it's in (or above).
+    fn out_by(&self, p: Pos2) -> bool {
+        self.back.contains(p) || p.y <= self.back.bottom() + BACK_REACH
+    }
+
     pub fn settled(&self) -> bool {
         self.shown_frames >= 2 && self.reading.is_empty()
     }
@@ -1323,8 +1354,7 @@ impl Gallery {
             self.back = row.union(row.translate(vec2(300.0, 0.0)));
             let response = ui.interact(self.back, ui.scope_id().with("back"), Sense::click());
             // blue while touched, or while something dragged is over it, to take it out
-            let over =
-                self.lifted.is_some() && ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| self.back.contains(p));
+            let over = self.lifted.is_some() && ui.input(|i| i.pointer.latest_pos()).is_some_and(|p| self.out_by(p));
             let lit = response.is_pointer_button_down_on() || over;
             let ink = if lit { argb(crate::look::pc::ACCENT) } else { argb(TITLE) };
             look.icon(ui, &icons::CHEVRON_LEFT, row.center(), 28.0, ink);
@@ -1506,7 +1536,7 @@ impl Gallery {
                         }
                     }
                     // (a touch that stops the page gliding is no tap)
-                    let tapped = response.clicked() && self.lifted.is_none() && !caught;
+                    let tapped = response.clicked() && self.lifted.is_none() && !caught && !self.putting_away;
                     // its picture shrinks under a press and grows as it lifts
                     let dir = entry_dir(entry);
                     let pressed = ui.input(|inp| inp.pointer.press_start_time().map_or(0.0, |t| inp.time - t));
@@ -1741,8 +1771,7 @@ impl Gallery {
             (Some((None, to)), Some(at)) => Some((at, *to)),
             _ => None,
         };
-        let back =
-            if down { self.stack.is_some() && pointer.is_some_and(|p| self.back.contains(p)) } else { self.last_back };
+        let back = if down { self.stack.is_some() && pointer.is_some_and(|p| self.out_by(p)) } else { self.last_back };
         self.last_back = back;
         // what it rests on that opens: the way back, or a stack it would be put in
         let rests_on = if back {
@@ -1758,6 +1787,10 @@ impl Gallery {
             }
         };
         let now_ms = (ui.input(|i| i.time) * 1000.0) as i64;
+        // resting (a finger held still sends nothing), the time it waits is still counted
+        if down && rests_on.is_some() {
+            ui.ctx().request_repaint_after(Duration::from_millis(50));
+        }
         if down && self.rest.over(rests_on.as_deref(), now_ms) {
             match rests_on.as_deref() {
                 Some("") => self.leave_stack(),
@@ -1870,6 +1903,9 @@ impl Gallery {
         let (k, origin) = (0.2 + 0.8 * open, pos2(cell.center().x + width / 2.0, frame.center().y));
         let grown = |r: Rect| Rect::from_min_max(origin + (r.min - origin) * k, origin + (r.max - origin) * k);
         let mut x = cell.center().x - width / 2.0;
+        if shown {
+            self.pills.clear();
+        }
         for (label, delete) in [("Share", false), ("Duplicate", false), ("Delete", true)] {
             let pill =
                 Rect::from_min_size(pos2(x, frame.center().y - SWIPE_PILL.1 / 2.0), vec2(SWIPE_PILL.0, SWIPE_PILL.1));
@@ -1891,6 +1927,7 @@ impl Gallery {
             if !shown {
                 continue;
             }
+            self.pills.push(pill);
             if ui.interact(pill, ui.scope_id().with(("swiped", label)), Sense::click()).clicked() {
                 match label {
                     "Duplicate" => {
@@ -2708,9 +2745,11 @@ const EDGE_SCROLL: f32 = 110.0;
 const EDGE_SCROLL_MOST: f32 = 1400.0;
 /// How quickly the others slide over to make room (a second's share).
 const SHUFFLE_EASE: f32 = 14.0;
+/// A lifted artwork in a stack held this far below its title bar or higher (points) is taken out.
+const BACK_REACH: f32 = 16.0;
 /// How far in from each side of a picture its middle starts (a share of its size): a lifted
 /// artwork over the middle goes onto it, over the rest into its place.
-const STACK_MIDDLE: f32 = 0.22;
+const STACK_MIDDLE: f32 = 0.12;
 const OVER_SPRING: f32 = 13.0;
 /// How long a flick's speed is measured over (seconds).
 const GLIDE_SPAN: f64 = 0.08;
@@ -3132,6 +3171,37 @@ mod tests {
         shown.page(Vec::new());
         let stacks = shown.gallery.store.list(None).iter().filter(|e| matches!(e, GalleryEntry::Stack { .. })).count();
         assert_eq!(stacks, 1, "{:?}", names(&shown));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_press_off_a_swiped_artworks_actions_puts_them_away_and_opens_nothing() {
+        let (mut shown, root) = with_artworks("put-away", 4);
+        shown.page(Vec::new());
+        let one = entry_dir(&shown.gallery.entries[1]).to_owned();
+        shown.gallery.swiped = Some(one.clone());
+        for _ in 0..30 {
+            shown.page(Vec::new());
+        }
+        assert_eq!(shown.gallery.pills.len(), 3, "its actions show");
+        // a tap on another artwork: the actions go, and that one doesn't open
+        let other =
+            shown.gallery.drawn_cells.iter().find(|(e, _)| entry_dir(e) != one).map(|(_, c)| c.center()).unwrap();
+        shown.page(vec![Event::PointerMoved(other), Shown::button(other, true)]);
+        assert_eq!(shown.gallery.swiped, None);
+        shown.page(vec![Shown::button(other, false), Event::PointerGone]);
+        shown.page(Vec::new());
+        assert!(shown.gallery.putting_away || shown.gallery.swiped.is_none());
+        assert!(!shown.gallery.putting_away, "over once let go");
+        // and a tap on the empty page below puts them away too
+        shown.gallery.swiped = Some(one);
+        for _ in 0..30 {
+            shown.page(Vec::new());
+        }
+        let empty = pos2(shown.size.x / 2.0, shown.size.y - 20.0);
+        shown.page(vec![Event::PointerMoved(empty), Shown::button(empty, true)]);
+        shown.page(vec![Shown::button(empty, false), Event::PointerGone]);
+        assert_eq!(shown.gallery.swiped, None);
         let _ = std::fs::remove_dir_all(&root);
     }
 
