@@ -3063,7 +3063,7 @@ mod tests {
         shown.wait_at(over, 0.4);
         assert_eq!(shown.gallery.shuffle, Some((0, 1)));
         // "1" has slid into "0"'s place
-        let slid = shown.gallery.shown_at.get(&entry_dir(&shown.gallery.entries[1]).to_owned()).copied().unwrap();
+        let slid = shown.gallery.shown_at.get(entry_dir(&shown.gallery.entries[1])).copied().unwrap();
         assert!((slid.min - first.min).length() < 2.0, "{slid:?} vs {first:?}");
         // held at the bottom edge, the gallery scrolls down
         let y_before = shown.gallery.glide.y;
