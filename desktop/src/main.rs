@@ -488,6 +488,41 @@ fn artwork_stamp(dir: &str) -> Option<std::time::SystemTime> {
 
 /// The identity Windows groups the app's windows, its taskbar pin and its shortcuts by (the
 /// installer's shortcuts carry it too).
+/// Makes `window` the one in front taking touches, as it opens. Windows lets only the app in
+/// front pass that on, and by the time the window shows (after its first frame) the launch has
+/// often let it go: the window showed inactive, its first tap spent making it active. Joined to
+/// the input of the window in front for the moment, it may.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn bring_to_front(window: &Window) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let Ok(RawWindowHandle::Win32(handle)) = window.window_handle().map(|h| h.as_raw()) else { return };
+    let ours = HWND(handle.hwnd.get() as *mut std::ffi::c_void);
+    // SAFETY: plain calls on this window's handle (alive while `window` is) and on thread ids
+    // the system gives; the input joined is let go again before returning
+    unsafe {
+        let front = GetForegroundWindow();
+        if front == ours {
+            log::info!("the window is in front, taking touches");
+            return;
+        }
+        let theirs = GetWindowThreadProcessId(front, None);
+        let me = GetCurrentThreadId();
+        let joined: bool = theirs != 0 && theirs != me && AttachThreadInput(me, theirs, true).into();
+        let _ = BringWindowToTop(ours);
+        let made: bool = SetForegroundWindow(ours).into();
+        if joined {
+            let _ = AttachThreadInput(me, theirs, false);
+        }
+        log::info!("the window brought to the front: {made} (joined {joined})");
+    }
+}
+
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn set_app_identity() {
@@ -710,6 +745,8 @@ impl ApplicationHandler for App {
             // (in the background) it would otherwise show without taking touches until one
             // activated it
             screen.window.focus_window();
+            #[cfg(windows)]
+            bring_to_front(&screen.window);
             screen.window.request_redraw();
         }
     }
