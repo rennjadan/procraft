@@ -165,6 +165,14 @@ pub fn eraser_end(id: u64) -> bool {
     flags & (FLAG_INVERTED | FLAG_ERASER) != 0
 }
 
+/// A pen has touched the screen in this run.
+static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a pen has touched the screen in this run (a tablet's pen moving the mouse too).
+pub fn seen() -> bool {
+    SEEN.load(std::sync::atomic::Ordering::Relaxed) || mouse_pen().is_some()
+}
+
 /// Whether pointer `id` is a pen (true) or a finger (false), if the system said which: a touch
 /// screen may give its fingers a pressure too, so a pressure alone doesn't make a pen.
 pub fn is_pen(id: u64) -> Option<bool> {
@@ -174,6 +182,9 @@ pub fn is_pen(id: u64) -> Option<bool> {
 /// The system said pointer `id` is a pen (`pen`) or a finger.
 #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
 pub(crate) fn pointer_kind(id: u64, pen: bool) {
+    if pen {
+        SEEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Ok(mut kinds) = KINDS.lock() {
         kinds.get_or_insert_with(Default::default).insert(id, pen);
     }

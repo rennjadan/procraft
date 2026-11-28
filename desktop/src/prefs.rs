@@ -67,6 +67,9 @@ pub struct Prefs {
     /// The palette strip in the top bar: its five colours (hex) and whether it shows.
     pub strip_colors: String,
     pub strip_shown: bool,
+    /// A pen has been used here once, and fingers were set to leave painting to it (done once:
+    /// the settings are the user's after that).
+    pub pen_set_up: bool,
     pub cursor_shows: CursorShows,
     pub cursor_style: CursorStyle,
     /// The colour model the Colors panel's disc and Value sliders work in.
@@ -153,6 +156,7 @@ impl Default for Prefs {
             card_width_in: 2.5,
             strip_colors: String::new(),
             strip_shown: true,
+            pen_set_up: false,
             cursor_shows: CursorShows::Hovering,
             cursor_style: CursorStyle::Brush,
             colour_model: procraft_core::ColourModel::Hsb,
@@ -235,6 +239,7 @@ impl Prefs {
                 "card_bleed_in" => p.card_bleed_in = number.map_or(p.card_bleed_in, |v| v.clamp(0.0, 1.0)),
                 "strip_colors" => p.strip_colors = value.to_owned(),
                 "strip_shown" => p.strip_shown = on,
+                "pen_set_up" => p.pen_set_up = on,
                 "card_width_in" => p.card_width_in = number.map_or(p.card_width_in, |v| v.clamp(0.5, 20.0)),
                 "cursor_shows" => p.cursor_shows = pick(&SHOWS, value).unwrap_or(p.cursor_shows),
                 "cursor_style" => p.cursor_style = pick(&STYLES, value).unwrap_or(p.cursor_style),
@@ -322,6 +327,7 @@ impl Prefs {
             format!("card_width_in {}", self.card_width_in),
             format!("strip_colors {}", self.strip_colors),
             format!("strip_shown {}", self.strip_shown),
+            format!("pen_set_up {}", self.pen_set_up),
             format!("cursor_shows {}", place(&SHOWS, self.cursor_shows)),
             format!("cursor_style {}", place(&STYLES, self.cursor_style)),
             format!("colour_model {}", self.colour_model.key()),

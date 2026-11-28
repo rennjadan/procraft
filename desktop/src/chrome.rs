@@ -566,7 +566,16 @@ struct Press {
     moved: bool,
     /// Held still long enough to bring up the panel: let go, it is no tap.
     held: bool,
+    /// Where the pointer was last frame (the bar's points), and how far it has gone in all.
+    last: Option<Pos2>,
+    travelled: f32,
+    /// Where it was pressed.
+    origin: Option<Pos2>,
 }
+
+/// A press on a side slider that goes this far (points) is a drag: the thumb follows it from
+/// the first point (not from where a drag would be told apart), and it is no tap.
+const SLIDER_SLOP: f32 = 2.5;
 
 /// A slider held still this long brings up its panel.
 const HOLD: std::time::Duration = std::time::Duration::from_millis(400);
@@ -860,27 +869,47 @@ impl SideBar {
             Slider::Size => session.set_brush_size(v),
             Slider::Opacity => session.set_brush_opacity(v),
         };
-        if response.is_pointer_button_down_on() && self.pressed.is_none_or(|p| p.which != which) {
-            self.pressed =
-                Some(Press { which, raw: value, since: std::time::Instant::now(), moved: false, held: false });
+        let down = response.is_pointer_button_down_on();
+        if down && self.pressed.is_none_or(|p| p.which != which) {
+            self.pressed = Some(Press {
+                which,
+                raw: value,
+                since: std::time::Instant::now(),
+                moved: false,
+                held: false,
+                last: response.interact_pointer_pos(),
+                travelled: 0.0,
+                origin: response.interact_pointer_pos(),
+            });
         }
-        if let Some(press) = self.pressed.as_mut().filter(|p| p.which == which) {
-            let dy = response.drag_delta().y;
-            if dy != 0.0 {
-                if !press.moved {
-                    self.panel = Some(which);
-                }
+        // the thumb follows the pointer itself, from the press on: each frame by as far as it
+        // went (finer the farther out to the side it is), so it stays with the finger or pen
+        if down
+            && let Some(press) = self.pressed.as_mut().filter(|p| p.which == which)
+            && let Some(now) = response.interact_pointer_pos()
+        {
+            let last = press.last.unwrap_or(now);
+            press.last = Some(now);
+            let dy = now.y - last.y;
+            press.travelled += (now - last).length();
+            if !press.moved && press.travelled >= SLIDER_SLOP {
                 press.moved = true;
-                // the farther out to the side the pointer is, the finer the thumb follows it
-                let across = response.interact_pointer_pos().map_or(0.0, |p| p.x - rect.center().x);
+                self.panel = Some(which);
+                // what it went before it counted as a drag counts too
+                let from = press.origin.unwrap_or(now);
+                press.raw = (press.raw - (now.y - from.y) / travel).clamp(0.0, 1.0);
+                set(session.slider_notch_at(size, press.raw).unwrap_or(press.raw));
+            } else if press.moved && dy != 0.0 {
+                let across = now.x - rect.center().x;
                 press.raw = (press.raw - dy / travel * side_slider_drag_share(across)).clamp(0.0, 1.0);
                 set(session.slider_notch_at(size, press.raw).unwrap_or(press.raw));
             }
+            ui.ctx().request_repaint();
         }
         // a tap on the thumb brings up the panel (or takes it away); elsewhere the thumb goes
         // there (or onto a notch's mark there)
         if response.clicked()
-            && !self.pressed.is_some_and(|p| p.held)
+            && !self.pressed.is_some_and(|p| p.held || p.moved)
             && let Some(p) = response.interact_pointer_pos()
         {
             let at = 1.0 - (p.y - rect.top() - pc::THUMB_INSET - pc::THUMB_HEIGHT / 2.0) / travel;

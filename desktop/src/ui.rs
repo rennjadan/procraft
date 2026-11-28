@@ -1303,6 +1303,7 @@ impl Interface {
         }
         self.drop.show(&ctx, session, to_hex(self.colours.rgb()), bar_bottom);
         self.erase_drop.show(&ctx, session, 0, bar_bottom);
+        self.pen_set_up(session);
         self.copy_paste_panel(&ctx, session);
         self.layer_choice(&ctx, session);
         self.quick_menu(&ctx, session);
@@ -1810,6 +1811,25 @@ impl Interface {
     fn follow_shape(&mut self, session: &CanvasSession) {
         self.overlays.shape = session.quickshape_info();
         self.overlays.shape_editing &= self.overlays.shape.is_some();
+    }
+
+    /// The first time a pen is used here, as Procreate does once a Pencil is: fingers leave
+    /// painting to it (they move, zoom and turn the canvas, and tap), and a finger kept still no
+    /// longer picks a colour (it would, a pinch's first finger landing a moment early). Once: the
+    /// settings (Gestures) are the user's after that.
+    fn pen_set_up(&mut self, session: &CanvasSession) {
+        if self.prefs.pen_set_up || !crate::pen::seen() {
+            return;
+        }
+        self.prefs.pen_set_up = true;
+        self.prefs.keep();
+        self.gestures.set(GesturePurpose::General, "FINGER_PAINT".into(), false);
+        self.gestures.set(GesturePurpose::Eyedropper, "HOLD".into(), false);
+        session.set_touch_settings(self.prefs.touch_settings(&self.gestures));
+        crate::files::keep_gestures(&self.gestures.kept());
+        log::info!("a pen in use: fingers leave painting and picking colours to it");
+        self.overlays
+            .notice("Pen in use: fingers now pinch, zoom and turn without painting (Gestures to change)", false);
     }
 
     /// The palette strip kept as it now is.
@@ -4362,6 +4382,8 @@ mod tests {
             let ctx = egui::Context::default();
             crate::look::install_fonts(&ctx);
             let mut ui = Interface::with_prefs(prefs);
+            // the pen the tests use set up already (fingers left as each test has them)
+            ui.prefs.pen_set_up = true;
             ui.opened(&session, 1.0);
             let (input, touches) = (Input::default(), Default::default());
             let mut window = Window {
@@ -5205,6 +5227,53 @@ mod tests {
         let torn = layout.shown(LayoutPiece::Brushes).expect("the brush library in a window of its own");
         assert!(torn.y > shown.y + 100.0, "{torn:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The side bar's size slider dragged with the pen: the thumb goes with it from the first
+    /// point, as far as the pen went (the drag's first few points not lost).
+    #[test]
+    fn the_size_slider_follows_the_pen_from_its_first_point() {
+        use crate::look::pc;
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), false) else { return };
+        w.frame();
+        let bar = crate::panel::side_bar_shown_at(&w.ctx).expect("the side bar");
+        w.session.set_brush_size(0.3);
+        w.frame();
+        let before = w.session.info().size;
+        let travel = pc::SLIDER_HEIGHT - pc::THUMB_HEIGHT - pc::THUMB_INSET * 2.0;
+        let from = bar.min + vec2(25.0, 6.0 + pc::SLIDER_HEIGHT * 0.6);
+        // up 30 points, a point a move at first (each under a drag's threshold), then on
+        w.pen(TouchPhase::Started, from);
+        w.frame();
+        let mut at = from;
+        for k in 1..=30 {
+            at = from - vec2(0.0, k as f32);
+            w.pen(TouchPhase::Moved, at);
+            w.frame();
+        }
+        w.pen(TouchPhase::Ended, at);
+        w.frame();
+        let moved = w.session.info().size - before;
+        let expected = 30.0 / travel;
+        assert!((moved - expected).abs() < 0.02, "moved {moved}, the pen went {expected}");
+        untouched(&w, "the size slider");
+    }
+
+    /// A pen used once: fingers leave painting and picking colours to it, and only once.
+    #[test]
+    fn a_pen_used_leaves_painting_to_it_once() {
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), true) else { return };
+        w.ui.prefs.pen_set_up = false;
+        w.ui.gestures.set(GesturePurpose::General, "FINGER_PAINT".into(), true);
+        crate::pen::pointer_kind(9001, true);
+        w.frame();
+        assert!(!w.ui.gestures.is_on(GesturePurpose::General, "FINGER_PAINT".into()));
+        assert!(!w.ui.gestures.is_on(GesturePurpose::Eyedropper, "HOLD".into()));
+        assert!(w.ui.prefs.pen_set_up);
+        // turned back on, it stays on
+        w.ui.gestures.set(GesturePurpose::General, "FINGER_PAINT".into(), true);
+        w.frame();
+        assert!(w.ui.gestures.is_on(GesturePurpose::General, "FINGER_PAINT".into()));
     }
 
     /// Shapes: a rectangle drawn with the pen, then each of its dots dragged with the pen (the
