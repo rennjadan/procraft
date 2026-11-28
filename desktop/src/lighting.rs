@@ -5,6 +5,7 @@
 //! environment shows, the exposure, and which environment lights the model. Also the environments
 //! themselves (our own panoramas, bundled with the Android app) a model is lit by.
 
+use crate::scroll::ScrollArea;
 use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{CanvasSession, ModelLight};
 
@@ -371,7 +372,7 @@ impl LightingStudio {
                 // the environments
                 let list = Rect::from_min_max(pos2(x0, y), pos2(x1, rect.bottom() - 12.0));
                 let mut child = ui.new_child(UiBuilder::new().max_rect(list));
-                egui::ScrollArea::vertical().id_salt("environments").show(&mut child, |ui| {
+                ScrollArea::vertical().id_salt("environments").show(&mut child, |ui| {
                     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
                     let chosen = session.model_environment();
                     let n = ENVIRONMENTS.len();

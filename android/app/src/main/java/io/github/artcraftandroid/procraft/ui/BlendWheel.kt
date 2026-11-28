@@ -4,6 +4,7 @@ import androidx.compose.foundation.gestures.FlingBehavior
 import androidx.compose.foundation.gestures.ScrollScope
 import androidx.compose.runtime.withFrameNanos
 import io.github.artcraftandroid.procraft.core.BlendStep
+import io.github.artcraftandroid.procraft.core.ScrollMotion
 import io.github.artcraftandroid.procraft.core.blendCoast
 import io.github.artcraftandroid.procraft.core.blendCoastAt
 import kotlin.math.abs
@@ -22,7 +23,7 @@ internal class BlendFling(
 ) : FlingBehavior {
     override suspend fun ScrollScope.performFling(initialVelocity: Float): Float {
         val coast = blendCoast(position() / density, initialVelocity / density, rowPx / density, rows.toUInt())
-        return followBlend(rowPx, density, position) { blendCoastAt(coast, it) }
+        return followBlend(rowPx, density, position, coast as? ScrollMotion.Bounce) { blendCoastAt(coast, it) }
     }
 }
 
@@ -31,12 +32,22 @@ internal class BlendFling(
  * until it is done, then onto its row to the pixel. Returns the speed left (pixels a second) when
  * an end stops it first, else 0.
  */
-internal suspend fun ScrollScope.followBlend(rowPx: Int, density: Float, position: () -> Int, at: (Float) -> BlendStep): Float {
+internal suspend fun ScrollScope.followBlend(
+    rowPx: Int,
+    density: Float,
+    position: () -> Int,
+    edge: ScrollMotion.Bounce? = null,
+    at: (Float) -> BlendStep,
+): Float {
     val start = withFrameNanos { it }
     var shown = position().toFloat()
     while (true) {
-        val now = withFrameNanos { it }
-        val step = at((now - start) / 1e9f)
+        val time = withFrameNanos { (it - start) / 1e9f }
+        if (edge != null && time >= edge.hitTime) {
+            scrollBy(edge.edge * density - position())
+            return edge.hitVelocity * density
+        }
+        val step = at(time)
         val target = if (step.done) (step.position * density / rowPx).roundToInt() * rowPx.toFloat() else step.position * density
         val wanted = target - shown
         val moved = scrollBy(wanted)

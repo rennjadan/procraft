@@ -128,6 +128,18 @@ fn file(folder: &Path, id: u64) -> PathBuf {
     folder.join(format!("{id:016x}.grain"))
 }
 
+/// Keeps a grain's pixels in the grains' folder `folder` (whole or not at all), as one brought in
+/// is kept before its brush joins the library (see `brush_pictures::spill`); false if they
+/// couldn't be written.
+pub(crate) fn write_to(folder: &Path, id: u64, pixels: &[u8]) -> bool {
+    write(folder, id, pixels)
+}
+
+/// The grains' folder beside the library in the brushes' folder `dir`.
+pub(crate) fn folder_in(dir: &Path) -> PathBuf {
+    dir.join(FOLDER)
+}
+
 /// Keeps a grain's pixels, whole or not at all (a grain already kept is the same pixels); false if
 /// they couldn't be written.
 fn write(folder: &Path, id: u64, pixels: &[u8]) -> bool {

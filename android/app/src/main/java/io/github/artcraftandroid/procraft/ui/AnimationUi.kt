@@ -1,8 +1,6 @@
 package io.github.artcraftandroid.procraft.ui
 
 import androidx.compose.animation.core.animate
-import androidx.compose.animation.core.calculateTargetValue
-import androidx.compose.animation.core.exponentialDecay
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -41,6 +39,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -63,6 +62,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.core.AnimationPlayback
+import io.github.artcraftandroid.procraft.core.scrollDrag
+import io.github.artcraftandroid.procraft.core.scrollDragVelocity
+import io.github.artcraftandroid.procraft.core.scrollMotion
+import io.github.artcraftandroid.procraft.core.scrollMotionAt
 import kotlin.math.floor
 import kotlin.math.roundToInt
 import kotlinx.coroutines.Job
@@ -210,8 +213,9 @@ private fun Timeline(vm: CanvasViewModel, width: Dp, modifier: Modifier) {
     val (cw, ch) = vm.canvasSize()
     val frameWidth = FrameHeight * frameAspect(cw, ch) + 1.dp
     val pitch = frameWidth + 1.dp
-    val pitchPx = with(LocalDensity.current) { pitch.toPx() }
+    val density = LocalDensity.current.density
     val last = (slots.size - 1).coerceAtLeast(0)
+    val end = last * pitch.value
     // the place in the middle, fractional while the track moves
     var at by remember { mutableFloatStateOf(focus.toFloat()) }
     var dragging by remember { mutableStateOf(false) }
@@ -221,7 +225,7 @@ private fun Timeline(vm: CanvasViewModel, width: Dp, modifier: Modifier) {
     val scope = rememberCoroutineScope()
     fun scrubTo(p: Float) {
         at = p
-        val i = p.roundToInt()
+        val i = p.roundToInt().coerceIn(0, last)
         if (i != shown) {
             shown = i
             slots.getOrNull(i)?.let(vm::scrubFrame)
@@ -233,13 +237,16 @@ private fun Timeline(vm: CanvasViewModel, width: Dp, modifier: Modifier) {
         if (vm.playingFrame != null) at = focus.toFloat() else animate(at, focus.toFloat(), animationSpec = Motion.frameSlide()) { v, _ -> if (!dragging) at = v }
     }
     DisposableEffect(Unit) { onDispose { if (dragging) vm.endScrub(null) } }
-    val drag = rememberDraggableState { delta -> scrubTo((at - delta / pitchPx).coerceIn(0f, last.toFloat())) }
+    val drag = rememberDraggableState { delta ->
+        scrubTo(scrollDrag(at * pitch.value, -delta / density, 0f, end, width.value) / pitch.value)
+    }
     Box(
         modifier.size(width, 44.dp).clip(RoundedCornerShape(18.dp)).background(TrackFill).border(1.dp, TrackEdge, RoundedCornerShape(18.dp))
             .draggable(
                 drag,
                 Orientation.Horizontal,
                 enabled = slots.size > 1,
+                startDragImmediately = settling?.isActive == true,
                 onDragStarted = {
                     settling?.cancel()
                     if (!dragging) {
@@ -249,11 +256,17 @@ private fun Timeline(vm: CanvasViewModel, width: Dp, modifier: Modifier) {
                     }
                 },
                 onDragStopped = { velocity ->
-                    val target = exponentialDecay<Float>().calculateTargetValue(at, -velocity / pitchPx).roundToInt().coerceIn(0, last)
+                    val from = at * pitch.value
+                    val speed = scrollDragVelocity(from, -velocity / density, 0f, end, width.value)
+                    val motion = scrollMotion(from, speed, 0f, end, pitch.value)
                     settling = scope.launch {
-                        animate(at, target.toFloat(), -velocity / pitchPx, Motion.frameSlide()) { v, _ -> scrubTo(v.coerceIn(0f, last.toFloat())) }
+                        val start = withFrameNanos { it }
+                        do {
+                            val step = scrollMotionAt(motion, withFrameNanos { (it - start) / 1e9f })
+                            scrubTo(step.position / pitch.value)
+                        } while (!step.done)
                         dragging = false
-                        vm.endScrub(target)
+                        vm.endScrub(at.roundToInt().coerceIn(0, last))
                     }
                 },
             ),

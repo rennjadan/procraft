@@ -198,8 +198,9 @@ Build time dependencies:
 
 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option.
 
-- **Third-party material:** the Inter font, Lucide icons and the light panoramas the app bundles,
-  and the libraries it's built with, are listed in [NOTICE](NOTICE).
+- **Third-party material:** the Inter font, Lucide icons, Material Symbols' undo and redo icons and
+  the light panoramas the app bundles, and the libraries it's built with, are listed in
+  [NOTICE](NOTICE).
 - **Every asset**, with its author, source and licence, is in [ATTRIBUTION.md](ATTRIBUTION.md).
 - **Icons** drawn using vector outlines ([`tools/icons/draw_icons.py`](tools/icons/draw_icons.py),
   to the [style guide](docs/icons/STYLE_GUIDE.md)).

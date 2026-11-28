@@ -5,6 +5,7 @@
 //! nothing relies on reading the render target in the shader (Android GPUs have no portable way).
 
 mod canvas;
+mod choice;
 #[cfg(windows)]
 mod compiler;
 // (naga's GLSL writer comes with the OpenGL backend, which Apple's systems go without)
@@ -32,7 +33,11 @@ pub use canvas::{
     Thumbnail, TipKind, VEIL_GRID, VeilCell, VeilCells, grey_levels, most_resident, read_texture, start_reading,
     textures_bytes,
 };
-pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, ViewLook};
+pub use canvas::{CanvasPaper, CarryFault, GREY_LOOK, PYRAMID_LEVELS, ViewLook, pyramid_levels};
+pub use choice::{
+    GpuMemory, best_gpu, choose_gpu, gpu_memory, gpus_to_choose, know_gpu_memory, passed_over, prefer_gpu,
+    preferred_gpu,
+};
 pub use kept::{forget_kept_pipelines, keep_pipelines_for, keep_pipelines_in};
 pub use lighting::Lighting;
 pub use scene::{
@@ -163,6 +168,32 @@ fn weak_gpu(name: &str, device_type: wgpu::DeviceType) -> bool {
         return n < 630 || (700..710).contains(&n);
     }
     false
+}
+
+/// Whether the GPU `info` is a weak one: a phone's or tablet's (see [`weak_gpu`]), or an old or
+/// entry-level graphics card (see [`choice::weak_card`]), drawn with as there was nothing better or
+/// as the person picked it.
+fn weak(info: &wgpu::AdapterInfo) -> bool {
+    weak_gpu(&info.name, info.device_type)
+        || (info.device_type == wgpu::DeviceType::DiscreteGpu
+            && choice::weak_card(&info.name, gpu_memory(info.vendor, info.device)))
+}
+
+/// Of the GPUs `seen` (one backend's), the one to draw with: as [`choose_gpu`] finds best of those
+/// that can show on `surface` (all, without one); none if none can. Where it isn't the graphics
+/// card wgpu takes, why is logged.
+fn pick(seen: Vec<wgpu::Adapter>, surface: Option<&wgpu::Surface<'_>>) -> Option<wgpu::Adapter> {
+    let mut usable: Vec<wgpu::Adapter> =
+        seen.into_iter().filter(|a| surface.is_none_or(|s| a.is_surface_supported(s))).collect();
+    let infos: Vec<wgpu::AdapterInfo> = usable.iter().map(wgpu::Adapter::get_info).collect();
+    if surface.is_some() {
+        choice::keep_to_choose(&infos);
+    }
+    let at = choose_gpu(&infos)?;
+    if let Some(why) = passed_over(&infos, at) {
+        log::info!("the GPU to draw with: {why}");
+    }
+    (at < usable.len()).then(|| usable.swap_remove(at))
 }
 
 /// Every GPU taken for a weak one (see [`weak_gpu`]): for measuring what that saves on others.
@@ -321,7 +352,14 @@ pub struct Gpu {
     /// Whether a dual brush's parts laid by their rule are carried from lot to lot here: checked
     /// before the first stroke that would carry one (see `canvas/carry_check.rs`).
     carry: Arc<canvas::CarryCheck>,
+    /// Whether it refuses the canvases made on it, as a test asks (see [`Gpu::refuse_canvases`]).
+    refuses: Arc<AtomicBool>,
 }
+
+/// Work sent to the GPU, looked at for whether it is done without waiting on it (see
+/// [`Gpu::sent`], [`Gpu::finished`]).
+#[derive(Clone, Debug)]
+pub struct Sent(Arc<AtomicBool>);
 
 /// Elsewhere there's no Direct3D 12 to choose a shader compiler for.
 #[cfg(not(windows))]
@@ -552,28 +590,37 @@ impl Gpu {
         // each stage timed in the log: on a slow driver, where a start stopped shows
         let started = std::time::Instant::now();
         // every GPU the backend sees, for the log (a laptop's two, a driver's own name and version)
-        for adapter in pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all())) {
+        let seen = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::all()));
+        for adapter in &seen {
             let info = adapter.get_info();
+            let memory = gpu_memory(info.vendor, info.device).map(|m| format!(", {} MB of its own", m >> 20));
             log::info!(
-                "GPU seen: {} ({:?}, {:?}, driver {} {})",
+                "GPU seen: {} ({:?}, {:?}, driver {} {}{})",
                 info.name,
                 info.backend,
                 info.device_type,
                 info.driver,
-                one_line(&info.driver_info)
+                one_line(&info.driver_info),
+                memory.unwrap_or_default()
             );
         }
         log::info!("the GPUs listed in {} ms", started.elapsed().as_millis());
         let chosen = std::time::Instant::now();
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            // the faster GPU of a laptop's two, unless `WGPU_POWER_PREF` says (`low`: to try the
-            // other when one fails or lags)
-            power_preference: wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
-            force_fallback_adapter: software,
-            compatible_surface: surface,
-            apply_limit_buckets: false,
-        }))
-        .map_err(|e| GpuError::NoAdapter(e.to_string()))?;
+        // as `choice` finds best of those that can show on the window (not where `WGPU_POWER_PREF`
+        // says which, to try the other when one fails or lags, nor for the software GPU)
+        let picked = if software || wgpu::PowerPreference::from_env().is_some() { None } else { pick(seen, surface) };
+        let adapter = match picked {
+            Some(adapter) => adapter,
+            None => pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                // the faster GPU of a laptop's two, unless `WGPU_POWER_PREF` says (`low`: to try the
+                // other when one fails or lags)
+                power_preference: wgpu::PowerPreference::from_env().unwrap_or(wgpu::PowerPreference::HighPerformance),
+                force_fallback_adapter: software,
+                compatible_surface: surface,
+                apply_limit_buckets: false,
+            }))
+            .map_err(|e| GpuError::NoAdapter(e.to_string()))?,
+        };
         let info = adapter.get_info();
         log::info!(
             "GPU: {} ({:?}, driver {}), chosen in {} ms",
@@ -587,7 +634,7 @@ impl Gpu {
             UNCOMPRESSED.store(true, Ordering::Relaxed);
             log::info!("the canvas's textures kept uncompressed on this GPU");
         }
-        if weak_gpu(&info.name, info.device_type) {
+        if weak(&info) {
             log::info!("a weak GPU: the frosted glass is blurred from a smaller picture");
         }
         let stale = starts_stale(&info);
@@ -663,6 +710,7 @@ impl Gpu {
             placed: Arc::default(),
             stale: Arc::new(stale::Stale::new(stale, drawn)),
             carry: Arc::default(),
+            refuses: Arc::default(),
         };
         // what an old GPU can't do, and what the canvas does without it (in the shared log)
         for lack in gpu.lacks() {
@@ -717,6 +765,38 @@ impl Gpu {
     /// Whether the device has been lost: nothing it held can be read back.
     pub fn is_lost(&self) -> bool {
         self.lost.load(Ordering::Relaxed)
+    }
+
+    /// The work sent last (just now, by the caller), to be looked at for whether it is done (see
+    /// [`Gpu::finished`]): wgpu says so once all that was sent by then is done (work another
+    /// thread sent after it among it, which only takes it for done a little later).
+    pub fn sent(&self) -> Sent {
+        let done = Arc::new(AtomicBool::new(false));
+        let told = Arc::clone(&done);
+        self.queue.on_submitted_work_done(move || told.store(true, Ordering::Release));
+        Sent(done)
+    }
+
+    /// Whether the work `sent` is done, looked at by a poll that waits for nothing: wgpu's wait of
+    /// no time for a submission, as another thread polls, can find the queue emptied by that poll
+    /// and its own look at the GPU older, and then panics ("If the queue is empty, the current
+    /// submission index ... should be at least the wait submission index"), dropping what the poll
+    /// was to call back (another thread's readback waited for). The canvas looked so at how fast
+    /// the GPU got through each render's stamps; the window's frames did, and the renderer stopped
+    /// (#412).
+    pub fn finished(&self, sent: &Sent) -> bool {
+        if !sent.0.load(Ordering::Acquire) {
+            let _ = poll(&self.device, wgpu::PollType::Poll);
+        }
+        sent.0.load(Ordering::Acquire)
+    }
+
+    /// Whether everything sent to the device is done, looked at and never waited on (true if it is
+    /// lost: nothing more comes of it). By a poll that waits for nothing: a wait of no time for all
+    /// the work sent, as another thread sends more, can find the newest not yet tracked, and wgpu
+    /// then panics in its poll (on the render thread, which stopped the renderer).
+    pub fn idle(&self) -> bool {
+        self.is_lost() || matches!(poll(&self.device, wgpu::PollType::Poll), Ok(wgpu::PollStatus::QueueEmpty))
     }
 
     /// When the device was lost, if it has been (as its driver told it, which can be before the
@@ -803,6 +883,20 @@ impl Gpu {
         }
     }
 
+    /// Canvases made on this device from now on (`on`) are refused by it, as a driver that can't
+    /// make them refuses them: an error comes in their making (their composite is asked to be wider
+    /// than the GPU's textures go). For testing what the app does when a canvas can't be made on
+    /// one backend.
+    #[doc(hidden)]
+    pub fn refuse_canvases(&self, on: bool) {
+        self.refuses.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether it refuses canvases (see [`Gpu::refuse_canvases`]).
+    pub(crate) fn refuses_canvases(&self) -> bool {
+        self.refuses.load(Ordering::Relaxed)
+    }
+
     /// GPU validation errors so far (each one is logged); tests expect none.
     pub fn errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
@@ -824,10 +918,16 @@ impl Gpu {
         if self.is_gl() { gl_array_layers(n) } else { n.max(1) }
     }
 
-    /// Whether the GPU is a weak one (see [`weak_gpu`]).
+    /// Whether the GPU is a weak one (see [`weak`]).
     pub fn is_weak(&self) -> bool {
+        WEAK.load(Ordering::Relaxed) || weak(&self.adapter.get_info())
+    }
+
+    /// The memory of its own the GPU has (a graphics card's), bytes, as the system told it (see
+    /// [`know_gpu_memory`]); none where it didn't.
+    pub fn dedicated_memory(&self) -> Option<u64> {
         let info = self.adapter.get_info();
-        WEAK.load(Ordering::Relaxed) || weak_gpu(&info.name, info.device_type)
+        gpu_memory(info.vendor, info.device)
     }
 
     /// Whether the GPU's memory is the computer's own: an integrated GPU's (a laptop's Intel or
@@ -938,6 +1038,169 @@ mod tests {
         }
         // Vulkan seeing no GPU at all: Vulkan first still (it fails soft, and OpenGL ES follows)
         assert_eq!(android_backends(&[]), [Backends::VULKAN, Backends::GL]);
+    }
+
+    /// Held by the tests that silence the panics they catch while they do (the panic hook is the
+    /// whole program's).
+    static SILENT_PANICS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A look at whether all the work sent is done while another thread sends work (texture clears
+    /// back to back): as the window's frames took it, a wait of no time for all the work sent, it
+    /// could find the work just sent not yet tracked, and wgpu then panicked in its poll ("If the
+    /// queue is empty, the current submission index ... should be at least the wait submission
+    /// index"), on the render thread stopping the renderer: the app said the device can't draw the
+    /// canvas (#412). [`super::Gpu::idle`] looks by a poll that waits for nothing, which never
+    /// panics so. Printed: how many of 50000 looks panicked each way (up to 93 of the old, 0 of the
+    /// new, on an NVIDIA laptop GPU).
+    #[test]
+    fn a_look_at_the_gpu_while_another_thread_sends_work_never_panics() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Ok(gpu) = super::Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        // (each a texture cleared, so that the GPU is a little behind)
+        let sender = std::thread::spawn({
+            let (device, queue, stop) = (gpu.device.clone(), gpu.queue.clone(), stop.clone());
+            move || {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("cleared"),
+                    size: wgpu::Extent3d { width: 1024, height: 1024, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                while !stop.load(Ordering::Relaxed) {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("cleared"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    }));
+                    queue.submit([encoder.finish()]);
+                }
+            }
+        });
+        let old = || wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::ZERO) };
+        // (the panics caught here aren't printed; nor, meanwhile, those of the test beside it)
+        let _alone = SILENT_PANICS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (mut panicked, mut now, mut idle) = (0, 0, 0);
+        for _ in 0..50_000 {
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.device.poll(old()))).is_err() {
+                panicked += 1;
+            }
+            let look = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.device.poll(wgpu::PollType::Poll)));
+            if look.is_err() {
+                now += 1;
+            }
+            if gpu.idle() {
+                idle += 1;
+            }
+        }
+        std::panic::set_hook(hook);
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+        println!(
+            "of 50000 looks while another thread sent work, a wait of no time panicked {panicked} times, a poll \
+             waiting for nothing {now} times (idle at {idle})"
+        );
+        assert_eq!(now, 0, "a poll waiting for nothing panicked");
+        assert!(!gpu.is_lost());
+        super::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(gpu.idle(), "idle once the work is done");
+    }
+
+    /// Whether a render's work is done, looked at while another thread sends work (texture clears
+    /// back to back), as the canvas looks at it to pace its strokes: by a wait of no time for its
+    /// submission, wgpu panicked now and then (caught, taken for the device lost, and dropping what
+    /// that poll was to call back); by [`super::Gpu::finished`], never, and it is done once the
+    /// work is. Printed: how many of 20000 looks panicked each way.
+    #[test]
+    fn a_look_at_whether_work_sent_is_done_never_panics_as_another_thread_sends_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let Ok(gpu) = super::Gpu::headless() else { return eprintln!("skipped: no GPU") };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let sender = std::thread::spawn({
+            let (device, queue, stop) = (gpu.device.clone(), gpu.queue.clone(), stop.clone());
+            move || {
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("cleared"),
+                    size: wgpu::Extent3d { width: 1024, height: 1024, depth_or_array_layers: 1 },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let view = texture.create_view(&Default::default());
+                while !stop.load(Ordering::Relaxed) {
+                    let mut encoder = device.create_command_encoder(&Default::default());
+                    drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("cleared"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    }));
+                    queue.submit([encoder.finish()]);
+                }
+            }
+        });
+        // (the panics caught here aren't printed; nor, meanwhile, those of the test beside it)
+        let _alone = SILENT_PANICS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (mut old, mut new, mut done) = (0, 0, 0);
+        for _ in 0..20_000 {
+            let index = gpu.queue.submit(std::iter::empty());
+            let sent = gpu.sent();
+            let now = wgpu::PollType::Wait { submission_index: Some(index), timeout: Some(std::time::Duration::ZERO) };
+            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.device.poll(now))).is_err() {
+                old += 1;
+            }
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| gpu.finished(&sent))) {
+                Ok(true) => done += 1,
+                Ok(false) => {}
+                Err(_) => new += 1,
+            }
+        }
+        std::panic::set_hook(hook);
+        stop.store(true, Ordering::Relaxed);
+        sender.join().unwrap();
+        println!(
+            "of 20000 looks at work sent while another thread sent more, a wait of no time panicked {old} times, a look \
+             at whether it is done {new} times (done at {done})"
+        );
+        assert_eq!(new, 0, "a look at whether work sent is done panicked");
+        let sent = gpu.sent();
+        super::poll(&gpu.device, wgpu::PollType::wait_indefinitely()).unwrap();
+        assert!(gpu.finished(&sent), "not done once all the work is");
+        assert!(!gpu.is_lost());
     }
 
     /// Where Vulkan's driver crashes, OpenGL ES with some of the canvases' pipelines failing is
@@ -1057,6 +1320,24 @@ mod tests {
         }
         assert!(!weak_gpu("NVIDIA GeForce RTX 5060 Laptop GPU", DiscreteGpu));
         assert!(weak_gpu("Microsoft Basic Render Driver", Cpu));
+    }
+
+    /// An old or entry-level graphics card drawn with (nothing better beside it, or picked in the
+    /// settings) is a weak GPU too: the frosted glass is blurred from a smaller picture there.
+    /// Others aren't, and an integrated GPU is told by its name alone.
+    #[test]
+    fn an_entry_level_card_is_a_weak_gpu() {
+        use wgpu::DeviceType::{DiscreteGpu, IntegratedGpu};
+        let gpu = |name: &str, device_type| wgpu::AdapterInfo {
+            name: name.to_owned(),
+            ..wgpu::AdapterInfo::new(device_type, wgpu::Backend::Vulkan)
+        };
+        assert!(super::weak(&gpu("GeForce GT 710", DiscreteGpu)));
+        assert!(super::weak(&gpu("AMD Radeon R7 240", DiscreteGpu)));
+        assert!(!super::weak(&gpu("NVIDIA GeForce GTX 1650", DiscreteGpu)));
+        assert!(!super::weak(&gpu("NVIDIA GeForce RTX 5060 Laptop GPU", DiscreteGpu)));
+        assert!(!super::weak(&gpu("Intel(R) UHD Graphics 630", IntegratedGpu)));
+        assert!(super::weak(&gpu("Mali-T830 MP1", IntegratedGpu)));
     }
 
     #[test]

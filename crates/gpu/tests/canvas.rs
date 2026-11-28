@@ -161,13 +161,13 @@ fn a_whole_layer_kept_in_a_step_let_go_undoes_as_it_should() {
 /// Both layers' pixels after each step.
 type States = Vec<(Vec<u8>, Vec<u8>)>;
 
-/// Nine steps over two layers on a canvas of a device of little memory, its newest two steps kept
-/// on the GPU: strokes and a whole layer cleared (read back in several bands as it is packed). The
-/// layers after each step.
-fn steps_to_pack(gpu: &Gpu) -> (Document, Canvas, States) {
+/// Nine steps over two layers on a canvas of a device whose layers' textures are given `budget`
+/// bytes, its newest two steps kept on the GPU: strokes and a whole layer cleared (read back in
+/// several bands as it is packed). The layers after each step.
+fn steps_to_pack(gpu: &Gpu, budget: u64) -> (Document, Canvas, States) {
     let mut doc = Document::new(1100, 1000);
     let mut canvas = Canvas::new(gpu, &doc).unwrap();
-    canvas.set_resident_budget(1 << 30);
+    canvas.set_resident_budget(budget);
     canvas.keep_recent_history(Some(0));
     let first = doc.current();
     let second = doc.add_layer();
@@ -212,7 +212,7 @@ fn undo_and_redo_through(gpu: &Gpu, doc: &mut Document, canvas: &mut Canvas, sta
 fn older_steps_kept_compressed_off_the_gpu_undo_and_redo_as_they_were() {
     let Some(gpu) = gpu() else { return };
     let _check = NoErrors(&gpu);
-    let (mut doc, mut canvas, states) = steps_to_pack(&gpu);
+    let (mut doc, mut canvas, states) = steps_to_pack(&gpu, 1 << 30);
     canvas.pack_history_now(&gpu);
     assert!(canvas.history_packed_bytes() > 0, "nothing packed");
     // the newest two left on the GPU, a stroke's region each: the whole layer cleared is packed
@@ -225,11 +225,40 @@ fn older_steps_kept_compressed_off_the_gpu_undo_and_redo_as_they_were() {
     undo_and_redo_through(&gpu, &mut doc, &mut canvas, &states);
 }
 
+/// A tablet of more memory (12 GB: its layers given 2.9 GB) keeps the older steps compressed off
+/// the GPU too, as one of little memory does, and they undo and redo as they were: kept on the GPU,
+/// a long session's history held 768 MB on such a tablet (one whose GPU shares its memory), which
+/// the system closed for memory as soon as it was put away. Without a budget (a computer's GPU of
+/// its own) they all stay on it.
+#[test]
+fn a_tablet_of_more_memory_keeps_older_steps_compressed_too() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (mut doc, mut canvas, states) = steps_to_pack(&gpu, 2900 << 20);
+    canvas.pack_history_now(&gpu);
+    let (_, mut computer, _) = steps_to_pack(&gpu, 0);
+    computer.pack_history_now(&gpu);
+    println!(
+        "the history on the GPU {} KB, {} KB packed; without a budget {} KB on the GPU, {} KB packed",
+        canvas.history_bytes() >> 10,
+        canvas.history_packed_bytes() >> 10,
+        computer.history_bytes() >> 10,
+        computer.history_packed_bytes() >> 10
+    );
+    // the newest two left on the GPU, a stroke's region each: the whole layer cleared is packed
+    let layer = 1100 * 1000 * 4;
+    assert!(canvas.history_packed_bytes() > 0, "nothing packed");
+    assert!(canvas.history_bytes() < layer / 4, "{} bytes still on the GPU", canvas.history_bytes());
+    undo_and_redo_through(&gpu, &mut doc, &mut canvas, &states);
+    assert_eq!(computer.history_packed_bytes(), 0, "packed without a budget");
+    assert!(computer.history_bytes() >= layer, "the layer cleared not kept on the GPU without a budget");
+}
+
 #[test]
 fn steps_undone_while_their_pixels_are_being_packed_come_back_as_they_were() {
     let Some(gpu) = gpu() else { return };
     let _check = NoErrors(&gpu);
-    let (mut doc, mut canvas, states) = steps_to_pack(&gpu);
+    let (mut doc, mut canvas, states) = steps_to_pack(&gpu, 1 << 30);
     // a lot being packed (started by the last render, as the app's would be), undone under it
     assert!(canvas.wants_render(), "no packing under way");
     undo_and_redo_through(&gpu, &mut doc, &mut canvas, &states);
@@ -1671,6 +1700,112 @@ fn a_narrow_blur_is_a_gaussian_of_every_pixel_either_side() {
         assert!(most <= 2, "sigma {sigma}: off by {most}");
         canvas.end_transform(false);
         canvas.render(&gpu, &mut doc, None);
+    }
+}
+
+/// The Gaussian blur painted on, worked out on the CPU along one row of a picture whose rows are
+/// all alike (each pass kept to 8 bits as the GPU keeps them): the row halved for each level as
+/// mip levels are, each level blurred by `3 + 2k` taps, read back between texels at the canvas's
+/// pixels, between two levels by `amount`, and the least mixed into the row as it was.
+fn pyramid_row(row: &[f32], amount: f32) -> Vec<f32> {
+    let w = row.len();
+    let levels = procraft_gpu::pyramid_levels(w as u32, 1) as usize;
+    let blur = |src: &[f32], k: usize| -> Vec<f32> {
+        let taps = (3 + 2 * k) as f32;
+        let (sigma, reach) = (taps / 3.0, taps as i32 - 1);
+        let weights: Vec<f32> = (-reach..=reach).map(|j| (-((j * j) as f32) / (2.0 * sigma * sigma)).exp()).collect();
+        let total: f32 = weights.iter().sum();
+        let n = src.len() as i32;
+        (0..n)
+            .map(|x| {
+                let sum: f32 =
+                    (-reach..=reach).zip(&weights).map(|(j, wt)| src[(x + j).clamp(0, n - 1) as usize] * wt).sum();
+                (sum / total).round()
+            })
+            .collect()
+    };
+    let mut unblurred = row.to_vec();
+    let mut pyramid = Vec::new();
+    for k in 0..levels {
+        if k > 0 {
+            let lw = (w >> k).max(1);
+            unblurred = (0..lw)
+                .map(|i| ((unblurred[2 * i] + unblurred[(2 * i + 1).min(unblurred.len() - 1)]) / 2.0).round())
+                .collect();
+        }
+        pyramid.push(blur(&unblurred, k));
+    }
+    let read = |level: &[f32], x: usize| -> f32 {
+        let p = (x as f32 + 0.5) / w as f32 * level.len() as f32 - 0.5;
+        let i = p.floor();
+        let f = p - i;
+        let at = |j: f32| level[(j.max(0.0) as usize).min(level.len() - 1)];
+        at(i) * (1.0 - f) + at(i + 1.0) * f
+    };
+    let up = (levels as f32 + 1.0) * amount;
+    let level = (up - 1.0).max(0.0);
+    let low = level.floor().min(levels as f32 - 1.0) as usize;
+    let high = (low + 1).min(levels - 1);
+    let between = (level - level.floor()).clamp(0.0, 1.0);
+    (0..w)
+        .map(|x| {
+            let blurred = read(&pyramid[low], x) * (1.0 - between) + read(&pyramid[high], x) * between;
+            (row[x] + (blurred - row[x]) * up.min(1.0)).round()
+        })
+        .collect()
+}
+
+/// The standard deviation of the drops along `row` (an edge blurred: its blur's own spread).
+fn spread(row: &[f32]) -> f32 {
+    let drops: Vec<f32> = row.windows(2).map(|w| w[0] - w[1]).collect();
+    let total: f32 = drops.iter().sum();
+    let mean = drops.iter().enumerate().map(|(i, d)| i as f32 * d).sum::<f32>() / total;
+    (drops.iter().enumerate().map(|(i, d)| (i as f32 - mean).powi(2) * d).sum::<f32>() / total).sqrt()
+}
+
+/// Painted on, the Gaussian blur reads each pixel from a pyramid of six ever wider blurs by its
+/// amount: as worked out on the CPU, within a few levels of 8 bits; nothing at none, and at its
+/// most only a quarter as wide as the plain blur at that amount was (the 60% it starts at: a
+/// ninth).
+#[test]
+fn a_gaussian_blur_painted_on_reads_its_pyramid_as_worked_out() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    assert_eq!([1, 2, 3, 32, 33, 64, 1024, 4096].map(|s| procraft_gpu::pyramid_levels(s, 1)), [1, 1, 2, 5, 6, 6, 6, 6]);
+    let (w, h) = (1024u32, 4u32);
+    let mut doc = Document::new(w, h);
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    let layer = doc.current();
+    // a hard edge: opaque black on the left half, clear on the right
+    let picture: Vec<u8> = (0..w * h).flat_map(|i| if i % w < w / 2 { [0, 0, 0, 255] } else { [0; 4] }).collect();
+    canvas.upload_layer(&gpu, layer, &picture).unwrap();
+    let row: Vec<f32> = (0..w).map(|x| if x < w / 2 { 255.0 } else { 0.0 }).collect();
+    println!("amount  spread (pyramid)  worked out  plain blur's sigma before");
+    for amount in [0.0, 0.05, 0.1, 0.2, 0.35, 0.5, 0.6, 0.8, 1.0] {
+        canvas.begin_transform(layer);
+        canvas.set_filter(procraft_gpu::Filter::PyramidBlur { amount });
+        canvas.render(&gpu, &mut doc, None);
+        let px = canvas.read_layer(&gpu, layer).unwrap();
+        canvas.end_transform(false);
+        canvas.render(&gpu, &mut doc, None);
+        let expected = pyramid_row(&row, amount);
+        for y in 0..h {
+            let got: Vec<f32> = (0..w).map(|x| f32::from(pixel(&px, w, x, y)[3])).collect();
+            let most = got.iter().zip(&expected).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+            assert!(most <= 3.0, "{amount}: row {y} off by {most}");
+        }
+        let got: Vec<f32> = (0..w).map(|x| f32::from(pixel(&px, w, x, 0)[3])).collect();
+        let before = procraft_engine::selection::feather_radius(amount);
+        println!("{amount:6.2} {:14.2} {:11.2} {before:12.2}", spread(&got), spread(&expected));
+        if amount == 0.0 {
+            assert!(got == row, "nothing at none");
+        }
+        if amount == 1.0 {
+            assert!(spread(&got) * 4.0 < before, "{} against {before}", spread(&got));
+        }
+        if amount == 0.6 {
+            assert!(spread(&got) * 9.0 < before, "{} against {before}", spread(&got));
+        }
     }
 }
 
@@ -5937,6 +6072,49 @@ fn a_fill_stroke_lays_its_region_in_place_of_its_stamps_as_its_paint_one_step_an
     assert_eq!(pixel(&layer, 256, 190, 8)[3], 255);
 }
 
+/// #411: a growing fill's region laid again only in parts (rectangles, odd sizes, several at once,
+/// one over the canvas's edge left out) keeps the rest as it was laid, and is laid as one step as
+/// if laid whole; the same where copies are placed as Direct3D 12 places them.
+#[test]
+fn a_fill_stroke_s_parts_lay_again_only_where_they_are_the_rest_kept() {
+    use procraft_engine::geom::IRect;
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    for placed in [false, true] {
+        gpu.emulate_placed_copies(placed);
+        let mut doc = Document::new(96, 80);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.begin_stroke(doc.current(), style(StrokeTool::Paint, 1.0).as_fill());
+        // all of it half covered, then shown a frame
+        canvas.fill_stroke(IRect::new(0, 0, 96, 80), vec![128; 96 * 80]);
+        canvas.render(&gpu, &mut doc, None);
+        // then three parts covered fully, one a single pixel, one nothing; one off the canvas
+        let parts = vec![
+            (IRect::new(5, 3, 42, 33), vec![255; 37 * 30]),
+            (IRect::new(60, 50, 61, 51), vec![255; 1]),
+            (IRect::new(70, 10, 93, 41), vec![0; 23 * 31]),
+            (IRect::new(90, 70, 100, 80), vec![255; 100]),
+        ];
+        canvas.fill_stroke_parts(parts);
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        let layer = canvas.read_layer(&gpu, doc.current()).unwrap();
+        let a = |x: u32, y: u32| pixel(&layer, 96, x, y)[3];
+        assert_eq!((a(5, 3), a(41, 32), a(20, 20)), (255, 255, 255), "placed {placed}");
+        assert_eq!(a(60, 50), 255, "placed {placed}");
+        assert_eq!((a(70, 10), a(92, 40)), (0, 0), "placed {placed}");
+        // the rest as laid before, and the part off the canvas left out
+        for (x, y) in [(4, 3), (42, 20), (20, 33), (61, 50), (60, 51), (69, 10), (93, 40), (95, 79), (0, 79)] {
+            assert!(a(x, y).abs_diff(128) <= 1, "({x}, {y}) {} placed {placed}", a(x, y));
+        }
+        // one step takes it all back
+        canvas.undo();
+        canvas.render(&gpu, &mut doc, None);
+        assert!(canvas.read_layer(&gpu, doc.current()).unwrap().iter().all(|&v| v == 0), "placed {placed}");
+        gpu.emulate_placed_copies(false);
+    }
+}
+
 /// A target `size` pixels of `format` to show a canvas on, as the window does, and its view.
 fn window_target(gpu: &Gpu, size: (u32, u32), format: wgpu::TextureFormat) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
@@ -6608,4 +6786,161 @@ fn a_device_of_little_memory_lays_dual_brushes_without_carrying_them() {
     assert_eq!((low_check, low_full), (None, 0));
     assert!(low_more + 8 * layer <= carried_more, "little memory: +{low_more} bytes, carried +{carried_more}");
     assert_eq!(apart(&low, &plain), 0, "little memory lays the stroke as the plain pass does");
+}
+
+/// A ring of `count` round stamps of `size` about (128, 128), `r` out.
+fn ring(r: f32, size: f32, count: usize) -> Vec<Stamp> {
+    (0..count)
+        .map(|i| {
+            let a = i as f32 / count as f32 * std::f32::consts::TAU;
+            let mut s = Stamp::round(Vec2::new(128.0 + r * a.cos(), 128.0 + r * a.sin()), size, 0.8);
+            s.time_ms = f64::from(i as u32) * 4.0;
+            s
+        })
+        .collect()
+}
+
+/// Wet paint laid in place, and a second, for a dual brush's stroke.
+fn wet_dual() -> (StrokeStyle, procraft_gpu::SecondStroke) {
+    let first = StrokeStyle {
+        hardness: 0.3,
+        wet_pull: Some(0.5),
+        dilution: 0.3,
+        ..StrokeStyle::new(StrokeTool::Paint, [0.8, 0.1, 0.1], 1.0)
+    };
+    let second = procraft_gpu::SecondStroke {
+        style: StrokeStyle::new(StrokeTool::Paint, [0.0, 0.0, 1.0], 1.0),
+        mode: 0,
+        threshold: -1.0,
+        classic: false,
+    };
+    (first, second)
+}
+
+/// A dual brush's stroke drawn again from scratch over and over before a render (a shape dragged
+/// about faster than the frames lay it) keeps only its last drawing of each part queued: the second
+/// is drawn again first, so the first's stamps never came last and neither was let go, and every
+/// move was laid whole one after another long after the drag (28 moves of a big brush's shape a
+/// minute and a half on a tablet). Laid, it comes out as its last drawing alone does.
+#[test]
+fn a_dual_stroke_drawn_again_from_scratch_over_and_over_queues_only_its_last() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let (first, second) = wet_dual();
+    let laid = |moves: &[f32]| -> (Vec<u8>, (usize, usize)) {
+        let mut doc = Document::new(256, 256);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.begin_dual_stroke(doc.current(), first, second);
+        canvas.add_second_stamps(&ring(40.0, 20.0, 40));
+        canvas.add_stamps(&ring(40.0, 8.0, 40));
+        canvas.render(&gpu, &mut doc, None);
+        for &r in moves {
+            canvas.replace_second_stamps(&ring(r, 20.0, 40));
+            canvas.replace_stamps(&ring(r, 8.0, 40));
+        }
+        let queued = canvas.queued_stamps();
+        canvas.end_stroke();
+        canvas.render(&gpu, &mut doc, None);
+        (canvas.read_layer(&gpu, doc.current()).unwrap(), queued)
+    };
+    let moves: Vec<f32> = (0..30).map(|k| 42.0 + k as f32 * 2.0).collect();
+    let (dragged, queued) = laid(&moves);
+    println!("30 moves queued {queued:?} stamps (first, second)");
+    assert_eq!(queued, (40, 40), "every move queued");
+    let (last, _) = laid(&moves[moves.len() - 1..]);
+    let differ = dragged.iter().zip(&last).filter(|(a, b)| a != b).count();
+    assert_eq!(differ, 0, "laid otherwise than its last drawing alone");
+}
+
+/// A render that shows the canvas, laying a long stroke a share at a time (a slow GPU's, set),
+/// uploads only about that share of its stamps: it took them all (up to a million), uploading and
+/// sizing for all of them each frame and putting them back after, however little it laid, a big
+/// shape's queued moves keeping a tablet's frames at a minute's work. However short a while it is
+/// given to record them in, a render lays some, and the stroke comes out as laid at once.
+#[test]
+fn a_render_that_shows_the_canvas_takes_only_its_share_of_a_long_stroke() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let size = (512, 512);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let (_screen, view) = window_target(&gpu, size, format);
+    let target = || shown_on(&view, format, size, procraft_engine::geom::Affine::IDENTITY, None);
+    // a long stroke of big stamps kept strongest (cut anywhere, it comes out the same)
+    let stamps: Vec<Stamp> = (0..20_000)
+        .map(|i| {
+            let t = i as f32 * 0.01;
+            dot(Vec2::new(256.0 + 200.0 * t.cos(), 256.0 + 200.0 * (1.3 * t).sin()), 30.0)
+        })
+        .collect();
+    // (`slow`: a slow GPU's pace, set; `record`: how long a render records stamps for)
+    let laid = |slow: bool, record: std::time::Duration| -> (Vec<u8>, u64, usize) {
+        let mut doc = Document::new(size.0, size.1);
+        let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+        canvas.set_dry_paced(slow, slow.then_some(1.0));
+        canvas.set_record_most(record);
+        canvas.render(&gpu, &mut doc, Some(target()));
+        let mut paint = style(StrokeTool::Paint, 1.0);
+        paint.rendering = Rendering::Strongest;
+        canvas.begin_stroke(doc.current(), paint);
+        canvas.add_stamps(&stamps);
+        canvas.render(&gpu, &mut doc, Some(target()));
+        let (_, uploaded) = canvas.paced_spent();
+        let mut renders = 1;
+        while canvas.catching_up() && renders < 1000 {
+            canvas.render(&gpu, &mut doc, Some(target()));
+            renders += 1;
+        }
+        canvas.end_stroke();
+        canvas.render_finished(&gpu, &mut doc);
+        (canvas.read_layer(&gpu, doc.current()).unwrap(), uploaded, renders)
+    };
+    let long = std::time::Duration::from_secs(3600);
+    let (at_once, all, _) = laid(false, long);
+    let (slow, uploaded, renders) = laid(true, long);
+    let (quick, _, quick_renders) = laid(false, std::time::Duration::ZERO);
+    println!(
+        "20000 stamps: {all} uploaded at once; paced, {uploaded} uploaded by the first render, laid in {renders}; \
+         recorded for no while, laid in {quick_renders}"
+    );
+    assert_eq!(all, 20_000);
+    assert!(renders > 2, "paced, laid in {renders} renders");
+    assert!(uploaded * 4 <= all, "a paced render uploaded {uploaded} of {all} stamps");
+    assert!(quick_renders > 1, "recorded for no while, laid in {quick_renders} renders");
+    assert_eq!(at_once, slow, "laid a share at a time otherwise than at once");
+    assert_eq!(at_once, quick, "laid a lot a render otherwise than at once");
+}
+
+/// A dual brush's stroke laid again from scratch is shown as it was until all of it is laid: also
+/// while the part laid again first is laid and the other hasn't begun (its second laid again, its
+/// paint still as it was), which showed the one with the other as it was, a frame at a time.
+#[test]
+fn a_dual_stroke_laid_again_holds_its_picture_until_both_parts_are_laid() {
+    let Some(gpu) = gpu() else { return };
+    let _check = NoErrors(&gpu);
+    let size = (256, 256);
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let (_screen, view) = window_target(&gpu, size, format);
+    let target = || shown_on(&view, format, size, procraft_engine::geom::Affine::IDENTITY, None);
+    let (first, second) = wet_dual();
+    let mut doc = Document::new(size.0, size.1);
+    let mut canvas = Canvas::new(&gpu, &doc).unwrap();
+    canvas.begin_dual_stroke(doc.current(), first, second);
+    canvas.add_second_stamps(&ring(40.0, 20.0, 40));
+    canvas.add_stamps(&ring(40.0, 8.0, 40));
+    canvas.render(&gpu, &mut doc, Some(target()));
+    let before = canvas.read_composite(&gpu).unwrap();
+    // each render records the stamps of one lot alone
+    canvas.set_record_most(std::time::Duration::ZERO);
+    canvas.replace_second_stamps(&ring(80.0, 20.0, 40));
+    canvas.replace_stamps(&ring(80.0, 8.0, 40));
+    canvas.render(&gpu, &mut doc, Some(target()));
+    assert!(canvas.relaying(), "the picture let go with the second laid again alone");
+    assert_eq!(canvas.read_composite(&gpu).unwrap(), before, "shown half laid again");
+    let mut renders = 1;
+    while (canvas.relaying() || canvas.catching_up()) && renders < 100 {
+        canvas.render(&gpu, &mut doc, Some(target()));
+        renders += 1;
+    }
+    assert!(renders < 100);
+    assert_ne!(canvas.read_composite(&gpu).unwrap(), before, "never shown laid again");
 }

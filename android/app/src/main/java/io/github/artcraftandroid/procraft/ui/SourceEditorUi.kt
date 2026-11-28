@@ -1,6 +1,5 @@
 package io.github.artcraftandroid.procraft.ui
 
-import android.content.res.Configuration
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
@@ -49,7 +48,6 @@ import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -120,8 +118,8 @@ fun SourceEditor(vm: CanvasViewModel) {
     val file = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> uri?.let { scope.launch { take(vm.decodeSource(it)) } } }
     val photo = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri -> uri?.let { scope.launch { take(vm.decodeSource(it)) } } }
     BackHandler { vm.sourceEditing = null }
-    // landscape: a page sliding over the studio from the right, its pages' card still showing
-    val landscape = LocalConfiguration.current.orientation == Configuration.ORIENTATION_LANDSCAPE
+    // laid side by side: a page sliding over the studio from the right, its pages' card still showing
+    val landscape = LocalStudioSideBySide.current
     Box(Modifier.fillMaxSize().pointerInput(Unit) { awaitEachGesture { awaitFirstDown().consume() } }) {
         Box(
             Modifier.fillMaxSize()
@@ -384,6 +382,8 @@ private fun SourceLibrary(vm: CanvasViewModel, grain: Boolean, onPick: (Int) -> 
                 horizontalArrangement = Arrangement.spacedBy(53.dp),
                 verticalArrangement = Arrangement.spacedBy(18.dp),
                 modifier = Modifier.fillMaxSize(),
+                flingBehavior = rememberScrollFling(),
+                overscrollEffect = rememberScrollEdges(),
             ) {
                 items(shown.size) { k ->
                     val (i, item) = shown[k]

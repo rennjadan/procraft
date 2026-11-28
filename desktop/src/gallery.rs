@@ -5,14 +5,13 @@
 //! share, duplicate or delete. The artworks are the core's store (gallery.rs), kept in the app's folder; the presets
 //! are the core's too, kept as the Android app keeps them.
 
+use crate::scroll::ScrollArea;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::text::{LayoutJob, TextFormat, TextWrapping};
-use egui::{
-    Align2, Color32, Id, Order, Pos2, Rect, ScrollArea, Sense, Stroke, TextureHandle, Ui, UiBuilder, Vec2, pos2, vec2,
-};
+use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, UiBuilder, Vec2, pos2, vec2};
 use procraft_core::{
     ArtworkStore, CanvasPreset, DragRest, GalleryAction, GalleryArtwork, GalleryEntry, GalleryHeaderFit, GalleryPick,
     P3, gallery_columns, gallery_header_fit, gallery_pick, preset_label, presets_from_json, profile_chip,
@@ -1480,11 +1479,13 @@ impl Gallery {
         // and the scroll bar too
         let lifted = self.lifted.is_some() || self.spreading.is_some();
         let driven = self.glide.frame(ui, rect, lifted);
-        let mut area =
-            ScrollArea::vertical().id_salt("gallery grid").scroll_source(egui::containers::scroll_area::ScrollSource {
+        // (egui's own area: the drag, the flick and the edges' scrolling are the glide's here)
+        let mut area = egui::ScrollArea::vertical().id_salt("gallery grid").scroll_source(
+            egui::containers::scroll_area::ScrollSource {
                 drag: egui::containers::scroll_area::DragScroll::Never,
                 ..Default::default()
-            });
+            },
+        );
         if let Some(y) = driven {
             area = area.vertical_scroll_offset(y);
         }
@@ -2506,7 +2507,7 @@ impl Gallery {
             let presets = self.presets.clone();
             ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
                 ui.set_clip_rect(list);
-                ScrollArea::vertical().id_salt("presets").show(ui, |ui| {
+                ScrollArea::vertical().id_salt("presets").scroll_child_drags(true).show(ui, |ui| {
                     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                     for (i, p) in presets.iter().enumerate() {
                         let (line, response) =

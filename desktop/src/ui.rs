@@ -288,6 +288,11 @@ impl Default for Interface {
 }
 
 impl Interface {
+    /// The GPU picked to draw with in the settings, if one was (see `Prefs::gpu`).
+    pub fn gpu_preference(&self) -> Option<(u32, u32)> {
+        self.prefs.gpu
+    }
+
     /// The interface as it starts, with `prefs` (the ones kept, as the app runs).
     fn with_prefs(prefs: crate::prefs::Prefs) -> Interface {
         Interface {
@@ -2918,7 +2923,7 @@ impl Interface {
         }
         self.open = if self.open == Some(popover) { None } else { Some(popover) };
         if self.open == Some(Popover::Brushes) {
-            self.library.opens();
+            self.library.opens(session);
         }
     }
 

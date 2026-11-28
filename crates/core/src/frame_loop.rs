@@ -140,9 +140,12 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
                 // nothing is drawn while the app is away, and a device lost draws nothing again:
                 // shown, it is handed back to be made anew; away, there is only the app's return or
                 // the window's stop to wait for
-                // (pen input waiting for the canvas asks for one; none while frames are held, the
-                // canvas being redrawn a stroke at a time: its end asks for one)
-                let wanted = |st: &crate::State| !st.holding_frames && (st.needs_frame || shared.input_waiting());
+                // (pen input waiting for the canvas asks for one, as do frosted panels told while
+                // it was held; none while frames are held, the canvas being redrawn a stroke at a
+                // time: its end asks for one)
+                let wanted = |st: &crate::State| {
+                    !st.holding_frames && (st.needs_frame || shared.input_waiting() || shared.glass_waiting())
+                };
                 let lost = |st: &crate::State| st.gpu.as_ref().is_some_and(Gpu::is_lost);
                 while !st.stop && (st.hidden || !wanted(&st) || lost(&st)) {
                     if !st.hidden && lost(&st) {
@@ -282,8 +285,10 @@ pub(crate) fn draw_loop<S: Screen>(shared: &Shared, screen: &mut S, mut presente
                 st.reconfigure = true;
                 continue;
             }
-            // the pen input that came while the canvas was held goes in this frame
+            // the pen input that came while the canvas was held goes in this frame, as do the
+            // frosted panels told meanwhile
             shared.take_queued_input(st);
+            shared.take_glass(st);
             st.draw_frame(&view, format, size, profile, started);
             shared.lands_on.note(st);
             let now = Instant::now();

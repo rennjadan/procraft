@@ -1,9 +1,10 @@
 """Draws ProCraft's own interface icons from plain geometry (docs/icons/STYLE_GUIDE.md), takes in the
-ones contributors drew (assets/icons/contributed/), and puts them in place: an SVG master per icon
-(assets/icons/procraft/<name>.svg, a 24-unit grid), and its path data, scaled into its slot
-(assets/icons/slots.tsv), in Icons.kt. The plugins' own icons (PLUGIN_ICONS) go the same way into
-their folders: a master in plugins/<plugin>/icons/<key>.svg, and its path data, on the grid, into the
-manifest's menu choice of that key.
+ones contributors drew (assets/icons/contributed/) and the few taken whole from an open icon set
+(TAKEN_ICONS: Undo and Redo, from Material Symbols, in assets/icons/material-symbols/), and puts
+them in place: an SVG master per icon (assets/icons/procraft/<name>.svg, a 24-unit grid), and its
+path data, scaled into its slot (assets/icons/slots.tsv), in Icons.kt. The plugins' own icons
+(PLUGIN_ICONS) go the same way into their folders: a master in plugins/<plugin>/icons/<key>.svg, and
+its path data, on the grid, into the manifest's menu choice of that key.
 Needs shapely. Run from anywhere:
 
     python tools/icons/draw_icons.py
@@ -61,17 +62,19 @@ def along_diagonal(shape, tip):
     return translate(rotate(shape, -45, origin=(0, 0)), tip[0], tip[1])
 
 
-SVG_TOKEN = re.compile(r'[MmLlHhVvCcSsZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
+SVG_TOKEN = re.compile(r'[MmLlHhVvCcSsQqTtZz]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?')
 
 
 def path_rings(d):
-    """SVG path data (M, L, H, V, C, S and Z, absolute or relative) as closed rings, curves flattened."""
+    """SVG path data (M, L, H, V, C, S, Q, T and Z, absolute or relative) as closed rings, curves
+    flattened."""
     tokens = SVG_TOKEN.findall(d)
-    if re.search(r'[QqTtAa]', d):
-        raise SystemExit(f'path data with quadratic curves or arcs: {d[:40]}')
+    if re.search(r'[Aa]', d):
+        raise SystemExit(f'path data with arcs: {d[:40]}')
     rings, ring, cmd, i = [], None, None, 0
     x = y = 0.0
-    ctrl = None
+    # the last cubic's and the last quadratic's second control point, which S and T mirror
+    ctrl = qctrl = None
     while i < len(tokens):
         if tokens[i].isalpha():
             cmd = tokens[i]
@@ -80,9 +83,9 @@ def path_rings(d):
                 if ring:
                     rings.append(ring)
                     x, y = ring[0]
-                ring, ctrl = None, None
+                ring, ctrl, qctrl = None, None, None
                 continue
-        nums = {'M': 2, 'L': 2, 'H': 1, 'V': 1, 'C': 6, 'S': 4}[cmd.upper()]
+        nums = {'M': 2, 'L': 2, 'H': 1, 'V': 1, 'C': 6, 'S': 4, 'Q': 4, 'T': 2}[cmd.upper()]
         v = [float(t) for t in tokens[i:i + nums]]
         i += nums
         rel = cmd.islower()
@@ -92,7 +95,7 @@ def path_rings(d):
             if ring:
                 rings.append(ring)
             x, y = v[0] + ox, v[1] + oy
-            ring, ctrl = [(x, y)], None
+            ring, ctrl, qctrl = [(x, y)], None, None
             cmd = 'l' if rel else 'L'
             continue
         if c in 'LHV':
@@ -103,8 +106,22 @@ def path_rings(d):
             else:
                 y = v[0] + oy
             ring.append((x, y))
-            ctrl = None
+            ctrl = qctrl = None
             continue
+        if c in 'QT':
+            if c == 'Q':
+                q, p3 = (v[0] + ox, v[1] + oy), (v[2] + ox, v[3] + oy)
+            else:
+                q = (2 * x - qctrl[0], 2 * y - qctrl[1]) if qctrl else (x, y)
+                p3 = (v[0] + ox, v[1] + oy)
+            for k in range(1, 17):
+                t = k / 16
+                u = 1 - t
+                ring.append((u * u * x + 2 * u * t * q[0] + t * t * p3[0], u * u * y + 2 * u * t * q[1] + t * t * p3[1]))
+            ctrl, qctrl = None, q
+            x, y = p3
+            continue
+        qctrl = None
         if c == 'C':
             p1, p2, p3 = (v[0] + ox, v[1] + oy), (v[2] + ox, v[3] + oy), (v[4] + ox, v[5] + oy)
         else:
@@ -123,8 +140,11 @@ def path_rings(d):
 
 
 def svg_parts(path):
-    """A drawing made in an editor: each of its paths, polygons and rectangles as a filled shape."""
+    """A drawing made in an editor: each of its paths, polygons and rectangles as a filled shape, its
+    viewBox (if not 0 0 24 24) mapped onto the 24 grid."""
     text = open(path, encoding='utf-8').read()
+    view = re.search(r'<svg\b[^>]*\bviewBox="([^"]*)"', text)
+    vx, vy, vw, vh = (float(t) for t in view.group(1).replace(',', ' ').split()) if view else (0.0, 0.0, 24.0, 24.0)
     parts = []
     for tag, attrs in re.findall(r'<(path|polygon|rect)\b([^>]*)>', text):
         a = dict(re.findall(r'([\w-]+)="([^"]*)"', attrs))
@@ -137,6 +157,8 @@ def svg_parts(path):
             x0, y0, w, h = (float(a.get(k, 0)) for k in ('x', 'y', 'width', 'height'))
             r = float(a.get('rx', a.get('ry', 0)))
             rings = [list(soft(box(x0, y0, x0 + w, y0 + h), r).exterior.coords)]
+        if (vx, vy, vw, vh) != (0.0, 0.0, 24.0, 24.0):
+            rings = [[((x - vx) * 24 / vw, (y - vy) * 24 / vh) for x, y in ring] for ring in rings]
         # each ring cuts what it lies over (even-odd), which is the same as non-zero for drawings
         # whose holes run the other way round
         shape = Polygon()
@@ -207,6 +229,20 @@ ADJUSTED = {'transform': (lork_arrow, 'its head shortened and its tail drawn out
             'erase': (lork_eraser_whole, 'its lower end drawn whole'),
             'layers': (lork_layers, 'its back sheet set further back')}
 
+# Icons taken whole from an open icon set: its files as its makers give them, on their own grid
+# (assets/icons/<set>/<file>.svg, the set's licence and SOURCE.md beside them), put on the 24 grid
+# and placed in their slots as drawn, nothing widened or rounded. Each set: how its masters' notes
+# credit it, and its licence.
+ICON_SETS = {'material-symbols': ("Google's Material Symbols (Outlined, fill 0, weight 400, grade 0, optical size 24)",
+                                  'Apache-2.0')}
+TAKEN_ICONS = {'undo': ('material-symbols', 'undo'), 'redo': ('material-symbols', 'redo'),
+               'pieundo': ('material-symbols', 'undo')}
+
+
+def taken(icon_set, name):
+    """An icon from an open set (assets/icons/<icon_set>/<name>.svg), as given, on the 24 grid."""
+    return unary_union(svg_parts(os.path.join(ROOT, 'assets', 'icons', icon_set, f'{name}.svg')))
+
 
 def wrench():
     """Actions: an open-end wrench with a hole in its handle."""
@@ -239,8 +275,8 @@ def layers():
     return unary_union([top, under])
 
 
-def turning_arrow(mirror):
-    """Undo (or, mirrored, Redo): a curved arrow turning back."""
+def turning_arrow():
+    """Reset's arrow: a curved arrow turning back."""
     cx, cy, r = 13.0, 13.0, 6.4
     angles = [math.radians(-150 + 260 * i / 64) for i in range(65)]
     arc = LineString([(cx + r * math.cos(a), cy + r * math.sin(a)) for a in angles]).buffer(1.25, cap_style='flat')
@@ -251,11 +287,7 @@ def turning_arrow(mirror):
     normal = (math.cos(a), math.sin(a))
     tip = (sx + back[0] * 3.6, sy + back[1] * 3.6)
     head = soft(Polygon([tip, (sx + normal[0] * 3.6, sy + normal[1] * 3.6), (sx - normal[0] * 3.6, sy - normal[1] * 3.6)]), 0.45)
-    shape = unary_union([arc, head])
-    if mirror:
-        from shapely.affinity import scale
-        shape = scale(shape, -1, 1, origin=(12, 12))
-    return shape
+    return unary_union([arc, head])
 
 
 def ring(cx, cy, r, w):
@@ -508,7 +540,7 @@ def interpolation():
 
 def reset_transform():
     """Reset: a turning arrow back, round a dot."""
-    return unary_union([turning_arrow(False), Point(13.0, 13.0).buffer(1.6, quad_segs=12)])
+    return unary_union([turning_arrow(), Point(13.0, 13.0).buffer(1.6, quad_segs=12)])
 
 
 def colour_wheel():
@@ -1732,7 +1764,6 @@ BLENDS = {'multiply': overlap_dark, 'darken': darken, 'shade': sunset, 'color-bu
 SHRINK = {'blend-subtract': 0.75, 'blend-divide': 0.85}
 DRAWINGS = {
     'actions': wrench,
-    'undo': lambda: turning_arrow(False), 'redo': lambda: turning_arrow(True),
     'tabadd': plus, 'tabcanvas': canvas_tab, 'tabshare': share_tab, 'tabimport': import_tab, 'tabvideo': video_tab,
     'tabprefs': prefs_tab, 'tabhelp': help_tab,
     'automatic': wand, 'freehand': lasso, 'rectangleshape': rectangle_tool, 'ellipseshape': ellipse_tool,
@@ -1748,7 +1779,7 @@ DRAWINGS = {
     'adjustchromatic': fringed_lens, 'adjustliquify': spiral, 'adjustclone': stamp,
     'modedisc': colour_disc, 'modeclassic': classic_picker, 'modeharmony': harmony, 'modevalue': value_sliders,
     'modepalettes': palette, 'modelayer': one_sheet, 'modepencil': pencil, 'apply': check_in_disc, 'preview': eye,
-    'canceladjust': cross_in_disc, 'pieundo': lambda: turning_arrow(False), 'piereset': reset_transform,
+    'canceladjust': cross_in_disc, 'piereset': reset_transform,
     'adjustknob': knob,
     'studiostroke': dotted_path, 'studiostabilize': smoothed, 'studiotaper': spindle, 'studioshape': three_shapes,
     'studiograin': grain_tile, 'studiorendering': roller, 'studiowet': two_drops, 'studiocolor': colour_circles,
@@ -1782,6 +1813,8 @@ DRAWINGS = {
 }
 DRAWINGS.update({name: ADJUSTED[name][0] if name in ADJUSTED else (lambda who=who, name=name: contributed(who, name))
                  for name, who in CONTRIBUTED_ICONS.items()})
+DRAWINGS.update({name: lambda icon_set=icon_set, file=file: taken(icon_set, file)
+                 for name, (icon_set, file) in TAKEN_ICONS.items()})
 DRAWINGS.update({f'set-{k}': draw for k, draw in enumerate(SET_ICONS)})
 DRAWINGS.update({f'blend-{k}': draw for k, draw in BLENDS.items()})
 
@@ -1826,7 +1859,13 @@ def main():
     src = open(ICONS, encoding='utf-8', newline='').read()
     for name, draw in DRAWINGS.items():
         shape = draw().simplify(0.02)
-        if name in CONTRIBUTED_ICONS:
+        licence = 'MIT OR Apache-2.0'
+        if name in TAKEN_ICONS:
+            icon_set, file = TAKEN_ICONS[name]
+            title, licence = ICON_SETS[icon_set]
+            origin = (f'{title} "{file}", put on the 24 grid from assets/icons/{icon_set}/{file}.svg '
+                      'by tools/icons/draw_icons.py')
+        elif name in CONTRIBUTED_ICONS:
             who = CONTRIBUTED_ICONS[name]
             how = f'{ADJUSTED[name][1]}, ' if name in ADJUSTED else ''
             origin = (f'drawn by {CONTRIBUTORS[who]}, {how}placed from assets/icons/contributed/{who}/{name}.svg '
@@ -1835,7 +1874,7 @@ def main():
             origin = 'original, drawn by tools/icons/draw_icons.py'
         with open(os.path.join(MASTERS, f'{name}.svg'), 'w', encoding='utf-8', newline='\n') as f:
             f.write('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">\n'
-                    f'  <!-- ProCraft {name} icon: {origin}. MIT OR Apache-2.0. -->\n'
+                    f'  <!-- ProCraft {name} icon: {origin}. {licence}. -->\n'
                     f'  <path fill="currentColor" fill-rule="evenodd" d="{path_data(shape)}"/>\n</svg>\n')
         w, h, (x0, y0, x1, y1) = places[name]
         bx0, by0, bx1, by1 = shape.bounds

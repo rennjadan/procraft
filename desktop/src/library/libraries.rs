@@ -1,9 +1,10 @@
 //! The brush libraries in the library panel: the title's menu, every library's card and its
 //! menu, and a library with no sets yet.
 
+use crate::scroll::ScrollArea;
 use std::sync::Arc;
 
-use egui::{Align2, Color32, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{BrushLibraryInfo, CanvasSession};
 
 use super::{Deleting, Library, SET_CELL, one_line};

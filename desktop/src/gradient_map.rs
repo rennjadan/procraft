@@ -4,9 +4,10 @@
 //! on the bar adds a stop, a stop drags along it, a tap on one opens the compact colour picker
 //! over it, a hold offers Delete). The library is the core's (gradients.rs), kept between runs.
 
+use crate::scroll::ScrollArea;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, Id, Order, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{AdjustShown, CanvasSession, GradientInfo, Gradients};
 
 use crate::compact_colours::{CompactColours, Picked};

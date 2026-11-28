@@ -4,8 +4,9 @@
 //! palette under the pickers, the modes as icons under them. Plugins may show it smaller than the
 //! rest of the interface, or as Classic's picker alone.
 
+use crate::scroll::ScrollArea;
 use egui::emath::TSTransform;
-use egui::{Align2, Color32, LayerId, Order, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2};
+use egui::{Align2, Color32, LayerId, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, Vec2, pos2, vec2};
 use procraft_core::{CanvasSession, LayoutPiece};
 
 use super::{

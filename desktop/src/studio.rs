@@ -3,6 +3,7 @@
 //! pad, a canvas of its own painting with the brush as it is being edited. Cancel puts the brush
 //! back as it was; Done keeps the edits.
 
+use crate::scroll::ScrollArea;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -53,6 +54,22 @@ const DONE: u32 = 0xFF0190FF;
 const SETTINGS_WIDTH: f32 = 323.0;
 const PAD_HEIGHT: f32 = 510.0;
 const TABS_WIDTH: f32 = 81.0;
+/// A window wider than tall and wider than this (points) has the studio's pages, settings and pad
+/// side by side, as the reference lays it; else the pages are a rail beside the pad over the
+/// settings, as upright.
+const SIDE_BY_SIDE_PAST: f32 = 1024.0;
+
+/// Whether the studio in a window `width` × `height` (points) lays its pages, settings and pad side
+/// by side (see [`SIDE_BY_SIDE_PAST`]).
+fn side_by_side(width: f32, height: f32) -> bool {
+    width > height && width > SIDE_BY_SIDE_PAST
+}
+
+/// How tall the pad over the settings is in a window `height` tall (points), laid upright: as
+/// measured, but at most 45% of the window, so the settings under it always have room.
+fn upright_pad_height(height: f32) -> f32 {
+    PAD_HEIGHT.min(height * 0.45)
+}
 /// How far in from the track's ends a slider's knob stops.
 const KNOB_INSET: f32 = 5.0;
 /// The pad's colours to paint with (white the first time, as the pad is dark), and its own grey.
@@ -1069,7 +1086,7 @@ impl Studio {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
         let screen = ctx.content_rect();
-        let wide = screen.width() > screen.height();
+        let wide = side_by_side(screen.width(), screen.height());
         self.wide = wide;
         // a sphere showing the brush's materials on their page, or on every page with the 3D
         // preview on
@@ -1119,7 +1136,7 @@ impl Studio {
                 let rail = Rect::from_min_max(screen.min, pos2(screen.left() + TABS_WIDTH, screen.bottom()));
                 let pad = Rect::from_min_max(
                     pos2(rail.right(), screen.top()),
-                    pos2(screen.right(), screen.top() + PAD_HEIGHT),
+                    pos2(screen.right(), screen.top() + upright_pad_height(screen.height())),
                 );
                 let line =
                     Rect::from_min_max(pos2(rail.right(), pad.bottom()), pos2(screen.right(), pad.bottom() + 1.0));
@@ -1239,7 +1256,7 @@ impl Studio {
         }
         let column = Rect::from_min_max(pos2(area.left() + 20.0, area.top()), pos2(area.right() - 20.0, area.bottom()));
         ui.scope_builder(UiBuilder::new().max_rect(column), |ui| {
-            egui::ScrollArea::vertical()
+            ScrollArea::vertical()
                 .id_salt(("studio page", self.tab))
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
@@ -2689,7 +2706,7 @@ impl Studio {
             ui.painter().add(shadow.as_shape(rect, 13.0));
             ui.painter().rect_filled(rect, 13, argb(MODE_LIST_FILL));
             ui.scope_builder(UiBuilder::new().max_rect(rect), |ui| {
-                let mut area = egui::ScrollArea::vertical()
+                let mut area = ScrollArea::vertical()
                     .id_salt("blend list")
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden);
                 if fresh {
@@ -2858,6 +2875,23 @@ mod tests {
     }
 
     #[test]
+    fn the_pad_goes_beside_the_settings_only_in_a_window_wider_than_tall_and_past_1024() {
+        for (w, h) in [(1133.0, 744.0), (1200.0, 700.0), (1280.0, 800.0), (1366.0, 1024.0), (1025.0, 768.0)] {
+            assert!(side_by_side(w, h), "{w} x {h}");
+        }
+        // the reference's cut: 1024 across on its side is laid as upright, as is a narrower window
+        // on its side, and any window taller than wide
+        for (w, h) in
+            [(1024.0, 768.0), (1000.0, 600.0), (900.0, 500.0), (744.0, 1133.0), (1200.0, 1300.0), (1100.0, 1100.0)]
+        {
+            assert!(!side_by_side(w, h), "{w} x {h}");
+        }
+        // upright, the pad is as measured, but at most 45% of a short window
+        assert!((upright_pad_height(1400.0) - 510.0).abs() < 1e-3);
+        assert!((upright_pad_height(700.0) - 315.0).abs() < 1e-3);
+    }
+
+    #[test]
     fn a_page_scrolls_with_a_pen_dragged_up_it_as_a_touch_or_as_the_mouse_pointer() {
         let open = || {
             let mut open = Open {
@@ -2876,9 +2910,8 @@ mod tests {
             open
         };
         let heading = "Stroke color jitter";
-        // how far up a pen dragged 200 points up from the heading takes it, the interface told it
-        // is on a touch screen first if `told` (egui drags a list only once it has had a touch,
-        // from the frame after)
+        // How far a 200 point drag on the heading takes it, with or without a detected
+        // touch screen.
         let scrolled = |touches: bool, told: bool| {
             let mut open = open();
             if told {
@@ -2896,8 +2929,8 @@ mod tests {
         // the system's pen, which has touched before: its touches drag the page
         let by_touch = scrolled(true, true);
         assert!(by_touch > 150.0, "{by_touch}");
-        // a tablet's pen moving the mouse pointer: egui drags a list only on a touch screen
-        assert_eq!(scrolled(false, false), 0.0, "the mouse pointer alone");
+        let by_mouse = scrolled(false, false);
+        assert!(by_mouse > 150.0, "mouse drag only moved the page {by_mouse} points");
         let by_pointer = scrolled(false, true);
         assert!(by_pointer > 150.0, "{by_pointer}");
     }

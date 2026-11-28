@@ -326,6 +326,8 @@ fun LayersPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, 
             state = list,
             verticalArrangement = Arrangement.spacedBy(RowGap),
             contentPadding = PaddingValues(bottom = 12.dp),
+            flingBehavior = rememberScrollFling(),
+            overscrollEffect = rememberScrollEdges(),
         ) {
             // a closed group's layers are left out
             val shown = vm.layers.filter { !vm.hidden(it) }
@@ -1277,6 +1279,7 @@ private fun BlendEditor(vm: CanvasViewModel, l: LayerInfo, open: Boolean) {
                 contentPadding = PaddingValues(top = before, bottom = after),
                 flingBehavior = fling,
                 userScrollEnabled = !tapping,
+                overscrollEffect = rememberScrollEdges(),
             ) {
                 itemsIndexed(modes) { i, m ->
                     Box(

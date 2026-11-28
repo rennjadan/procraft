@@ -6,43 +6,11 @@
 //! Distances are points, the list at 0 with its first mode in the band and one row `row` further
 //! for each mode after; speeds are points a second, positive down the list.
 
-/// A list let go keeps this share of its speed every millisecond.
-const KEPT_PER_MS: f64 = 0.998;
-/// Pulled past an end, the list follows this share of the pull at first, less the farther it goes.
-const STRETCH_SHARE: f32 = 0.55;
-/// A list let go glides onto its row only if that slows it no less than this share of the usual
-/// and no more than [`QUICKEST_GLIDE`] times; else it springs there.
-const SLOWEST_GLIDE: f32 = 0.8;
-const QUICKEST_GLIDE: f32 = 2.5;
-/// How quickly a list too slow to glide springs onto its row (critically damped, a second).
-const LAND_RATE: f32 = 12.0;
-/// How quickly a list springs back from past an end (critically damped, a second).
-const BOUNCE_RATE: f32 = 14.0;
-/// Closer than this to where it stops (points) and slower than [`STILL`] (points a second), the
-/// list is there.
-const NEAR: f32 = 0.25;
-const STILL: f32 = 5.0;
+use crate::scroll::{ScrollMotion, scroll_motion, scroll_motion_at, stretch, unstretch};
+
 /// A tapped mode scrolls to the band over this long (seconds); meanwhile the list takes no
 /// touches and the modes it passes don't show on the layer.
 pub const BLEND_TAP_SECONDS: f32 = 0.3;
-
-/// How quickly a list let go slows: its speed falls by this much a second (exponentially).
-fn slowing() -> f32 {
-    (-1000.0 * KEPT_PER_MS.ln()) as f32
-}
-
-/// How a list let go moves on, worked out once by [`blend_coast`] and followed by
-/// [`blend_coast_at`].
-#[derive(Clone, Copy, Debug, PartialEq, uniffi::Enum)]
-pub enum BlendCoast {
-    /// From `from` going `speed`, slowing at `rate` a second straight onto the row at `to`.
-    Glide { from: f32, speed: f32, to: f32, rate: f32 },
-    /// From `from` going `speed`, springing onto `to` (critically damped at `rate`).
-    Spring { from: f32, speed: f32, to: f32, rate: f32 },
-    /// From `from` going `speed`, slowing as usual into the end at `edge`, reached after `seconds`
-    /// going `edge_speed`; past it, it springs back to it.
-    Bounce { from: f32, speed: f32, edge: f32, seconds: f32, edge_speed: f32 },
-}
 
 /// Where a moving list is: its `position` and `speed`, and whether it is `done` (at rest where it
 /// stops, `position` exactly that).
@@ -73,85 +41,30 @@ fn row_or_one(row: f32) -> f32 {
 /// straight onto that row in one motion (a release too slow to glide there springs there); let go
 /// past an end, it springs back to it; flicked into an end, it overshoots and springs back.
 #[uniffi::export]
-pub fn blend_coast(from: f32, speed: f32, row: f32, rows: u32) -> BlendCoast {
-    let (from, speed, row) = (finite(from), finite(speed), row_or_one(row));
-    let last = last(row, rows);
-    if from < 0.0 || from > last {
-        return BlendCoast::Spring { from, speed, to: from.clamp(0.0, last), rate: BOUNCE_RATE };
-    }
-    let k = slowing();
-    let stop = from + speed / k;
-    if stop < 0.0 || stop > last {
-        let edge = stop.clamp(0.0, last);
-        // the share of its speed left as it reaches the end (above 0: it would go past it)
-        let left = (1.0 - k * (edge - from) / speed).clamp(f32::MIN_POSITIVE, 1.0);
-        return BlendCoast::Bounce { from, speed, edge, seconds: -left.ln() / k, edge_speed: speed * left };
-    }
-    let to = ((stop / row).round() * row).clamp(0.0, last);
-    let rate = speed / (to - from);
-    if (to - from) * speed > 0.0 && (k * SLOWEST_GLIDE..=k * QUICKEST_GLIDE).contains(&rate) {
-        BlendCoast::Glide { from, speed, to, rate }
-    } else {
-        BlendCoast::Spring { from, speed, to, rate: LAND_RATE }
-    }
+pub fn blend_coast(from: f32, speed: f32, row: f32, rows: u32) -> ScrollMotion {
+    let row = row_or_one(row);
+    scroll_motion(from, speed, 0.0, last(row, rows), row)
 }
 
-/// Where the list moving as `coast` says is `seconds` after it was let go.
+/// Where the blend wheel is after the shared scroll motion has run for `seconds`.
 #[uniffi::export]
-pub fn blend_coast_at(coast: BlendCoast, seconds: f32) -> BlendStep {
-    let t = finite(seconds).max(0.0);
-    match coast {
-        BlendCoast::Glide { from, speed, to, rate } => {
-            let fade = (-rate * t).exp();
-            let left = (to - from) * fade;
-            if left.abs() < NEAR {
-                BlendStep { position: to, speed: 0.0, done: true }
-            } else {
-                BlendStep { position: to - left, speed: speed * fade, done: false }
-            }
-        }
-        BlendCoast::Spring { from, speed, to, rate } => spring(to, from - to, speed, rate, t),
-        BlendCoast::Bounce { from, speed, edge, seconds: reach, edge_speed } => {
-            if t < reach {
-                let k = slowing();
-                let fade = (-k * t).exp();
-                BlendStep { position: from + speed / k * (1.0 - fade), speed: speed * fade, done: false }
-            } else {
-                spring(edge, 0.0, edge_speed, BOUNCE_RATE, t - reach)
-            }
-        }
-    }
-}
-
-/// A critically damped spring onto `to`, `t` seconds after it was `off` from it going `speed`.
-fn spring(to: f32, off: f32, speed: f32, rate: f32, t: f32) -> BlendStep {
-    let b = speed + rate * off;
-    let fade = (-rate * t).exp();
-    let x = (off + b * t) * fade;
-    let v = (b - rate * (off + b * t)) * fade;
-    if x.abs() < NEAR && v.abs() < STILL {
-        BlendStep { position: to, speed: 0.0, done: true }
-    } else {
-        BlendStep { position: to + x, speed: v, done: false }
-    }
+pub fn blend_coast_at(coast: ScrollMotion, seconds: f32) -> BlendStep {
+    let sample = scroll_motion_at(coast, seconds);
+    BlendStep { position: sample.position, speed: sample.velocity, done: sample.done }
 }
 
 /// Pulled `past` points beyond an end, how far beyond it the list goes: about half the pull at
 /// first, less and less the farther it goes, with no hard stop (`height` the list's height).
 #[uniffi::export]
 pub fn blend_stretch(past: f32, height: f32) -> f32 {
-    let d = finite(height).max(1.0);
-    let x = finite(past);
-    (1.0 - 1.0 / (x.abs() * STRETCH_SHARE / d + 1.0)) * d * x.signum()
+    stretch(past, height)
 }
 
 /// How far beyond an end a pull is that takes the list `shown` points beyond it: what
 /// [`blend_stretch`] undoes.
 #[uniffi::export]
 pub fn blend_unstretch(shown: f32, height: f32) -> f32 {
-    let d = finite(height).max(1.0);
-    let f = finite(shown).abs().min(d * 0.999);
-    d / STRETCH_SHARE * (f / (d - f)) * shown.signum()
+    unstretch(shown, height)
 }
 
 /// Where the list of `rows` rows, `row` apart, `height` tall, shows when a finger has taken it to
@@ -213,7 +126,7 @@ mod tests {
     const ROWS: u32 = 27;
 
     /// A coast followed at 120 frames a second: each frame's step, the last done.
-    fn follow(coast: BlendCoast) -> Vec<(f32, BlendStep)> {
+    fn follow(coast: ScrollMotion) -> Vec<(f32, BlendStep)> {
         let mut steps = Vec::new();
         for frame in 0..2400 {
             let t = frame as f32 / 120.0;
@@ -233,7 +146,7 @@ mod tests {
     #[test]
     fn a_flick_at_1000_points_a_second_goes_about_500_points_over_about_2_seconds() {
         let coast = blend_coast(0.0, 1000.0, ROW, ROWS);
-        assert!(matches!(coast, BlendCoast::Glide { .. }), "{coast:?}");
+        assert!(matches!(coast, ScrollMotion::Coast { .. }), "{coast:?}");
         let steps = follow(coast);
         let (_, end) = steps[steps.len() - 1];
         // 13 rows: 504.4, the nearest row to 499.5
@@ -264,11 +177,11 @@ mod tests {
     fn a_flick_slows_straight_onto_its_row_in_one_motion() {
         for from in [0.0, 13.0, 200.0, 333.3] {
             for speed in [200.0, 600.0, 1000.0, 1500.0, -200.0, -600.0] {
-                if !(0.0..=last(ROW, ROWS)).contains(&(from + speed / slowing())) {
+                if !(0.0..=last(ROW, ROWS)).contains(&(from + speed / crate::scroll::coast_rate())) {
                     continue;
                 }
                 let coast = blend_coast(from, speed, ROW, ROWS);
-                assert!(matches!(coast, BlendCoast::Glide { .. }), "from {from} at {speed}: {coast:?}");
+                assert!(matches!(coast, ScrollMotion::Coast { .. }), "from {from} at {speed}: {coast:?}");
                 let steps = follow(coast);
                 for pair in steps.windows(2) {
                     let ((_, a), (_, b)) = (pair[0], pair[1]);
@@ -337,7 +250,7 @@ mod tests {
         let most = last(ROW, ROWS);
         for (from, speed, edge) in [(2.0 * ROW, -2000.0, 0.0), (most - 2.0 * ROW, 2000.0, most)] {
             let coast = blend_coast(from, speed, ROW, ROWS);
-            assert!(matches!(coast, BlendCoast::Bounce { .. }), "{coast:?}");
+            assert!(matches!(coast, ScrollMotion::Bounce { .. }), "{coast:?}");
             let steps = follow(coast);
             let beyond = steps.iter().map(|(_, s)| (s.position - edge) * speed.signum()).fold(0.0, f32::max);
             assert!(beyond > 5.0, "overshot {beyond}");

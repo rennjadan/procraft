@@ -269,6 +269,7 @@ fn carry_over(st: &mut State, old: &mut State) {
     swap(&mut st.projection_stop, &mut old.projection_stop);
     swap(&mut st.frames, &mut old.frames);
     swap(&mut st.frame_drawn_at, &mut old.frame_drawn_at);
+    swap(&mut st.frame_thread, &mut old.frame_thread);
     swap(&mut st.frame_interval_ms, &mut old.frame_interval_ms);
     swap(&mut st.predicting, &mut old.predicting);
     swap(&mut st.display_scale, &mut old.display_scale);
@@ -301,6 +302,7 @@ fn carry_over(st: &mut State, old: &mut State) {
     swap(&mut st.sliders, &mut old.sliders);
     swap(&mut st.strokes, &mut old.strokes);
     swap(&mut st.drawn_previews, &mut old.drawn_previews);
+    swap(&mut st.library_scroll, &mut old.library_scroll);
     swap(&mut st.grain_store, &mut old.grain_store);
     swap(&mut st.library_kept, &mut old.library_kept);
     swap(&mut st.engine_studio, &mut old.engine_studio);

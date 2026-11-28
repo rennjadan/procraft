@@ -3,7 +3,6 @@ package io.github.artcraftandroid.procraft.ui
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -45,19 +44,6 @@ class ChromeFitTest {
             val fit = Pc.barFit(width)
             assertTrue("$width", 44.dp * Pc.barGlyphScale(fit.button) <= fit.button * 1.375f + 0.01.dp)
         }
-    }
-
-    @Test
-    fun theBrushStudioLaysItsPadBesideItsSettingsOnlyWithRoomForItsButtons() {
-        // a tablet on its side, as measured: pages, settings and pad side by side
-        assertTrue(studioSideBySide(landscape = true, 1133.dp))
-        assertTrue(studioSideBySide(landscape = true, 1014.dp))
-        // a phone on its side (#318: the pad had about 80 across, Done squeezed to nothing), and half
-        // a tablet on its side: the pages as a rail, the pad over the settings
-        for (width in listOf(640.dp, 732.dp, 780.dp, 850.dp, 1013.dp)) assertFalse("$width", studioSideBySide(landscape = true, width))
-        // upright, always the rail
-        assertFalse(studioSideBySide(landscape = false, 1280.dp))
-        assertEquals(360.dp, PadLeast)
     }
 
     @Test

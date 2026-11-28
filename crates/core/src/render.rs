@@ -8,7 +8,7 @@ use procraft_gpu::{Gpu, wgpu};
 
 use crate::Shared;
 use crate::frame::{configure, configure_with, screen_profile};
-use crate::frame_loop::{Acquired, Ended};
+use crate::frame_loop::Acquired;
 
 /// The window drawn into: Android's native window, or the iPad app's `CAMetalLayer`.
 #[cfg(target_os = "android")]
@@ -18,30 +18,64 @@ type Window = crate::layer::Layer;
 
 pub(crate) fn run(shared: Arc<Shared>, window: Window) {
     // a device lost while drawing: the lost canvas let go, a new device made (perhaps on OpenGL ES,
-    // see `device::lost`), and the artwork reopened on it from its last save
+    // see `device::lost`), and the artwork reopened on it from its last save; a canvas Vulkan
+    // couldn't make: a device made on OpenGL ES, and the canvas made there
     let mut reopening = false;
     loop {
-        match draw_into(&shared, &window, reopening) {
+        let again = match draw_into(&shared, &window, reopening) {
             Ended::Stopped => break,
-            Ended::Lost => {
-                reopening = crate::device::recover(&shared);
-                if !reopening {
-                    // nothing it held draws again: there is only the window's stop to wait for
-                    let mut st = shared.lock();
-                    while !st.stop {
-                        shared.wake.wait(&mut st);
-                    }
-                    break;
-                }
+            Ended::Lost => crate::device::recover(&shared),
+            Ended::Failed(e) => crate::device::canvas_failed(&shared, &e) || told(&shared, &e),
+        };
+        if !again {
+            // nothing it held draws again: there is only the window's stop to wait for, the app
+            // told if no canvas was made (a device lost again and again as one was)
+            let mut st = shared.lock();
+            if st.canvas.is_none() && st.error.is_none() {
+                st.error = Some(procraft_gpu::GpuError::Lost.to_string());
             }
+            while !st.stop {
+                shared.wake.wait(&mut st);
+            }
+            break;
         }
+        reopening = true;
     }
     drop(window);
 }
 
-/// Draws into `window` until the session stops or its device is lost: on the session's device, or
-/// the app's, or one made for the window (`reopening`: after the session's was lost, the artwork
-/// then reopened on it).
+/// Why [`draw_into`] ended.
+enum Ended {
+    /// The session said stop (see [`crate::frame_loop::Ended::Stopped`]).
+    Stopped,
+    /// The device was lost (see [`crate::frame_loop::Ended::Lost`]), perhaps as the canvas was
+    /// made.
+    Lost,
+    /// The canvas couldn't be made on the device (as the error says), and the app isn't told yet:
+    /// Vulkan's, made on OpenGL ES instead where it can be (see `device::lost::canvas_failed`).
+    Failed(procraft_gpu::GpuError),
+}
+
+impl From<crate::frame_loop::Ended> for Ended {
+    fn from(ended: crate::frame_loop::Ended) -> Ended {
+        match ended {
+            crate::frame_loop::Ended::Stopped => Ended::Stopped,
+            crate::frame_loop::Ended::Lost => Ended::Lost,
+        }
+    }
+}
+
+/// The canvas couldn't be made (`e`), and nothing else is to be tried: the app is told. False (the
+/// window draws nothing again).
+fn told(shared: &Shared, e: &procraft_gpu::GpuError) -> bool {
+    shared.tell_canvas_failed(e);
+    false
+}
+
+/// Draws into `window` until the session stops, its device is lost, or its canvas can't be made on
+/// a backend that has another to try ([`Ended::Failed`]): on the session's device, or the app's, or
+/// one made for the window (`reopening`: after the session's was lost or refused its canvas, the
+/// artwork then opened again on it).
 fn draw_into(shared: &Arc<Shared>, window: &Window, reopening: bool) -> Ended {
     // the session's own device lost (perhaps while the app was away): a new one first
     if shared.lock().gpu.as_ref().is_some_and(Gpu::is_lost) {
@@ -144,7 +178,23 @@ fn draw_into(shared: &Arc<Shared>, window: &Window, reopening: bool) -> Ended {
         }
         None => {}
     }
-    shared.make_canvas();
+    // (reopened, the canvas is made already, or told)
+    if !reopening {
+        // a canvas that can't be made isn't told yet: a device lost making it is made anew (the
+        // artwork opened on the next as it was), and one Vulkan refuses is made on OpenGL ES, before
+        // the app says the device can't draw it
+        match shared.make_canvas_untold() {
+            Ok(()) => {}
+            Err(procraft_gpu::GpuError::Lost) => return Ended::Lost,
+            Err(e) => {
+                let retried = shared.lock().gpu.as_ref().is_some_and(|gpu| crate::device::canvas_retried(gpu, &e));
+                if retried {
+                    return Ended::Failed(e);
+                }
+                shared.tell_canvas_failed(&e);
+            }
+        }
+    }
     let queue = {
         let mut st = shared.lock();
         st.reconfigure = true;
@@ -171,7 +221,7 @@ fn draw_into(shared: &Arc<Shared>, window: &Window, reopening: bool) -> Ended {
     });
     // (the window's surface let go before another is made on it)
     drop(screen);
-    ended
+    ended.into()
 }
 
 /// The window's surface, as the render loop draws into it: its capabilities asked once (they last
@@ -222,9 +272,9 @@ impl crate::frame_loop::Screen for WindowScreen {
 
     fn gpu_idle(&mut self) -> bool {
         // looked at, never waited on: a wait with a timeout lost the device on a tablet's driver
-        // (one without, as the canvas's own, never did)
-        let now = wgpu::PollType::Wait { submission_index: None, timeout: Some(Duration::ZERO) };
-        self.gpu.is_lost() || self.gpu.device.poll(now).is_ok()
+        // (one without, as the canvas's own, never did); and a wait of no time panicked in wgpu as
+        // another thread sent work, stopping the renderer (see `Gpu::idle`)
+        self.gpu.idle()
     }
 }
 

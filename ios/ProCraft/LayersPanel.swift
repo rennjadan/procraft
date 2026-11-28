@@ -69,8 +69,8 @@ private let newRowFade = 0.1
 private let rowAside = Animation.spring(duration: 0.3, bounce: 0.25)
 
 /// Calls its tick once a frame with the seconds since the frame before, until the tick says to
-/// stop or it is stopped.
-private final class FrameLoop: NSObject {
+/// stop or it is stopped. The blend wheel and the animation timeline move by it.
+final class FrameLoop: NSObject {
     private var link: CADisplayLink?
     private var last: CFTimeInterval = 0
     private var tick: ((CFTimeInterval) -> Bool)?
@@ -1196,7 +1196,7 @@ private enum BlendMotion {
     /// dragging, it only stops).
     case held(start: CGFloat, caught: Bool, from: CGFloat)
     /// Let go at `since`, moving on as `coast` says.
-    case coasting(BlendCoast, since: CFTimeInterval)
+    case coasting(ScrollMotion, since: CFTimeInterval)
     /// A tapped mode on its way to the band since `since`: the list takes no touches and the
     /// modes it passes don't show on the layer.
     case tapped(from: Float, to: Float, since: CFTimeInterval)
@@ -1301,7 +1301,10 @@ private final class BlendWheel {
                 // down the list: the finger going up
                 speed = -(last.y - first.y) / CGFloat(last.at - first.at)
             }
-            motion = .coasting(blendCoast(from: Float(position), speed: Float(speed), row: Float(blendRowHeight), rows: rows), since: now)
+            let end = rows > 0 ? Float(rows - 1) * Float(blendRowHeight) : 0
+            let velocity = scrollDragVelocity(position: Float(position), velocity: Float(speed),
+                                              min: 0, max: end, viewport: Float(blendListHeight))
+            motion = .coasting(blendCoast(from: Float(position), speed: velocity, row: Float(blendRowHeight), rows: rows), since: now)
         }
         trail = []
         loop.start { [weak self] _ in self?.advance() ?? false }

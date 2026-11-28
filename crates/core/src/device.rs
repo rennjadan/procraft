@@ -11,7 +11,7 @@
 //! good would then crash every start. A driver that crashes the app later, once drawing, is told
 //! from how the last runs ended (see [`driver_crashes`]). A Vulkan driver that loses the app's
 //! device again and again, or as a canvas opens, sends the rest of the run, and later starts in the
-//! same build, to OpenGL ES (see [`lost`]).
+//! same build, to OpenGL ES (see [`lost`]), and so does a canvas Vulkan couldn't make at all.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,7 +24,7 @@ mod lost;
 
 pub(crate) use lost::canvas_made;
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub(crate) use lost::{lost, recover};
+pub(crate) use lost::{canvas_failed, canvas_retried, lost, recover};
 
 static DEVICE: Mutex<Option<Gpu>> = Mutex::new(None);
 

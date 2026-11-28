@@ -105,6 +105,7 @@ impl State {
         // and when it ends: a frame that took long (a weak GPU's, a third of a second) still counts
         // as one being drawn, so a read beside the frames keeps leaving them what they lay
         self.frame_drawn_at = Some(Instant::now());
+        self.frame_thread = Some(std::thread::current().id());
     }
 
     fn lay_frame(

@@ -16,14 +16,14 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
@@ -42,14 +42,21 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupProperties
 import io.github.artcraftandroid.procraft.canvas.CanvasViewModel
 import io.github.artcraftandroid.procraft.canvas.keptPlugins
 import io.github.artcraftandroid.procraft.canvas.wideColorByDefault
+import io.github.artcraftandroid.procraft.ui.MenuPlace
 import io.github.artcraftandroid.procraft.ui.Pc
 import io.github.artcraftandroid.procraft.ui.Switch
 import io.github.artcraftandroid.procraft.ui.fittedInterfaceSize
+import io.github.artcraftandroid.procraft.ui.kineticVerticalScroll
+import io.github.artcraftandroid.procraft.ui.rememberScrollEdges
+import io.github.artcraftandroid.procraft.ui.rememberScrollFling
 
 /**
  * The app's own settings, apart from the canvas: what Android's page for the app links to as its
@@ -134,7 +141,7 @@ private fun SettingsScreen(prefs: android.content.SharedPreferences, onDone: () 
     var licences by remember { mutableStateOf(false) }
     if (licences) return Licences { licences = false }
     Box(Modifier.fillMaxSize().background(Back).safeDrawingPadding(), contentAlignment = Alignment.TopCenter) {
-        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth().verticalScroll(rememberScrollState()).padding(24.dp)) {
+        Column(Modifier.widthIn(max = 640.dp).fillMaxWidth().kineticVerticalScroll(rememberScrollState()).padding(24.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text("ProCraft", color = Ink, fontSize = 30.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 Text("Done", color = Blue, fontSize = 17.sp, modifier = Modifier.clickable(onClick = onDone).padding(8.dp))
@@ -236,16 +243,24 @@ private fun ChoiceRow(prefs: android.content.SharedPreferences, s: Choice) {
         // the menu opens under the value
         Box {
             Text(s.options[chosen], color = Dim, fontSize = 17.sp)
-            DropdownMenu(open, { open = false }, containerColor = Group) {
-                s.options.forEachIndexed { i, name ->
-                    DropdownMenuItem(
-                        text = { Text(name, color = if (i == chosen) Blue else Ink, fontSize = 17.sp) },
-                        onClick = {
-                            chosen = i
-                            prefs.edit().putInt(s.key, i).apply()
-                            open = false
-                        },
-                    )
+            if (open) {
+                val position = remember { MenuPlace { anchor, size -> IntOffset(anchor.right - size.width, anchor.bottom) } }
+                Popup(position, onDismissRequest = { open = false }, properties = PopupProperties(focusable = true)) {
+                    Surface(color = Group, shape = RoundedCornerShape(4.dp), shadowElevation = 3.dp) {
+                        Column(Modifier.widthIn(min = 112.dp, max = 280.dp).heightIn(max = 320.dp)
+                            .kineticVerticalScroll(rememberScrollState()).padding(vertical = 8.dp)) {
+                            s.options.forEachIndexed { i, name ->
+                                DropdownMenuItem(
+                                    text = { Text(name, color = if (i == chosen) Blue else Ink, fontSize = 17.sp) },
+                                    onClick = {
+                                        chosen = i
+                                        prefs.edit().putInt(s.key, i).apply()
+                                        open = false
+                                    },
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -265,12 +280,18 @@ private fun Licences(onBack: () -> Unit) {
         val text = "The interface font is Inter, by The Inter Project Authors, under the SIL Open Font License 1.1." + gap +
             asset("fonts/Inter-OFL.txt").trim() + gap +
             "The app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors, under the ISC License." + gap +
-            asset("icons/LICENSE-lucide.txt").trim() + gap + asset("licenses.txt")
+            asset("icons/LICENSE-lucide.txt").trim() + gap +
+            "The undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the Apache License 2.0 (its text at the end)." + gap +
+            asset("licenses.txt")
         text.split(gap).map { it.trimEnd() }.filter { it.isNotBlank() }
     }
     androidx.activity.compose.BackHandler(onBack = onBack)
     Box(Modifier.fillMaxSize().background(Back).safeDrawingPadding(), contentAlignment = Alignment.TopCenter) {
-        androidx.compose.foundation.lazy.LazyColumn(Modifier.widthIn(max = 640.dp).fillMaxWidth().padding(horizontal = 24.dp)) {
+        androidx.compose.foundation.lazy.LazyColumn(
+            Modifier.widthIn(max = 640.dp).fillMaxWidth().padding(horizontal = 24.dp),
+            flingBehavior = rememberScrollFling(),
+            overscrollEffect = rememberScrollEdges(),
+        ) {
             item {
                 Text("‹ Settings", color = Blue, fontSize = 17.sp, modifier = Modifier.padding(top = 24.dp).clickable(onClick = onBack).padding(vertical = 8.dp))
                 Text("Licenses", color = Ink, fontSize = 30.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 8.dp, bottom = 16.dp))

@@ -12,6 +12,9 @@ struct ProCraftApp: App {
     init() {
         // the log kept in a file too, for Help's Share log
         AppLog.start()
+        // three fingers are the canvas's, not the system's editing gestures, wherever the touches
+        // land (but in text being typed)
+        EditingGestures.turnOff()
         // the layers' textures may take a quarter of what the app may use (an iPad app is ended
         // well short of the device's memory); none said (the simulator), all of them
         let available = os_proc_available_memory()

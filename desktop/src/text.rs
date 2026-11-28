@@ -4,6 +4,7 @@
 //! face), the design sliders and the attributes. As the Android app's (ui/TextUi.kt); the core
 //! lays the text out and draws it.
 
+use crate::scroll::ScrollArea;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
@@ -996,7 +997,7 @@ impl TextEditor {
             Rect::from_min_max(pos2(inside.left() + 10.0, inside.top()), pos2(inside.right() - 17.0, inside.bottom()));
         let mut child = ui.new_child(UiBuilder::new().max_rect(list));
         let mut tapped = None;
-        egui::ScrollArea::vertical()
+        ScrollArea::vertical()
             .id_salt(("text cells", id))
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .show(&mut child, |ui| {

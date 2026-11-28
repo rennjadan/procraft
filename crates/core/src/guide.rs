@@ -295,8 +295,11 @@ impl State {
 
 #[uniffi::export]
 impl CanvasSession {
+    ///
+    /// Asked each frame while the view settles, it never waits long on the canvas (see
+    /// [`crate::Shared::read_seen`]).
     pub fn guide(&self) -> GuideInfo {
-        self.shared.lock().guide_info()
+        self.shared.read_seen(crate::State::guide_info, |seen| &mut seen.guide)
     }
 
     pub fn set_guide_on(&self, on: bool) -> GuideInfo {

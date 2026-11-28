@@ -11,8 +11,12 @@ pub(crate) fn sample(x: f32, y: f32, t: f64) -> PenSample {
 
 /// A session on a headless GPU with a `window` × `window` "screen", or `None` without a GPU.
 pub(crate) fn session(canvas: u32, window: u32) -> Option<std::sync::Arc<CanvasSession>> {
+    Some(session_on(headless_gpu()?, canvas, window))
+}
+
+fn headless_gpu() -> Option<Gpu> {
     match Gpu::headless() {
-        Ok(gpu) => Some(session_on(gpu, canvas, window)),
+        Ok(gpu) => Some(gpu),
         Err(e) => {
             eprintln!("skipped: {e}");
             None
@@ -457,7 +461,7 @@ fn quickshape_edit_cost() {
                 let mut st = s.shared.lock();
                 // the stroke laid along the shape, then the frame recorded
                 let t = Instant::now();
-                st.draw_moved_shape();
+                st.draw_shape_now();
                 alone_lay.push(t.elapsed());
                 let t = Instant::now();
                 st.draw_frame(&view, format, (width, height), procraft_engine::profile::Profile::Srgb, Instant::now());
@@ -1920,6 +1924,171 @@ fn continue_filling_s_touches_never_wait_on_their_fill() {
     assert!(red(&s, 500, 1000) && !red(&s, 1500, 1000));
     s.undo();
     assert!(!red(&s, 500, 1000));
+}
+
+/// What a pinch costs on an empty `width` × `height` canvas fitted to a 1600 square window, with
+/// Continue filling off, on as it was (the first finger's fill handed to the app's fill thread as
+/// it landed, a whole layer's, and taken back by the second finger), and on now: each step (both
+/// fingers moved, out to twice as far apart and back, and the frame they make drawn through the
+/// view and done on the GPU), in milliseconds; and the fill commands the touches handed over.
+/// None without a GPU.
+fn pinch_cost(width: u32, height: u32) -> Option<[(Vec<f64>, usize); 3]> {
+    use crate::TouchCommand;
+    use crate::touch::Fill;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+    let gpu = match Gpu::headless() {
+        Ok(gpu) => gpu,
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return None;
+        }
+    };
+    let s = CanvasSession::new(width, height);
+    let fitted = View::fit((width, height), (1600, 1600));
+    {
+        let mut st = s.shared.lock();
+        st.window_size = (1600, 1600);
+        st.view = Some(fitted);
+        st.gpu = Some(gpu.clone());
+        st.ensure_canvas();
+    }
+    // the app's fill thread, pouring what the touches hand it, in order; told None, it says when
+    // all before is done
+    let (to_fill, asked) = mpsc::channel::<Option<TouchCommand>>();
+    let (idle, idled) = mpsc::channel::<()>();
+    let filler = std::thread::spawn({
+        let s = std::sync::Arc::clone(&s);
+        move || {
+            for c in asked {
+                match c {
+                    Some(TouchCommand::PourAt { x, y, fill }) => {
+                        _ = s.pour_begin(x, y, fill.r, fill.g, fill.b, fill.threshold)
+                    }
+                    Some(TouchCommand::FillThreshold { threshold }) => s.pour_threshold(threshold),
+                    Some(TouchCommand::PourEnd { keep }) => s.pour_end(keep, None),
+                    Some(_) => {}
+                    None => {
+                        let _ = idle.send(());
+                    }
+                }
+            }
+        }
+    });
+    let view = window_view(&s, 1600);
+    let fill = Fill { r: 0.9, g: 0.1, b: 0.1, threshold: 0.3 };
+    let frame = || {
+        s.draw(
+            &view,
+            procraft_gpu::wgpu::TextureFormat::Rgba8Unorm,
+            (1600, 1600),
+            procraft_engine::profile::Profile::Srgb,
+            Instant::now(),
+        );
+        let (done, drawn) = mpsc::channel();
+        gpu.queue.on_submitted_work_done(move || {
+            let _ = done.send(());
+        });
+        while drawn.try_recv().is_err() {
+            let _ = gpu.device.poll(procraft_gpu::wgpu::PollType::Poll);
+            std::thread::sleep(Duration::from_micros(200));
+        }
+    };
+    let runs = [0usize, 1, 2].map(|mode| {
+        s.shared.lock().view = Some(fitted);
+        s.set_touch_filling((mode > 0).then_some(fill));
+        frame();
+        let mut handed = 0;
+        let mut hand = |out: Vec<TouchCommand>| {
+            for c in out {
+                if matches!(
+                    c,
+                    TouchCommand::PourAt { .. } | TouchCommand::FillThreshold { .. } | TouchCommand::PourEnd { .. }
+                ) {
+                    handed += 1;
+                    let _ = to_fill.send(Some(c));
+                }
+            }
+        };
+        let t0 = 10_000.0 * (mode + 1) as f64;
+        let (a, b) = ((700.0f32, 800.0f32), (900.0f32, 800.0f32));
+        hand(s.touch_down(1, PointerKind::Finger, vec![sample(a.0, a.1, t0)]));
+        // as it was: the first finger's fill, handed over as it landed
+        if mode == 1 {
+            let _ = to_fill.send(Some(TouchCommand::PourAt { x: a.0, y: a.1, fill }));
+        }
+        hand(s.touch_down(2, PointerKind::Finger, vec![sample(b.0, b.1, t0 + 30.0)]));
+        // and taken back by the second
+        if mode == 1 {
+            let _ = to_fill.send(Some(TouchCommand::PourEnd { keep: false }));
+        }
+        let mut steps = Vec::new();
+        for k in 1..=40 {
+            let spread = if k <= 20 { k } else { 40 - k } as f32 * 10.0;
+            let ms = t0 + 30.0 + 16.0 * f64::from(k);
+            let t = Instant::now();
+            hand(s.touch_move(1, vec![sample(a.0 - spread, a.1, ms)]));
+            hand(s.touch_move(2, vec![sample(b.0 + spread, b.1, ms)]));
+            frame();
+            steps.push(t.elapsed().as_secs_f64() * 1000.0);
+        }
+        hand(s.touch_up(2, vec![sample(b.0, b.1, t0 + 700.0)]));
+        hand(s.touch_up(1, vec![sample(a.0, a.1, t0 + 710.0)]));
+        let _ = to_fill.send(None);
+        let _ = idled.recv();
+        (steps, handed)
+    });
+    drop(to_fill);
+    assert!(filler.join().is_ok());
+    assert_eq!(gpu.errors(), 0);
+    Some(runs)
+}
+
+/// The pinch's steps' mean and worst (milliseconds).
+fn mean_and_worst(steps: &[f64]) -> (f64, f64) {
+    (steps.iter().sum::<f64>() / steps.len().max(1) as f64, steps.iter().copied().fold(0.0, f64::max))
+}
+
+/// Prints [`pinch_cost`]'s runs on a `width` × `height` canvas; their means and worsts.
+fn print_pinch_cost(width: u32, height: u32) -> Option<[(f64, f64, usize); 3]> {
+    let runs = pinch_cost(width, height)?;
+    println!("a pinch on an empty {width} x {height} canvas, 40 steps (two moves and their frame):");
+    let mut out = [(0.0, 0.0, 0); 3];
+    for ((what, (steps, handed)), to) in
+        ["Continue filling off", "on, as it was", "on, now"].iter().zip(&runs).zip(&mut out)
+    {
+        let (mean, worst) = mean_and_worst(steps);
+        println!("  {what}: {mean:.2} ms a step on average, {worst:.1} ms at most ({handed} fill commands)");
+        *to = (mean, worst, *handed);
+    }
+    Some(out)
+}
+
+/// #411: with Continue filling on, zooming in and out lagged: each pinch's first finger filled the
+/// whole layer on the app's fill thread as it landed (on a large canvas the layer read back and
+/// flooded, with the canvas held) and the second finger took it back, so the pinch's first steps
+/// waited. A touch now fills once it is one finger's, so a pinch hands over no fill and costs what
+/// it costs with Continue filling off. Here on a 2048 square canvas. Printed: each run's steps.
+/// Bound: on now, no fill handed over, the steps within 1.5x (+2 ms on average, +8 ms at worst)
+/// of off.
+#[test]
+fn a_pinch_with_continue_filling_on_costs_what_it_does_with_it_off() {
+    let Some([off, was, now]) = print_pinch_cost(2048, 2048) else { return };
+    assert_eq!(off.2, 0);
+    assert_eq!(was.2, 0, "the touches themselves hand over nothing; as it was is the test's");
+    assert_eq!(now.2, 0, "a pinch hands over no fill");
+    assert!(now.0 <= off.0 * 1.5 + 2.0, "{:.2} ms against {:.2} ms off", now.0, off.0);
+    assert!(now.1 <= off.1 * 1.5 + 8.0, "{:.1} ms against {:.1} ms off", now.1, off.1);
+}
+
+/// The same at the sizes #411 named: a 4096 square canvas and A3 at 300 dpi (3508 × 4961). Run
+/// with `--ignored --nocapture` (release for real numbers).
+#[test]
+#[ignore]
+fn pinch_with_continue_filling_cost() {
+    for (w, h) in [(4096, 4096), (3508, 4961)] {
+        let _ = print_pinch_cost(w, h);
+    }
 }
 
 /// What ColorDrop costs on a large canvas (`POUR_COST_SIDE`, 4096 square): a colour dropped into a
@@ -7776,7 +7945,7 @@ fn a_long_wet_stroke_made_a_shape_is_laid_quickly_and_never_breaks() {
         for k in 0..6 {
             let t = std::time::Instant::now();
             s.quickshape_move(400.0, 400.0, 400.0 + k as f32 * 3.0, 400.0 + k as f32 * 2.0);
-            s.shared.lock().draw_moved_shape();
+            s.shared.lock().draw_shape_now();
             finish(&s);
             moves.push(t.elapsed().as_secs_f64() * 1000.0);
         }
@@ -7784,7 +7953,7 @@ fn a_long_wet_stroke_made_a_shape_is_laid_quickly_and_never_breaks() {
         let (hx, hy) = (info.handles[0], info.handles[1]);
         for k in 1..info.handles.len() / 2 {
             s.quickshape_move_handle(k as u32, hx, hy);
-            s.shared.lock().draw_moved_shape();
+            s.shared.lock().draw_shape_now();
             finish(&s);
         }
         s.quickshape_done();
@@ -7934,11 +8103,12 @@ fn a_shape_still_held_follows_the_pen_and_a_finger_snaps_it() {
     assert_eq!(s.quickshape_info().unwrap().handles, on.handles);
     assert_eq!(s.quickshape_finger(false).unwrap().handles, on.handles);
     s.quickshape_done();
-    // a held ellipse near round is a circle while a finger is down
+    // a held ellipse near round (its long axis less than half as long again as its short) is a
+    // circle while a finger is down
     let pts: Vec<PenSample> = (0..=60)
         .map(|i| {
             let t = i as f32 / 60.0 * std::f32::consts::TAU;
-            sample(100.0 + 60.0 * t.cos() + 2.0 * (7.0 * t).sin(), 100.0 + 40.0 * t.sin(), f64::from(i) * 8.0)
+            sample(100.0 + 60.0 * t.cos() + 2.0 * (7.0 * t).sin(), 100.0 + 45.0 * t.sin(), f64::from(i) * 8.0)
         })
         .collect();
     s.stroke_begin(PointerKind::Finger, pts[..1].to_vec());
@@ -8597,6 +8767,455 @@ fn the_reference_windows_read_of_the_canvas_leaves_a_strokes_end_to_the_frames()
     // the picture is the stroke with its end: as the canvas reads now
     assert_eq!(s.canvas_thumbnail(256).map(|t| t.rgba), Some(read.rgba));
     assert_eq!(gpu.errors(), 0);
+}
+
+/// Watches `s`'s canvas from a thread of its own until `done`: how long each take of it waited, at
+/// most (a touch on the app's thread waits so).
+fn watch_waits(
+    s: &std::sync::Arc<CanvasSession>,
+    done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<std::time::Duration> {
+    let (s, done) = (std::sync::Arc::clone(s), std::sync::Arc::clone(done));
+    std::thread::spawn(move || {
+        let mut most = std::time::Duration::ZERO;
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            let asked = std::time::Instant::now();
+            drop(s.shared.lock());
+            most = most.max(asked.elapsed());
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        most
+    })
+}
+
+/// The Layers panel's reads after a stroke whose end the frames lay a share at a time (its layers'
+/// versions, then the stroke's layer's thumbnail, each from a thread of the app's own) wait for
+/// the frames with the canvas let go, rather than laying the rest at once in their hold of it: a
+/// heavy brush's end so laid held the canvas 13 s on a tester's phone, and the app's thread, waiting
+/// on it, was ended as not responding. They then read the stroke with its end. The picture the
+/// artwork closes with, asked for on the app's own thread, is taken as it shows, the end left to
+/// the frames. Printed: the longest a take of the canvas waited meanwhile, and how many frames
+/// laid the end.
+#[test]
+fn the_layers_panels_reads_leave_a_strokes_end_to_the_frames() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let Some(s) = session(512, 512) else { return };
+    let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
+    assert!(s.select_brush(set, index));
+    s.set_brush_size(1.0);
+    // (the reads wait for the frames however slow a busy machine makes them: what they do when
+    // the wait runs out is `reads_beside_frames_still_laying_give_the_picture_as_it_showed_or_none`)
+    s.shared.set_read_wait(Duration::from_secs(120));
+    // the end laid whole again (as one its end taper reaches back over is), a piece at each frame
+    s.shared.lock().canvas.as_mut().unwrap().set_relay_at_once(Duration::ZERO);
+    s.shared.lock().canvas.as_mut().unwrap().lay_ends_whole(true);
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let view = window_view(&s, 512);
+    let frame = || {
+        let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+        s.draw(&view, format, (512, 512), procraft_engine::profile::Profile::Srgb, Instant::now());
+        gpu.flush();
+    };
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let unshown = || s.shared.lock().canvas.as_deref().map_or(0, procraft_gpu::Canvas::laid_unshown);
+    let stroke = |y: f32, from: f64| {
+        s.stroke_begin(PointerKind::Stylus, vec![sample(40.0, y, from)]);
+        for i in 1..60 {
+            let x = 40.0 + i as f32 * 7.0;
+            s.stroke_add(vec![PenSample {
+                pressure: 0.5,
+                ..sample(x, y + (x / 40.0).sin() * 60.0, from + i as f64 * 8.0)
+            }]);
+            if i % 2 == 0 {
+                frame();
+            }
+        }
+        s.stroke_end(vec![]);
+        frame();
+    };
+    stroke(200.0, 0.0);
+    assert!(lays(), "the stroke's end is laid over frames");
+    let current = s.layers().into_iter().find(|l| l.current).unwrap().id;
+    let laid_at_once = unshown();
+    // the picture the artwork closes with, asked for on the app's own thread: as it shows, at once,
+    // the end left to the frames
+    let closing = {
+        let s = Arc::clone(&s);
+        std::thread::spawn(move || s.canvas_thumbnail(64))
+    };
+    assert!(closing.join().unwrap().is_some(), "a closing picture");
+    assert!(lays(), "the closing picture laid the stroke's end at once");
+    assert_eq!(unshown(), laid_at_once, "laid at once by the closing picture");
+    let reader = {
+        let s = Arc::clone(&s);
+        std::thread::Builder::new()
+            .name("layers reader".into())
+            .spawn(move || (s.layer_versions(), s.layer_thumbnail(current, 64)))
+            .unwrap()
+    };
+    // once the reads have taken the canvas (nothing else takes it meanwhile, no frame drawn): they
+    // left the end to the frames, whatever the machine's load (counted, not timed)
+    while s.shared.holder.thread().as_deref() != Some("layers reader") && !reader.is_finished() {
+        std::thread::yield_now();
+    }
+    assert!(lays(), "the reads left the stroke's end to the frames");
+    assert_eq!(unshown(), laid_at_once, "laid at once by the reads");
+    let done = Arc::new(AtomicBool::new(false));
+    let watcher = watch_waits(&s, &done);
+    let mut frames = 0;
+    while lays() && frames < 1000 {
+        frame();
+        frames += 1;
+    }
+    let (versions, thumbnail) = reader.join().unwrap();
+    done.store(true, Ordering::Relaxed);
+    let waited = watcher.join().unwrap();
+    println!(
+        "the stroke's end laid over {frames} frames, then read; a take of the canvas waited {:.1} ms at most meanwhile",
+        waited.as_secs_f64() * 1000.0
+    );
+    assert!(frames > 1, "laid over {frames} frames");
+    assert_eq!(unshown(), laid_at_once, "laid at once by the reads");
+    // what they read is the stroke with its end: as the canvas reads now
+    assert_eq!(versions, s.layer_versions());
+    assert_eq!(thumbnail.map(|t| t.rgba), s.layer_thumbnail(current, 64).map(|t| t.rgba));
+
+    assert_eq!(gpu.errors(), 0);
+}
+
+/// Heavy strokes on a GPU as slow as a phone's (the system's software GPU; `HOLDS_GPU=hw` for the
+/// PC's own), the canvas drawn on its own thread as the apps draw it (each frame's GPU work waited
+/// for), the Layers panel open: after each stroke its layers' versions and the stroke's layer's
+/// thumbnail are read from a thread of their own, as the app reads them, while a stand-in for the
+/// app's thread takes the canvas every few milliseconds. Printed: the longest a frame held the
+/// canvas, the longest the app's thread waited for it, and how long the reads took. `HOLDS_BRUSH`
+/// names the brush (Shorewalker: wet paint with a second), `HOLDS_SECONDS` each stroke's length
+/// (1.5), `HOLDS_STROKES` how many (3), `HOLDS_CANVAS` its side (1024). Run with `--ignored
+/// --nocapture`, alone.
+#[test]
+#[ignore]
+fn heavy_strokes_with_the_layers_panel_open_on_a_slow_gpu() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let env = |name: &str, default: &str| std::env::var(name).unwrap_or_else(|_| default.to_owned());
+    let gpu = if env("HOLDS_GPU", "software") == "hw" { Gpu::headless() } else { Gpu::headless_software_old() };
+    let Ok(gpu) = gpu else { return eprintln!("skipped: no such GPU") };
+    let side: u32 = env("HOLDS_CANVAS", "1024").parse().unwrap_or(1024);
+    let seconds: f64 = env("HOLDS_SECONDS", "1.5").parse().unwrap_or(1.5);
+    let strokes: usize = env("HOLDS_STROKES", "3").parse().unwrap_or(3);
+    let name = env("HOLDS_BRUSH", "Shorewalker");
+    let s = session_on(gpu.clone(), side, side);
+    let Some((set, index)) = library_brush(&s, |b| b.name == name) else { return eprintln!("no brush {name}") };
+    assert!(s.select_brush(set, index));
+    s.set_brush_size(1.0);
+    let stop = Arc::new(AtomicBool::new(false));
+    // the frames, each one's hold of the canvas
+    let frames = {
+        let (s, stop, gpu) = (Arc::clone(&s), Arc::clone(&stop), gpu.clone());
+        std::thread::spawn(move || {
+            let view = window_view(&s, side);
+            let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+            let mut held = Duration::ZERO;
+            let mut count = 0u32;
+            while !stop.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                s.draw(&view, format, (side, side), procraft_engine::profile::Profile::Srgb, started);
+                held = held.max(started.elapsed());
+                gpu.flush();
+                count += 1;
+                std::thread::sleep(Duration::from_millis(8).saturating_sub(started.elapsed()));
+            }
+            (held, count)
+        })
+    };
+    // the app's thread, as a touch or the interface's call takes the canvas
+    let app = {
+        let (s, stop) = (Arc::clone(&s), Arc::clone(&stop));
+        std::thread::spawn(move || {
+            let mut most = Duration::ZERO;
+            while !stop.load(Ordering::Relaxed) {
+                let asked = Instant::now();
+                drop(s.shared.lock());
+                most = most.max(asked.elapsed());
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            most
+        })
+    };
+    let current = s.layers().into_iter().find(|l| l.current).unwrap().id;
+    let mut reads = Vec::new();
+    let begun = Instant::now();
+    for k in 0..strokes {
+        let events = (seconds * 240.0) as usize;
+        let t0 = begun.elapsed().as_secs_f64() * 1000.0;
+        let at = |e: usize| {
+            let t = e as f32 * 4.17 / 1000.0;
+            let along = (t * 1500.0) % (2.0 * (side as f32 - 200.0));
+            let x = 100.0 + if along < side as f32 - 200.0 { along } else { 2.0 * (side as f32 - 200.0) - along };
+            PenSample {
+                pressure: 0.4 + 0.5 * (t * 9.0).sin().abs(),
+                ..sample(
+                    x,
+                    side as f32 / 2.0 + (t * 7.0 + k as f32).sin() * side as f32 / 3.0,
+                    t0 + f64::from(t) * 1000.0,
+                )
+            }
+        };
+        let started = Instant::now();
+        s.stroke_begin(PointerKind::Stylus, vec![at(0)]);
+        for e in 1..=events {
+            s.stroke_add(vec![at(e)]);
+            let due = started + Duration::from_secs_f64(e as f64 * 4.17 / 1000.0);
+            std::thread::sleep(due.saturating_duration_since(Instant::now()));
+        }
+        s.stroke_end(vec![]);
+        // the Layers panel's reads as the stroke ends
+        let reader = {
+            let s = Arc::clone(&s);
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let _ = s.layer_versions();
+                let _ = s.layer_thumbnail(current, 64);
+                started.elapsed()
+            })
+        };
+        reads.push(reader.join().unwrap());
+    }
+    // all laid
+    let lifted = Instant::now();
+    while s.shared.lock().canvas.as_deref().is_some_and(|c| c.wants_render() || c.lays_over_frames())
+        && lifted.elapsed() < Duration::from_secs(120)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    stop.store(true, Ordering::Relaxed);
+    let ((held, count), waited) = (frames.join().unwrap(), app.join().unwrap());
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    println!(
+        "{:?} {name}, {strokes} strokes of {seconds} s on {side}²: a frame held the canvas {:.0} ms at most ({count} frames); \
+         the app's thread waited {:.0} ms at most; the reads took {} ms; all laid {:.0} ms after the last",
+        gpu.adapter.get_info().backend,
+        ms(held),
+        ms(waited),
+        reads.iter().map(|d| format!("{:.0}", ms(*d))).collect::<Vec<_>>().join(", "),
+        ms(lifted.elapsed())
+    );
+    assert_eq!(gpu.errors(), 0);
+}
+
+/// Queues work for `s`'s GPU that takes it a while (the canvas composited again over and over),
+/// sent and not waited for, as a weak GPU still drawing the frames before is: how long it took,
+/// once it is done.
+fn keep_gpu_busy(s: &CanvasSession, renders: usize) -> std::sync::mpsc::Receiver<std::time::Instant> {
+    let mut guard = s.shared.lock();
+    let st = &mut *guard;
+    let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+    for _ in 0..renders {
+        canvas.invalidate();
+        canvas.render(gpu, &mut st.doc, None);
+    }
+    let (done, finished) = std::sync::mpsc::channel();
+    gpu.queue.on_submitted_work_done(move || {
+        let _ = done.send(std::time::Instant::now());
+    });
+    finished
+}
+
+/// The eyedropper's read and a layer's thumbnail, with the GPU still busy with what came before
+/// (a weak GPU's frames), hold the canvas only to start their copies and wait for them with it let
+/// go: the eyedropper read its window back in its hold, the frames and touches waiting behind it
+/// as long as the GPU took. Bound: a take of the canvas meanwhile waits at most half as long as
+/// the read takes (when the GPU's work takes long enough to tell: 40 ms or more). Printed: both
+/// times for each read.
+#[test]
+fn reads_wait_for_the_gpus_copy_with_the_canvas_let_go() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let Some(s) = session(4096, 1024) else { return };
+    // something painted, to read
+    s.stroke_begin(PointerKind::Stylus, vec![sample(100.0, 100.0, 0.0)]);
+    s.stroke_add(vec![sample(900.0, 900.0, 50.0)]);
+    s.stroke_end(vec![sample(900.0, 900.0, 60.0)]);
+    let current = s.layers().into_iter().find(|l| l.current).unwrap().id;
+    // as many renders as take the GPU about a third of a second
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let mut renders = 8;
+    loop {
+        let started = Instant::now();
+        let finished = keep_gpu_busy(&s, renders);
+        let _ = gpu.device.poll(procraft_gpu::wgpu::PollType::wait_indefinitely());
+        let took = finished.recv().map_or(Duration::ZERO, |at| at - started);
+        if took >= Duration::from_millis(300) || renders >= 4096 {
+            println!("{renders} renders keep the GPU busy {:.0} ms", took.as_secs_f64() * 1000.0);
+            break;
+        }
+        renders *= 2;
+    }
+    type Read = Box<dyn Fn(&CanvasSession) -> bool + Send + Sync>;
+    let reads: [(&str, Read); 2] = [
+        ("the eyedropper's read", Box::new(|s| s.pick(500.0, 500.0, 64).is_some())),
+        ("a layer's thumbnail", Box::new(move |s| s.layer_thumbnail(current, 64).is_some())),
+    ];
+    for (name, read) in reads {
+        let read = Arc::new(read);
+        let _ = keep_gpu_busy(&s, renders);
+        let done = Arc::new(AtomicBool::new(false));
+        let watcher = watch_waits(&s, &done);
+        // (the GPU's work polled for meanwhile, as the render thread's looks at it do)
+        let reader = {
+            let (s, read) = (Arc::clone(&s), Arc::clone(&read));
+            std::thread::spawn(move || {
+                let started = Instant::now();
+                let ok = read(&s);
+                (ok, started.elapsed())
+            })
+        };
+        while !reader.is_finished() {
+            let _ = gpu.device.poll(procraft_gpu::wgpu::PollType::Poll);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let (ok, took) = reader.join().unwrap();
+        done.store(true, Ordering::Relaxed);
+        let waited = watcher.join().unwrap();
+        println!(
+            "{name}: took {:.1} ms, a take of the canvas waited {:.1} ms at most meanwhile",
+            took.as_secs_f64() * 1000.0,
+            waited.as_secs_f64() * 1000.0
+        );
+        assert!(ok, "{name} read nothing");
+        if took >= Duration::from_millis(40) {
+            assert!(waited * 2 <= took, "{name} held the canvas through the GPU's wait: {waited:?} of {took:?}");
+        }
+    }
+    assert_eq!(gpu.errors(), 0);
+}
+
+/// Reads beside frames that are still laying a stroke's end when their wait runs out (frames held
+/// up, here never drawn again, as a GPU far behind; the wait made short so that it runs out at
+/// once) never give a picture that didn't show: a layer's thumbnail and a frame's picture are none
+/// (the layer half laid again; the app keeps the one it has), the closing picture and the Reference
+/// window's are the canvas as it last showed, and nothing is laid at once. A canvas whose composite
+/// was never made (made anew after its device was lost, its first frame to come) gives none, never
+/// its blank. Before, the layer was read half laid, and the blank composite read as a picture.
+#[test]
+fn reads_beside_frames_still_laying_give_the_picture_as_it_showed_or_none() {
+    use std::time::{Duration, Instant};
+    let Some(s) = session(256, 256) else { return };
+    let Some((set, index)) = library_brush(&s, |b| b.name == "Easterly") else { return };
+    assert!(s.select_brush(set, index));
+    s.set_brush_size(1.0);
+    s.shared.set_read_wait(Duration::from_millis(30));
+    // the end laid whole again (as one its end taper reaches back over is), a piece at each frame
+    s.shared.lock().canvas.as_mut().unwrap().set_relay_at_once(Duration::ZERO);
+    s.shared.lock().canvas.as_mut().unwrap().lay_ends_whole(true);
+    let gpu = s.shared.lock().gpu.clone().unwrap();
+    let view = window_view(&s, 256);
+    let frame = || {
+        let format = procraft_gpu::wgpu::TextureFormat::Rgba8Unorm;
+        s.draw(&view, format, (256, 256), procraft_engine::profile::Profile::Srgb, Instant::now());
+        gpu.flush();
+    };
+    let lays = || s.shared.lock().canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames);
+    let unshown = || s.shared.lock().canvas.as_deref().map_or(0, procraft_gpu::Canvas::laid_unshown);
+    let stroke = |y: f32, from: f64| {
+        s.stroke_begin(PointerKind::Stylus, vec![sample(20.0, y, from)]);
+        for i in 1..30 {
+            let x = 20.0 + i as f32 * 7.0;
+            s.stroke_add(vec![PenSample {
+                pressure: 0.5,
+                ..sample(x, y + (x / 30.0).sin() * 20.0, from + i as f64 * 8.0)
+            }]);
+            if i % 2 == 0 {
+                frame();
+            }
+        }
+        s.stroke_end(vec![]);
+        frame();
+    };
+    // a stroke laid whole by the frames, then another whose end they are still laying
+    stroke(70.0, 0.0);
+    let mut frames = 0;
+    while lays() && frames < 1000 {
+        frame();
+        frames += 1;
+    }
+    stroke(170.0, 1000.0);
+    assert!(lays(), "the second stroke's end is laid over frames");
+    // the frames are another thread's, drawn a moment ago and no more
+    let other = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
+    let fresh = || {
+        let mut st = s.shared.lock();
+        st.frame_thread = Some(other);
+        st.frame_drawn_at = Some(Instant::now());
+    };
+    fresh();
+    let shown = {
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+        canvas.start_composite_thumbnail_as_laid(gpu, 64).pixels().unwrap().rgba
+    };
+    assert!(shown.chunks(4).any(|p| p[0] < 200), "the first stroke shows");
+    let current = s.layers().into_iter().find(|l| l.current).unwrap().id;
+    let laid_at_once = unshown();
+    fresh();
+    let versions = s.layer_versions();
+    assert!(versions.iter().any(|v| v.id == current));
+    fresh();
+    assert_eq!(s.layer_thumbnail(current, 64).map(|t| t.rgba.len()), None, "a layer's thumbnail half laid");
+    fresh();
+    assert_eq!(s.frame_thumbnail(current, 64).map(|t| t.rgba.len()), None, "a frame's picture half laid");
+    fresh();
+    assert_eq!(s.canvas_thumbnail(64).map(|t| t.rgba), Some(shown.clone()), "the closing picture as it showed");
+    fresh();
+    assert_eq!(s.reference_canvas(64).map(|t| t.rgba), Some(shown), "the reference picture as it showed");
+    assert!(lays(), "the reads laid the end at once");
+    assert_eq!(unshown(), laid_at_once, "laid at once by the reads");
+
+    // a canvas whose composite was never made, its work queued, frames drawn on another thread
+    let Some(t) = session(256, 256) else { return };
+    t.shared.set_read_wait(Duration::from_millis(30));
+    t.stroke_begin(PointerKind::Stylus, vec![sample(20.0, 60.0, 0.0)]);
+    t.stroke_add(vec![sample(200.0, 60.0, 50.0)]);
+    t.stroke_end(vec![sample(220.0, 60.0, 60.0)]);
+    let blank = || {
+        let mut st = t.shared.lock();
+        st.frame_thread = Some(other);
+        st.frame_drawn_at = Some(Instant::now());
+        assert!(st.paced_work_waiting(), "work waits for the frames");
+        assert!(!st.composite_shown(), "the composite was never made");
+    };
+    blank();
+    assert_eq!(t.canvas_thumbnail(64).map(|p| p.rgba.len()), None, "a closing picture of a blank composite");
+    blank();
+    assert_eq!(t.reference_canvas(64).map(|p| p.rgba.len()), None, "a reference picture of a blank composite");
+    assert_eq!(gpu.errors(), 0);
+}
+
+/// The eyedropper with no frames being drawn reads the canvas with all that waits laid, however
+/// slow the machine: its own render, timed as a frame's, laid only the first lot of a stroke where
+/// recording it took long (a busy machine; here it is given no time at all), and the colour read
+/// was the paper's white where the rest of the stroke was still to come, then black at the next
+/// pick at the same spot (as a test saw on a loaded machine).
+#[test]
+fn the_eyedropper_reads_the_whole_stroke_however_long_its_recording_takes() {
+    let Some(s) = session(200, 200) else { return };
+    s.shared.lock().canvas.as_mut().unwrap().set_record_most(std::time::Duration::ZERO);
+    s.set_color(0.0, 0.0, 0.0);
+    s.stroke_begin(PointerKind::Stylus, vec![sample(20.0, 50.0, 0.0)]);
+    for k in 0..6 {
+        let from = 20.0 + k as f32 * 30.0;
+        s.stroke_add((1..=5).map(|i| sample(from + i as f32 * 6.0, 50.0, f64::from(k * 5 + i) * 8.0)).collect());
+    }
+    s.stroke_end(vec![sample(200.0, 50.0, 260.0)]);
+    let first = s.pick(160.0, 50.0, 21).unwrap().rgb;
+    let again = s.pick(160.0, 50.0, 21).unwrap().rgb;
+    assert_eq!(first, again, "the same spot read twice");
+    assert_eq!(first, Some(0), "the stroke's black there");
 }
 
 /// A time-lapse frame asked for while the frames lay one stroke's end, the pen already on the
@@ -21900,6 +22519,10 @@ fn a_heavy_brushs_stamps_are_laid_a_frames_share_at_a_time_and_come_out_the_same
             let canvas = st.canvas.as_mut()?;
             // (paint laid in place and a stroke laid again too, but at the GPU's own pace)
             let all = Duration::from_secs(3600);
+            // (the set shares alone: recorded for however long they take, a debug build's too)
+            if pace != Pace::Own {
+                canvas.set_record_most(all);
+            }
             match pace {
                 Pace::Off => {
                     canvas.set_dry_paced(false, None);
@@ -22145,7 +22768,10 @@ fn a_fast_stroke_on_a_slow_gpu_stays_under_the_pen() {
             st.view = Some(View::fit((width, height), (width, height)));
             st.gpu = Some(gpu.clone());
             st.ensure_canvas();
-            st.canvas.as_mut()?.set_dry_paced(rate.is_some(), rate);
+            let canvas = st.canvas.as_mut()?;
+            canvas.set_dry_paced(rate.is_some(), rate);
+            // (the GPU's share alone: recorded for however long it takes, a debug build's too)
+            canvas.set_record_most(Duration::from_secs(3600));
         }
         let (set, index) = library_brush(&s, |b| b.name == "Easterly")?;
         assert!(s.select_brush(set, index));
@@ -25080,6 +25706,7 @@ fn paint_laid_in_place_laid_again_as_it_ends_goes_back_to_a_mark_and_ends_as_lai
 /// taper of their own.
 #[test]
 fn paint_laid_in_place_with_a_timed_start_taper_ends_without_laying_its_start_again() {
+    let Some(gpu) = headless_gpu() else { return };
     let side = 512;
     let point = |k: usize| PenSample {
         pressure: 0.4 + 0.5 * (k as f32 * 0.06).sin().abs(),
@@ -25092,7 +25719,7 @@ fn paint_laid_in_place_with_a_timed_start_taper_ends_without_laying_its_start_ag
         // the layer, the dispatches at its end, and whether it held its start: ended as it ends, laid
         // again from scratch (no marks to go back to), or all of it laid again whole
         let ended = |rewinds: bool, whole: bool| -> Option<(Vec<u8>, u64, bool)> {
-            let s = session(side, side)?;
+            let s = session_on(gpu.clone(), side, side);
             let (set, index) = library_brush(&s, |b| b.name == name && timed(b))?;
             assert!(s.select_brush(set, index));
             s.set_brush_size(0.3);
@@ -25154,6 +25781,7 @@ const TIMED_START_WET: [&str; 5] = ["Lundy", "Kingsley", "Dunlin", "Copperwing",
 /// and as the stroke ends, in fewer windows.
 #[test]
 fn a_wet_dual_brushs_second_is_put_together_in_its_paints_window_as_in_one_of_its_own() {
+    let Some(gpu) = headless_gpu() else { return };
     let side = 512;
     let point = |k: usize| PenSample {
         pressure: 0.3 + 0.6 * (k as f32 * 0.05).sin().abs(),
@@ -25167,7 +25795,7 @@ fn a_wet_dual_brushs_second_is_put_together_in_its_paints_window_as_in_one_of_it
     for (name, size) in brushes {
         // the picture every tenth event, the layer as it ends, and the windows laid while drawn
         let drawn = |joined: bool| -> Option<(Vec<Vec<u8>>, Vec<u8>, u64)> {
-            let s = session(side, side)?;
+            let s = session_on(gpu.clone(), side, side);
             let (set, index) = library_brush(&s, |b| b.name == name && b.secondary.is_some())?;
             assert!(s.select_brush(set, index));
             s.set_brush_size(size);
@@ -25329,6 +25957,7 @@ fn a_wet_dual_brushs_stroke_gone_back_to_a_mark_ends_as_with_its_second_put_toge
 /// Either way it comes out the same, pixel for pixel. Prints what each holds.
 #[test]
 fn a_thin_stroke_painting_in_place_keeps_thin_tiles_and_comes_out_the_same() {
+    let Some(gpu) = headless_gpu() else { return };
     let side = 1024;
     let point = |k: usize| PenSample {
         pressure: 0.5 + 0.3 * (k as f32 * 0.05).sin(),
@@ -25338,7 +25967,7 @@ fn a_thin_stroke_painting_in_place_keeps_thin_tiles_and_comes_out_the_same() {
         // the layer, the most the canvas held past what it held before, the side of its tiles, and
         // whether it is on OpenGL
         let drawn = |tiles: Option<u32>| -> Option<(Vec<u8>, u64, u32, bool)> {
-            let s = session(side, side)?;
+            let s = session_on(gpu.clone(), side, side);
             let (set, index) = library_brush(&s, |b| b.name == name)?;
             assert!(s.select_brush(set, index));
             s.set_brush_size(size);
@@ -26356,4 +26985,86 @@ fn a_dual_brushs_stroke_shows_its_tip_and_comes_out_as_without_it() {
 #[test]
 fn a_stroke_painting_in_place_shows_its_tip_and_comes_out_as_without_it() {
     tips_reach_the_pen(&["Pangolin", "Ibis", "Highmoor", "Olympus", "Copperwing", "Lundy"]);
+}
+
+/// A hard edge (opaque black on the left half, clear on the right) on the current layer of a
+/// `side` square canvas, and that layer.
+fn hard_edge(s: &CanvasSession, side: u32) -> procraft_engine::document::LayerId {
+    let picture: Vec<u8> =
+        (0..side * side).flat_map(|i| if i % side < side / 2 { [0, 0, 0, 255] } else { [0; 4] }).collect();
+    let mut guard = s.shared.lock();
+    let st = &mut *guard;
+    let current = st.doc.current();
+    let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+    canvas.upload_layer(gpu, current, &picture).unwrap();
+    current
+}
+
+/// How far a blur spread the hard edge along the middle row of `layer` (a `side` square), read
+/// as it shows while the adjustment is open (reading it through the session would keep it): the
+/// standard deviation of the drops in alpha from pixel to pixel, which are the blur's own kernel.
+fn edge_spread(s: &CanvasSession, layer: procraft_engine::document::LayerId, side: u32) -> f32 {
+    let rgba = {
+        let mut guard = s.shared.lock();
+        let st = &mut *guard;
+        let (canvas, gpu) = (st.canvas.as_mut().unwrap(), st.gpu.as_ref().unwrap());
+        canvas.render(gpu, &mut st.doc, None);
+        canvas.read_layer(gpu, layer).unwrap()
+    };
+    let row = (side / 2) as usize * side as usize;
+    let alpha: Vec<f32> = (0..side as usize).map(|x| f32::from(rgba[(row + x) * 4 + 3]) / 255.0).collect();
+    let drops: Vec<f32> = alpha.windows(2).map(|w| w[0] - w[1]).collect();
+    let total: f32 = drops.iter().sum();
+    let mean = drops.iter().enumerate().map(|(i, d)| i as f32 * d).sum::<f32>() / total;
+    let variance = drops.iter().enumerate().map(|(i, d)| (i as f32 - mean).powi(2) * d).sum::<f32>() / total;
+    variance.sqrt()
+}
+
+/// The Gaussian blur adjustment spreads a hard edge as far as its sigma at that amount says, on
+/// canvases of every size alike (canvas pixels, whatever the canvas): at 1% three times less than
+/// it did, at 5% half as far again. Prints the amounts, the sigma it had and has, and what was
+/// measured.
+#[test]
+fn the_gaussian_blur_spreads_an_edge_as_far_as_its_sigma_on_any_canvas() {
+    use crate::adjust::gaussian_blur_sigma;
+    use crate::adjust_menu::Adjustment;
+    let cases: [(u32, &[f32]); 4] = [
+        (128, &[0.01, 0.03, 0.05]),
+        (256, &[0.01, 0.03, 0.05, 0.1]),
+        (512, &[0.01, 0.05, 0.1]),
+        (1024, &[0.03, 0.1, 0.2]),
+    ];
+    println!("canvas  amount  sigma before  sigma now  measured");
+    for (side, amounts) in cases {
+        let Some(s) = session(side, side) else { return };
+        let layer = hard_edge(&s, side);
+        for &a in amounts {
+            s.adjustment_start(Adjustment::GaussianBlur);
+            s.adjustment_amount_by(a);
+            assert!((s.adjustment_shown().amount - a).abs() < 1e-6);
+            let measured = edge_spread(&s, layer, side);
+            s.adjustment_end(false);
+            let (before, now) = (procraft_engine::selection::feather_radius(a), gaussian_blur_sigma(a));
+            println!("{side:6} {a:7.3} {before:12.3} {now:10.3} {measured:9.3}");
+            assert!((measured - now).abs() <= 0.04 * now + 0.15, "{side} {a}: {measured} against {now}");
+        }
+        // put back each time: the edge as it was
+        assert!(edge_spread(&s, layer, side) < 0.01);
+    }
+}
+
+/// Painted on, the Gaussian blur picks a blur per pixel from its pyramid at its own amount (60%
+/// to begin with), and on the layer it is the plain blur at the amount swiped.
+#[test]
+fn the_gaussian_blur_painted_on_reads_its_pyramid_and_on_the_layer_its_sigma() {
+    use crate::adjust::gaussian_blur_sigma;
+    use crate::adjust_menu::Adjustment;
+    use procraft_gpu::Filter;
+    let Some(s) = session(64, 64) else { return };
+    s.adjustment_start(Adjustment::GaussianBlur);
+    s.adjustment_amount_by(0.2);
+    assert_eq!(s.shared.lock().last_filter, Some(Filter::Blur { sigma: gaussian_blur_sigma(0.2) }));
+    s.adjustment_pencil(true);
+    assert_eq!(s.shared.lock().last_filter, Some(Filter::PyramidBlur { amount: 0.6 }));
+    s.adjustment_end(false);
 }

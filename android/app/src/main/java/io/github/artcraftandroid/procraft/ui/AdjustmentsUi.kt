@@ -2,7 +2,6 @@ package io.github.artcraftandroid.procraft.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
@@ -24,7 +23,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -122,7 +120,7 @@ fun AdjustmentsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modif
             }
         }
         Column(
-            Modifier.verticalScroll(rememberScrollState()).padding(start = 10.dp, top = 8.dp, end = 10.dp, bottom = 10.dp),
+            Modifier.kineticVerticalScroll(rememberScrollState()).padding(start = 10.dp, top = 8.dp, end = 10.dp, bottom = 10.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
             if (showFilters) {
@@ -582,7 +580,7 @@ private fun GradientCards(vm: CanvasViewModel) {
     var held by androidx.compose.runtime.remember { androidx.compose.runtime.mutableStateOf<Int?>(null) }
     Row(
         Modifier.fillMaxWidth().padding(top = 11.dp).height(81.dp).clip(RoundedCornerShape(12.dp)).background(GradientBand)
-            .horizontalScroll(rememberScrollState()).padding(horizontal = 6.dp),
+            .kineticHorizontalScroll(rememberScrollState()).padding(horizontal = 6.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalAlignment = Alignment.Bottom,
     ) {

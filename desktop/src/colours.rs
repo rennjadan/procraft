@@ -4,6 +4,7 @@
 //! colour's companions; Value: number sliders and the hex code), the history, the default
 //! palette's swatches and the mode tabs.
 
+use crate::scroll::{ScrollArea, ScrollOffset};
 use egui::{Align2, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2};
 use std::sync::Arc;
 
@@ -277,7 +278,7 @@ pub struct Colours {
     /// The short panel's "•••" (where it is) and its menu.
     short_dots: Rect,
     /// How far the picker is scrolled, in a window too short for all of it.
-    scrolled: f32,
+    scrolled: ScrollOffset,
     short_menu: crate::menu::Menu,
     /// Plugins' menus at Classic's corner: their choices (none: no button), the button there and
     /// its menu, and a choice picked from it, for the app to make and keep.
@@ -361,7 +362,7 @@ impl Default for Colours {
             new_palette_button: Rect::NOTHING,
             swatch_press: None,
             short_dots: Rect::NOTHING,
-            scrolled: 0.0,
+            scrolled: ScrollOffset::default(),
             short_menu: crate::menu::Menu::default(),
             classic_choices: Vec::new(),
             classic_button: Rect::NOTHING,
@@ -721,7 +722,9 @@ impl Colours {
         };
         let height = whole.min(screen.height() - pc::BAR_HEIGHT - PANEL_MARGIN);
         let overflow = whole - height;
-        self.scrolled = self.scrolled.min(overflow);
+        if overflow <= 0.0 {
+            self.scrolled = ScrollOffset::default();
+        }
         let mut hex_row = Rect::NOTHING;
         let rect = Rect::from_min_size(pos2(left, top), vec2(PANEL_WIDTH, height));
         let rect = panel::hung_rect(ctx, rect, whole, PANEL_MARGIN);
@@ -807,15 +810,30 @@ impl Colours {
             let clip = ui.clip_rect();
             let top = if overflow > 0.0 {
                 let view = Rect::from_min_max(pos2(body.left(), top), pos2(body.right(), body.bottom() - 70.0));
-                let dragged = ui.interact(view, ui.scope_id().with("scroll"), Sense::drag()).drag_delta().y;
+                let grab = ui.interact(view, ui.scope_id().with("scroll"), Sense::drag());
+                let now = ui.input(|i| i.time);
+                let extent = view.height();
+                if grab.dragged_by(egui::PointerButton::Primary) {
+                    self.scrolled.drag(-grab.drag_delta().y, overflow, extent);
+                } else if grab.drag_stopped_by(egui::PointerButton::Primary) {
+                    let speed = panel::in_panel_by(ctx, ui.input(|i| i.pointer.velocity())).y;
+                    self.scrolled.release(-speed, overflow, extent, now);
+                } else if self.scrolled.advance(now) {
+                    ui.request_repaint();
+                } else {
+                    // at rest in a window grown since: within its new reach
+                    self.scrolled.position = self.scrolled.position.clamp(0.0, overflow);
+                }
                 let wheel = if ui.rect_contains_pointer(view) {
                     ui.input_mut(|i| std::mem::take(&mut i.smooth_scroll_delta.y))
                 } else {
                     0.0
                 };
-                self.scrolled = (self.scrolled - dragged - wheel).clamp(0.0, overflow);
+                if wheel != 0.0 {
+                    self.scrolled.wheel(-wheel, overflow);
+                }
                 ui.set_clip_rect(clip.intersect(view));
-                top - self.scrolled
+                top - self.scrolled.position
             } else {
                 top
             };
@@ -909,7 +927,7 @@ impl Colours {
             if let Some(mode) = mode_tabs(ui, look, tabs, self.mode) {
                 self.mode = mode;
                 self.hex = None;
-                self.scrolled = 0.0;
+                self.scrolled = ScrollOffset::default();
             }
         });
         if self.mode == Mode::Harmony {
@@ -1820,7 +1838,7 @@ impl Colours {
         let default = self.palettes.default_palette();
         let pad = if self.palette_cards { 8.0 } else { 8.5 };
         ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-            egui::ScrollArea::vertical()
+            ScrollArea::vertical()
                 .id_salt("palettes")
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {

@@ -3,7 +3,8 @@
 //! it is narrow) and, for the one chosen, a card of switches for the ways of touching that do it,
 //! a delay under the held ones; Reset to defaults under General; Done.
 
-use egui::{Align2, Color32, Id, Order, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use crate::scroll::ScrollArea;
+use egui::{Align2, Color32, Id, Order, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{GestureOption, GesturePurpose, GestureSettings, gesture_options, gesture_purposes};
 
 use crate::alert::{Alert, Answer};

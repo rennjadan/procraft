@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -308,6 +307,8 @@ private fun MenusPopover(
             Modifier.padding(top = MenusRowsAt, bottom = 9.5.dp).fillMaxSize(),
             verticalArrangement = Arrangement.spacedBy(PickerRowGap),
             contentPadding = PaddingValues(start = MenusInset, end = MenusInset, bottom = 6.dp),
+            flingBehavior = rememberScrollFling(),
+            overscrollEffect = rememberScrollEdges(),
         ) {
             items(order.size, key = { order[it] }) { k ->
                 val i = order[k]
@@ -492,6 +493,8 @@ private fun ActionPicker(
             state = list,
             verticalArrangement = Arrangement.spacedBy(PickerRowGap),
             contentPadding = PaddingValues(start = PickerInset, end = PickerInset, bottom = 6.dp),
+            flingBehavior = rememberScrollFling(),
+            overscrollEffect = rememberScrollEdges(),
         ) {
             items(rows.size) { k ->
                 val row = rows[k]
@@ -550,7 +553,7 @@ fun BoxScope.LayerChoice(vm: CanvasViewModel) {
         val y = with(density) { at.y.toDp() + 24.dp }.within(8.dp, maxHeight - tall - 8.dp)
         androidx.compose.foundation.layout.Column(
             Modifier.offset(x = x, y = y).size(200.dp, tall).clip(androidx.compose.foundation.shape.RoundedCornerShape(16.dp))
-                .background(Pc.PopoverFill).verticalScroll(rememberScrollState()).padding(vertical = 8.dp),
+                .background(Pc.PopoverFill).kineticVerticalScroll(rememberScrollState()).padding(vertical = 8.dp),
         ) {
             for (id in ids) {
                 val l = vm.layers.firstOrNull { it.id == id } ?: continue

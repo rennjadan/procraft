@@ -2,6 +2,7 @@
 //! as the Textures sheet is, with the filters the plugins on offer under their headings, in the
 //! order they list them. A click picks one; Cancel, or a click off the sheet, closes it.
 
+use crate::scroll::ScrollArea;
 use egui::{Align2, Rect, Sense, Ui, UiBuilder, pos2, vec2};
 use procraft_core::PluginLayerFilter;
 
@@ -86,7 +87,7 @@ impl FilterList {
         );
         let mut picked = Picked::Open;
         ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                 for (group, filters) in grouped(&self.filters) {
                     let (rect, _) = ui.allocate_exact_size(vec2(list.width(), HEADING), Sense::hover());
                     let at = pos2(rect.left(), rect.bottom() - 10.0);

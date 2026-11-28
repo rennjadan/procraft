@@ -34,7 +34,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.runtime.saveable.rememberSaveable
+import kotlinx.coroutines.flow.first
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
@@ -238,6 +241,8 @@ private fun SearchResults(vm: CanvasViewModel, query: String, onPick: (BrushInfo
         contentPadding = PaddingValues(start = 12.dp, top = 11.dp, end = 12.dp, bottom = 12.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp),
+        flingBehavior = rememberScrollFling(),
+        overscrollEffect = rememberScrollEdges(),
     ) {
         items(found, key = { "${it.set}-${it.index}" }) { b ->
             val key = "${b.set}-${b.index}"
@@ -268,8 +273,10 @@ private fun SearchResults(vm: CanvasViewModel, query: String, onPick: (BrushInfo
  */
 @Composable
 fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier, floating: FloatingFrame? = null) {
-    // closed, hanging from its button or floating: the core lets go of what its strokes are drawn on
-    androidx.compose.runtime.DisposableEffect(vm) { onDispose { vm.libraryClosed() } }
+    // where its lists stand, kept as it closes for it to open again so on the same set; closed, hanging from its button
+    // or floating, the core lets go of what its strokes are drawn on
+    val spot = remember { LibrarySpot() }
+    androidx.compose.runtime.DisposableEffect(vm) { onDispose { vm.libraryClosed(spot.now(vm.shownSet)) } }
     val sets = vm.brushSets
     val tints = remember(vm.colorRgb(), vm.pluginLooks) { vm.previewTints() }
     // the Recent set, or one of the library's
@@ -545,8 +552,25 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
             }
         } else {
         Row(Modifier.fillMaxSize()) {
+            // the lists as they stood when it last closed on this set, else the shown set and the brush in use scrolled
+            // into sight, as little as it takes (asked as the lists first show: it may open on the libraries' cards)
+            if (!spot.asked) {
+                spot.asked = true
+                spot.start = vm.libraryStart()
+            }
+            val setsState = rememberSaveable(saver = LazyListState.Saver) {
+                val from = spot.start.takeIf { !spot.setsTaken }
+                spot.setsTaken = true
+                LazyListState(from?.setsFirst?.toInt() ?: 0, from?.setsOffset?.roundToInt() ?: 0)
+            }
+            androidx.compose.runtime.SideEffect { spot.sets = setsState }
+            LaunchedEffect(setsState) {
+                if (spot.start == null && !spot.setsRevealed) {
+                    spot.setsRevealed = true
+                    revealRow(setsState, vm.shownSet + 1)
+                }
+            }
             // a brush found (from the search, or the Recent set) shows its set (the Recent row first)
-            val setsState = rememberLazyListState()
             val found = vm.foundBrush
             LaunchedEffect(found) {
                 if (found == null) return@LaunchedEffect
@@ -560,6 +584,8 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                 state = setsState,
                 contentPadding = PaddingValues(12.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
+                flingBehavior = rememberScrollFling(),
+                overscrollEffect = rememberScrollEdges(),
             ) {
                 // the brushes last painted with, and those pinned there, above the sets
                 item {
@@ -678,6 +704,8 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                                     columns = GridCells.Fixed(PICKER_COLUMNS),
                                     state = androidx.compose.foundation.lazy.grid.rememberLazyGridState(initialFirstVisibleItemIndex = first),
                                     modifier = look.size(250.dp, 325.dp).clip(shape).background(MenuFill).border(1.dp, MenuEdge, shape).padding(3.dp),
+                                    flingBehavior = rememberScrollFling(),
+                                    overscrollEffect = rememberScrollEdges(),
                                 ) {
                                     items(PcIcons.PICKED_SET_ICONS) { k ->
                                         val chosen = k == set.icon.toInt()
@@ -700,10 +728,22 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
             }
             // another set's brushes replace these at once (rows fade only as brushes come and go)
             androidx.compose.runtime.key(vm.shownSet) {
+                // from its top, but the set it opens on: as it stood, or with the brush in use brought into sight (another
+                // set opened meanwhile starts at its top, as there)
+                val opening = !spot.brushesTaken
+                val listState = rememberSaveable(saver = LazyListState.Saver) {
+                    val from = spot.start?.takeIf { opening && it.shownSet == vm.shownSet }
+                    spot.brushesTaken = true
+                    LazyListState(from?.brushesFirst?.toInt() ?: 0, from?.brushesOffset?.roundToInt() ?: 0)
+                }
+                androidx.compose.runtime.SideEffect { spot.brushes = listState }
                 // a brush found from the Recent set is scrolled to in its own
-                val listState = rememberLazyListState()
                 LaunchedEffect(vm.foundBrush) {
-                    val found = vm.foundBrush ?: return@LaunchedEffect
+                    val found = vm.foundBrush
+                    if (found == null) {
+                        if (opening && spot.start?.shownSet != vm.shownSet) revealRow(listState, listed.indexOfFirst { (b, _) -> vm.highlighted(b) })
+                        return@LaunchedEffect
+                    }
                     vm.foundBrush = null
                     listed.indexOfFirst { (b, _) -> "${b.set}-${b.index}" == found }.takeIf { it >= 0 }?.let { listState.scrollToItem(it) }
                 }
@@ -712,6 +752,8 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
                     state = listState,
                     contentPadding = PaddingValues(start = 12.dp, top = 9.75.dp, end = 12.dp, bottom = 12.dp),
                     verticalArrangement = Arrangement.spacedBy(BrushGap),
+                    flingBehavior = rememberScrollFling(),
+                    overscrollEffect = rememberScrollEdges(),
                 ) {
                     items(listed, key = { (b, _) -> "${b.set}-${b.index}" }) { (b, pinned) ->
                         val key = "${b.set}-${b.index}"
@@ -1052,6 +1094,50 @@ fun BrushLibrary(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier,
 private class SwipeAction(val icon: ImageVector, val label: String, val fill: Color = SwipeFill, val ink: Color = SwipeInk, val onClick: () -> Unit)
 
 /**
+ * Where the library's lists stand (for when it closes), and where they start as it opens (see
+ * [CanvasViewModel.libraryStart]): asked once, as the lists first show, and each list started from it once.
+ */
+private class LibrarySpot {
+    var asked = false
+    var start: io.github.artcraftandroid.procraft.core.LibraryScroll? = null
+    var setsTaken = false
+    var setsRevealed = false
+    var brushesTaken = false
+    var sets: LazyListState? = null
+    var brushes: LazyListState? = null
+
+    /** The lists as they stand, showing set [shownSet]; none if they never showed. */
+    fun now(shownSet: Int): io.github.artcraftandroid.procraft.core.LibraryScroll? {
+        val sets = sets ?: return null
+        return io.github.artcraftandroid.procraft.core.LibraryScroll(
+            shownSet = shownSet,
+            setsFirst = sets.firstVisibleItemIndex.toUInt(),
+            setsOffset = sets.firstVisibleItemScrollOffset.toFloat(),
+            brushesFirst = (brushes?.firstVisibleItemIndex ?: 0).toUInt(),
+            brushesOffset = (brushes?.firstVisibleItemScrollOffset ?: 0).toFloat(),
+        )
+    }
+}
+
+/**
+ * Scrolls [state] as little as it takes for row [index] to show whole, once the list is laid out: to the top if it is
+ * above, to the bottom if below; nothing if it shows whole already or isn't there.
+ */
+private suspend fun revealRow(state: LazyListState, index: Int) {
+    if (index < 0) return
+    val laid = androidx.compose.runtime.snapshotFlow { state.layoutInfo }.first { it.totalItemsCount > 0 }
+    if (index >= laid.totalItemsCount) return
+    val row = laid.visibleItemsInfo.firstOrNull { it.index == index }
+    if (row != null && row.offset >= 0 && row.offset + row.size <= laid.viewportEndOffset) return
+    val below = row?.let { it.offset > 0 } ?: (index > (laid.visibleItemsInfo.firstOrNull()?.index ?: 0))
+    state.scrollToItem(index)
+    if (!below) return
+    val now = state.layoutInfo.visibleItemsInfo.firstOrNull { it.index == index } ?: return
+    val past = now.offset + now.size - state.layoutInfo.viewportEndOffset
+    if (past < 0) state.scrollBy(past.toFloat())
+}
+
+/**
  * A brush that slides away to the left, showing its [actions] in its place: Share, Duplicate and
  * Delete; in the Recent set Find, Pin (or Unpin) and Clear. Slid right past half of [PickReach] it
  * springs back and is picked or let go ([onPick]).
@@ -1384,6 +1470,8 @@ private fun LibrariesPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier, 
                 contentPadding = PaddingValues(start = 12.dp, end = 12.dp, bottom = 12.dp),
                 horizontalArrangement = Arrangement.spacedBy(CardGap),
                 verticalArrangement = Arrangement.spacedBy(CardGap),
+                flingBehavior = rememberScrollFling(),
+                overscrollEffect = rememberScrollEdges(),
             ) {
                 items(vm.brushLibraries.size) { i ->
                     val library = vm.brushLibraries[i]

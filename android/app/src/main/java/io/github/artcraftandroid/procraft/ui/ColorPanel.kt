@@ -11,7 +11,6 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.offset
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.layout.positionInRoot
@@ -319,7 +318,7 @@ fun ColorPanel(vm: CanvasViewModel, arrowX: Dp, screenHeight: Dp, modifier: Modi
         }
         if (vm.colorMode == ColorMode.PALETTES) {
             Palettes(vm, c, (screenHeight - PalettesRest).coerceIn(40.dp, if (short) 458.dp else 577.dp))
-        } else Column(Modifier.weight(1f, fill = false).verticalScroll(rememberScrollState())) {
+        } else Column(Modifier.weight(1f, fill = false).kineticVerticalScroll(rememberScrollState())) {
             // on a screen too short for it all the picker scrolls, the tabs staying
             when (vm.colorMode) {
                 ColorMode.DISC -> Disc(c, short = short, m = m)
@@ -605,6 +604,8 @@ private fun FloatingPalettes(vm: CanvasViewModel, c: ColorPick) {
         Modifier.padding(top = 6.dp).fillMaxWidth().height(246.dp),
         contentPadding = PaddingValues(horizontal = 10.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
+        flingBehavior = rememberScrollFling(),
+        overscrollEffect = rememberScrollEdges(),
     ) {
         itemsIndexed(vm.palettes) { i, p ->
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).background(FloatingGroup)) {
@@ -697,6 +698,8 @@ private fun CompactPalettes(vm: CanvasViewModel, c: ColorPick) {
         Modifier.fillMaxWidth().height(240.dp),
         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
+        flingBehavior = rememberScrollFling(),
+        overscrollEffect = rememberScrollEdges(),
     ) {
         itemsIndexed(vm.palettes) { _, p ->
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))) {
@@ -1421,6 +1424,8 @@ private fun Palettes(vm: CanvasViewModel, c: ColorPick, listHeight: Dp) {
         // cards: three 120 tiles across
         contentPadding = if (cards) PaddingValues(start = 8.dp, end = 8.dp, bottom = 8.dp) else PaddingValues(start = 8.5.dp, end = 8.5.dp, bottom = 8.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
+        flingBehavior = rememberScrollFling(),
+        overscrollEffect = rememberScrollEdges(),
     ) {
         itemsIndexed(vm.palettes) { i, p ->
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(Pc.SetCell)) {

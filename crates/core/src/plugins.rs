@@ -4416,7 +4416,7 @@ mod tests {
         assert!(card(&plugins, EFFECTS).on);
         // an older one is updated
         let touch = card(&plugins, TOUCH);
-        assert_eq!((touch.version.as_str(), touch.on), ("1.0.0", false));
+        assert_eq!((touch.version.as_str(), touch.on), ("1.0.1", false));
         assert!(!card(&plugins, COLOUR_TOOLS).on);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5756,7 +5756,11 @@ mod tests {
         switch(true);
         v.use_plugins(Arc::clone(&plugins));
         assert_eq!(fills(&v), 1);
+        // (the library kept on a thread of its own as the set came back wrote into the folder after
+        // it was removed, and left it behind)
+        crate::brush_library::plugin_sets_kept();
         let _ = std::fs::remove_dir_all(&dir);
+        assert!(!std::path::Path::new(&dir).exists(), "{dir} left behind");
     }
 
     /// Switching each of Infinite Plugins' features on and off, as the apps do it (the switch set,

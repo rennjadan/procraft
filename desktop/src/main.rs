@@ -28,9 +28,11 @@ mod filter_list;
 #[cfg(target_os = "macos")]
 mod finder;
 mod floating_panels;
+mod frame_parts;
 mod full_screen;
 mod gallery;
 mod gesture_controls;
+mod gpus;
 mod gradient_map;
 mod guide_editor;
 mod held_layers;
@@ -58,6 +60,7 @@ mod quick_menu;
 mod recolor;
 mod reference;
 mod screen;
+mod scroll;
 mod selection;
 mod settings;
 mod shapes;
@@ -166,16 +169,17 @@ const LAYERS_ON_GPU: u64 = 2 << 30;
 const LAYERS_ON_SHARED_GPU_LEAST: u64 = 512 << 20;
 
 /// What the layers' textures may take on the GPU (see [`LAYERS_ON_GPU`]), on a GPU that has its own
-/// memory or `shares` the computer's `memory` (bytes, none if the system doesn't say). A graphics
-/// card holds 2 GiB of them. An integrated GPU has at most half the computer's memory (as Windows
-/// gives it), which the system and every other app draw on too, and running out of it loses the
-/// device (wgpu loses it on a copy it can't make room for): its layers take an eighth of the
+/// memory (`dedicated`, bytes, where the system says) or `shares` the computer's `memory` (bytes,
+/// none if the system doesn't say). A graphics card holds half its own memory of them, up to 2 GiB
+/// (see [`gpus::layers_on_card`]). An integrated GPU has at most half the computer's memory (as
+/// Windows gives it), which the system and every other app draw on too, and running out of it loses
+/// the device (wgpu loses it on a copy it can't make room for): its layers take an eighth of the
 /// computer's memory, 512 MiB to 2 GiB. A laptop of 8 GB gives them 1 GiB, which the canvas takes
 /// for a device of little memory: its history's older steps kept compressed off the GPU, and fewer
 /// of wet paint's marks to go back to.
-fn layers_on_gpu(shares: bool, memory: Option<u64>) -> u64 {
+fn layers_on_gpu(shares: bool, memory: Option<u64>, dedicated: Option<u64>) -> u64 {
     match (shares, memory) {
-        (false, _) => LAYERS_ON_GPU,
+        (false, _) => gpus::layers_on_card(dedicated, LAYERS_ON_GPU),
         (true, Some(memory)) => (memory / 8).clamp(LAYERS_ON_SHARED_GPU_LEAST, LAYERS_ON_GPU),
         (true, None) => LAYERS_ON_GPU / 2,
     }
@@ -219,14 +223,22 @@ const TITLE_CHECK: Duration = Duration::from_secs(1);
 const SLOW_EVENT: Duration = Duration::from_millis(100);
 
 /// Logs, once dropped, a window event that took longer than [`SLOW_EVENT`] (a dialog it waited on
-/// counts too): what holds the window up shows in the log.
+/// counts too), with the parts of it that took long (see [`frame_parts`]): what holds the window up
+/// shows in the log.
 struct Timed(&'static str, Instant);
+
+impl Timed {
+    fn new(what: &'static str) -> Timed {
+        frame_parts::begin();
+        Timed(what, Instant::now())
+    }
+}
 
 impl Drop for Timed {
     fn drop(&mut self) {
         let took = self.1.elapsed();
         if took > SLOW_EVENT {
-            log::warn!("{} took {} ms", self.0, took.as_millis());
+            log::warn!("{} took {} ms{}", self.0, took.as_millis(), frame_parts::said());
         }
     }
 }
@@ -695,6 +707,10 @@ impl ApplicationHandler for App {
         if let Err(e) = read.spawn(|| procraft_core::prepare_brushes(files::brushes_dir())) {
             log::warn!("reading the brushes ahead: {e}");
         }
+        // how much memory of its own each GPU has, and the one picked in the settings, for the
+        // choice of which to draw with (before the backends' order, which goes by it)
+        gpus::tell_gpu_memory();
+        procraft_gpu::prefer_gpu(self.ui.gpu_preference());
         // in this machine's order, from the backend the last run used, or the next if that one
         // was at risk when it stopped
         let order = startup::backend_order();
@@ -707,12 +723,12 @@ impl ApplicationHandler for App {
         let display = event_loop.owned_display_handle();
         let screen = match Screen::new(window, &display, order, from, tried, startup::gpu_trying, self.wake.clone()) {
             Ok((s, backend)) => {
-                startup::gpu_made(backend);
+                startup::gpu_made(backend, &s.gpu.adapter.get_info());
                 // on OpenGL, whether the drivers gave it the GPU Direct3D 12 would draw with
                 startup::gpu_drawing(&s.gpu.adapter.get_info());
                 // the layers' room on the GPU, by whether its memory is the computer's (before any
                 // canvas is made)
-                let layers = layers_on_gpu(s.gpu.shares_memory(), memory_total());
+                let layers = layers_on_gpu(s.gpu.shares_memory(), memory_total(), s.gpu.dedicated_memory());
                 log::info!("the layers' textures may take {} MB on the GPU", layers >> 20);
                 procraft_core::set_resident_budget(layers);
                 s
@@ -757,8 +773,7 @@ impl ApplicationHandler for App {
         if matches!(event, WindowEvent::AxisMotion { .. }) {
             return;
         }
-        let _timed =
-            Timed(if event == WindowEvent::RedrawRequested { "a frame" } else { "a window event" }, Instant::now());
+        let _timed = Timed::new(if event == WindowEvent::RedrawRequested { "a frame" } else { "a window event" });
         if self.projection.as_ref().is_some_and(|p| p.window.id() == id) {
             self.projection_event(event);
             return;
@@ -1118,7 +1133,6 @@ impl App {
         if self.screen.is_none() {
             return;
         }
-        let began = Instant::now();
         // on OpenGL nothing is drawn while the canvases' pipelines are made (see
         // `Screen::gl_busy`), and nothing that would draw is taken in: looked at again soon (the
         // window answers meanwhile)
@@ -1178,11 +1192,11 @@ impl App {
         // the strokes heard while a plugin makes their sound
         self.stroke_sound.follow(Some(&session), self.ui.plugins().makes_stroke_sound());
         let raw = screen.take_input();
-        let before_ui = began.elapsed();
         // an artwork showing: ready to be seen
         self.full.ready(true);
         let full = &mut self.full;
         let mut leave_answer = None;
+        let laid_out = Instant::now();
         let output = screen.egui.egui_ctx().clone().run_ui(raw, |ui| {
             self.ui.show(ui, &session, &mut self.input);
             update::prompt(ui.ctx(), &mut self.ui.look, &mut self.update_alert);
@@ -1201,22 +1215,12 @@ impl App {
             // whether to leave the artwork without saving it, over everything
             leave_answer = leave_answer.or(self.leave_question.show(ui.ctx(), &mut self.ui.look));
         });
-        let built = began.elapsed();
+        frame_parts::part("the interface", laid_out);
+        let pad = Instant::now();
         let pad_soon = self.studio_pad(&session);
+        frame_parts::part("the drawing pad", pad);
         let Some(screen) = self.screen.as_mut() else { return };
         self.again = screen.draw(Some(&session), self.started, output).map(|after| Instant::now() + after);
-        // a slow frame: what it spent its time on, to find what holds the window up
-        let total = began.elapsed();
-        if total > SLOW_EVENT {
-            log::warn!(
-                "slow canvas frame {} ms: before the interface {} ms (reading, opening), the interface {} ms, \
-                 drawing and showing {} ms",
-                total.as_millis(),
-                before_ui.as_millis(),
-                built.saturating_sub(before_ui).as_millis(),
-                total.saturating_sub(built).as_millis()
-            );
-        }
         if pad_soon {
             self.again = Some(Instant::now());
         }
@@ -2163,17 +2167,36 @@ mod tests {
     fn a_gpu_sharing_the_computers_memory_gives_the_layers_an_eighth_of_it() {
         use super::layers_on_gpu;
         const GB: u64 = 1 << 30;
-        // a graphics card: 2 GiB, whatever the computer has
-        assert_eq!(layers_on_gpu(false, Some(8 * GB)), 2 * GB);
-        assert_eq!(layers_on_gpu(false, None), 2 * GB);
+        // a graphics card whose memory isn't known: 2 GiB, whatever the computer has
+        assert_eq!(layers_on_gpu(false, Some(8 * GB), None), 2 * GB);
+        assert_eq!(layers_on_gpu(false, None, None), 2 * GB);
         // an integrated GPU: an eighth of the computer's memory, 512 MiB to 2 GiB (a laptop of 8 GB,
-        // as #341's, 1 GiB: a device of little memory to the canvas, at most 1280 MiB)
-        assert_eq!(layers_on_gpu(true, Some(8 * GB)), GB);
-        assert!(layers_on_gpu(true, Some(8 * GB)) <= 1280 << 20);
-        assert_eq!(layers_on_gpu(true, Some(4 * GB)), 512 << 20);
-        assert_eq!(layers_on_gpu(true, Some(2 * GB)), 512 << 20);
-        assert_eq!(layers_on_gpu(true, Some(16 * GB)), 2 * GB);
-        assert_eq!(layers_on_gpu(true, Some(64 * GB)), 2 * GB);
-        assert_eq!(layers_on_gpu(true, None), GB);
+        // as #341's, 1 GiB: a device of little memory to the canvas, at most 1280 MiB), whatever
+        // the system sets aside for it
+        assert_eq!(layers_on_gpu(true, Some(8 * GB), None), GB);
+        assert_eq!(layers_on_gpu(true, Some(8 * GB), Some(128 << 20)), GB);
+        assert!(layers_on_gpu(true, Some(8 * GB), None) <= 1280 << 20);
+        assert_eq!(layers_on_gpu(true, Some(4 * GB), None), 512 << 20);
+        assert_eq!(layers_on_gpu(true, Some(2 * GB), None), 512 << 20);
+        assert_eq!(layers_on_gpu(true, Some(16 * GB), None), 2 * GB);
+        assert_eq!(layers_on_gpu(true, Some(64 * GB), None), 2 * GB);
+        assert_eq!(layers_on_gpu(true, None, None), GB);
+    }
+
+    /// A graphics card's layers take half its own memory, as the system tells it: the report's GT
+    /// 710 (1 or 2 GB) took 2 GiB of layers, more than it had, and its frames waited on Windows
+    /// moving textures over the bus. Its 1 GB gives 512 MiB, 2 GB 1 GiB (both within the canvas's
+    /// device of little memory, 1280 MiB), and 4 GB or more 2 GiB as before.
+    #[test]
+    fn a_graphics_card_gives_the_layers_half_its_own_memory() {
+        use super::layers_on_gpu;
+        const GB: u64 = 1 << 30;
+        for memory in [Some(4 * GB), Some(128 * GB), None] {
+            assert_eq!(layers_on_gpu(false, memory, Some(GB)), 512 << 20);
+            assert_eq!(layers_on_gpu(false, memory, Some(2 * GB)), GB);
+            assert!(layers_on_gpu(false, memory, Some(2 * GB)) <= 1280 << 20);
+            assert_eq!(layers_on_gpu(false, memory, Some(4 * GB)), 2 * GB);
+            assert_eq!(layers_on_gpu(false, memory, Some(8 * GB)), 2 * GB);
+        }
     }
 }

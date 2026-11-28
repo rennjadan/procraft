@@ -3,21 +3,22 @@
 //! background under them. Tap a layer to make it current, the current one for its options (where
 //! it is renamed in place), its blend letter for its blend mode and opacity, its box to show or
 //! hide it (hold it to show it alone), the plus for a new layer; hold a row and drag it to move it
-//! (with a mouse, just drag it up or down), out past the panel's side to lift it out and drop it
+//! out past the panel's side to lift it out and drop it
 //! on the canvas or, through the gallery, into another artwork;
 //! slide it left for lock, duplicate and delete, or a little right to pick it. On a model: each
 //! texture set's name over its meshes (each its picture and box), the open mesh's layers under it,
 //! and under a layer its channels (colour, roughness, metalness), one of which a click paints on.
 
+use crate::scroll::{RowDrag, ScrollArea};
 use std::collections::HashMap;
 use std::time::Instant;
 
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat, TextWrapping};
-use egui::{Align2, Color32, Pos2, Rect, ScrollArea, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{
-    BlendCoast, BlendModeInfo, CanvasSession, LayerInfo, LayerOption, LayerOptionRow, LayerType, ModelInfo, NoticeKind,
-    RowDrop, ShownRow, ThumbnailImage, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
-    blend_tap, blend_tap_at,
+    BlendModeInfo, CanvasSession, LayerInfo, LayerOption, LayerOptionRow, LayerType, ModelInfo, NoticeKind, RowDrop,
+    ScrollMotion, ShownRow, ThumbnailImage, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
+    blend_tap, blend_tap_at, scroll_drag_velocity,
 };
 use resvg::tiny_skia;
 
@@ -98,14 +99,6 @@ const BLEND_WHEEL_PAUSE: f64 = 0.12;
 /// picked.
 const SWIPE_BUTTON: f32 = 82.0;
 const SWIPE_GAP: f32 = 2.0;
-/// A flick of the layer list: how fast it slows (per second, as the gallery's), the slowest
-/// speed it glides at and the fastest (points a second), the moments its speed is read over
-/// (seconds), and the speed it stops below.
-const FLING_SLOWING: f32 = 3.2;
-const FLING_LEAST: f32 = 120.0;
-const FLING_MOST: f32 = 6000.0;
-const FLING_WINDOW: f64 = 0.1;
-const FLING_STOP: f32 = 12.0;
 /// A text layer's Pin Text button (its semi-lock), in the accent's blue.
 const SWIPE_PIN_FILL: u32 = 0xFF0A84FF;
 const SWIPE_FILL: u32 = 0xFF3F3F3F;
@@ -141,7 +134,9 @@ enum Way {
     Swipe,
     /// Held: the row is dragged up or down to move it.
     Reorder,
-    /// Moved up or down first: nothing.
+    /// Moved up or down first: drag the list and let it coast at release.
+    Scroll,
+    /// A row that cannot be reordered was held.
     Ignored,
 }
 
@@ -185,7 +180,7 @@ enum BlendMotion {
     /// Scrolled by a wheel or trackpad, last at `last` (seconds).
     Wheel { last: f64 },
     /// Let go at `since` (seconds), moving on as `coast` says.
-    Coasting { coast: BlendCoast, since: f64 },
+    Coasting { coast: ScrollMotion, since: f64 },
     /// A tapped mode scrolling from `from` to the band at `to` since `since` (seconds): the list
     /// takes no touches and shows no modes on the way.
     Tapped { from: f32, to: f32, since: f64 },
@@ -210,6 +205,8 @@ impl Blend {
 
     /// Let go at `now` (seconds) going `speed` (points a second, down the list).
     fn let_go(&mut self, speed: f32, now: f64, rows: u32) {
+        let end = BLEND_ROW * rows.saturating_sub(1) as f32;
+        let speed = scroll_drag_velocity(self.scroll, speed, 0.0, end, BLEND_LIST_HEIGHT);
         self.motion = BlendMotion::Coasting { coast: blend_coast(self.scroll, speed, BLEND_ROW, rows), since: now };
     }
 
@@ -274,6 +271,8 @@ pub struct Layers {
     closed_contents: HashMap<u64, Vec<(LayerInfo, u32)>>,
     last_rows: HashMap<u64, Rect>,
     list: Option<Rect>,
+    list_can_scroll: bool,
+    list_drag: Option<RowDrag>,
     /// The panel's box and its rows where the window has them, as last shown: where layers held out
     /// of it drop.
     box_on_window: Option<Rect>,
@@ -282,10 +281,6 @@ pub struct Layers {
     /// it).
     pub lifted: Option<u64>,
     scroll_by: f32,
-    /// A flick of the list let go: it glides on (points a second, as `scroll_by` goes), slowing
-    /// to a stop; and the finger's recent moves (when, how far down) to tell a flick's speed.
-    fling: f32,
-    moves: Vec<(f64, f32)>,
     /// A row being slid: its recent places (when, how far), to tell a flick's speed; and the
     /// speed it was let go at (points a second), which its settling carries on from.
     swipe_track: Vec<(f64, f32)>,
@@ -583,22 +578,13 @@ impl Layers {
             let mut read = 0;
             self.list = Some(list);
             ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
-                ScrollArea::vertical()
+                let layout = ScrollArea::vertical()
                     .id_salt("layers list")
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .row_drag(self.list_drag.take())
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                        // a flick let go glides on, slowing as Procreate's list does
-                        if self.press.is_none() && self.fling != 0.0 {
-                            let dt = ui.input(|i| i.stable_dt).clamp(0.001, 0.05);
-                            self.scroll_by += self.fling * dt;
-                            self.fling *= (-FLING_SLOWING * dt).exp();
-                            if self.fling.abs() < FLING_STOP {
-                                self.fling = 0.0;
-                            }
-                            ui.ctx().request_repaint();
-                        }
-                        // at once: a finger's drag or a dragged row's at the edge, each frame
+                        // A reordered row held near an edge scrolls the list directly.
                         ui.scroll_with_delta_animation(
                             vec2(0.0, -std::mem::take(&mut self.scroll_by)),
                             egui::style::ScrollAnimation::none(),
@@ -701,7 +687,6 @@ impl Layers {
                                         closed_other,
                                     });
                                     // a press catches the list gliding
-                                    self.fling = 0.0;
                                     self.swipe_track.clear();
                                 }
                                 let mut row_ui = ui.new_child(UiBuilder::new().max_rect(row));
@@ -758,6 +743,7 @@ impl Layers {
                             self.draw_row(&mut row_ui, look, session, l, at, looks, &modes, &mut read);
                         }
                     });
+                self.list_can_scroll = layout.content_size.y > layout.inner_rect.height();
             });
         });
         self.follow_press(ctx, session, &layers, &row_rects, rect);
@@ -1480,9 +1466,8 @@ impl Layers {
     }
 
     /// Follows the press on a row: moved sideways it slides the row (let go past half its buttons,
-    /// it stays open; slid right past half the way, it picks the layer); held still (or, with a
-    /// mouse, moved up or down: a finger or pen doing that scrolls the list, which follows it), the
-    /// row is dragged up and down and, let go, the layer moves next to the row it is over.
+    /// it stays open; slid right past half the way, it picks the layer). A vertical drag scrolls
+    /// an overflowing list. Holding the row first lets the drag reorder it.
     fn follow_press(
         &mut self,
         ctx: &egui::Context,
@@ -1504,12 +1489,10 @@ impl Layers {
                     // an open row takes a nudge right as closing it (a slanting one too)
                     let closing = open && d.x > SLOP * 0.4 && d.x > d.y.abs() * 0.4;
                     let sideways = closing || d.x.abs() > d.y.abs();
-                    if (d.length() > SLOP || closing) && (sideways || !p.mouse) {
-                        p.way = if sideways { Way::Swipe } else { Way::Ignored };
-                        // up or down: the list follows the finger from where it was put down
-                        if !sideways {
-                            self.scroll_by -= d.y;
-                            self.moves = vec![(ctx.input(|i| i.time), d.y)];
+                    if (d.length() > SLOP || closing) && (sideways || self.list_can_scroll || !p.mouse) {
+                        p.way = if sideways { Way::Swipe } else { Way::Scroll };
+                        if !sideways && self.list_can_scroll {
+                            self.list_drag = Some(RowDrag::Move(-d.y));
                             ctx.request_repaint();
                         }
                     } else if open {
@@ -1587,39 +1570,22 @@ impl Layers {
                     }
                     ctx.request_repaint();
                 }
-                // a finger's: the row has the drag (not the list's own drag to scroll), the list
-                // follows it
-                Way::Ignored if !p.mouse => {
-                    let dy = panel::in_panel_by(ctx, ctx.input(|i| i.pointer.delta())).y;
-                    let now = ctx.input(|i| i.time);
-                    self.scroll_by -= dy;
-                    // the last moment's moves, for the flick's speed
-                    self.moves.push((now, dy));
-                    self.moves.retain(|(t, _)| now - t <= FLING_WINDOW);
+                Way::Scroll if self.list_can_scroll => {
+                    let delta = panel::in_panel_by(ctx, ctx.input(|i| i.pointer.delta())).y;
+                    self.list_drag = Some(RowDrag::Move(-delta));
                     ctx.request_repaint();
                 }
-                Way::Ignored => {}
+                Way::Scroll | Way::Ignored => {}
             }
             self.press = Some(p);
             return;
         }
         self.press = None;
         self.dragged_rows.clear();
-        // a finger's scroll let go while moving: the list glides on at its speed
-        if p.way == Way::Ignored && !p.mouse {
-            let now = ctx.input(|i| i.time);
-            let recent: Vec<&(f64, f32)> = self.moves.iter().filter(|(t, _)| now - t <= FLING_WINDOW).collect();
-            let moved: f32 = recent.iter().map(|(_, d)| d).sum();
-            let span = recent.first().map_or(0.0, |(t, _)| (now - t) as f32).max(1.0 / 60.0);
-            let speed = -moved / span;
-            self.fling = if speed.abs() >= FLING_LEAST { speed.clamp(-FLING_MOST, FLING_MOST) } else { 0.0 };
-            self.moves.clear();
-            ctx.request_repaint();
-        }
         self.drop_at = None;
         // an open row's press closes it: a tap, a scroll, or any real move right, whatever way it
         // was let go; only one slid on left (or not at all) keeps it open
-        if open && (matches!(p.way, Way::Undecided | Way::Ignored) || p.most_right > SLOP * 0.75) {
+        if open && (matches!(p.way, Way::Undecided | Way::Ignored | Way::Scroll) || p.most_right > SLOP * 0.75) {
             self.swiped = None;
             if p.way == Way::Swipe {
                 self.swipe_track.clear();
@@ -1665,6 +1631,11 @@ impl Layers {
                 let held = self.held_over(rows, y);
                 self.over = None;
                 session.drop_row(p.id, session.row_drop(Some(p.id), shown_rows(rows), y, held));
+            }
+            Way::Scroll => {
+                let velocity = panel::in_panel_by(ctx, ctx.input(|i| i.pointer.velocity())).y;
+                self.list_drag = Some(RowDrag::Release(-velocity));
+                ctx.request_repaint();
             }
             Way::Undecided | Way::Ignored => {}
         }
@@ -3026,9 +2997,8 @@ mod tests {
         (asked, session.background().visible)
     }
 
-    /// A finger dragged 180 points up a row of a long list, quickly (before a hold picks the row
-    /// up): how far the row moved up, points.
-    fn finger_drag_up_a_row() -> f32 {
+    /// A quick 180 point drag on a row of a long list, by touch or mouse.
+    fn drag_up_a_row(touch_input: bool) -> (f32, f32) {
         let (ctx, mut look) = (egui::Context::default(), Look::default());
         crate::look::install_fonts(&ctx);
         let session = CanvasSession::new(64, 64);
@@ -3081,24 +3051,42 @@ mod tests {
             pressed,
             modifiers: Modifiers::NONE,
         };
-        // as egui-winit gives a touch: the touch, and the pointer it moves
+        let touch_event = |phase, pos| touch_input.then(|| touch(phase, pos));
+        // egui-winit delivers a touch together with the pointer it moves.
         let mut at = row.center();
-        frame(&mut layers, vec![touch(egui::TouchPhase::Start, at), Event::PointerMoved(at), button_at(at, true)]);
+        let mut events = vec![Event::PointerMoved(at), button_at(at, true)];
+        events.extend(touch_event(egui::TouchPhase::Start, at));
+        frame(&mut layers, events);
         for _ in 0..15 {
             at.y -= 12.0;
-            frame(&mut layers, vec![touch(egui::TouchPhase::Move, at), Event::PointerMoved(at)]);
+            let mut events = vec![Event::PointerMoved(at)];
+            events.extend(touch_event(egui::TouchPhase::Move, at));
+            frame(&mut layers, events);
         }
-        frame(&mut layers, vec![touch(egui::TouchPhase::End, at), button_at(at, false), Event::PointerGone]);
-        for _ in 0..4 {
+        let distance = |layers: &Layers| layers.last_rows.get(&id).map_or(0.0, |after| row.top() - after.top());
+        let dragged = distance(&layers);
+        let mut events = vec![button_at(at, false)];
+        if let Some(end) = touch_event(egui::TouchPhase::End, at) {
+            events.extend([end, Event::PointerGone]);
+        }
+        frame(&mut layers, events);
+        for _ in 0..12 {
             frame(&mut layers, Vec::new());
         }
-        layers.last_rows.get(&id).map_or(0.0, |after| row.top() - after.top())
+        (dragged, distance(&layers))
     }
 
     #[test]
     fn a_finger_dragged_up_a_row_scrolls_the_list() {
-        let moved = finger_drag_up_a_row();
+        let (_, moved) = drag_up_a_row(true);
         assert!(moved > 120.0, "the row moved {moved} points up");
+    }
+
+    #[test]
+    fn mouse_drag_on_a_layer_row_scrolls_and_coasts_after_release() {
+        let (dragged, released) = drag_up_a_row(false);
+        assert!(dragged > 120.0, "the list only moved {dragged} points while dragging");
+        assert!(released - dragged > 40.0, "the list moved from {dragged} to {released} after release");
     }
 
     #[test]

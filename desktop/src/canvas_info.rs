@@ -3,11 +3,10 @@
 //! card at the left (a rail of icons on an upright window), the artwork's name to edit as the
 //! title, Cancel and Done. About keeps the author's photo and signature in the artwork's folder.
 
+use crate::scroll::ScrollArea;
 use std::path::Path;
 
-use egui::{
-    Align2, Color32, Id, Order, Pos2, Rect, ScrollArea, Sense, Stroke, TextureHandle, Ui, UiBuilder, pos2, vec2,
-};
+use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{
     ArtworkInfo, CanvasSession, cmyk_profiles, color_profiles, convert_color, is_cmyk_profile, read_signature,
     write_photo, write_signature,

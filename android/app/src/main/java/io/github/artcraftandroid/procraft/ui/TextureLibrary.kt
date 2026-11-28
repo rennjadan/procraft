@@ -140,6 +140,8 @@ private fun TextureLibrary(vm: CanvasViewModel, key: String, onClose: () -> Unit
                     horizontalArrangement = Arrangement.spacedBy(53.dp),
                     verticalArrangement = Arrangement.spacedBy(18.dp),
                     modifier = Modifier.fillMaxSize(),
+                    flingBehavior = rememberScrollFling(),
+                    overscrollEffect = rememberScrollEdges(),
                 ) {
                     items(tiles.size) { k ->
                         val tile = tiles[k]

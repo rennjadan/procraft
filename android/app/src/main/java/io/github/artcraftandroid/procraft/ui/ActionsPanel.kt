@@ -29,7 +29,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
@@ -413,7 +412,7 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
                     }
                 }
                 Column(
-                    Modifier.heightIn(max = 760.dp).verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 20.dp, bottom = 11.dp)
+                    Modifier.heightIn(max = 760.dp).kineticVerticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 20.dp, bottom = 11.dp)
                         .graphicsLayer { alpha = rowsShown.value },
                 ) {
                     groups.forEachIndexed { g, all ->
@@ -480,7 +479,7 @@ fun ActionsPanel(vm: CanvasViewModel, arrowX: Dp, modifier: Modifier = Modifier)
         AlertDialog(
             onDismissRequest = { dialog = null },
             title = { Text(title) },
-            text = { Text(text, modifier = Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) },
+            text = { Text(text, modifier = Modifier.heightIn(max = 420.dp).kineticVerticalScroll(rememberScrollState())) },
             confirmButton = { TextButton(onClick = { dialog = null }) { Text("Done") } },
         )
     }
@@ -645,7 +644,7 @@ private fun PenButtonsPage(vm: CanvasViewModel, onBack: () -> Unit) {
     val at = if (second) 1 else 0
     val set = vm.penButtonActions.getOrNull(at)
     val chosen = pluginSet(at)?.let { choices.size + pluginActions.indexOf(it) } ?: choices.indexOf(set).coerceAtLeast(0)
-    Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 13.dp)) {
+    Column(Modifier.heightIn(max = 520.dp).kineticVerticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 13.dp)) {
         ChoiceGroup(choices.map(::penButtonLabel) + pluginActions.map { it.label }, chosen) {
             val plugin = pluginActions.getOrNull(it - choices.size)
             if (plugin != null) vm.setPenButtonPlugin(second, plugin.key) else vm.setPenButtonAction(second, choices.getOrNull(it))
@@ -697,7 +696,7 @@ private fun PluginsPage(vm: CanvasViewModel, onBack: () -> Unit) {
     val dropNow by rememberUpdatedState(::drop)
     Box(Modifier.onGloballyPositioned { listBounds = it.boundsInWindow() }) {
         Column(
-            Modifier.verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 13.dp),
+            Modifier.kineticVerticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 13.dp),
             verticalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(20.dp),
         ) {
             if (shown.isEmpty()) Text("Nothing imported yet. Import a .procraft-plugin file to add one.", color = Pc.ActionsRow, fontSize = 15.sp, modifier = Modifier.padding(16.dp))
@@ -910,7 +909,7 @@ fun PluginPanelView(vm: CanvasViewModel, modifier: Modifier = Modifier) {
             Text(panel.title, color = Pc.PanelTitle, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.weight(1f))
             Text("Done", color = Pc.Accent, fontSize = 17.sp, maxLines = 1, modifier = Modifier.clickable { vm.closePluginPanel() })
         }
-        Column(Modifier.verticalScroll(rememberScrollState()).padding(start = 10.dp, top = 8.dp, end = 10.dp, bottom = 10.dp)) {
+        Column(Modifier.kineticVerticalScroll(rememberScrollState()).padding(start = 10.dp, top = 8.dp, end = 10.dp, bottom = 10.dp)) {
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(13.dp)).background(Pc.ActionsGroup)) {
                 panel.rows.forEachIndexed { i, row ->
                     if (i > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(Pc.ActionsSeparator))
@@ -1233,7 +1232,7 @@ private fun PressurePage(vm: CanvasViewModel, onBack: () -> Unit) {
         }
         Text("Pressure & Smoothing", color = Pc.PanelTitle, fontSize = 22.sp, fontWeight = FontWeight.Bold, maxLines = 1)
     }
-    Column(Modifier.heightIn(max = 760.dp).verticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 20.dp, bottom = 13.dp)) {
+    Column(Modifier.heightIn(max = 760.dp).kineticVerticalScroll(rememberScrollState()).padding(start = 12.dp, end = 12.dp, top = 20.dp, bottom = 13.dp)) {
         Group(
             listOf(
                 Slide("Stabilization", percent(vm.inputStabilization), vm.inputStabilization, 64.dp) { vm.changeInput(stabilization = it) },
@@ -1434,7 +1433,9 @@ private fun versionName(context: Context): String =
 private fun licences(context: Context): String {
     fun asset(name: String) = runCatching { context.assets.open(name).bufferedReader().use { it.readText() } }.getOrDefault("")
     return "The interface font is Inter, by The Inter Project Authors.\n\n${asset("fonts/Inter-OFL.txt")}\n\n" +
-        "The app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors.\n\n${asset("icons/LICENSE-lucide.txt")}"
+        "The app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors.\n\n${asset("icons/LICENSE-lucide.txt")}\n\n" +
+        "The undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the Apache License 2.0.\n\n" +
+        asset("icons/LICENSE-material-symbols.txt")
 }
 
 /** Offers [files] to other apps through the share sheet. */

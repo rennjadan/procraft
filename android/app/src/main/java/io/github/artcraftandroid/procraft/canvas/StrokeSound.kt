@@ -52,6 +52,9 @@ class StrokeSound {
     }
 
     private fun play() {
+        // fed ahead of the audio as an audio thread is, so a busy moment (a big fill on a large canvas) never
+        // leaves the sound waiting for a turn and running dry
+        runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO) }
         val format = AudioFormat.Builder()
             .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
             .setSampleRate(RATE)

@@ -3,7 +3,8 @@
 //! mode and the modes as icons, 260 wide; no swatches, history or palette. It edits a colour of its
 //! own, which the screen that opened it takes as it changes.
 
-use egui::{Align2, Color32, Rect, ScrollArea, Sense, Ui, UiBuilder, Vec2, pos2, vec2};
+use crate::scroll::ScrollArea;
+use egui::{Align2, Color32, Rect, Sense, Ui, UiBuilder, Vec2, pos2, vec2};
 use procraft_core::{HueControl, Palettes, SLIDER_HUES, hue_at, hue_position};
 
 use crate::colours::{

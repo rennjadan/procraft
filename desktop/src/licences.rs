@@ -4,9 +4,10 @@
 //! third-party crates (Android's does), so they follow here (desktop/licenses.txt, written by
 //! tools/licenses.py).
 
+use crate::scroll::ScrollArea;
 use std::sync::{Arc, OnceLock};
 
-use egui::{Align2, Color32, Id, Order, Rect, ScrollArea, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Id, Order, Rect, Sense, Stroke, StrokeKind, Ui, UiBuilder, pos2, vec2};
 
 use crate::look::{Weight, argb, pc, text};
 
@@ -22,6 +23,8 @@ const LICENCES: &str = concat!(
     include_str!("../../android/app/src/main/assets/fonts/Inter-OFL.txt"),
     "\n\nThe app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors.\n\n",
     include_str!("../../android/app/src/main/assets/icons/LICENSE-lucide.txt"),
+    "\n\nThe undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the ",
+    "Apache License 2.0 (its text at the end).",
 );
 /// What the Windows packages hold besides the app: Microsoft's DirectX Shader Compiler, beside the
 /// .exe, which Direct3D 12 makes the shaders with (packaging/windows).

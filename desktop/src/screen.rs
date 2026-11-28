@@ -20,6 +20,10 @@ pub struct Screen {
     format: wgpu::TextureFormat,
     /// The brush studio's drawing pad: its own picture, shown by the interface.
     pad: Option<Pad>,
+    /// The pad's pictures let go, still in the frame being drawn: the interface shows a pad's
+    /// picture once more in the frame its studio closes in (laid out before it closed), so they go
+    /// once that frame is drawn ("Missing texture" else, the frame drawing nothing there).
+    pads_gone: Vec<egui::TextureId>,
     /// The canvases' pipelines being made on a thread of their own, the window showing meanwhile
     /// (seconds; many more with Direct3D 12's shader compiler): whether they were made without a
     /// GPU error.
@@ -214,6 +218,7 @@ impl Screen {
             renderer,
             format,
             pad: None,
+            pads_gone: Vec::new(),
             canvases: None,
             canvases_since: Instant::now(),
             canvases_later: None,
@@ -358,10 +363,11 @@ impl Screen {
         p.id
     }
 
-    /// The pad's picture goes (the studio closed).
+    /// The pad's picture goes (the studio closed), once the frame being drawn is (see
+    /// [`Screen::pads_gone`]).
     pub fn drop_pad(&mut self) {
         if let Some(p) = self.pad.take() {
-            self.renderer.free_texture(&p.id);
+            self.pads_gone.push(p.id);
         }
     }
 
@@ -374,7 +380,6 @@ impl Screen {
         started: Instant,
         output: egui::FullOutput,
     ) -> Option<Duration> {
-        let began = Instant::now();
         let egui::FullOutput { platform_output, mut textures_delta, shapes, pixels_per_point, viewport_output } =
             output;
         // a pen read by the app itself (on Wayland) has its cursor set apart from the mouse's
@@ -418,8 +423,11 @@ impl Screen {
         };
         let size = (config.width, config.height);
         let (format, screen) = (config.format, screen_profile(config));
-        let textures_done = began.elapsed();
-        let frame = match crate::window_watch::picture(self.surface.get_current_texture()) {
+        // handed out once the GPU is far enough through the frames before: a wait here is the GPU's
+        let asked = Instant::now();
+        let picture = self.surface.get_current_texture();
+        crate::frame_parts::part("waiting for the GPU", asked);
+        let frame = match crate::window_watch::picture(picture) {
             Ok(frame) => frame,
             // drawn again whatever the surface said, soon, then less often while it says it: on a
             // Mac an occluded window is one the system counts as hidden, and it can be late to count
@@ -438,13 +446,14 @@ impl Screen {
                 return Some(retry.after);
             }
         };
-        let got_frame = began.elapsed();
         if let Some(line) = self.surface_misses.shown(Instant::now()) {
             log::info!("{line}");
         }
         let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let canvas = Instant::now();
         let canvas_after = session.and_then(|s| s.draw(&view, format, size, screen, started));
-        let canvas_done = began.elapsed();
+        crate::frame_parts::part("the canvas", canvas);
+        let interface = Instant::now();
 
         let jobs = self.egui.egui_ctx().tessellate(shapes, pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor { size_in_pixels: [size.0, size.1], pixels_per_point };
@@ -461,21 +470,16 @@ impl Screen {
             return Some(MISSED_RETRY);
         };
         self.after_frame = self.misses.frame(true);
+        crate::frame_parts::part("the interface drawn", interface);
+        let sent = Instant::now();
         self.gpu.queue.submit(uploads.into_iter().chain([encoder.finish()]));
-        let interface_done = began.elapsed();
         self.window.pre_present_notify();
-        if began.elapsed() > Duration::from_millis(100) {
-            log::warn!(
-                "slow draw {} ms: the interface's pictures {} ms, waiting for the screen {} ms, the canvas {} ms, \
-                 the interface {} ms",
-                began.elapsed().as_millis(),
-                textures_done.as_millis(),
-                got_frame.saturating_sub(textures_done).as_millis(),
-                canvas_done.saturating_sub(got_frame).as_millis(),
-                interface_done.saturating_sub(canvas_done).as_millis()
-            );
-        }
         self.gpu.queue.present(frame);
+        crate::frame_parts::part("sent and shown", sent);
+        // the pads' pictures let go in this frame, now it is drawn
+        for id in std::mem::take(&mut self.pads_gone) {
+            self.renderer.free_texture(&id);
+        }
         // the backend shows: a crash from now on isn't its start's
         crate::startup::gpu_shown();
         // on OpenGL the canvases' pipelines once there is a window to see

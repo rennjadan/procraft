@@ -151,6 +151,9 @@ pub(crate) mod field {
     /// none (a finger's), then two 32-bit floats, how far it grew from nothing at the start and fell
     /// to nothing at the end (canvas pixels, before its transform).
     pub(crate) const PRESSURE: u16 = 27;
+    /// 32-bit float: how far the pen's pressure reached (see
+    /// [`procraft_engine::stroke::InputSettings::pressure_scale`]); none, 1.
+    pub(crate) const PRESSURE_SCALE: u16 = 28;
     /// The first id of a plugin's own fields.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) const OWN: u16 = 0x8000;
@@ -498,6 +501,9 @@ impl Item {
             input.extend_from_slice(&p.y.to_le_bytes());
         }
         r.field(field::INPUT, &input);
+        if i.pressure_scale != 1.0 {
+            r.floats(field::PRESSURE_SCALE, &[i.pressure_scale]);
+        }
         if let Some(symmetry) = self.symmetry {
             r.field(field::SYMMETRY, &symmetry.bytes());
         }
@@ -638,7 +644,15 @@ impl Item {
                         .map(|z| z.clamp(1e-4, 1e4));
                 }
                 field::ALPHA_LOCK => item.alpha_lock = bytes.first().is_some_and(|b| *b != 0),
-                field::INPUT => item.input = input_of(bytes).unwrap_or_default(),
+                field::INPUT => {
+                    // (its pressure's reach kept, whichever field came first)
+                    let scale = item.input.pressure_scale;
+                    item.input = InputSettings { pressure_scale: scale, ..input_of(bytes).unwrap_or_default() };
+                }
+                field::PRESSURE_SCALE => {
+                    item.input.pressure_scale =
+                        floats::<1>(bytes).filter(|[v]| v.is_finite()).map_or(1.0, |[v]| v.clamp(1.0, 16.0));
+                }
                 field::SYMMETRY => item.symmetry = Symmetry::read(bytes),
                 field::STARTED => {
                     item.started = bytes
@@ -945,6 +959,7 @@ fn input_of(bytes: &[u8]) -> Option<InputSettings> {
         speed_distance: speed_distance.clamp(0.25, 1.0),
         tip_attached,
         tilt_known: true,
+        pressure_scale: 1.0,
     })
 }
 
@@ -2525,6 +2540,8 @@ mod tests {
                 stabilization: 0.2,
                 pressure_curve: Curve::new(&[Vec2::new(0.0, 0.0), Vec2::new(0.5, 0.7), Vec2::new(1.0, 1.0)]),
                 tip_attached: false,
+                // drawn with an iPad's Pencil
+                pressure_scale: 25.0 / 6.0,
                 ..InputSettings::default()
             },
             symmetry: Some(Symmetry {

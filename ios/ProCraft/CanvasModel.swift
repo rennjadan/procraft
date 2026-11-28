@@ -1151,12 +1151,22 @@ final class CanvasModel {
         }
     }
 
-    /// The library closed: the core lets go of the canvas its sample strokes are drawn on (100 MB
-    /// and more of the GPU's memory after a heavy set), made again for the next. The pictures stay,
-    /// so it opens again at once.
-    func libraryClosed() {
+    /// The library closed, its lists standing as `spot` says (kept for when it opens again on the
+    /// same set): the core lets go of the canvas its sample strokes are drawn on (100 MB and more
+    /// of the GPU's memory after a heavy set), made again for the next. The pictures stay, so it
+    /// opens again at once.
+    func libraryClosed(_ spot: LibraryScroll?) {
+        if let spot {
+            session.libraryClosed(scroll: spot)
+        }
         let session = session
         DispatchQueue.global(qos: .utility).async { session.letGoOfPreviews() }
+    }
+
+    /// Where the brush library's lists start as it opens: as they stood when it last closed on
+    /// the set it shows now, else none (the shown set and the brush in use are brought into sight).
+    func libraryStart() -> LibraryScroll? {
+        session.libraryOpens(shownSet: Int32(clamping: shownSet))
     }
 
     /// `image` kept as brush `key`'s sample stroke, the oldest let go past the most kept.

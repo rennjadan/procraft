@@ -2,7 +2,7 @@
   "schema": 1,
   "id": "io.github.artcraftandroid.brush-extras",
   "name": "Brush extras",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "holds": ["hooks"],
   "publisher": {"name": "ProCraft"},
   "description": "Randomise in the brush studio, a sound as you draw, a pressure for your finger, strokes moved off the pen tip and QuickShape curves, each with a switch of its own.",

@@ -7,6 +7,17 @@ private let settingsWidth: CGFloat = 323
 private let padHeight: CGFloat = 510
 private let tabsWidth: CGFloat = 81
 
+/// A window wider than tall and wider than this (points) has the studio's pages, settings and pad
+/// side by side, as the reference lays it; else the pages are a rail beside the pad over the
+/// settings, as upright (a 1024-point screen on its side too).
+private let sideBySidePast: CGFloat = 1024
+
+/// Whether the studio in a window of `size` lays its pages, settings and pad side by side (see
+/// `sideBySidePast`).
+func studioSideBySide(_ size: CGSize) -> Bool {
+    size.width > size.height && size.width > sideBySidePast
+}
+
 /// The studio's colours, dark or as the light interface has them.
 enum StudioInk {
     private static func pick(_ dark: UInt32, _ light: UInt32) -> Color {
@@ -82,7 +93,8 @@ struct BrushStudio: View {
 
     var body: some View {
         GeometryReader { screen in
-            let landscape = screen.size.width > screen.size.height
+            // (the settings, parts and source editor take the layout's shapes)
+            let landscape = studioSideBySide(screen.size)
             ZStack(alignment: .topLeading) {
                 StudioInk.back
                 if landscape {
@@ -97,8 +109,9 @@ struct BrushStudio: View {
                     HStack(spacing: 0) {
                         StudioRail(studio: studio, ui: ui)
                         VStack(spacing: 0) {
+                            // at most 45% of a short window, so the settings under it have room
                             StudioPad(model: model)
-                                .frame(height: padHeight)
+                                .frame(height: min(padHeight, screen.size.height * 0.45))
                             StudioInk.line.frame(height: 1)
                             StudioSettings(model: model, ui: ui, landscape: false)
                         }

@@ -2109,14 +2109,21 @@ class CanvasViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * The library closed: the core lets go of the canvas its sample strokes are drawn on (100 MB and
-     * more of the GPU's memory after a heavy set), made again for the next. The pictures stay, so it
-     * opens again at once.
+     * The library closed, its lists standing as [scroll] says (kept for when it opens again on the same set): the core
+     * lets go of the canvas its sample strokes are drawn on (100 MB and more of the GPU's memory after a heavy set),
+     * made again for the next. The pictures stay, so it opens again at once.
      */
-    fun libraryClosed() {
+    fun libraryClosed(scroll: io.github.artcraftandroid.procraft.core.LibraryScroll?) {
         val s = session ?: return
+        scroll?.let { s.libraryClosed(it) }
         viewModelScope.launch(Dispatchers.Default) { s.letGoOfPreviews() }
     }
+
+    /**
+     * Where the library's lists start as it opens: as they stood when it last closed, if it closed on the set it
+     * shows now; else none, and the shown set and the brush in use are scrolled into sight.
+     */
+    fun libraryStart(): io.github.artcraftandroid.procraft.core.LibraryScroll? = session?.libraryOpens(shownSet)
 
     /** Counts the library's changes: a sample stroke asked for before the last one isn't kept. */
     var previewRound by androidx.compose.runtime.mutableIntStateOf(0)

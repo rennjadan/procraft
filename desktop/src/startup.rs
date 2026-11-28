@@ -59,6 +59,9 @@ const GPU_ASKING: &str = "gpu-asking.txt";
 const GPU_RETRY: &str = "gpu-retry.txt";
 /// The graphics backend chosen in Settings ("Direct3D 12", "Vulkan", "OpenGL"): tried first.
 const GPU_CHOICE: &str = "gpu-choice.txt";
+/// The GPU the backend record is kept for, "<vendor> <device>" (see [`Chosen`]): a record kept for
+/// another GPU than the one to draw with now is of no use (see [`backend_order`]).
+const GPU_CHOSEN: &str = "gpu-chosen.txt";
 /// How far the app last got with a tablet driver's WinTab, and the version that got there.
 #[cfg_attr(not(windows), allow(dead_code))]
 const WINTAB: &str = "wintab.txt";
@@ -82,6 +85,9 @@ const START_WATCH: Duration = Duration::from_secs(5);
 const START_WATCH_MOST: Duration = Duration::from_secs(10 * 60);
 /// When the app was started.
 static LAUNCHED: OnceLock<Instant> = OnceLock::new();
+/// The backend record was kept for another GPU than the one the app now draws with (see
+/// [`backend_order`]): the start goes as if there were none.
+static FOR_ANOTHER_GPU: AtomicBool = AtomicBool::new(false);
 
 /// The log of the run before this one (the one a crash ended, after one), else this run's: what to
 /// send on when asked for it.
@@ -324,20 +330,33 @@ fn usual_order() -> Vec<usize> {
         if !asked {
             return listed;
         }
-        // nothing to choose where the record keeps its backend: and asking takes a Direct3D 12
-        // device for each GPU, which a machine that has already drawn needn't risk at each start
-        let saved = if recorded() {
-            std::fs::read_to_string(files::app_dir().join(GPU_START)).unwrap_or_default()
+        // nothing to choose where the record keeps its backend, for the GPU it was kept for: and
+        // asking takes a Direct3D 12 device for each GPU, which a machine that has already drawn
+        // needn't risk at each start
+        let (saved, chosen) = if recorded() {
+            let dir = files::app_dir();
+            let read = |name| std::fs::read_to_string(dir.join(name)).ok();
+            (read(GPU_START).unwrap_or_default(), Chosen::read(read(GPU_CHOSEN).as_deref()))
         } else {
-            String::new()
+            (String::new(), Chosen::Missing)
         };
-        if keeps_backend(&saved, backends.len(), ENDS_TOLD) {
+        if keeps_backend(&saved, backends.len(), ENDS_TOLD) && matches!(chosen, Chosen::Gpu(..)) {
             return listed;
         }
-        let Some((picked, took)) = d3d12_choice() else {
+        let Some((picked, before, took)) = d3d12_choice() else {
             log::warn!("the last start stopped as Direct3D 12 listed the GPUs: the backends in their order");
             return listed;
         };
+        // a record kept for another GPU (the one an earlier version drew with, or before the GPU
+        // was picked in the settings) says nothing of this one's backends; but never once the app
+        // has started itself again after a backend crashed (that run's GPU is this one's, and
+        // starting over would try the backend that crashed again)
+        let ids = |a: &wgpu::AdapterInfo| (a.vendor, a.device);
+        let another = chosen.another(before.as_ref().map(ids), picked.as_ref().map(ids));
+        if !saved.trim().is_empty() && gpu_tried() == 0 && another {
+            FOR_ANOTHER_GPU.store(true, Ordering::Relaxed);
+            log::info!("the backend record was kept for another GPU: the backends start over");
+        }
         let order = order_for(&backends, picked.as_ref().map(|a| (a.vendor, a.device_type)));
         match picked {
             Some(gpu) if order != listed => log::info!(
@@ -359,11 +378,13 @@ fn usual_order() -> Vec<usize> {
     }
 }
 
-/// The GPU Direct3D 12 would draw with (see [`drawn_with`]), as it lists them, once a run, and how
-/// long that took (ms); none where they can't be listed: the last start stopped as they were (a
-/// driver that crashes as it is asked mustn't do so at every start).
-fn d3d12_choice() -> Option<&'static (Option<wgpu::AdapterInfo>, u128)> {
-    static CHOICE: OnceLock<Option<(Option<wgpu::AdapterInfo>, u128)>> = OnceLock::new();
+/// The GPU the app draws with, of those Direct3D 12 lists (see `procraft_gpu::choose_gpu`), and the
+/// one versions before drew with (see [`drawn_with`]), once a run, and how long that took (ms);
+/// none where they can't be listed: the last start stopped as they were (a driver that crashes as
+/// it is asked mustn't do so at every start).
+#[allow(clippy::type_complexity)]
+fn d3d12_choice() -> Option<&'static (Option<wgpu::AdapterInfo>, Option<wgpu::AdapterInfo>, u128)> {
+    static CHOICE: OnceLock<Option<(Option<wgpu::AdapterInfo>, Option<wgpu::AdapterInfo>, u128)>> = OnceLock::new();
     CHOICE
         .get_or_init(|| {
             let asking = files::app_dir().join(GPU_ASKING);
@@ -385,8 +406,13 @@ fn d3d12_choice() -> Option<&'static (Option<wgpu::AdapterInfo>, u128)> {
                 let _ = std::fs::remove_file(&asking);
             }
             let gpus: Vec<(u32, wgpu::DeviceType)> = seen.iter().map(|a| (a.vendor, a.device_type)).collect();
-            let picked = drawn_with(&gpus).and_then(|i| seen.get(i)).cloned();
-            Some((picked, started.elapsed().as_millis()))
+            let before = drawn_with(&gpus).and_then(|i| seen.get(i)).cloned();
+            let at = procraft_gpu::choose_gpu(&seen);
+            let picked = at.and_then(|i| seen.get(i)).cloned();
+            if let Some(why) = at.and_then(|i| procraft_gpu::passed_over(&seen, i)) {
+                log::info!("the GPU to draw with: {why}");
+            }
+            Some((picked, before, started.elapsed().as_millis()))
         })
         .as_ref()
 }
@@ -401,11 +427,11 @@ pub fn gpu_drawing(gpu: &wgpu::AdapterInfo) {
     }
     match d3d12_choice() {
         None => log::info!("OpenGL draws on {} (Direct3D 12 isn't asked which GPU it would draw with)", gpu.name),
-        Some((None, _)) => log::info!("OpenGL draws on {} (Direct3D 12 lists no GPU)", gpu.name),
-        Some((Some(d3d12), _)) if same_gpu(gpu, d3d12) => {
+        Some((None, ..)) => log::info!("OpenGL draws on {} (Direct3D 12 lists no GPU)", gpu.name),
+        Some((Some(d3d12), ..)) if same_gpu(gpu, d3d12) => {
             log::info!("OpenGL draws on {}, the GPU Direct3D 12 would draw with", gpu.name);
         }
-        Some((Some(d3d12), _)) => log::warn!(
+        Some((Some(d3d12), ..)) => log::warn!(
             "OpenGL draws on {} (vendor {:#06x}), not on {} (vendor {:#06x}) as Direct3D 12 would: the GPU the              drivers give the app",
             gpu.name,
             gpu.vendor,
@@ -430,8 +456,10 @@ fn keeps_backend(saved: &str, count: usize, ends_told: bool) -> bool {
     Record::read(saved).is_some_and(|r| r.backend < count && !r.stage.counts(ends_told))
 }
 
-/// Which of `gpus` (vendor, type) the app would draw with: the first discrete one, else the first
-/// integrated one, as wgpu picks one for high performance; none if all are software or unknown.
+/// Which of `gpus` (vendor, type) versions before this one drew with: the first discrete one, else
+/// the first integrated one, as wgpu picks one for high performance; none if all are software or
+/// unknown. (Now an old or entry-level card gives way to a recent integrated GPU: see
+/// `procraft_gpu::choose_gpu`.)
 fn drawn_with(gpus: &[(u32, wgpu::DeviceType)]) -> Option<usize> {
     use wgpu::DeviceType::{DiscreteGpu, IntegratedGpu};
     let first = |kind| gpus.iter().position(|&(_, t)| t == kind);
@@ -458,7 +486,8 @@ fn order_for(backends: &[wgpu::Backends], gpu: Option<(u32, wgpu::DeviceType)>) 
 /// The backend to start from, of those in `order`: the one the last run used, or the next if that
 /// one was at risk when the run stopped (see the module's note).
 pub fn gpu_start(order: &[usize]) -> usize {
-    let saved = if recorded() {
+    // (a record kept for another GPU is as none: see `backend_order`)
+    let saved = if recorded() && !FOR_ANOTHER_GPU.load(Ordering::Relaxed) {
         std::fs::read_to_string(files::app_dir().join(GPU_START)).unwrap_or_default()
     } else {
         String::new()
@@ -535,9 +564,14 @@ pub fn gpu_trying(index: usize) {
     keep(&mut run);
 }
 
-/// The window's device is made from backend `index`.
-pub fn gpu_made(index: usize) {
+/// The window's device is made from backend `index`, on the GPU `gpu`: the record is kept for it.
+pub fn gpu_made(index: usize, gpu: &wgpu::AdapterInfo) {
     run_now().made(index);
+    if recorded()
+        && let Err(e) = files::write_whole(&files::app_dir().join(GPU_CHOSEN), Chosen::text(gpu).as_bytes())
+    {
+        log::warn!("keeping which GPU the backend record is for: {e}");
+    }
     // the drivers are loaded now, and one may have put its own filter in place of the app's
     #[cfg(windows)]
     native::watch_again();
@@ -799,6 +833,60 @@ impl Stage {
             Stage::Trying | Stage::Drawing => true,
             Stage::Running => ends_told,
             Stage::Ended => false,
+        }
+    }
+}
+
+/// Another GPU was picked in the settings: the next start asks which to draw with again, and the
+/// backend record, kept for the one before, counts for nothing then (see [`Chosen::Unknown`]).
+pub fn gpu_choice_changed() {
+    if recorded()
+        && let Err(e) = files::write_whole(&files::app_dir().join(GPU_CHOSEN), b"changed")
+    {
+        log::warn!("keeping that another GPU was picked: {e}");
+    }
+}
+
+/// Which GPU the backend record was kept for, as its file says (see [`GPU_CHOSEN`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Chosen {
+    /// No file: kept by a version before this one, for the GPU it drew with (see [`drawn_with`]).
+    Missing,
+    /// Another GPU was picked in the settings since (see [`gpu_choice_changed`]), or the file can't
+    /// be read: for none known.
+    Unknown,
+    /// For the GPU of this vendor and device.
+    Gpu(u32, u32),
+}
+
+impl Chosen {
+    /// The file's text for the GPU `gpu`.
+    fn text(gpu: &wgpu::AdapterInfo) -> String {
+        format!("{:#06x} {:#06x}", gpu.vendor, gpu.device)
+    }
+
+    /// What the file `saved` says (none: no file).
+    fn read(saved: Option<&str>) -> Chosen {
+        let Some(saved) = saved else { return Chosen::Missing };
+        let number = |w: &str| u32::from_str_radix(w.trim_start_matches("0x"), 16).ok();
+        let mut words = saved.split_whitespace();
+        match (words.next().and_then(number), words.next().and_then(number)) {
+            (Some(vendor), Some(device)) => Chosen::Gpu(vendor, device),
+            _ => Chosen::Unknown,
+        }
+    }
+
+    /// Whether the record it is for was kept for another GPU than `now` (vendor, device), the one
+    /// to draw with; `before` the one versions before this drew with. A GPU OpenGL drew on is told
+    /// by its vendor alone (OpenGL gives no device, nor always a vendor: then it is taken for the
+    /// same), and none to draw with (Direct3D 12 lists none) is taken for the same.
+    fn another(self, before: Option<(u32, u32)>, now: Option<(u32, u32)>) -> bool {
+        match self {
+            Chosen::Missing => before != now,
+            Chosen::Unknown => true,
+            Chosen::Gpu(vendor, device) => {
+                now.is_some_and(|(v, d)| vendor != 0 && (v != vendor || (device != 0 && d != device)))
+            }
         }
     }
 }
@@ -1556,7 +1644,7 @@ mod tests {
         assert_eq!(next_start("7 ended drew", &[1, 2, 0], false), 1);
     }
 
-    use super::{INTEL, drawn_with, keeps_backend, order_for};
+    use super::{Chosen, INTEL, drawn_with, keeps_backend, order_for};
     use procraft_gpu::wgpu::Backends;
     use procraft_gpu::wgpu::DeviceType::{Cpu, DiscreteGpu, IntegratedGpu, Other};
 
@@ -1633,6 +1721,46 @@ mod tests {
         // a run that never ended counts only where the system says when it ends
         assert!(!keeps_backend("0 running drew", 3, true));
         assert!(keeps_backend("0 running drew", 3, false));
+    }
+
+    /// The record kept for another GPU counts for nothing: the report's PC, which drew on Vulkan
+    /// with its GT 710, starts on Direct3D 12 with its Intel UHD 630 (whose Vulkan driver is the
+    /// kind that crashes), not on the Vulkan the record trusted. A record of this version's is
+    /// for the GPU its file names; one from before, for the GPU wgpu took then; one from before
+    /// another GPU was picked in the settings, for none.
+    #[test]
+    fn a_record_kept_for_another_gpu_counts_for_nothing() {
+        use procraft_gpu::wgpu;
+        let gt710 = (NVIDIA, 0x128b);
+        let uhd630 = (INTEL, 0x3e92);
+        // the file as written and read again
+        let info = wgpu::AdapterInfo {
+            vendor: gt710.0,
+            device: gt710.1,
+            ..wgpu::AdapterInfo::new(wgpu::DeviceType::DiscreteGpu, wgpu::Backend::Vulkan)
+        };
+        assert_eq!(Chosen::read(Some(&Chosen::text(&info))), Chosen::Gpu(gt710.0, gt710.1));
+        assert_eq!(Chosen::read(None), Chosen::Missing);
+        assert_eq!(Chosen::read(Some("changed")), Chosen::Unknown);
+        assert_eq!(Chosen::read(Some("")), Chosen::Unknown);
+        // a record from before: the GT 710 drew; now the UHD 630 does
+        assert!(Chosen::Missing.another(Some(gt710), Some(uhd630)));
+        assert!(!Chosen::Missing.another(Some(gt710), Some(gt710)));
+        // this version's
+        assert!(Chosen::Gpu(gt710.0, gt710.1).another(Some(gt710), Some(uhd630)));
+        assert!(!Chosen::Gpu(uhd630.0, uhd630.1).another(Some(gt710), Some(uhd630)));
+        // since another GPU was picked
+        assert!(Chosen::Unknown.another(Some(gt710), Some(gt710)));
+        // kept by a run on OpenGL, which gives no device (nor, on some drivers, a vendor)
+        assert!(!Chosen::Gpu(INTEL, 0).another(Some(gt710), Some(uhd630)));
+        assert!(Chosen::Gpu(NVIDIA, 0).another(Some(gt710), Some(uhd630)));
+        assert!(!Chosen::Gpu(0, 0).another(Some(gt710), Some(uhd630)));
+        // Direct3D 12 listing nothing to draw with
+        assert!(!Chosen::Gpu(gt710.0, gt710.1).another(Some(gt710), None));
+        // and so the start, from the report's order on the Intel GPU
+        let intel = [1, 2, 0];
+        assert_eq!(next_start("0 ended drew", &intel, true), 0, "the record as it was kept");
+        assert_eq!(next_start("", &intel, true), 1, "no record: Direct3D 12 first");
     }
 
     #[test]

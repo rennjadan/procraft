@@ -1187,13 +1187,25 @@ impl CanvasSession {
     /// window; none before the canvas exists. The copy is started under the lock and waited for
     /// once it is let go: frames and touches go on while the GPU gets through the work before it
     /// (read after each stroke, with a heavy brush's end before it that held them for most of a
-    /// second).
+    /// second). Work the frames, being drawn on another thread, still lay a share at a time is left
+    /// to them: the picture is as it shows, as they keep it until that is laid (the app's own thread
+    /// asks for it as the artwork closes, and laid at once, a heavy stroke's end held it for
+    /// seconds on a phone).
     pub fn canvas_thumbnail(&self, max_side: u32) -> Option<ThumbnailImage> {
         let pending = {
             let mut guard = self.shared.lock();
             let st = &mut *guard;
+            let laying = st.paced_work_waiting() && st.frame_thread != Some(std::thread::current().id());
+            // (none rather than a composite never made: a canvas made anew, its first frame to come)
+            if laying && !st.composite_shown() {
+                return None;
+            }
             let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
-            canvas.start_composite_thumbnail_without(gpu, &mut st.doc, max_side, &[])
+            if laying {
+                canvas.start_composite_thumbnail_as_laid(gpu, max_side)
+            } else {
+                canvas.start_composite_thumbnail_without(gpu, &mut st.doc, max_side, &[])
+            }
         };
         let t = pending.pixels().ok()?;
         Some(ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba })
@@ -1287,11 +1299,15 @@ impl CanvasSession {
     }
 
     /// Each paint layer's and mask's pixels' version, the queued work done first: a thumbnail
-    /// need only be read again when its layer's is new.
+    /// need only be read again when its layer's is new. Read beside the frames (see
+    /// [`crate::Shared::lock_beside_frames`]): once they have laid what they lay a share at a time,
+    /// or, still laying it after a while, as far as they have laid it.
     pub fn layer_versions(&self) -> Vec<LayerVersion> {
-        let mut guard = self.shared.lock();
+        let (mut guard, laid) = self.shared.lock_beside_frames();
         let st = &mut *guard;
-        st.flush();
+        if laid {
+            st.flush();
+        }
         let Some(canvas) = st.canvas.as_ref() else { return Vec::new() };
         st.doc
             .layers()
@@ -1307,27 +1323,37 @@ impl CanvasSession {
         // frames go on meanwhile (thumbnails are read after every change while Layers is open)
         let id = LayerId(id);
         let no_canvas = || procraft_gpu::GpuError::Readback("no canvas".into());
-        let read = || -> Result<procraft_gpu::Thumbnail, procraft_gpu::GpuError> {
+        let read = || -> Result<Option<procraft_gpu::Thumbnail>, procraft_gpu::GpuError> {
+            // (beside the frames, once they have laid a heavy stroke's end rather than all the rest
+            // of it at once; still laying it after a while, none: the layer is part laid, perhaps
+            // half laid again, a picture that never showed, and the app keeps the one it has)
             let first = {
-                let mut guard = self.shared.lock();
+                let (mut guard, laid) = self.shared.lock_beside_frames();
                 let st = &mut *guard;
                 let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return Err(no_canvas()) };
+                if !laid {
+                    return Ok(None);
+                }
                 canvas.start_layer_thumbnail(gpu, &mut st.doc, id, max_side)?
             };
             let (coarse, mask) = match first {
-                procraft_gpu::LayerThumbnailStep::Ready(t) => return Ok(t),
+                procraft_gpu::LayerThumbnailStep::Ready(t) => return Ok(Some(t)),
                 procraft_gpu::LayerThumbnailStep::Coarse { pending, mask } => (pending.pixels()?, mask),
             };
             let fine = {
                 let mut guard = self.shared.lock();
                 let st = &mut *guard;
                 let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return Err(no_canvas()) };
+                // (a stroke ended meanwhile being laid again: none, as above)
+                if canvas.relaying() {
+                    return Ok(None);
+                }
                 canvas.start_layer_thumbnail_fine(gpu, id, &coarse, mask, max_side)?
             };
-            fine.pixels()
+            fine.pixels().map(Some)
         };
         match read() {
-            Ok(t) => Some(ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba }),
+            Ok(t) => t.map(|t| ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba }),
             Err(e) => {
                 log::warn!("thumbnail: {e}");
                 None
@@ -1652,10 +1678,14 @@ impl CanvasSession {
 impl crate::State {
     /// Takes the time-lapse frame asked for (see [`CanvasSession::record_time_lapse`]), if there
     /// is one: in a frame (`at_once` false) once the frames have laid what they lay a share at a
-    /// time and the caches are whole (else a frame after this one does, more asked for until
-    /// then); otherwise now, laying that at once. Its picture (private layers left out, so a
-    /// private insert never shows in the replay or its video) is only started on the GPU here and
-    /// handed to the keeper, never waited for.
+    /// time, an open shape's stroke among it (not the stroke the pen is drawing), and the caches are
+    /// whole (else a frame after this one does, more asked for until then); otherwise now, laying
+    /// that at once. Its picture
+    /// (private layers left out, so a private insert never shows in the replay or its video) is
+    /// only started on the GPU here and handed to the keeper, never waited for. (Taken while a big
+    /// shape's stroke was still being laid a share a frame, the render it is read with laid all
+    /// that was left at once: the app asks for a frame as the pen lifts, and the frame after a big
+    /// shape of a heavy brush was dragged about held the canvas for a minute and more.)
     pub(crate) fn take_lapse_picture(&mut self, at_once: bool) {
         if self.lapse_wanted.is_none() {
             return;
@@ -1666,7 +1696,10 @@ impl crate::State {
             return;
         }
         let (Some(canvas), Some(gpu)) = (self.canvas.as_mut(), self.gpu.as_ref()) else { return };
-        if !at_once && (canvas.busy() || canvas.lays_over_frames()) {
+        // (and an open shape's stroke still being laid: not the pen's own stroke, whose work comes as
+        // it moves)
+        let laying_shape = self.shape.is_some() && (canvas.catching_up() || canvas.relaying());
+        if !at_once && (canvas.busy() || canvas.lays_over_frames() || laying_shape) {
             self.needs_frame = true;
             return;
         }

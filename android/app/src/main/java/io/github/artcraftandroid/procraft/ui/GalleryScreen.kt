@@ -100,7 +100,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -333,6 +332,8 @@ fun GalleryScreen(vm: CanvasViewModel) {
                         state = grid,
                         columns = GridCells.Fixed(columns),
                         contentPadding = PaddingValues(bottom = 24.dp),
+                        flingBehavior = rememberScrollFling(),
+                        overscrollEffect = rememberScrollEdges(),
                     ) {
                         items(entries, key = { it.dir.name }) { entry ->
                             if (entry is io.github.artcraftandroid.procraft.gallery.Stack) {
@@ -1916,7 +1917,7 @@ private fun NewCanvasPanel(
         // the presets scroll past 376 tall
         Column(
             Modifier.padding(start = 9.dp, end = 9.dp, top = 9.5.dp, bottom = if (kinds.isEmpty()) 30.dp else 0.dp).heightIn(max = 376.dp).clip(RoundedCornerShape(24.dp)).background(Pc.LightRow)
-                .verticalScroll(rememberScrollState()),
+                .kineticVerticalScroll(rememberScrollState()),
         ) {
             presets.forEachIndexed { i, p ->
                 if (i > 0) Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(1.dp).background(Pc.LightSeparator))

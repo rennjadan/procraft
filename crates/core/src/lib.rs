@@ -71,12 +71,20 @@ mod layer_ops;
 mod layer_store;
 mod layers;
 mod layout;
+#[cfg(test)]
+mod library_preview_tests;
+#[cfg(test)]
+mod limited_gpu_tests;
 mod liquify;
 mod liquify_steps;
 mod list_slider;
 mod lost;
 #[cfg(test)]
 mod low_storage_tests;
+#[cfg(test)]
+mod many_brushes_tests;
+#[cfg(test)]
+mod memory_tests;
 mod modes;
 mod named_layouts;
 mod open_marks;
@@ -84,6 +92,7 @@ mod pacing;
 mod palettes;
 mod pick;
 mod pickers;
+mod scroll;
 /// A picker plugin's picture compiled: whose it is, its code, the keys it reads its controls by.
 pub(crate) type PickerProgram = (String, Arc<str>, Option<Arc<[String]>>, Arc<procraft_gpu::PictureProgram>);
 #[cfg(test)]
@@ -107,6 +116,8 @@ mod project;
 mod projection;
 mod quick_menu;
 mod quickshape;
+#[cfg(test)]
+mod quickshape_tests;
 mod recolor;
 mod reference_view;
 mod reference_window;
@@ -180,7 +191,7 @@ pub use bars::{BarHang, BarLayout, BarPlace, BarSides, EdgeCollapse, HangSide, L
 pub use big_pictures::{big_pictures_left, wait_for_big_pictures};
 pub use blend::{GradientKind, GradientSpec};
 pub use blend_wheel::{
-    BLEND_TAP_SECONDS, BlendCoast, BlendStep, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
+    BLEND_TAP_SECONDS, BlendStep, blend_centred, blend_coast, blend_coast_at, blend_pull_for, blend_pulled,
     blend_stretch, blend_tap, blend_tap_at, blend_unstretch,
 };
 pub use brush_files::BrushEngines;
@@ -194,7 +205,7 @@ pub use brush_hold::{
 };
 pub use brush_libraries::BrushLibraryInfo;
 pub use brush_library::{BrushDrop, BrushDropOver, brush_drop_copies, brush_drop_place, prepare_brushes};
-pub use brushes::{BrushInfo, BrushSetInfo, HoverFill, RecentBrush, brush_previews_kept};
+pub use brushes::{BrushInfo, BrushSetInfo, HoverFill, LibraryScroll, RecentBrush, brush_previews_kept};
 pub use clipboard::{COPY_PIXELS_A_METRE, copy_straight, picture_png, write_copy_png};
 pub use colour::{
     cmyk_profiles, color_profiles, colours_in_p3, convert_color, import_profile, is_cmyk_profile, set_profile_folder,
@@ -277,6 +288,7 @@ pub use presets::{
     CanvasPreset, P3, SRGB, per_inch, preset_height, preset_label, preset_number, preset_width, presets_from_json,
     presets_json, profile_chip, standard_presets,
 };
+pub use pressure::{pen_pressure, pen_pressure_scale};
 pub use project::{
     ArtworkInfo, Leaving, PdfBook, export_file_name, read_signature, save_failure_said, write_photo, write_signature,
 };
@@ -305,6 +317,10 @@ pub use scene3d::{
     ModelFile, ModelInfo, ModelLight, ModelTextureFile, ModelWarning, SubmeshInfo, Turntable, model_warning_name,
     unpack_model_artwork, zip_model_name,
 };
+pub use scroll::{
+    ScrollMotion, ScrollSample, scroll_coast_at, scroll_coast_velocity, scroll_drag, scroll_drag_velocity,
+    scroll_fling_velocity, scroll_motion, scroll_motion_at, scroll_pull_distance,
+};
 pub use selection::{SelectionDisplay, SelectionJoin};
 pub use shapes::{PlacedShape, ShapeKind, ShapeMake, ShapeSpec, shape_holding, shape_parallel_corner, shape_points};
 pub use side_bar::{
@@ -312,7 +328,8 @@ pub use side_bar::{
     side_bar_kept_centre,
 };
 pub use side_slider::{
-    ShadowStep, SideSliderTap, side_slider_drag_share, side_slider_shown_percent, side_slider_tap, side_thumb_shadow,
+    ShadowStep, SideSliderTap, side_slider_drag_share, side_slider_drags, side_slider_land, side_slider_lift,
+    side_slider_shown_percent, side_slider_tap, side_thumb_shadow,
 };
 pub use storage::{NO_ROOM, save_failure_to_tell, storage_full_writes, storage_was_full};
 pub use studio::{
@@ -730,6 +747,9 @@ pub(crate) struct State {
     preview_pictures: Vec<(procraft_engine::brush::Pixels, procraft_engine::brush::Pixels)>,
     /// Sample strokes drawn already, kept by what they were drawn from.
     drawn_previews: drawn_previews::DrawnPreviews,
+    /// Where the brush library's lists stood as it last closed, and the library it showed (see
+    /// [`CanvasSession::library_opens`]).
+    library_scroll: Option<(String, brushes::LibraryScroll)>,
     color: [f32; 3],
     /// The secondary colour, for secondary colour dynamics.
     secondary: [f32; 3],
@@ -767,6 +787,9 @@ pub(crate) struct State {
     /// When a frame was last drawn: a read beside the frames waits for them to lay what they lay a
     /// share at a time only while they are being drawn (see [`Shared::await_frames_laid`]).
     pub(crate) frame_drawn_at: Option<std::time::Instant>,
+    /// The thread that drew the last frame: the render thread on the tablets, the app's own on the
+    /// desktop (a read there waits for no frames: none would come meanwhile).
+    pub(crate) frame_thread: Option<std::thread::ThreadId>,
     /// A time-lapse frame asked for while frames are drawn, for this time-lapse: the frame that
     /// has laid what the frames lay a share at a time takes its picture (see
     /// [`State::take_lapse_picture`]).
@@ -1008,10 +1031,31 @@ impl State {
     }
 
     /// Whether the frames, being drawn, have work to lay a share at a time (see
-    /// [`procraft_gpu::Canvas::lays_over_frames`]).
+    /// [`procraft_gpu::Canvas::lays_over_frames`]), an open shape's stroke they are still laying among
+    /// it (laid again as it is let go, which a read beside the frames laid at once: a heavy brush's,
+    /// seconds of a tablet's GPU with the canvas held), not the stroke the pen is drawing.
     pub(crate) fn frames_laying(&self) -> bool {
+        let shape = self.shape.is_some();
         self.frame_drawn_at.is_some_and(|at| at.elapsed() < FRAMES_GONE)
-            && self.canvas.as_deref().is_some_and(procraft_gpu::Canvas::lays_over_frames)
+            && self
+                .canvas
+                .as_deref()
+                .is_some_and(|c| c.lays_over_frames() || (shape && (c.catching_up() || c.relaying())))
+    }
+
+    /// Whether the frames, being drawn, have work to lay a share at a time that a render showing
+    /// nothing would lay all at once: as [`State::frames_laying`], and the open stroke's paint
+    /// catching up with the pen too (see [`Shared::lock_beside_frames`]).
+    pub(crate) fn paced_work_waiting(&self) -> bool {
+        self.frames_drawn()
+            && self.canvas.as_deref().is_some_and(|c| c.lays_over_frames() || c.catching_up() || c.relaying())
+    }
+
+    /// Whether the canvas's composite is the picture as it last showed: it has been made at least
+    /// once (a canvas made anew, after its device was lost, holds a blank one until its first
+    /// render), so a read that renders nothing may take it as it is.
+    pub(crate) fn composite_shown(&self) -> bool {
+        self.canvas.as_deref().is_some_and(|c| c.composites() > 0)
     }
 
     /// Window pixels per point of what the interface draws, its handles over the canvas too.
@@ -1098,7 +1142,7 @@ impl State {
             return;
         }
         // a shape kept as it shows, moved since the last frame or not
-        self.draw_moved_shape();
+        self.draw_shape_now();
         let shape = self.shape.take();
         // a stroke on a model ends there, as the pen lifting would end it
         if self.scene_shown() && self.scene.as_ref().is_some_and(|s| s.stroking) {
@@ -1792,10 +1836,27 @@ pub(crate) struct Shared {
     /// [`CanvasSession::stroke_add`]).
     queued: parking_lot::Mutex<QueuedInput>,
     input_queued: std::sync::atomic::AtomicBool,
+    /// The touches' input kept while something held the canvas a while, to be taken in order once
+    /// it is free, and whether input is so kept at all (on the tablets, whose app's thread must
+    /// never wait long: see `touch/mail.rs`).
+    pub(crate) touch_mail: parking_lot::Mutex<touch::mail::Mail>,
+    touch_mail_on: std::sync::atomic::AtomicBool,
+    /// The frosted panels over the canvas as last told, and whether a frame has yet to take them:
+    /// told without waiting on the canvas (see [`CanvasSession::set_glass`]).
+    glass: parking_lot::Mutex<Glass>,
+    glass_new: std::sync::atomic::AtomicBool,
+    /// What the interface reads of the canvas each frame, as last read (see [`Shared::read_seen`]).
+    pub(crate) seen: parking_lot::Mutex<Seen>,
+    /// The longest a read beside the frames waits for them (ms; see
+    /// [`Shared::lock_beside_frames`]): [`FRAMES_LAY_MOST`], shorter in tests.
+    read_wait_ms: std::sync::atomic::AtomicU64,
     /// How the brush cursor's outline turns, read without waiting on the canvas.
     pub(crate) cursor: cursor_turn::CursorTurns,
     /// Where the artwork is on the screen as last seen, for a dragged colour's rest.
     pub(crate) lands_on: pour::LandsOn,
+    /// What the stroke's sound last went by, for its thread to go on with while a frame holds the
+    /// canvas (see [`CanvasSession::stroke_sound`]).
+    pub(crate) sound_read: parking_lot::Mutex<Option<stroke_sound::SoundRead>>,
     /// Counts this session among those alive until all of it goes (see [`live_sessions`]).
     _alive: activity::Alive,
     /// The folders the plugins name, told of each save (interface 22); none until the plugins are
@@ -1804,6 +1865,25 @@ pub(crate) struct Shared {
     /// How many times the artwork was opened again from its folder after its GPU device was lost
     /// (see `lost.rs`), for the apps to read their layers and thumbnails again.
     pub(crate) reopened: std::sync::atomic::AtomicU64,
+}
+
+/// The frosted panels over the canvas as last told (see [`Shared::glass`]): five numbers and a
+/// look each, window pixels, as [`State::backdrops`] keeps them.
+#[derive(Default)]
+struct Glass {
+    regions: Vec<[f32; 6]>,
+    windows: Vec<[f32; 6]>,
+}
+
+/// What the interface reads of the canvas each frame while the view settles (where the view is,
+/// whether it still moves, the guide's lines, the snapped shape's handles), as last read: what it
+/// is told while something holds the canvas a while (see [`Shared::read_seen`]).
+#[derive(Default)]
+pub(crate) struct Seen {
+    pub(crate) view_matrix: Option<Vec<f32>>,
+    pub(crate) view_moving: Option<bool>,
+    pub(crate) guide: Option<guide::GuideInfo>,
+    pub(crate) shape: Option<Option<quickshape::QuickShapeInfo>>,
 }
 
 /// Pen input waiting for the canvas (see [`Shared::queued`]): the stroke's samples in order (those
@@ -1830,6 +1910,86 @@ impl Shared {
         let guard = self.state.try_lock()?;
         self.holder.took(at);
         Some(guard)
+    }
+
+    /// Whether the canvas is free, or comes free within `wait`: not waited for at all if whatever
+    /// holds it took it that long ago already (a long hold, which the app's thread mustn't wait
+    /// out: see `touch/mail.rs`). Taken and let go at once.
+    pub(crate) fn free_soon(&self, wait: std::time::Duration) -> bool {
+        !self.state.is_locked() || self.lock_soon(wait).is_some()
+    }
+
+    /// The lock, if it is free or comes free within `wait` (see [`Shared::free_soon`]).
+    #[track_caller]
+    pub(crate) fn lock_soon(&self, wait: std::time::Duration) -> Option<parking_lot::MutexGuard<'_, State>> {
+        let at = std::panic::Location::caller();
+        let guard = match self.state.try_lock() {
+            Some(guard) => guard,
+            None => {
+                let held = self.holder.taken_ago().unwrap_or_default();
+                if held >= wait {
+                    return None;
+                }
+                self.state.try_lock_for(wait - held)?
+            }
+        };
+        self.holder.took(at);
+        Some(guard)
+    }
+
+    /// `read` of the canvas, for the app's own thread each frame: read now if the canvas is free
+    /// within a frame's usual hold, and kept in `seen`'s place for it; else as last read, without
+    /// waiting (read once, waiting, if never yet).
+    #[track_caller]
+    pub(crate) fn read_seen<T: Clone>(
+        &self,
+        read: impl FnOnce(&State) -> T,
+        kept: impl Fn(&mut Seen) -> &mut Option<T>,
+    ) -> T {
+        let fresh = match self.lock_soon(touch::mail::WAIT_MOST) {
+            Some(st) => read(&st),
+            None => {
+                if let Some(seen) = kept(&mut self.seen.lock()).clone() {
+                    return seen;
+                }
+                read(&self.lock())
+            }
+        };
+        *kept(&mut self.seen.lock()) = Some(fresh.clone());
+        fresh
+    }
+
+    /// Whether the touches' input is kept while the canvas is held (see `touch/mail.rs`).
+    pub(crate) fn touch_mail_on(&self) -> bool {
+        self.touch_mail_on.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Keeps the touches' input while the canvas is held from now on (or not): the tablets' way,
+    /// for tests elsewhere.
+    #[cfg(test)]
+    pub(crate) fn set_touch_mail_on(&self, on: bool) {
+        self.touch_mail_on.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether touch input is kept for later (see `touch/mail.rs`).
+    pub(crate) fn touch_input_kept(&self) -> bool {
+        self.touch_mail_on() && self.touch_mail.lock().kept()
+    }
+
+    /// Takes the frosted panels told since the last frame into `st` (see
+    /// [`CanvasSession::set_glass`]).
+    pub(crate) fn take_glass(&self, st: &mut State) {
+        if !self.glass_new.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let glass = self.glass.lock();
+        st.backdrops.clone_from(&glass.regions);
+        st.backdrop_windows.clone_from(&glass.windows);
+    }
+
+    /// Whether frosted panels were told that no frame has taken yet.
+    pub(crate) fn glass_waiting(&self) -> bool {
+        self.glass_new.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Pen input for later (the canvas held): samples after those waiting, or (`predicted`) where the
@@ -1953,6 +2113,45 @@ impl Shared {
         }
     }
 
+    /// The lock for a read beside the frames, from a thread that may wait (a thumbnail's, an
+    /// eyedropper's; never the app's own thread, nor the one that draws): taken once the frames
+    /// have laid the work they lay a share at a time ([`State::paced_work_waiting`]), waited for
+    /// with the lock let go between looks, for at most [`FRAMES_LAY_MOST`]; and whether that work
+    /// is all laid (`true`). While it isn't, the read renders nothing (a render that shows nothing
+    /// lays all of it at once, and a heavy brush's stroke on a phone's GPU took seconds so: a
+    /// thumbnail's read after a stroke held the canvas 13 s, and the app's thread waiting on it was
+    /// ended as not responding), and gives the picture as it last showed ([`State::composite_shown`])
+    /// or none: never a layer half laid again, nor a composite never made.
+    #[track_caller]
+    pub(crate) fn lock_beside_frames(&self) -> (parking_lot::MutexGuard<'_, State>, bool) {
+        let at = std::panic::Location::caller();
+        let wait = std::time::Duration::from_millis(self.read_wait_ms.load(std::sync::atomic::Ordering::Relaxed));
+        let until = std::time::Instant::now() + wait;
+        let here = std::thread::current().id();
+        loop {
+            let guard = self.state.try_lock().unwrap_or_else(|| self.wait_for(at));
+            self.holder.took(at);
+            // (on the thread that draws the frames, as the desktop's reads are, none come
+            // meanwhile: it lays what is left itself, as ever)
+            if !guard.paced_work_waiting() || guard.frame_thread == Some(here) {
+                return (guard, true);
+            }
+            if std::time::Instant::now() >= until {
+                return (guard, false);
+            }
+            drop(guard);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+    }
+
+    /// Waits at most `wait` for the frames in a read beside them (see
+    /// [`Shared::lock_beside_frames`]): for tests, which make the wait run out at once.
+    #[cfg(test)]
+    pub(crate) fn set_read_wait(&self, wait: std::time::Duration) {
+        let ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX);
+        self.read_wait_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Whether nothing is under way that a save would cut short ([`State::idle`]) and the frames,
     /// while they are drawn, have nothing to lay a share at a time (which a render that shows
     /// nothing, as a save's does, would lay at once, the frames and touches waiting on it). A
@@ -1992,13 +2191,24 @@ impl Shared {
     /// seconds, and the app's own thread would wait that long on any call. Each layer is copied
     /// out (and decoded) as it goes, so what was opened stays in the state (a save meanwhile still
     /// has it); if the document or what was opened changed meanwhile, the canvas is made again
-    /// under the hold.
+    /// under the hold. One that can't be made is told to the app (see
+    /// [`Shared::tell_canvas_failed`]).
     #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
     pub(crate) fn make_canvas(&self) {
+        if let Err(e) = self.make_canvas_untold() {
+            self.tell_canvas_failed(&e);
+        }
+    }
+
+    /// [`Shared::make_canvas`], what went wrong handed back and not yet told: none is made again on
+    /// this device (another device's makes it, see `device::lost::canvas_failed`), and what was
+    /// opened stays.
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub(crate) fn make_canvas_untold(&self) -> Result<(), procraft_gpu::GpuError> {
         let (gpu, doc, ids) = {
             let st = self.lock();
             let Some(gpu) = st.gpu.as_ref().filter(|_| st.canvas.is_none() && !st.closed && !st.pixels_lost) else {
-                return;
+                return Ok(());
             };
             (gpu.clone(), st.doc.clone(), st.pending_pixels.iter().map(|(id, _)| *id).collect::<Vec<_>>())
         };
@@ -2015,7 +2225,7 @@ impl Shared {
         let made = canvas_of_opened(&gpu, &doc, &ids, opened, read);
         let mut st = self.lock();
         if st.canvas.is_some() {
-            return;
+            return Ok(());
         }
         let same = st.doc == doc && st.pending_pixels.iter().map(|(id, _)| *id).eq(ids.iter().copied());
         match made {
@@ -2033,12 +2243,23 @@ impl Shared {
                 st.ensure_canvas();
             }
             Err(e) => {
-                log::error!("canvas: {e}");
-                st.error = Some(e.to_string());
+                log::warn!("canvas: {e}");
                 st.canvas_failed = true;
-                st.open_mark = None;
+                return Err(e);
             }
         }
+        Ok(())
+    }
+
+    /// The canvas couldn't be made (`e`): the app is told (its info's `error`: this device's
+    /// graphics can't draw it), and what was opened stays.
+    #[cfg_attr(not(any(target_os = "android", test)), allow(dead_code))]
+    pub(crate) fn tell_canvas_failed(&self, e: &procraft_gpu::GpuError) {
+        log::error!("canvas: {e}");
+        let mut st = self.lock();
+        st.error = Some(e.to_string());
+        st.canvas_failed = true;
+        st.open_mark = None;
     }
 }
 
@@ -2309,6 +2530,7 @@ impl CanvasSession {
             preview: None,
             preview_pictures: Vec::new(),
             drawn_previews: Default::default(),
+            library_scroll: None,
             color: [0.0, 0.0, 0.0],
             secondary: [1.0, 1.0, 1.0],
             colour_history: None,
@@ -2329,6 +2551,7 @@ impl CanvasSession {
             projection_stop: false,
             frames: 0,
             frame_drawn_at: None,
+            frame_thread: None,
             lapse_wanted: None,
             lapse_keeper: crate::timelapse::FrameKeeper::default(),
             pad_strokes: None,
@@ -2463,8 +2686,20 @@ impl CanvasSession {
                 nudge: Arc::new(activity::Nudge::default()),
                 queued: parking_lot::Mutex::new(QueuedInput::default()),
                 input_queued: std::sync::atomic::AtomicBool::new(false),
+                touch_mail: parking_lot::Mutex::new(touch::mail::Mail::default()),
+                touch_mail_on: std::sync::atomic::AtomicBool::new(cfg!(all(
+                    any(target_os = "android", target_os = "ios"),
+                    not(test)
+                ))),
+                glass: parking_lot::Mutex::new(Glass::default()),
+                glass_new: std::sync::atomic::AtomicBool::new(false),
+                seen: parking_lot::Mutex::new(Seen::default()),
+                read_wait_ms: std::sync::atomic::AtomicU64::new(
+                    u64::try_from(FRAMES_LAY_MOST.as_millis()).unwrap_or(u64::MAX),
+                ),
                 cursor: cursor_turn::CursorTurns::default(),
                 lands_on: pour::LandsOn::default(),
+                sound_read: parking_lot::Mutex::new(None),
                 _alive: activity::Alive::new(),
                 folders: Mutex::new(None),
                 reopened: std::sync::atomic::AtomicU64::new(0),
@@ -2641,9 +2876,16 @@ impl CanvasSession {
         let whole_pixels = st.whole_pixels(&samples).filter(|_| shown_ahead);
         let make = |st: &State, brush: Brush, diameter: f32, seed: u32| {
             let preview_tilt = brush.setting("preview_tilt") >= 0.5;
+            // (the pad's sample scribble is pressed as it is to be laid: its pressure reaches no
+            // further, whatever pen drew on the pad)
+            let input = if st.pad_sample {
+                procraft_engine::stroke::InputSettings { pressure_scale: 1.0, ..st.input.clone() }
+            } else {
+                st.input.clone()
+            };
             let builder = StrokeBuilder::with_seed(brush, diameter, pointer.into(), seed)
                 .scaled(st.brush_scale())
-                .with_input(st.input.clone())
+                .with_input(input)
                 .on_view_turned(st.view.map_or(0.0, |v| v.rotation()))
                 .on_canvas_made_turned(st.doc.made_turns)
                 .seen_at(st.view.map_or(1.0, |v| v.zoom()) / st.display_scale);
@@ -2795,6 +3037,11 @@ impl CanvasSession {
     /// never kept. Waiting for the canvas, only the newest is kept (see
     /// [`CanvasSession::stroke_add`]).
     pub fn stroke_predict(&self, samples: Vec<PenSample>) {
+        // (the touches' own input kept for the canvas comes first: a prediction now would run
+        // ahead of where the stroke has got to, and the next comes after it)
+        if self.shared.touch_input_kept() {
+            return;
+        }
         let samples = self.pen_predicted(samples);
         let Some(mut guard) = self.shared.try_lock() else {
             self.shared.queue_input(samples, true);
@@ -3303,8 +3550,10 @@ impl CanvasSession {
     }
 
     /// Whether the view is still moving into place (what is drawn over the canvas follows it).
+    /// Asked each frame while it settles, it never waits long on the canvas (see
+    /// [`Shared::read_seen`]).
     pub fn view_moving(&self) -> bool {
-        self.shared.lock().view_motion.is_some()
+        self.shared.read_seen(|st| st.view_motion.is_some(), |seen| &mut seen.view_moving)
     }
 
     /// Whether the canvas is made (once the artwork is shown): until then nothing can read its
@@ -3321,13 +3570,29 @@ impl CanvasSession {
 
     /// The same, with `windows` drawn over them, where the glass is thin: what is behind only
     /// softens there.
+    ///
+    /// Told by the interface as it lays itself out (each frame while a panel moves), it never waits
+    /// on the canvas: a frame takes them (the app's thread waited here for a heavy stroke's frame,
+    /// seconds on a phone, and the system ended the app as not responding).
     pub fn set_glass(&self, regions: Vec<f32>, windows: Vec<f32>) {
         let ((regions, _), (windows, _)) = (regions.as_chunks::<6>(), windows.as_chunks::<6>());
-        let mut st = self.shared.lock();
-        if st.backdrops != regions || st.backdrop_windows != windows {
-            st.backdrops = regions.to_vec();
-            st.backdrop_windows = windows.to_vec();
-            self.shared.frame(&mut st);
+        {
+            let mut glass = self.shared.glass.lock();
+            if glass.regions == regions && glass.windows == windows {
+                return;
+            }
+            glass.regions = regions.to_vec();
+            glass.windows = windows.to_vec();
+        }
+        self.shared.glass_new.store(true, std::sync::atomic::Ordering::Release);
+        // a frame asked for now if the canvas is free; else whatever holds it is a frame, whose
+        // loop looks for them after, or something else, the render thread waiting to be woken
+        match self.shared.try_lock() {
+            Some(mut st) => {
+                self.shared.take_glass(&mut st);
+                self.shared.frame(&mut st);
+            }
+            None => _ = self.shared.wake.notify_all(),
         }
     }
 

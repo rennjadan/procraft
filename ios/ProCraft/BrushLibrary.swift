@@ -149,6 +149,22 @@ private final class LibraryUi {
     var brushFrames: [String: CGRect] = [:]
     /// Where the shown set's brushes list is.
     var brushListFrame = CGRect.zero
+    /// Where the lists start as the library opens (see `CanvasModel.libraryStart`): asked once, as
+    /// the lists first show; and whether the brushes' list has started.
+    @ObservationIgnored var startAsked = false
+    @ObservationIgnored var start: LibraryScroll?
+    @ObservationIgnored var brushesStarted = false
+
+    /// Where the lists start as the library opens: as they stood when it last closed on the set it
+    /// shows, else none (the shown set and the brush in use are brought into sight).
+    func opening(_ model: CanvasModel) -> LibraryScroll? {
+        if !startAsked {
+            startAsked = true
+            start = model.libraryStart()
+        }
+        return start
+    }
+
     /// Follows the finger dragging brushes from the window, once their row has begun the drag.
     @ObservationIgnored weak var touches: LibraryTouches.Follower?
     /// Dragged brushes resting on another set's row open it.
@@ -326,6 +342,36 @@ struct BrushLibrary: View {
         }
     }
 
+    /// Where the lists stand as the library closes: the set shown, and the first row in sight of
+    /// each, counted as its list counts them (the Recent row first among the sets); none if they
+    /// don't show.
+    private func listsSpot() -> LibraryScroll? {
+        let top = ui.brushListFrame.minY
+        guard ui.brushListFrame.height > 0 else { return nil }
+        let set = ui.setFrames.filter { $0.value.maxY > top + 1 }.min { $0.value.minY < $1.value.minY }?.key
+        let brush = ui.brushFrames.filter { $0.value.maxY > top + 1 }.min { $0.value.minY < $1.value.minY }?.key
+        let listed: [BrushInfo]
+        if model.shownSet == CanvasModel.recentSet {
+            listed = model.recentBrushes.compactMap { r -> BrushInfo? in
+                guard model.brushSets.indices.contains(Int(r.set)) else { return nil }
+                let brushes = model.brushSets[Int(r.set)].brushes
+                return brushes.indices.contains(Int(r.index)) ? brushes[Int(r.index)] : nil
+            }
+        } else if model.brushSets.indices.contains(model.shownSet) {
+            listed = model.brushSets[model.shownSet].brushes
+        } else {
+            listed = []
+        }
+        let at = brush.flatMap { key in listed.firstIndex { CanvasModel.brushKey($0) == key } } ?? 0
+        return LibraryScroll(
+            shownSet: Int32(clamping: model.shownSet),
+            setsFirst: UInt32(clamping: (set ?? model.shownSet) + 1),
+            setsOffset: 0,
+            brushesFirst: UInt32(clamping: at),
+            brushesOffset: 0
+        )
+    }
+
     /// A word in the plus's place while brushes are picked.
     private func pickedAction(_ label: String, width: CGFloat, perform: @escaping () -> Void) -> some View {
         Text(verbatim: label)
@@ -440,7 +486,7 @@ struct BrushLibrary: View {
         }
         .onDisappear {
             model.renamingBrush = nil
-            model.libraryClosed()
+            model.libraryClosed(listsSpot())
         }
         #if DEBUG
         .onAppear {
@@ -894,7 +940,15 @@ private struct SetColumn: View {
                     .padding(12)
                 }
             }
-            .onAppear { reader.scrollTo(model.shownSet) }
+            // as the library opens: as it stood when it last closed on this set, else with the shown
+            // set brought into sight
+            .onAppear {
+                if let start = ui.opening(model) {
+                    reader.scrollTo(Int(start.setsFirst) - 1, anchor: .top)
+                } else {
+                    reader.scrollTo(model.shownSet)
+                }
+            }
         }
         .scrollIndicators(.hidden)
         .scrollDisabled(ui.dragging || ui.holding)
@@ -1121,12 +1175,18 @@ private struct BrushColumn: View {
                     .padding(.bottom, 12)
                 }
             }
-            // a brush found from the Recent set is scrolled to in its own; else the set's lit
-            // brush is brought into sight as little as it takes
+            // a brush found from the Recent set is scrolled to in its own; the set the library opens
+            // on as it stood when it last closed on it; else the set's lit brush is brought into
+            // sight as little as it takes
             .onChange(of: model.foundBrush, initial: true) { _, found in
+                let opening = !ui.brushesStarted
+                ui.brushesStarted = true
                 if let found {
                     reader.scrollTo(found, anchor: .center)
                     model.foundBrush = nil
+                } else if opening, let start = ui.opening(model), start.shownSet == Int32(clamping: model.shownSet),
+                          listed.indices.contains(Int(start.brushesFirst)) {
+                    reader.scrollTo(listed[Int(start.brushesFirst)].id, anchor: .top)
                 } else if let lit = listed.first(where: { litInList($0.brush) }) {
                     reader.scrollTo(lit.id)
                 }

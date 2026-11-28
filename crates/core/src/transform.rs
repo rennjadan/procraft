@@ -721,10 +721,15 @@ impl CanvasSession {
 
     /// The view as six numbers `[a, b, c, d, e, f]`: canvas pixel (x, y) is shown at window pixel
     /// (a·x + c·y + e, b·x + d·y + f). The identity before the canvas is shown.
+    ///
+    /// Asked each frame while the view settles, it never waits long on the canvas (see
+    /// [`crate::Shared::read_seen`]).
     pub fn view_matrix(&self) -> Vec<f32> {
-        let st = self.shared.lock();
-        let m = st.view.map_or(Affine::IDENTITY, |v| v.to_screen());
-        vec![m.a, m.b, m.c, m.d, m.e, m.f]
+        let read = |st: &crate::State| {
+            let m = st.view.map_or(Affine::IDENTITY, |v| v.to_screen());
+            vec![m.a, m.b, m.c, m.d, m.e, m.f]
+        };
+        self.shared.read_seen(read, |seen| &mut seen.view_matrix)
     }
 
     /// The view the canvas opens with in a window of `width` × `height` pixels (fitted, turned as

@@ -3,9 +3,10 @@
 //! shortcuts while its command key is held; Help's Keyboard shortcuts opens it until Done, Esc or
 //! a click beside it. With a plugin rebinding keys, it shows them as they are now.
 
+use crate::scroll::ScrollArea;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, Galley, Id, Order, Rect, ScrollArea, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Galley, Id, Order, Rect, Sense, Stroke, StrokeKind, UiBuilder, pos2, vec2};
 use procraft_core::{Plugins, ShortcutGroup};
 
 use crate::look::{Weight, argb, pc, text};

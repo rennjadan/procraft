@@ -117,6 +117,28 @@ fn fs_up(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
     return kept(i, textureSampleLevel(src, smp, uv, 0.0));
 }
 
+// a Gaussian blur painted on, from the pyramid in src's mip levels (a.y of them, each blurred wider
+// than the last): a.x × how much is painted picks how far up it reads (between two levels, mixed),
+// and for the least only part of the lowest level is mixed into the copy
+@fragment
+fn fs_pyramid(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
+    let i = vec2<i32>(pos.xy);
+    let levels = max(fu.a.y, 1.0);
+    let t = clamp(fu.a.x * taken(i), 0.0, 1.0);
+    let up = (levels + 1.0) * t;
+    let level = max(up - 1.0, 0.0);
+    let low = min(floor(level), levels - 1.0);
+    let high = min(low + 1.0, levels - 1.0);
+    let uv = pos.xy / fu.size.xy;
+    let blurred = mix(
+        textureSampleLevel(src, smp, uv, low),
+        textureSampleLevel(src, smp, uv, high),
+        clamp(level - floor(level), 0.0, 1.0),
+    );
+    let was = textureLoad(before, i, 0);
+    return mix(was, on_alpha(was, blurred), min(up, 1.0));
+}
+
 // copy pixel i moved by o, held at the edges
 fn near(i: vec2<i32>, o: vec2<i32>) -> vec4<f32> {
     let dims = vec2<i32>(textureDimensions(src));

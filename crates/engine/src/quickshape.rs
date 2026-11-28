@@ -50,12 +50,17 @@ pub struct Shape {
 const STRAIGHT: f32 = 0.06;
 /// A stroke whose ends are this close (a share of its length) is closed.
 const CLOSED: f32 = 0.18;
+/// An open stroke that goes at least this far round the ellipse it fits (a share of a whole turn
+/// about its centre) is that ellipse, left open where the stroke didn't reach; one that goes less
+/// far is an arc of it.
+const ROUND_COVERS: f32 = 0.5;
 /// Simplifying a stroke into corners keeps points this far off (a share of its size).
 const CORNER_TOLERANCE: f32 = 0.08;
 /// Points sampled around a curved outline.
 const OUTLINE_STEPS: usize = 128;
-/// A held finger turns an ellipse into a circle when its axes' ratio is within this of 1, and a
-/// rectangle into a square within this.
+/// A held finger turns an ellipse into a circle when its long axis is less than this much longer
+/// than its short one (a half: less than half as long again), and a rectangle into a square when
+/// its sides' ratio is within this of 1.
 const ROUND_ENOUGH: f32 = 0.5;
 const SQUARE_ENOUGH: f32 = 0.25;
 /// The steps a held finger keeps a shape's turn to: 15 degrees.
@@ -304,7 +309,7 @@ impl Shape {
                     b.normalized_or(Vec2::new(0.0, 1.0)) * r,
                 )
             }
-            ShapeKind::Ellipse => fit_ellipse(stroke),
+            ShapeKind::Ellipse => fit_round(stroke),
             ShapeKind::Square | ShapeKind::Rectangle => {
                 let rect = fit_rect(stroke);
                 if kind == ShapeKind::Square { squared(&rect) } else { rect }
@@ -389,8 +394,10 @@ impl Shape {
     pub fn snapped(&self, stroke: &[Vec2]) -> Shape {
         match self.kind {
             ShapeKind::Ellipse => {
+                // its long axis against its short, whichever its stroke began nearer
                 let (_, a, b) = self.ellipse_frame();
-                if b.length() > 0.0 && (1.0 - a.length() / b.length()).abs() < ROUND_ENOUGH {
+                let (long, short) = (a.length().max(b.length()), a.length().min(b.length()));
+                if short > 0.0 && long / short - 1.0 < ROUND_ENOUGH {
                     self.as_kind(ShapeKind::Circle, stroke)
                 } else {
                     self.clone()
@@ -546,23 +553,28 @@ pub fn recognise(stroke: &[Vec2]) -> Vec<Shape> {
         return vec![line_of(&pts)];
     }
     if chord > CLOSED * length {
-        // open: corners make a polyline; an even bend an arc
+        // open: corners make a polyline; an even bend an arc, or the ellipse it is a stretch of
+        // where it goes half way round that or more
         let polyline = Shape { kind: ShapeKind::Polyline, nodes: simplify(&pts, CORNER_TOLERANCE * size(&pts)) };
-        let arc = fit_arc(&pts);
-        let arc_error = arc.as_ref().map_or(f32::MAX, |a| outline_error(a, &pts));
+        let oval = fit_oval(&pts);
+        let arc = oval.and_then(|oval| arc_of(oval, &pts));
+        let arc_error = arc.as_ref().map_or(f32::MAX, |(a, _)| outline_error(a, &pts));
         // a sharp corner counts only where the corners fit clearly better than an even bend: a
         // hand's wobble along an arc can turn as sharply between a few points, but is no corner
         let cornered = || sharp_corner(&pts, &polyline.nodes) && arc_error > 2.0 * outline_error(&polyline, &pts);
         if polyline.nodes.len() >= 3 && (arc_error > 0.04 || cornered()) {
             return vec![polyline, line_of(&pts)];
         }
-        return match arc {
-            Some(a) => vec![a, line_of(&pts)],
-            None => vec![polyline],
+        return match (arc, oval) {
+            (Some((_, covers)), Some(oval)) if covers >= ROUND_COVERS => {
+                with_circle(oval_ellipse(oval, pts.first().copied().unwrap_or(oval.centre)))
+            }
+            (Some((a, _)), _) => vec![a, line_of(&pts)],
+            (None, _) => vec![polyline],
         };
     }
     // closed: an ellipse against the polygon the corners make
-    let ellipse = fit_ellipse(&pts);
+    let ellipse = fit_round(&pts);
     let ellipse_error = outline_error(&ellipse, &pts);
     let corners = closed_corners(&pts);
     let polygon_shape = match corners.len() {
@@ -570,8 +582,6 @@ pub fn recognise(stroke: &[Vec2]) -> Vec<Shape> {
         4 => Some(Shape { kind: ShapeKind::Quadrilateral, nodes: corners }),
         _ => None,
     };
-    let (c, a, b) = ellipse.ellipse_frame();
-    let round = a.length().min(b.length()) / a.length().max(b.length()).max(1e-3);
     let mut out = Vec::new();
     match polygon_shape {
         Some(p) if outline_error(&p, &pts) < ellipse_error * 0.8 => {
@@ -593,15 +603,58 @@ pub fn recognise(stroke: &[Vec2]) -> Vec<Shape> {
                 out.push(p);
             }
         }
-        None => {
-            out.push(ellipse);
-            if round > 0.75 {
-                let r = (a.length() + b.length()) * 0.5;
-                out.push(axes_shape(ShapeKind::Circle, c, Vec2::new(r, 0.0), Vec2::new(0.0, r)));
-            }
-        }
+        None => out = with_circle(ellipse),
     }
     out
+}
+
+/// An ellipse as a stroke's shape, and the circle it can be shown as instead where it is round
+/// enough.
+fn with_circle(ellipse: Shape) -> Vec<Shape> {
+    let (c, a, b) = ellipse.ellipse_frame();
+    let round = a.length().min(b.length()) / a.length().max(b.length()).max(1e-3);
+    let mut out = vec![ellipse];
+    if round > 0.75 {
+        let r = (a.length() + b.length()) * 0.5;
+        out.push(axes_shape(ShapeKind::Circle, c, Vec2::new(r, 0.0), Vec2::new(0.0, r)));
+    }
+    out
+}
+
+/// The ellipse a stroke is taken onto: the one nearest its points (see `fit_oval`), which holds
+/// for a stroke that left part of it out, or ran on over its start, where the stroke's spread
+/// doesn't (a gap of an eighth pulled that one's centre a tenth of the way across); the one with
+/// its centre and spread (see [`fit_ellipse`]) where no ellipse fits. Its first axis points to
+/// where the stroke began.
+pub fn fit_round(stroke: &[Vec2]) -> Shape {
+    let pts: Vec<Vec2> = stroke.iter().copied().filter(|p| p.is_finite()).collect();
+    let Some(&first) = pts.first() else { return fit_ellipse(&pts) };
+    fit_oval(&pts).map_or_else(|| fit_ellipse(&pts), |oval| oval_ellipse(oval, first))
+}
+
+/// `oval` as an ellipse shape: its centre and the ends of its two axes, the first pointing to
+/// `start`.
+fn oval_ellipse(oval: Oval, start: Vec2) -> Shape {
+    // its axes, from the spread of its two conjugate half-axes (the axes' squares, summed)
+    let (a, b) = (oval.a, oval.b);
+    let (xx, xy, yy) = (a.x * a.x + b.x * b.x, a.x * a.y + b.x * b.y, a.y * a.y + b.y * b.y);
+    let mean = (xx + yy) * 0.5;
+    let gap = (((xx - yy) * 0.5).powi(2) + xy * xy).sqrt();
+    let angle = 0.5 * (2.0 * xy).atan2(xx - yy);
+    oriented(oval.centre, Vec2::new(angle.cos(), angle.sin()), (mean + gap).sqrt(), (mean - gap).max(0.0).sqrt(), start)
+}
+
+/// The ellipse about `c` with half-axes `a` along `u` and `b` across it, its first axis turned to
+/// point to `start`.
+fn oriented(c: Vec2, u: Vec2, a: f32, b: f32, start: Vec2) -> Shape {
+    let v = Vec2::new(-u.y, u.x);
+    let start = start - c;
+    let (ua, vb) = if start.dot(u).abs() / a.max(1e-3) >= start.dot(v).abs() / b.max(1e-3) {
+        (u * a * start.dot(u).signum(), v * b)
+    } else {
+        (v * b * start.dot(v).signum(), u * a * -1.0)
+    };
+    axes_shape(ShapeKind::Ellipse, c, ua, vb)
 }
 
 fn path_length(pts: &[Vec2]) -> f32 {
@@ -735,17 +788,9 @@ pub fn fit_ellipse(pts: &[Vec2]) -> Shape {
     let gap = (((xx - yy) * 0.5).powi(2) + xy * xy).sqrt();
     let (l1, l2) = (mean + gap, (mean - gap).max(0.0));
     let angle = 0.5 * (2.0 * xy).atan2(xx - yy);
-    let u = Vec2::new(angle.cos(), angle.sin());
-    let v = Vec2::new(-u.y, u.x);
     // the first axis points to where the stroke began, so the outline starts there
-    let start = pts.first().copied().unwrap_or(c) - c;
-    let (a, b) = ((2.0 * l1).sqrt(), (2.0 * l2).sqrt());
-    let (ua, vb) = if start.dot(u).abs() / a.max(1e-3) >= start.dot(v).abs() / b.max(1e-3) {
-        (u * a * start.dot(u).signum(), v * b)
-    } else {
-        (v * b * start.dot(v).signum(), u * a * -1.0)
-    };
-    axes_shape(ShapeKind::Ellipse, c, ua, vb)
+    let start = pts.first().copied().unwrap_or(c);
+    oriented(c, Vec2::new(angle.cos(), angle.sin()), (2.0 * l1).sqrt(), (2.0 * l2).sqrt(), start)
 }
 
 fn axes_shape(kind: ShapeKind, c: Vec2, a: Vec2, b: Vec2) -> Shape {
@@ -871,7 +916,12 @@ impl Oval {
 /// The stretch of the ellipse fitted to the stroke that the stroke swept: from the least to the
 /// most of the way round the centre it got, the way it went, its middle halfway between.
 fn fit_arc(pts: &[Vec2]) -> Option<Shape> {
-    let oval = fit_oval(pts)?;
+    arc_of(fit_oval(pts)?, pts).map(|(arc, _)| arc)
+}
+
+/// The stretch of `oval` the stroke `pts` swept (see [`fit_arc`]), and how much of a whole turn
+/// about its centre that is (at most 1).
+fn arc_of(oval: Oval, pts: &[Vec2]) -> Option<(Shape, f32)> {
     let angle = |p: Vec2| (p - oval.centre).y.atan2((p - oval.centre).x);
     let first = angle(*pts.first()?);
     let (mut was, mut gone, mut least, mut most) = (first, 0.0f32, 0.0f32, 0.0f32);
@@ -894,7 +944,8 @@ fn fit_arc(pts: &[Vec2]) -> Option<Shape> {
         oval.centre + oval.a,
         oval.centre + oval.b,
     ];
-    nodes.iter().all(|p| p.is_finite()).then_some(Shape { kind: ShapeKind::Arc, nodes })
+    let covers = ((most - least) / TAU).min(1.0);
+    nodes.iter().all(|p| p.is_finite()).then_some((Shape { kind: ShapeKind::Arc, nodes }, covers))
 }
 
 /// `shapes` with the curve through `stroke`'s bends first, where the first is a polyline (as the
@@ -1486,8 +1537,12 @@ mod tests {
                 })
             })
             .collect();
+        // it goes more than half way round the ellipse it lies on (0.62 of a turn about its
+        // centre): that ellipse, left open where the hook didn't go; never corners
         let shape = &recognise(&hook)[0];
-        assert_eq!(shape.kind, ShapeKind::Arc);
+        assert_eq!(shape.kind, ShapeKind::Ellipse);
+        let stray = hook.iter().map(|&p| shape.edge_distance(p)).fold(0.0f32, f32::max);
+        assert!(stray < 12.0, "strays {stray}");
     }
 
     #[test]
@@ -1599,6 +1654,47 @@ mod tests {
         assert_eq!(found[0].nodes.len(), 4);
     }
 
+    /// A hand's go round an ellipse about (400, 300) with half-axes 160 and 100, turned a little:
+    /// `turns` of the way round from its upper left, a little lumpy and trembling.
+    fn hand_round(turns: f32) -> Vec<Vec2> {
+        let n = (turns * 200.0) as usize;
+        let (sin, cos) = 0.3f32.sin_cos();
+        (0..=n)
+            .map(|i| {
+                let a = -2.0 + i as f32 / 200.0 * TAU;
+                let lumps = 1.0 + 0.04 * (2.0 * a + 1.3).sin();
+                let tremor = 0.4 * (((i * 37 % 11) as f32 / 5.0) - 1.0);
+                let (x, y) = (160.0 * lumps * a.cos() + tremor, 100.0 * lumps * a.sin());
+                Vec2::new(400.0 + x * cos - y * sin, 300.0 + x * sin + y * cos)
+            })
+            .collect()
+    }
+
+    /// #411: an open stroke that goes half way round the ellipse it fits or more is that ellipse
+    /// (left open where it didn't reach, as it is redrawn), not an arc; less far, an arc. The
+    /// ellipse is the one its points lie on, though they cover only part of it.
+    #[test]
+    fn an_open_stroke_half_way_round_or_more_is_its_ellipse() {
+        for turns in [0.55, 0.7, 0.8, 0.88] {
+            let stroke = hand_round(turns);
+            let found = recognise(&stroke);
+            assert_eq!(found[0].kind, ShapeKind::Ellipse, "{turns} round: {:?}", found[0].kind);
+            let (c, a, b) = found[0].ellipse_frame();
+            let (long, short) = (a.length().max(b.length()), a.length().min(b.length()));
+            assert!(c.distance(Vec2::new(400.0, 300.0)) < 8.0, "{turns} round: centre {c:?}");
+            assert!((long - 160.0).abs() < 10.0 && (short - 100.0).abs() < 8.0, "{turns} round: {long} by {short}");
+            // its first axis points to where the stroke began (within an eighth of a turn round
+            // it), and the menu's ellipse is the same
+            let d = stroke[0] - c;
+            let way = (d.dot(b) / b.dot(b)).atan2(d.dot(a) / a.dot(a));
+            assert!(way.abs() < PI / 4.0 + 0.05, "{turns} round: the start is {way} round from the first axis");
+            assert_eq!(found[0].as_kind(ShapeKind::Arc, &stroke).as_kind(ShapeKind::Ellipse, &stroke), found[0]);
+        }
+        for turns in [0.3, 0.42] {
+            assert_eq!(recognise(&hand_round(turns))[0].kind, ShapeKind::Arc, "{turns} round");
+        }
+    }
+
     #[test]
     fn handles_edit_their_shapes() {
         let mut rect = Shape {
@@ -1673,6 +1769,18 @@ mod tests {
         // too long and thin (axes 3 to 1) stays an ellipse
         let long = axes_shape(ShapeKind::Ellipse, Vec2::ZERO, Vec2::new(60.0, 0.0), Vec2::new(0.0, 20.0));
         assert_eq!(long.snapped(&[]).kind, ShapeKind::Ellipse);
+        // round enough is the long axis less than half as long again as the short, whichever the
+        // stroke began nearer (#411: one begun on its short axis was round enough up to twice as long)
+        for (along, across, kind) in [(44.0, 30.0, ShapeKind::Circle), (46.0, 30.0, ShapeKind::Ellipse)] {
+            let first_long = axes_shape(ShapeKind::Ellipse, Vec2::ZERO, Vec2::new(along, 0.0), Vec2::new(0.0, across));
+            let first_short =
+                axes_shape(ShapeKind::Ellipse, Vec2::ZERO, Vec2::new(0.0, across), Vec2::new(-along, 0.0));
+            assert_eq!(
+                (first_long.snapped(&[]).kind, first_short.snapped(&[]).kind),
+                (kind, kind),
+                "{along} by {across}"
+            );
+        }
         // a nearly square quadrilateral a square; a long one a rectangle
         let square_ish = [Vec2::new(0.0, 0.0), Vec2::new(100.0, 5.0), Vec2::new(95.0, 95.0), Vec2::new(-5.0, 90.0)];
         let quad = Shape { kind: ShapeKind::Quadrilateral, nodes: square_ish.to_vec() };

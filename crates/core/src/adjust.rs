@@ -115,6 +115,22 @@ fn chromatic(centre: [f32; 2], kind: ChromaticKind, amount: f32, offset: [f32; 2
     }
 }
 
+/// The Gaussian blur's sigma (canvas pixels) at `amount` (0..1), on the layer. It runs on the
+/// layer made smaller by 32 × the amount (rounded up), as many taps as one more than 63 × the
+/// amount's root, a third of them its sigma there at the share of that smaller size the amount
+/// reaches: so on the canvas a third of the taps times 32 × the amount, and a step narrower where
+/// that is a whole number (the smaller layer then as small as it reaches).
+pub(crate) fn gaussian_blur_sigma(amount: f32) -> f32 {
+    if amount.is_nan() || amount <= 0.0 {
+        return 0.0;
+    }
+    let a = amount.min(1.0);
+    let taps = (a.sqrt() * 63.0).floor() + 1.0;
+    let steps = a * 32.0;
+    let whole = steps >= 1.0 && steps.fract() == 0.0;
+    taps / 3.0 * if whole { steps - 1.0 } else { steps }
+}
+
 /// A halftone's cells (canvas pixels) for the amount.
 fn halftone_pitch(amount: f32) -> f32 {
     amount * 96.0 + 2.0
@@ -390,7 +406,9 @@ impl CanvasSession {
         let st = &mut *guard;
         let centre = [st.doc.width() as f32 / 2.0, st.doc.height() as f32 / 2.0];
         let filter = match kind {
-            SwipeAdjustment::GaussianBlur => Filter::Blur { sigma: feather_radius(a) },
+            // painted on, each pixel picks a blur of its own by how much is painted there
+            SwipeAdjustment::GaussianBlur if st.pencil => Filter::PyramidBlur { amount: a },
+            SwipeAdjustment::GaussianBlur => Filter::Blur { sigma: gaussian_blur_sigma(a) },
             SwipeAdjustment::Sharpen => Filter::Sharpen { amount: a },
             // the amount reads three times as strong
             SwipeAdjustment::Noise => noise(a, NoiseKind::Clouds, 0.0, 0.0, NOISE_TURBULENCE, false, true),
@@ -797,5 +815,56 @@ impl CanvasSession {
         let centre = origin.filter(|o| o.iter().all(|v| v.is_finite())).unwrap_or(middle);
         st.adjust(perspective(centre, kind, unit(amount), arrow));
         self.shared.frame(st);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Gaussian blur on the layer worked out as it runs, step by step: the layer made smaller
+    /// by 32 × the amount rounded up (once that is past one), the taps one more than 63 × the
+    /// amount's root, and their Gaussian a third of the taps times the share of the smaller layer
+    /// the amount reaches (the part of a step it is into, the rest of that step at one less than
+    /// the whole); in the smaller layer's texels, so as many canvas pixels each as it is smaller.
+    fn as_run(a: f32) -> f32 {
+        let taps = (a.sqrt() * 63.0).floor() + 1.0;
+        let steps = a * 32.0;
+        let smaller = steps.ceil();
+        let into = steps - steps.trunc();
+        let share = if smaller > 1.0 { into + (1.0 - into) * (1.0 - 1.0 / smaller) } else { into };
+        let texel = if smaller > 1.0 { smaller } else { 1.0 };
+        taps / 3.0 * share * texel
+    }
+
+    /// The Gaussian blur's sigma at each amount is the one its run on the layer makes, which is
+    /// much narrower than the feather's at the first few percent and a little wider between whole
+    /// steps; the amounts are those the swipe reaches, and its sigma is in canvas pixels, the same
+    /// for any canvas, zoom or screen.
+    #[test]
+    fn the_gaussian_blur_is_as_wide_as_its_run_on_the_layer_makes_it() {
+        let amounts = [
+            0.0, 0.002, 0.005, 0.01, 0.02, 0.03, 0.031_25, 0.032, 0.04, 0.05, 0.062_5, 0.07, 0.08, 0.1, 0.15, 0.2,
+            0.25, 0.3, 0.4, 0.5, 0.55, 0.6, 0.75, 0.9, 0.99, 1.0,
+        ];
+        println!("amount  feather(before)  now  as run  before/now");
+        for a in amounts {
+            let (before, now, run) = (feather_radius(a), gaussian_blur_sigma(a), as_run(a));
+            println!("{a:6.4} {before:9.3} {now:9.3} {run:9.3} {:6.2}", before / now.max(1e-6));
+            assert!((now - run).abs() <= 1e-4 * run.max(1.0), "{a}: {now} against {run}");
+        }
+        // known points: the most, a tenth, a hundredth, and a whole step (its smaller layer exact)
+        for (a, sigma) in
+            [(1.0, 64.0 / 3.0 * 31.0), (0.1, 20.0 / 3.0 * 3.2), (0.01, 7.0 / 3.0 * 0.32), (0.5, 15.0 * 15.0)]
+        {
+            assert!((gaussian_blur_sigma(a) - sigma).abs() < 1e-3, "{a}: {}", gaussian_blur_sigma(a));
+        }
+        // the first few percent blur much less than the feather did: a third at 1%
+        assert!(gaussian_blur_sigma(0.01) * 3.0 < feather_radius(0.01) * 1.01);
+        // nothing for nothing, and nothing for what isn't a number
+        assert_eq!(gaussian_blur_sigma(0.0), 0.0);
+        assert_eq!(gaussian_blur_sigma(f32::NAN), 0.0);
+        assert_eq!(gaussian_blur_sigma(-1.0), 0.0);
+        assert_eq!(gaussian_blur_sigma(2.0), gaussian_blur_sigma(1.0));
     }
 }

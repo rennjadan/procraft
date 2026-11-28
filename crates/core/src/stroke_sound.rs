@@ -3,10 +3,18 @@
 //! its last input, whether the pen hovers and where) and what the brush is, and the apps play what
 //! it hands back.
 
+use std::sync::Arc;
+use std::time::Instant;
+
+use crate::hooks::Hooks;
 use crate::{CanvasSession, ToolKind};
 
 /// A hover older than this is no longer heard (the pen has gone).
 const HOVER_STALE_MS: u128 = 100;
+/// While a frame holds the canvas, the sound goes on as last read for this long (milliseconds; a
+/// long frame's worth, as the pen's input waits for it too); held longer, the stroke counts as
+/// quiet from then on.
+const SOUND_HOLD_MS: f32 = 150.0;
 /// How far back the speed is measured over, milliseconds.
 const SPEED_SPAN_MS: f64 = 20.0;
 
@@ -27,6 +35,16 @@ pub(crate) struct SoundMotion {
     pub(crate) state: i32,
     pub(crate) hover: (f32, f32),
     pub(crate) height: f32,
+}
+
+/// What the sound went by when it last read the canvas: the plugins making it, the stroke's motion
+/// and the brush, and when it read them.
+#[derive(Clone)]
+pub(crate) struct SoundRead {
+    hooks: Arc<Hooks>,
+    motion: SoundMotion,
+    brush: SoundBrush,
+    at: Instant,
 }
 
 /// The brush the sound is told of: its name, its set's, the values of the plugin's rows in the brush
@@ -100,21 +118,42 @@ impl CanvasSession {
 
     /// The next `frames` samples (mono, -1 to 1, at `rate` a second) of the stroke's sound, as the
     /// plugin on the `stroke_sound` hook makes them: silence with none on. An app plays them one
-    /// after another as fast as they are used, on a thread of their own.
+    /// after another as fast as they are used, on a thread of their own. Never waits on the canvas:
+    /// while a frame holds it (a big fill's on a large canvas took a tenth of a second and more, and
+    /// the sound, waiting for it, ran dry and crackled), it goes on as it last read it.
     pub fn stroke_sound(&self, frames: u32, rate: u32) -> Vec<f32> {
         let frames = frames.min(48_000) as usize;
         let rate = rate.clamp(8_000, 192_000);
-        let Some(hooks) = self.shared.lock().hooks.clone().filter(|h| h.makes_stroke_sound()) else {
+        let Some(SoundRead { hooks, motion, brush, .. }) = self.sound_read() else {
             return vec![0.0; frames];
-        };
-        let keys = hooks.sound_brush_keys();
-        let (motion, brush) = {
-            let st = self.shared.lock();
-            (st.sound_motion(), st.sound_brush(&keys))
         };
         hooks
             .stroke_sound(frames, rate, &motion, &brush)
             .filter(|s| s.len() == frames)
             .unwrap_or_else(|| vec![0.0; frames])
+    }
+}
+
+impl CanvasSession {
+    /// What the sound goes by now (none with no plugin making it): read from the canvas if nothing
+    /// holds it, and kept; else as last read, the time since the stroke's last input going on only
+    /// once it has been held past [`SOUND_HOLD_MS`].
+    fn sound_read(&self) -> Option<SoundRead> {
+        if let Some(st) = self.shared.try_lock() {
+            let read = st.hooks.clone().filter(|h| h.makes_stroke_sound()).map(|hooks| {
+                let keys = hooks.sound_brush_keys();
+                let (motion, brush) = (st.sound_motion(), st.sound_brush(&keys));
+                SoundRead { hooks, motion, brush, at: Instant::now() }
+            });
+            drop(st);
+            self.shared.sound_read.lock().clone_from(&read);
+            return read;
+        }
+        let mut read = self.shared.sound_read.lock().clone()?;
+        let held_past = read.at.elapsed().as_secs_f32() * 1000.0 - SOUND_HOLD_MS;
+        if held_past > 0.0 && read.motion.since_ms >= 0.0 {
+            read.motion.since_ms += held_past;
+        }
+        Some(read)
     }
 }

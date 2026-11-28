@@ -65,6 +65,7 @@ struct LicencesPage: View {
         let text = "The interface font is Inter, by The Inter Project Authors.\n\n"
             + bundled("Inter-OFL", "txt", in: "fonts")
             + "\n\nThe app keeps Lucide icons (lucide.dev), by Lucide Icons and Contributors.\n\n"
+            + "The undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the Apache License 2.0 (its text at the end).\n\n"
             + bundled("licenses", "txt")
         return text.components(separatedBy: "\n\n")
     }

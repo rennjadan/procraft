@@ -25,7 +25,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -359,7 +358,7 @@ private fun EnvironmentPopover(vm: CanvasViewModel, modifier: Modifier) {
             Spacer(Modifier.height(10.dp))
             ExposureSlider(vm.modelExposure) { vm.changeExposure(it) }
             Spacer(Modifier.height(12.dp))
-            Column(Modifier.clip(RoundedCornerShape(14.dp)).background(GroupFill).verticalScroll(rememberScrollState())) {
+            Column(Modifier.clip(RoundedCornerShape(14.dp)).background(GroupFill).kineticVerticalScroll(rememberScrollState())) {
                 Environments.forEachIndexed { i, env ->
                     if (i > 0) Box(Modifier.fillMaxWidth().height(1.dp).background(RowLine))
                     val chosen = env.asset == vm.modelEnvironment

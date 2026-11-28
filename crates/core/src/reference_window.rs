@@ -281,8 +281,11 @@ impl CanvasSession {
     /// they lay a share at a time (the stroke's end it is read after), which the read would
     /// otherwise lay at once, frames and touches waiting on it: not from the thread that draws
     /// (both apps read it on a thread of their own).
+    ///
+    /// Frames still laying the stroke's end after a while ([`crate::FRAMES_LAY_MOST`]) are left to
+    /// it: the picture is the canvas as it last showed, not kept for the edits it reads (none if it
+    /// has never shown).
     pub fn reference_canvas(&self, max_side: u32) -> Option<crate::ThumbnailImage> {
-        let _ = self.shared.await_frames_laid();
         let edits = self.edits();
         {
             let st = self.shared.lock();
@@ -292,8 +295,26 @@ impl CanvasSession {
                 return Some(picture.as_ref().clone());
             }
         }
-        let picture = self.canvas_thumbnail(max_side)?;
-        self.shared.lock().reference_canvas = Some((edits, max_side, Arc::new(picture.clone())));
+        let (pending, laid) = {
+            let (mut guard, laid) = self.shared.lock_beside_frames();
+            let st = &mut *guard;
+            // (none rather than a composite never made: a canvas made anew, its first frame to come)
+            if !laid && !st.composite_shown() {
+                return None;
+            }
+            let (Some(canvas), Some(gpu)) = (st.canvas.as_mut(), st.gpu.as_ref()) else { return None };
+            let pending = if laid {
+                canvas.start_composite_thumbnail_without(gpu, &mut st.doc, max_side, &[])
+            } else {
+                canvas.start_composite_thumbnail_as_laid(gpu, max_side)
+            };
+            (pending, laid)
+        };
+        let t = pending.pixels().ok()?;
+        let picture = crate::ThumbnailImage { width: t.width, height: t.height, rgba: t.rgba };
+        if laid {
+            self.shared.lock().reference_canvas = Some((edits, max_side, Arc::new(picture.clone())));
+        }
         Some(picture)
     }
 

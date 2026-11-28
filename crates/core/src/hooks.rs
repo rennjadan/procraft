@@ -3043,6 +3043,97 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// #411: a frame holding the canvas a long while (a big fill's on a large canvas took a tenth of
+    /// a second and more) never holds up the stroke's sound: each 10 ms block its thread asks for
+    /// comes at once, going on as it was (the airbrush's steady hiss as loud), where it had waited
+    /// for the frame, and the apps, 30 ms ahead, ran dry and crackled. Printed: the longest a block
+    /// took with the canvas free and while a frame held it 120 ms, and how long the sound waited
+    /// for that frame as it was. Bound: no block took over 10 ms more than the slowest free one, nor
+    /// 60 ms; every block's hiss within half and twice as loud as the free ones'; heard from the
+    /// canvas again once it is free (the stroke ended: quiet).
+    #[test]
+    fn a_frame_holding_the_canvas_never_holds_up_the_stroke_s_sound() {
+        use std::time::Duration;
+        let Some(s) = session() else { return };
+        let dir = store("sound-held");
+        let plugins = brush_sounds(&dir);
+        assert!(plugins.set_on(SOUNDS.to_owned(), true));
+        s.use_plugins(Arc::clone(&plugins));
+        // every brush the airbrush, which hisses while pressed, moving or not
+        assert!(plugins.set_slider(format!("{SOUNDS}.sound"), 5.0).is_some());
+        s.stroke_begin(PointerKind::Finger, vec![sample(100.0, 100.0, 0.0)]);
+        s.stroke_add(vec![sample(101.0, 100.0, 4.0)]);
+        // (the first readies the plugin's sounds)
+        let _ = s.stroke_sound(9_600, 48_000);
+        let block = |s: &CanvasSession| {
+            let t = Instant::now();
+            let made = s.stroke_sound(480, 48_000);
+            (t.elapsed(), rms(&made))
+        };
+        // (the hiss settled first: how loud the last 15 of 30 are)
+        let (mut free, mut free_loud) = (Duration::ZERO, Vec::new());
+        for i in 0..30 {
+            let (took, loud) = block(&s);
+            free = free.max(took);
+            if i >= 15 {
+                free_loud.push(loud);
+            }
+        }
+        // a frame holding the canvas 120 ms; as it was, the sound's thread took the canvas as it
+        // asked, waiting for the frame
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let frame = std::thread::spawn({
+            let s = Arc::clone(&s);
+            move || {
+                let guard = s.shared.lock();
+                let _ = held_tx.send(());
+                std::thread::sleep(Duration::from_millis(120));
+                drop(guard);
+            }
+        });
+        let _ = held_rx.recv();
+        let as_it_was = std::thread::spawn({
+            let s = Arc::clone(&s);
+            move || {
+                let t = Instant::now();
+                drop(s.shared.lock());
+                t.elapsed()
+            }
+        });
+        let begun = Instant::now();
+        let (mut held, mut held_loud) = (Duration::ZERO, Vec::new());
+        while begun.elapsed() < Duration::from_millis(100) {
+            let (took, loud) = block(&s);
+            held = held.max(took);
+            held_loud.push(loud);
+        }
+        assert!(frame.join().is_ok());
+        let waited = as_it_was.join().unwrap();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+        let (quietest, loudest) = held_loud.iter().fold((f32::MAX, 0.0f32), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+        println!(
+            "10 ms of sound: at most {:.2} ms to make with the canvas free, {:.2} ms over {} blocks while a frame held it \
+             (as it was: waited {:.0} ms for the frame); hiss {:.4} free, {quietest:.4}..{loudest:.4} held",
+            ms(free),
+            ms(held),
+            held_loud.len(),
+            ms(waited),
+            mean(&free_loud),
+        );
+        assert!(waited >= Duration::from_millis(80), "as it was, the sound waited {:.0} ms", ms(waited));
+        assert!(held <= free + Duration::from_millis(10), "{:.2} ms held against {:.2} ms free", ms(held), ms(free));
+        assert!(held < Duration::from_millis(60), "{:.2} ms", ms(held));
+        let loud = mean(&free_loud);
+        assert!(loud > 0.005, "the airbrush hisses: {loud}");
+        assert!(quietest >= loud * 0.5 && loudest <= loud * 2.0, "{quietest}..{loudest} against {loud}");
+        // the canvas free again, the sound goes by it: the stroke ended, quiet
+        s.stroke_end(vec![]);
+        let _ = s.stroke_sound(9_600, 48_000);
+        assert!(rms(&s.stroke_sound(2_400, 48_000)) < 0.002);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_recording_picked_is_kept_with_its_plugin_and_played_by_it() {
         let Some(s) = session() else { return };
@@ -3189,6 +3280,39 @@ pub(crate) mod tests {
         assert_eq!(s.quickshape_choose(QuickShapeKind::Curve).map(|i| i.kind), Some(QuickShapeKind::Curve));
         s.quickshape_done();
         s.stroke_end(vec![]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #411: small loops drawn by hand, run on past their start (crossing inside it, or landing
+    /// with a tick) or stopped short, stay QuickShape's ellipses with QuickShape curves on: where a
+    /// loop's ends meet is no bend turning back (it was, and the loop became a curve with a notch).
+    #[test]
+    fn hand_drawn_loops_stay_ellipses_with_quickshape_curves_on() {
+        use crate::QuickShapeKind;
+        use crate::quickshape_tests::Hand;
+        let Some(s) = session() else { return };
+        let dir = store("curves-hand-loops");
+        let plugins = brush_extras(&dir, "quickshape_curves");
+        s.use_plugins(Arc::clone(&plugins));
+        assert!(plugins.set_on(SOUNDS.to_owned(), true));
+        let mut t0 = 0.0;
+        for (turns, tick, end_in) in
+            [(1.04, 0.0, 6.0), (1.1, 5.0, 4.0), (1.0, 4.0, 0.0), (1.12, 0.0, 6.0), (0.8, 0.0, 0.0)]
+        {
+            for seed in [2, 5] {
+                let hand = Hand { centre: (100.0, 100.0), turns, tick, end_in, seed, ..Hand::small(turns) };
+                let samples: Vec<PenSample> =
+                    hand.samples(0.0).into_iter().map(|p| PenSample { time_ms: p.time_ms + t0, ..p }).collect();
+                t0 += 5000.0;
+                s.stroke_begin(PointerKind::Finger, samples[..1].to_vec());
+                s.stroke_add(samples[1..].to_vec());
+                let shape = s.quickshape_hold().expect("it snaps");
+                assert_eq!(shape.kind, QuickShapeKind::Ellipse, "{turns} round, tick {tick}, {end_in} in, seed {seed}");
+                s.quickshape_done();
+                s.stroke_end(vec![]);
+            }
+        }
+        assert!(plugins.plugins().iter().find(|p| p.id == SOUNDS).is_some_and(|p| p.on && p.problem.is_none()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

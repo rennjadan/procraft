@@ -12,12 +12,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat, TextWrapping};
-use egui::{
-    Align2, Color32, Pos2, Rect, ScrollArea, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2,
-};
+use egui::{Align2, Color32, Pos2, Rect, Sense, TextureHandle, TextureOptions, Ui, UiBuilder, Vec2, pos2, vec2};
 use procraft_core::{
     BRUSH_MENU_HOLD, BrushDrop, BrushDropOver, BrushFileReading, BrushHoldMove, BrushInfo, BrushSetInfo, CanvasSession,
-    ReadBrushes, brush_hold_move, read_brushes_from,
+    LibraryScroll, ReadBrushes, brush_hold_move, read_brushes_from,
 };
 
 use crate::alert::{Alert, Answer};
@@ -25,6 +23,7 @@ use crate::icons;
 use crate::look::{Look, Shade, Themed, Weight, argb, pc, text};
 use crate::menu::{self, Entry, Menu};
 use crate::panel::{self, PANEL_GLYPH, PANEL_TITLE};
+use crate::scroll::ScrollArea;
 
 mod libraries;
 
@@ -357,6 +356,12 @@ pub struct Library {
     spring: Option<(usize, Instant)>,
     /// How far the brushes list is scrolled.
     list_at: f32,
+    /// Where the lists stood as the frame that last showed them ended (kept as the library closes,
+    /// see [`CanvasSession::library_closed`]), and where they start as it opens, once the lists
+    /// show: as they stood (some), or with the shown set and the brush in use scrolled into sight
+    /// (none).
+    lists_spot: Option<LibraryScroll>,
+    opening: Option<Option<LibraryScroll>>,
     /// Where the sets and the shown set's brushes were last drawn, for a dragged brush to land; and
     /// the shown set's list (its place, how many brushes it holds, where it shows), not the Recent
     /// set's.
@@ -419,11 +424,14 @@ impl Library {
     }
 
     /// The library opens: on the current brush's set (or the Recent set, if that was shown), not
-    /// on one tapped last time that the brush didn't come from.
-    pub fn opens(&mut self) {
+    /// on one tapped last time that the brush didn't come from; its lists as they stood when it
+    /// closed on that set, else with the set and the brush in use scrolled into sight.
+    pub fn opens(&mut self, session: &CanvasSession) {
         if !self.recent {
             self.shown_set = None;
         }
+        let shown = if self.recent { -1 } else { i32::try_from(session.current_brush().set).unwrap_or(i32::MAX) };
+        self.opening = Some(session.library_opens(shown));
     }
 
     /// A frame ends: the library shown last frame and not in this one has closed (hanging from its
@@ -432,6 +440,9 @@ impl Library {
     pub fn after_frame(&mut self, session: &CanvasSession) {
         let shown = std::mem::take(&mut self.shown_now);
         if self.shown_last && !shown {
+            if let Some(spot) = self.lists_spot {
+                session.library_closed(spot);
+            }
             session.let_go_of_previews();
         }
         self.shown_last = shown;
@@ -829,9 +840,20 @@ impl Library {
                 let corner = panel::POPOVER_CORNER;
                 panel::rounded(ui, look, "library brushes", brushes, [0.0, 0.0, corner, 0.0], argb(BRUSH_COLUMN));
 
+                // as it opens: the lists as they stood, or the shown set and the brush in use brought
+                // into sight as little as it takes
+                let (restore, reveal) = match self.opening.take() {
+                    Some(Some(spot)) => (Some(spot), false),
+                    Some(None) => (None, true),
+                    None => (None, false),
+                };
                 let sets_out = ui.scope_builder(UiBuilder::new().max_rect(sets), |ui| {
-                    ScrollArea::vertical()
-                        .id_salt("library sets")
+                    let list = ScrollArea::vertical();
+                    let list = match restore {
+                        Some(spot) => list.vertical_scroll_offset(spot.sets_offset),
+                        None => list,
+                    };
+                    list.id_salt("library sets")
                         .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                         // a lifted set is dragged, not the list
                         .scroll_source(if lifted.is_some() {
@@ -843,6 +865,9 @@ impl Library {
                             ui.add_space(12.0);
                             // the brushes last painted with, and those pinned there, above the sets
                             let (response, at) = self.recent_row(ui, look, recent);
+                            if reveal && recent {
+                                ui.scroll_to_rect(at, None);
+                            }
                             recent_row = Some(at);
                             recent_tapped = response.clicked();
                             ui.add_space(12.0);
@@ -859,8 +884,9 @@ impl Library {
                                     })
                                     .inner;
                                 set_rects.push((i, at));
-                                // a brush found (from a search, or the Recent set) shows its set
-                                if self.found.is_some_and(|f| f.0 as usize == i) {
+                                // a brush found (from a search, or the Recent set) shows its set, as
+                                // the library opening does
+                                if self.found.is_some_and(|f| f.0 as usize == i) || (reveal && !recent && i == shown) {
                                     ui.scroll_to_rect(at, None);
                                 }
                                 if self.set_press.is_none()
@@ -896,9 +922,10 @@ impl Library {
                         } else {
                             egui::scroll_area::ScrollSource::ALL
                         });
-                    let list = match held_at {
-                        Some(at) => list.vertical_scroll_offset(at),
-                        None => list,
+                    let list = match (held_at, restore) {
+                        (Some(at), _) => list.vertical_scroll_offset(at),
+                        (None, Some(spot)) => list.vertical_scroll_offset(spot.brushes_offset),
+                        (None, None) => list,
                     };
                     list.show(ui, |ui| {
                         ui.add_space(9.75);
@@ -925,10 +952,13 @@ impl Library {
                                 highlighted = Some((b.set, b.index));
                             }
                             let (response, cell) = self.brush_row(ui, look, session, b, selected, pinned);
-                            // a brush found from the Recent set is scrolled to in its own
+                            // a brush found from the Recent set is scrolled to in its own; the brush in
+                            // use, as the library opens
                             if self.found == Some((b.set, b.index)) {
                                 self.found = None;
                                 ui.scroll_to_rect(cell, Some(egui::Align::Center));
+                            } else if reveal && selected {
+                                ui.scroll_to_rect(cell, None);
                             }
                             brush_rects.push(((b.set, b.index), cell));
                             if let Some(r) = response {
@@ -945,6 +975,13 @@ impl Library {
                     })
                 });
                 self.list_at = brushes_out.inner.state.clamped_offset().y;
+                self.lists_spot = Some(LibraryScroll {
+                    shown_set: if recent { -1 } else { i32::try_from(shown).unwrap_or(i32::MAX) },
+                    sets_first: 0,
+                    sets_offset: sets_out.inner.state.clamped_offset().y,
+                    brushes_first: 0,
+                    brushes_offset: self.list_at,
+                });
                 self.lists_top =
                     (sets_out.inner.state.clamped_offset().y <= 0.5, brushes_out.inner.state.clamped_offset().y <= 0.5);
             }
@@ -3045,10 +3082,50 @@ mod tests {
         assert!(f.library.brush_rects.is_empty());
         assert_eq!((f.session.current_brush().set, f.session.current_brush().index), (start.set, start.index));
         // shut, and opened again
-        f.library.opens();
+        f.library.opens(&f.session);
         f.frame(Vec::new());
         assert!(f.library.brush_rects.iter().all(|(k, _)| k.0 == start.set));
         assert_eq!(f.library.highlighted, Some((start.set, start.index)));
+    }
+
+    /// The library opens with the brush in use in sight, as little scrolled as it takes (one in
+    /// sight already leaves its list where it is); closed and opened again on the same set, its
+    /// lists stand as they did when it closed.
+    #[test]
+    fn the_library_opens_with_the_brush_in_use_in_sight() {
+        let mut f = Finger::new();
+        let settle = |f: &mut Finger| {
+            for _ in 0..40 {
+                f.frame(Vec::new());
+            }
+        };
+        // a brush in sight already: nothing scrolls
+        let first = f.session.brush_library()[0].brushes[0].clone();
+        assert!(f.session.select_brush(first.set, first.index));
+        f.library.opens(&f.session);
+        settle(&mut f);
+        assert_eq!(f.library.list_at, 0.0);
+        // the longest set's last brush: brought into sight
+        let library = f.session.brush_library();
+        let longest = library.iter().max_by_key(|s| s.brushes.len()).unwrap();
+        let last = longest.brushes.last().unwrap().clone();
+        assert!(longest.brushes.len() > 12, "{} brushes", longest.brushes.len());
+        assert!(f.session.select_brush(last.set, last.index));
+        f.library.opens(&f.session);
+        settle(&mut f);
+        let (_, _, area) = f.library.brush_list.unwrap();
+        let lit = f.library.brush_rects.iter().find(|(k, _)| *k == (last.set, last.index)).map(|(_, r)| *r).unwrap();
+        assert!(area.expand(0.5).contains_rect(lit), "{lit:?} not in {area:?}");
+        let scrolled = f.library.list_at;
+        assert!(scrolled > 0.0);
+        // closed (a frame without it), and opened again on the same set: as it stood
+        f.library.after_frame(&f.session);
+        f.library.after_frame(&f.session);
+        let kept = f.session.library_opens(i32::try_from(last.set).unwrap()).map(|s| s.brushes_offset);
+        assert_eq!(kept, Some(scrolled));
+        f.library.opens(&f.session);
+        f.frame(Vec::new());
+        assert_eq!(f.library.list_at, scrolled);
     }
 
     /// A brush dragged and held over another set opens it as a tap on it would (the original's

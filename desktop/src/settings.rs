@@ -2,9 +2,11 @@
 //! over everything, as the Android app's (SettingsActivity.kt): an artwork opening as it was left,
 //! fitting the canvas inside the interface, no time-lapse for new artworks, simplified undos, the
 //! maximum speed distance, what an artwork dragged out becomes, the touch companion, colour names,
-//! feedback sounds and tap assistance. Kept with the Prefs tab's.
+//! feedback sounds and tap assistance; and, on a computer of several GPUs, which to draw with.
+//! Kept with the Prefs tab's.
 
-use egui::{Align2, Color32, Id, Order, Rect, ScrollArea, Sense, Stroke, UiBuilder, Vec2, pos2, vec2};
+use crate::scroll::ScrollArea;
+use egui::{Align2, Color32, Id, Order, Rect, Sense, Stroke, UiBuilder, Vec2, pos2, vec2};
 
 use crate::look::{Weight, argb, text};
 use crate::prefs::{DRAG_FORMATS, DRAG_IMAGE_FORMATS, Prefs};
@@ -223,6 +225,11 @@ pub fn show(ctx: &egui::Context, prefs: &mut Prefs) -> Option<Said> {
                         y += h;
                     }
                 }
+                // the GPU to draw with, on a computer of several (see `procraft_gpu::choose_gpu`)
+                let gpus = procraft_gpu::gpus_to_choose();
+                if gpus.len() > 1 && gpu_group(ui, width, prefs, &gpus) {
+                    said = Some(Said::Changed);
+                }
                 // the licences of what the app is made with
                 ui.add_space(24.0);
                 let (row, response) = ui.allocate_exact_size(vec2(width, 49.0), Sense::click());
@@ -368,38 +375,128 @@ fn draw_row(ui: &egui::Ui, row: &Row, at: Rect, prefs: &mut Prefs, id: (usize, u
             changed
         }
         Row::Choice(pick, name) => {
-            let cy = at.center().y;
-            text(ui.painter(), pos2(at.left() + 16.0, cy), Align2::LEFT_CENTER, name, 17.0, Weight::Regular, argb(INK));
-            let options = pick.options();
-            let chosen = (*pick.of(prefs)).min(options.len().saturating_sub(1));
-            let shown = options.get(chosen).copied().unwrap_or_default();
-            let value = text(
-                ui.painter(),
-                pos2(at.right() - 16.0, cy),
-                Align2::RIGHT_CENTER,
-                shown,
-                17.0,
-                Weight::Regular,
-                argb(DIM),
-            );
-            // which choice's menu is open (one at a time)
-            let key = Id::unique("settings choice open");
-            let open = ui.ctx().data(|d| d.get_temp::<Option<(usize, usize)>>(key)).flatten();
-            if open == Some(id) {
-                let mut close = false;
-                let tapped = choice_menu(ui, value, options, chosen, &mut close);
-                if close {
-                    ui.ctx().data_mut(|d| d.insert_temp(key, None::<(usize, usize)>));
-                }
-                if let Some(i) = tapped {
-                    *pick.of(prefs) = i;
-                    prefs.keep();
-                    return true;
-                }
-            } else if ui.interact(at, ui.scope_id().with(("settings row", id)), Sense::click()).clicked() {
-                ui.ctx().data_mut(|d| d.insert_temp(key, Some(id)));
-            }
-            false
+            let chosen = (*pick.of(prefs)).min(pick.options().len().saturating_sub(1));
+            let Some(i) = choice(ui, at, name, pick.options(), chosen, id) else { return false };
+            *pick.of(prefs) = i;
+            prefs.keep();
+            true
         }
+    }
+}
+
+/// A choice's row at `at`: its `name`, and the option `chosen` of `options` beside it, which opens
+/// a menu of them. Returns the option tapped in the menu.
+fn choice(ui: &egui::Ui, at: Rect, name: &str, options: &[&str], chosen: usize, id: (usize, usize)) -> Option<usize> {
+    let cy = at.center().y;
+    text(ui.painter(), pos2(at.left() + 16.0, cy), Align2::LEFT_CENTER, name, 17.0, Weight::Regular, argb(INK));
+    let shown = options.get(chosen).copied().unwrap_or_default();
+    let value =
+        text(ui.painter(), pos2(at.right() - 16.0, cy), Align2::RIGHT_CENTER, shown, 17.0, Weight::Regular, argb(DIM));
+    // which choice's menu is open (one at a time)
+    let key = Id::unique("settings choice open");
+    let open = ui.ctx().data(|d| d.get_temp::<Option<(usize, usize)>>(key)).flatten();
+    if open == Some(id) {
+        let mut close = false;
+        let tapped = choice_menu(ui, value, options, chosen, &mut close);
+        if close {
+            ui.ctx().data_mut(|d| d.insert_temp(key, None::<(usize, usize)>));
+        }
+        return tapped;
+    }
+    if ui.interact(at, ui.scope_id().with(("settings row", id)), Sense::click()).clicked() {
+        ui.ctx().data_mut(|d| d.insert_temp(key, Some(id)));
+    }
+    None
+}
+
+/// What the Graphics group says under its row.
+const GPU_NOTE: &str = "ProCraft draws with it from its next start. Automatic takes the graphics card, unless it is \
+                        an old or entry-level one and the computer's own graphics are recent.";
+
+/// The GPU choice's options for `gpus`: Automatic (naming the GPU it takes), then each by name.
+fn gpu_options(gpus: &[procraft_gpu::wgpu::AdapterInfo]) -> Vec<String> {
+    let best = procraft_gpu::best_gpu(gpus).and_then(|i| gpus.get(i));
+    let automatic = best.map_or_else(|| "Automatic".to_owned(), |g| format!("Automatic ({})", g.name));
+    std::iter::once(automatic).chain(gpus.iter().map(|g| g.name.clone())).collect()
+}
+
+/// Which of [`gpu_options`] is chosen: the GPU `picked` (vendor, device) where it is one of
+/// `gpus`, else Automatic.
+fn gpu_chosen(gpus: &[procraft_gpu::wgpu::AdapterInfo], picked: Option<(u32, u32)>) -> usize {
+    picked.and_then(|p| gpus.iter().position(|g| (g.vendor, g.device) == p)).map_or(0, |i| i + 1)
+}
+
+/// The GPU option `option` of [`gpu_options`] picks (none: Automatic).
+fn gpu_picked(gpus: &[procraft_gpu::wgpu::AdapterInfo], option: usize) -> Option<(u32, u32)> {
+    option.checked_sub(1).and_then(|i| gpus.get(i)).map(|g| (g.vendor, g.device))
+}
+
+/// The Graphics group, `width` wide: the GPU to draw with, of `gpus`, from the next start, and a
+/// note saying so. Whether the pick changed (and was kept).
+fn gpu_group(ui: &mut egui::Ui, width: f32, prefs: &mut Prefs, gpus: &[procraft_gpu::wgpu::AdapterInfo]) -> bool {
+    ui.add_space(24.0);
+    let (h, _) = ui.allocate_exact_size(vec2(width, 16.0), Sense::hover());
+    let heading = h.left_center() + vec2(MARGIN + 16.0, 0.0);
+    text(ui.painter(), heading, Align2::LEFT_CENTER, "GRAPHICS", 13.0, Weight::Regular, argb(DIM));
+    ui.add_space(6.0);
+    let (group, _) = ui.allocate_exact_size(vec2(width, 14.0 + 21.0 + 14.0), Sense::hover());
+    let group = group.shrink2(vec2(MARGIN, 0.0));
+    ui.painter().rect_filled(group, 12, argb(GROUP));
+    let options = gpu_options(gpus);
+    let names: Vec<&str> = options.iter().map(String::as_str).collect();
+    let tapped = choice(ui, group, "Draw With", &names, gpu_chosen(gpus, prefs.gpu), (GROUPS.len(), 0));
+    ui.add_space(6.0);
+    let note = detail(ui, GPU_NOTE, width - 2.0 * MARGIN - 32.0);
+    let (under, _) = ui.allocate_exact_size(vec2(width, note.size().y), Sense::hover());
+    ui.painter().galley(under.min + vec2(MARGIN + 16.0, 0.0), note, argb(DIM));
+    let Some(option) = tapped else { return false };
+    let picked = gpu_picked(gpus, option);
+    if picked == prefs.gpu {
+        return false;
+    }
+    prefs.gpu = picked;
+    prefs.keep();
+    // the next start asks again which to draw with, the backend kept for the one before counting
+    // for nothing there
+    crate::startup::gpu_choice_changed();
+    procraft_gpu::prefer_gpu(picked);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use procraft_gpu::wgpu;
+
+    use super::{gpu_chosen, gpu_options, gpu_picked};
+
+    fn gpu(name: &str, vendor: u32, device: u32, device_type: wgpu::DeviceType) -> wgpu::AdapterInfo {
+        wgpu::AdapterInfo {
+            name: name.to_owned(),
+            vendor,
+            device,
+            ..wgpu::AdapterInfo::new(device_type, wgpu::Backend::Dx12)
+        }
+    }
+
+    /// The report's PC: Automatic names the Intel GPU it takes over the GT 710; either can be
+    /// picked, and the pick shows as chosen; a pick no longer there shows Automatic.
+    #[test]
+    fn the_gpu_choice_offers_automatic_then_each_gpu() {
+        let gpus = [
+            gpu("NVIDIA GeForce GT 710", 0x10de, 0x128b, wgpu::DeviceType::DiscreteGpu),
+            gpu("Intel(R) UHD Graphics 630", 0x8086, 0x3e92, wgpu::DeviceType::IntegratedGpu),
+        ];
+        assert_eq!(
+            gpu_options(&gpus),
+            ["Automatic (Intel(R) UHD Graphics 630)", "NVIDIA GeForce GT 710", "Intel(R) UHD Graphics 630"]
+        );
+        assert_eq!(gpu_chosen(&gpus, None), 0);
+        assert_eq!(gpu_chosen(&gpus, Some((0x10de, 0x128b))), 1);
+        assert_eq!(gpu_chosen(&gpus, Some((0x8086, 0x3e92))), 2);
+        assert_eq!(gpu_chosen(&gpus, Some((0x1002, 0x73ff))), 0);
+        assert_eq!(gpu_picked(&gpus, 0), None);
+        assert_eq!(gpu_picked(&gpus, 1), Some((0x10de, 0x128b)));
+        assert_eq!(gpu_picked(&gpus, 2), Some((0x8086, 0x3e92)));
+        assert_eq!(gpu_picked(&gpus, 3), None);
     }
 }

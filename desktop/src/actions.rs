@@ -3,10 +3,11 @@
 //! Smoothing). Rows the desktop can't do yet show dimmed, as the Android app's own rows still to
 //! come do. Share writes the artwork to a file.
 
+use crate::scroll::ScrollArea;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use egui::{Align2, Color32, Id, Order, Painter, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Id, Order, Painter, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{
     PanelRow, PluginAction, PluginControl, PluginInfo, PluginPanel, PluginSlider, PluginSource, Plugins,
     plugin_slider_along, plugin_slider_at, plugin_slider_choice, plugin_slider_choices, plugin_slider_chosen,
@@ -3355,9 +3356,8 @@ mod tests {
 
     #[test]
     fn the_plugins_page_scrolls_with_a_pen_dragged_up_it_as_a_touch_or_as_the_mouse_pointer() {
-        // how far up a pen dragged 200 points up the first card takes the second card's name, the
-        // interface told it is on a touch screen first if `told` (egui drags a list only once it
-        // has had a touch, from the frame after)
+        // How far a 200 point drag on the first card takes the second card's name, with or
+        // without the input layer first marking the device as a touch screen.
         let scrolled = |touches: bool, told: bool| {
             let (mut page, dir) = with_store(&format!("scroll-{touches}-{told}"));
             page.prefs.plugins = crate::prefs::no_vector(Plugins::with_bundled(dir.to_string_lossy().into_owned()));
@@ -3383,8 +3383,8 @@ mod tests {
         // the system's pen, which has touched before: its touches drag the list
         let by_touch = scrolled(true, true);
         assert!(by_touch > 150.0, "{by_touch}");
-        // a tablet's pen moving the mouse pointer: egui drags a list only on a touch screen
-        assert_eq!(scrolled(false, false), 0.0, "the mouse pointer alone");
+        let by_mouse = scrolled(false, false);
+        assert!(by_mouse > 150.0, "mouse drag only moved the list {by_mouse} points");
         let by_pointer = scrolled(false, true);
         assert!(by_pointer > 150.0, "{by_pointer}");
     }

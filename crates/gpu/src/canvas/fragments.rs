@@ -363,6 +363,9 @@ pub(super) struct Fragments {
     /// `super::RuleLists`), taken in turn from the next.
     pub(super) rule_lists: Vec<RuleList>,
     rule_next: usize,
+    /// The bytes of the lists taken since the work last went to the GPU (see
+    /// `super::RULE_LISTS_AT_ONCE`).
+    pub(super) rule_taken: u64,
     tip_backup: Option<wgpu::Texture>,
     /// The build-up under a dual brush's tip in its second.
     second_tip_backup: Option<wgpu::Texture>,
@@ -408,6 +411,7 @@ impl Fragments {
     pub(super) fn rule_lists_begin(&mut self) {
         self.rule_lists.truncate(RULE_LISTS_KEPT);
         self.rule_next = 0;
+        self.rule_taken = 0;
     }
 
     /// Lets go of the rule's lists that take more than `most` bytes (see
@@ -710,6 +714,9 @@ impl Canvas {
         }
         self.fragments.rule_next += 1;
         let list = self.fragments.rule_lists.get_mut(at)?;
+        // (and the bytes its words and stamps are staged in on their way)
+        let staged = u64::from(rows * RULE_ROW) * 4 + stamps.len() as u64;
+        self.fragments.rule_taken = self.fragments.rule_taken.saturating_add(list.bytes().saturating_add(staged));
         let mut padded = words.to_vec();
         padded.resize((rows * RULE_ROW) as usize, 0);
         gpu.write_texture(

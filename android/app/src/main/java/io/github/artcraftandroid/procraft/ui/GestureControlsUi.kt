@@ -23,7 +23,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -119,7 +118,7 @@ private fun GesturePagesCard(page: GesturePurpose, onPage: (GesturePurpose) -> U
     Column(Modifier.padding(start = 10.dp, top = 10.dp, bottom = 10.dp).width(320.dp).fillMaxHeight().clip(shape).background(RailFill).border(1.dp, CardEdge, shape)) {
         Text("Gesture controls", color = Ink, fontSize = 24.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.padding(start = 24.dp, top = 19.dp))
         Column(
-            Modifier.scrollHint(scroll).verticalScroll(scroll).padding(start = 8.dp, end = 8.dp, top = 17.dp, bottom = 8.dp),
+            Modifier.scrollHint(scroll).kineticVerticalScroll(scroll).padding(start = 8.dp, end = 8.dp, top = 17.dp, bottom = 8.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp),
         ) {
             for (p in GesturePurpose.entries) {
@@ -172,7 +171,7 @@ fun GestureControls(vm: CanvasViewModel) {
             GesturePagesCard(page) { page = it }
         } else {
             val rail = rememberScrollState()
-            Column(Modifier.width(81.dp).fillMaxHeight().background(RailFill).scrollHint(rail).verticalScroll(rail).padding(start = 8.dp, top = 46.dp, bottom = 20.dp)) {
+            Column(Modifier.width(81.dp).fillMaxHeight().background(RailFill).scrollHint(rail).kineticVerticalScroll(rail).padding(start = 8.dp, top = 46.dp, bottom = 20.dp)) {
                 for (p in GesturePurpose.entries) {
                     val chosen = p == page
                     Box(
@@ -200,7 +199,7 @@ fun GestureControls(vm: CanvasViewModel) {
         ) {
             Icon(PcIcons.DoneTick, contentDescription = "Done", tint = Color.White, modifier = Modifier.requiredSize(40.dp))
         }
-        Column(Modifier.padding(start = if (wide) WideContentStart else 105.dp, end = if (wide) WideContentEnd else 24.dp, top = 100.dp).verticalScroll(rememberScrollState())) {
+        Column(Modifier.padding(start = if (wide) WideContentStart else 105.dp, end = if (wide) WideContentEnd else 24.dp, top = 100.dp).kineticVerticalScroll(rememberScrollState())) {
             Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(25.dp)).background(CardFill)) {
                 val options = GestureOptions[page].orEmpty()
                 options.forEachIndexed { i, o ->

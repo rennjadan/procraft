@@ -72,7 +72,11 @@ internal fun FilterLayerList(filters: List<PluginLayerFilter>, onPick: (String) 
                     Text("Filter Layer", color = FiltersTitle, fontSize = 28.sp, fontWeight = FontWeight.Bold, maxLines = 1, modifier = Modifier.weight(1f))
                     Text("Cancel", color = FiltersDim, fontSize = 17.sp, maxLines = 1, modifier = Modifier.clickable(onClick = onClose))
                 }
-                LazyColumn(Modifier.fillMaxWidth().padding(start = 19.dp, end = 19.dp, top = 14.dp, bottom = 19.dp)) {
+                LazyColumn(
+                    Modifier.fillMaxWidth().padding(start = 19.dp, end = 19.dp, top = 14.dp, bottom = 19.dp),
+                    flingBehavior = rememberScrollFling(),
+                    overscrollEffect = rememberScrollEdges(),
+                ) {
                     for ((group, list) in groups) {
                         item(key = "group $group") {
                             Box(Modifier.fillMaxWidth().height(38.dp), contentAlignment = Alignment.BottomStart) {

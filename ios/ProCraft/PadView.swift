@@ -134,6 +134,8 @@ final class PadView: UIView {
         studio.padMenuOpen = false
         stroke = ObjectIdentifier(touch)
         if touch.type == .pencil {
+            // its pressure reaches as far as its most force, as on the canvas
+            pad.setPenPressureScale(scale: penPressureScale(most: Double(touch.maximumPossibleForce)))
             pencil.down(touch)
             pencil.add(coalesced(touch, in: event), sample: sample)
             pencil.release()

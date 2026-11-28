@@ -31,7 +31,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -227,7 +226,7 @@ fun CanvasInfo(vm: CanvasViewModel) {
                 Icon(PcIcons.DoneTick, contentDescription = "Done", tint = Color.White, modifier = Modifier.requiredSize(40.dp))
             }
         }
-        Column(Modifier.padding(start = if (wide) WideContentStart else 105.dp, end = if (wide) WideContentEnd else 24.dp, top = 100.dp).verticalScroll(rememberScrollState())) {
+        Column(Modifier.padding(start = if (wide) WideContentStart else 105.dp, end = if (wide) WideContentEnd else 24.dp, top = 100.dp).kineticVerticalScroll(rememberScrollState())) {
             when (page) {
                 0 -> {
                     AboutCard(photo, author, { author = it.take(256) }, { pick.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }, signature)

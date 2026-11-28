@@ -8,7 +8,10 @@ use std::time::{Duration, Instant};
 
 use egui::emath::TSTransform;
 use egui::{Align2, Color32, Id, LayerId, Order, Pos2, Rect, Sense, Stroke, TextureHandle, Ui, pos2, vec2};
-use procraft_core::{AnimationPlayback, AnimationSettings, CanvasSession, Palettes, animation_next_step};
+use procraft_core::{
+    AnimationPlayback, AnimationSettings, CanvasSession, Palettes, ScrollMotion, animation_next_step, scroll_drag,
+    scroll_drag_velocity, scroll_motion, scroll_motion_at,
+};
 
 use crate::colours::HarmonyKind;
 use crate::compact_colours::{self, CompactColours};
@@ -58,9 +61,9 @@ struct Track {
     /// Dragged by the pointer; the frame shown last as it passed the middle.
     dragging: bool,
     shown: Option<usize>,
-    /// Sliding to a frame: from, to, since; and whether it ends a drag (the frame then becomes the
-    /// current one).
-    slide: Option<(f32, f32, Instant, bool)>,
+    /// A frame chosen by a click, or a timeline released by a drag.
+    slide: Option<(f32, f32, Instant)>,
+    coast: Option<(ScrollMotion, f64)>,
     /// The frame it last settled on.
     focus: Option<usize>,
 }
@@ -341,25 +344,28 @@ impl AnimationBar {
         let pitch = frame_width + 1.0;
         let t = &mut self.track;
         // played frames step; a frame chosen or added slides into the middle (a drag takes over)
-        if !t.dragging && t.focus != Some(focus) {
+        if !t.dragging && t.coast.is_none() && t.focus != Some(focus) {
             if self.playing.is_some() || t.focus.is_none() {
                 t.at = focus as f32;
                 t.slide = None;
-            } else if t.slide.is_none_or(|(_, to, _, _)| to != focus as f32) {
-                t.slide = Some((t.at, focus as f32, Instant::now(), false));
+            } else if t.slide.is_none_or(|(_, to, _)| to != focus as f32) {
+                t.slide = Some((t.at, focus as f32, Instant::now()));
             }
             t.focus = Some(focus);
         }
         let response = ui.interact(track, ui.scope_id().with("timeline"), Sense::click_and_drag());
         let scrub = |t: &mut Track, to: f32| {
-            t.at = to.clamp(0.0, last);
-            let i = t.at.round() as usize;
+            t.at = to;
+            let i = t.at.round().clamp(0.0, last) as usize;
             if t.shown != Some(i) {
                 t.shown = Some(i);
                 session.set_play_frame(slots.get(i).and_then(|f| u32::try_from(*f).ok()));
             }
         };
         let mut settled = None;
+        let now = ui.input(|input| input.time);
+        let max = last * pitch;
+        let viewport = track.width();
         if slots.len() > 1 && response.drag_started() {
             // playing stops and the frame's options close
             if self.playing.take().is_some() {
@@ -368,34 +374,38 @@ impl AnimationBar {
             self.options_open = false;
             t.dragging = true;
             t.slide = None;
+            t.coast = None;
             t.shown = Some(focus);
         }
         if t.dragging {
             if response.dragged() {
-                let to = t.at - response.drag_delta().x / pitch;
-                scrub(t, to);
+                let to = scroll_drag(t.at * pitch, -response.drag_delta().x, 0.0, max, viewport);
+                scrub(t, to / pitch);
             }
             if response.drag_stopped() {
-                // coasting as far as its speed carries it, then settling on a frame
-                let velocity = ui.input(|i| i.pointer.velocity().x);
-                let target = (t.at - velocity / pitch / 4.2).round().clamp(0.0, last);
-                t.slide = Some((t.at, target, Instant::now(), true));
+                let from = t.at * pitch;
+                let scale = ui.ctx().layer_transform_from_global(ui.layer_id()).map_or(1.0, |t| t.scaling);
+                let speed = -ui.input(|i| i.pointer.velocity().x) * scale;
+                let velocity = scroll_drag_velocity(from, speed, 0.0, max, viewport);
+                t.coast = Some((scroll_motion(from, velocity, 0.0, max, pitch), now));
                 t.dragging = false;
             }
         }
-        if let Some((from, to, since, ends_drag)) = t.slide {
-            let k = (since.elapsed().as_secs_f32() / SLIDE).min(1.0);
-            let at = from + (to - from) * cubic_bezier(0.2, 0.8, 0.5, 1.0, k);
-            if ends_drag {
-                scrub(t, at);
+        if let Some((motion, since)) = t.coast {
+            let step = scroll_motion_at(motion, (now - since) as f32);
+            scrub(t, step.position / pitch);
+            if step.done {
+                t.coast = None;
+                settled = Some(t.at.round().clamp(0.0, last) as usize);
             } else {
-                t.at = at;
+                ui.ctx().request_repaint();
             }
+        }
+        if let Some((from, to, since)) = t.slide {
+            let k = (since.elapsed().as_secs_f32() / SLIDE).min(1.0);
+            t.at = from + (to - from) * cubic_bezier(0.2, 0.8, 0.5, 1.0, k);
             if k >= 1.0 {
                 t.slide = None;
-                if ends_drag {
-                    settled = Some(to as usize);
-                }
             } else {
                 ui.ctx().request_repaint();
             }
@@ -439,6 +449,10 @@ impl AnimationBar {
             session.set_play_frame(None);
         }
         if let Some(i) = tapped {
+            if self.track.coast.take().is_some() {
+                session.set_play_frame(None);
+                self.track.shown = None;
+            }
             if self.playing.take().is_some() {
                 session.set_play_frame(None);
             }

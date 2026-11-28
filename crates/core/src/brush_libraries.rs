@@ -157,6 +157,11 @@ impl Default for Libraries {
 }
 
 impl Libraries {
+    /// The id of the library held.
+    pub(crate) fn held(&self) -> &str {
+        &self.held
+    }
+
     /// Whether shipped brushes join the library held.
     pub(crate) fn stock(&self) -> bool {
         self.list.iter().find(|e| e.id == self.held).is_some_and(|e| e.stock)

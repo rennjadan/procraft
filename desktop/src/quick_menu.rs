@@ -2,9 +2,10 @@
 //! opened and its six actions round it, spreading out as it opens. An action tapped runs and
 //! closes it, a tap anywhere else closes it, and a button held lists the actions it can be set to.
 
+use crate::scroll::ScrollArea;
 use std::time::{Duration, Instant};
 
-use egui::{Align2, Color32, Id, Order, Pos2, Rect, ScrollArea, Sense, Shape, Stroke, UiBuilder, pos2, vec2};
+use egui::{Align2, Color32, Id, Order, Pos2, Rect, Sense, Shape, Stroke, UiBuilder, pos2, vec2};
 use procraft_core::{
     BrushInfo, CanvasSession, QuickAction, QuickMenuSet, quick_action_label, quick_actions_listed,
     quick_adjustments_listed, quick_menu_active_after, quick_menu_added, quick_menu_renamed, quick_menus,
@@ -580,6 +581,7 @@ impl QuickMenu {
                 ScrollArea::vertical()
                     .id_salt("quick menus list")
                     .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+                    .scroll_child_drags(self.renaming.is_none())
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing = vec2(0.0, ROW_GAP);
                         for &i in &order {

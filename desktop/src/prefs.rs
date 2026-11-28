@@ -130,6 +130,9 @@ pub struct Prefs {
     /// Pen buttons: the plugins' actions (`<id>.<key>`) the pen's buttons run in place of
     /// `pen_buttons`, `None` for none; one runs only while its plugin is on.
     pub pen_button_plugins: Vec<Option<String>>,
+    /// The GPU picked to draw with (its PCI vendor and device), from the next start; none: the one
+    /// the app finds best (see `procraft_gpu::choose_gpu`).
+    pub gpu: Option<(u32, u32)>,
 }
 
 impl Default for Prefs {
@@ -184,8 +187,15 @@ impl Default for Prefs {
             recolor_threshold: 0.0,
             pen_buttons: procraft_core::pen_button_actions(None),
             pen_button_plugins: procraft_core::pen_button_plugin_actions(None),
+            gpu: None,
         }
     }
+}
+
+/// The GPU a `gpu` line names, "<vendor>:<device>" in hex; none if it can't be read.
+fn gpu_read(value: &str) -> Option<(u32, u32)> {
+    let (vendor, device) = value.trim().split_once(':')?;
+    Some((u32::from_str_radix(vendor, 16).ok()?, u32::from_str_radix(device, 16).ok()?))
 }
 
 /// The pressure curve as it starts: straight.
@@ -264,6 +274,7 @@ impl Prefs {
                     p.pen_button_plugins = procraft_core::pen_button_plugin_actions(Some(value.to_owned()));
                 }
                 "actions_tab" => p.actions_tab = value.parse::<usize>().map_or(0, |t| t.min(5)),
+                "gpu" => p.gpu = gpu_read(value),
                 name if name == procraft_core::side_bar_centre_key() => {
                     p.side_bar_centre = procraft_core::side_bar_kept_centre(number.unwrap_or(f32::NAN));
                 }
@@ -352,7 +363,8 @@ impl Prefs {
             .named_layouts
             .iter()
             .map(|kept| format!("{} {}", procraft_core::named_layouts_key(), kept.replace('\n', "\u{1e}")));
-        let layout = layout.chain(bars).chain(named);
+        let gpu = self.gpu.map(|(vendor, device)| format!("gpu {vendor:04x}:{device:04x}"));
+        let layout = layout.chain(bars).chain(named).chain(gpu);
         let lines: Vec<String> =
             lines.into_iter().chain(floating).chain(layout).chain(self.plugins.kept_lines()).collect();
         crate::files::keep_text("interface", &(lines.join("\n") + "\n"));
@@ -479,5 +491,16 @@ mod tests {
         assert_eq!((on.pen_button_runs, on.pen_second_button_runs), (None, Some(open)));
         assert_eq!(on.pen_button_does, Some(procraft_core::QuickAction::Undo));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The GPU picked in the settings is kept as its vendor and device, and read back; a line that
+    /// can't be read picks none.
+    #[test]
+    fn the_gpu_picked_is_kept_by_vendor_and_device() {
+        assert_eq!(gpu_read("10de:128b"), Some((0x10de, 0x128b)));
+        assert_eq!(gpu_read(&format!("{:04x}:{:04x}", 0x8086, 0x3e92)), Some((0x8086, 0x3e92)));
+        assert_eq!(gpu_read("8086"), None);
+        assert_eq!(gpu_read("nvidia:gt710"), None);
+        assert_eq!(gpu_read(""), None);
     }
 }

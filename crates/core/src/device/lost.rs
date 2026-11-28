@@ -9,6 +9,10 @@
 //! ([`LOSSES_TO_LEAVE`]), sends the rest of the run to OpenGL ES, and the record says so
 //! ([`LOST_RECORD`]) for later starts in the same build. Once the app or the system is updated,
 //! Vulkan is tried again.
+//!
+//! A canvas Vulkan couldn't make at all (its driver refusing what it is asked) goes the same way
+//! ([`canvas_failed`]): the artwork opens on OpenGL ES before the app is told the device can't
+//! draw it. A Tab S6 Lite's Mali-G72 showed no canvas at all where the build before drew one.
 // (the render thread finds a device lost: only the tablet apps have one, and the tests)
 #![cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
 
@@ -16,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use procraft_gpu::{Gpu, wgpu};
+use procraft_gpu::{Gpu, GpuError, wgpu};
 
 use super::{RECORD, Stage, built_by, note_in, read, record, write_record, writing};
 use crate::Shared;
@@ -27,9 +31,12 @@ const SOON_AFTER_CANVAS: Duration = Duration::from_secs(15);
 /// The Vulkan devices lost in a run after which the rest of it is on OpenGL ES.
 const LOSSES_TO_LEAVE: usize = 2;
 
-/// The file beside the record that says Vulkan lost the app's device in a build: "vulkan lost",
-/// then the build (as the record's second line).
+/// The file beside the record that says Vulkan lost the app's device in a build ("vulkan lost"),
+/// or couldn't make a canvas ([`FAILED_SAYS`]), then the build (as the record's second line).
 pub(crate) const LOST_RECORD: &str = "gpu-lost.txt";
+
+/// What [`LOST_RECORD`] says first where Vulkan couldn't make a canvas.
+const FAILED_SAYS: &str = "vulkan made no canvas";
 
 /// The most devices a run loses before an artwork whose device was lost isn't reopened on another
 /// (it stays as last saved until it is opened again): a GPU that loses every one draws nothing
@@ -166,11 +173,7 @@ fn lost_in(
         return (losses.lock().unwrap_or_else(PoisonError::into_inner).all, None);
     }
     let at = gpu.lost_at().unwrap_or_else(Instant::now);
-    // (not to OpenGL ES where its driver has crashed the app: a crash is worse than a loss)
-    let saved = record.as_ref().and_then(|(dir, _)| std::fs::read_to_string(dir.join(RECORD)).ok()).unwrap_or_default();
-    let opengl_crashed = super::driver_crashes::opengl_crashed(&saved);
-    let order: Vec<wgpu::Backends> =
-        Gpu::backends().into_iter().filter(|b| !(opengl_crashed && *b == wgpu::Backends::GL)).collect();
+    let order = backends_after(record.as_ref());
     let (after, all, vulkan) = {
         let mut losses = losses.lock().unwrap_or_else(PoisonError::into_inner);
         let after = after_loss(&mut losses, gpu.backend(), soon_after(made, at), &order, Gpu::backends_named());
@@ -203,6 +206,93 @@ fn lost_in(
     (all, Some(after))
 }
 
+/// The backends a device may be made from after one failed, by the record in `record` (its folder
+/// and build): not OpenGL ES where its driver has crashed the app (a crash is worse than a loss).
+fn backends_after(record: Option<&(PathBuf, String)>) -> Vec<wgpu::Backends> {
+    let saved = record.and_then(|(dir, _)| std::fs::read_to_string(dir.join(RECORD)).ok()).unwrap_or_default();
+    let opengl_crashed = super::driver_crashes::opengl_crashed(&saved);
+    Gpu::backends().into_iter().filter(|b| !(opengl_crashed && *b == wgpu::Backends::GL)).collect()
+}
+
+/// Whether a canvas that couldn't be made on `gpu` (`error`) is made on OpenGL ES instead (see
+/// [`canvas_failed`]), before the app is told the device can't draw it.
+pub(crate) fn canvas_retried(gpu: &Gpu, error: &GpuError) -> bool {
+    let left = LOSSES.lock().unwrap_or_else(PoisonError::into_inner).left;
+    retried(gpu.backend(), error, &backends_after(record().as_ref()), Gpu::backends_named(), left)
+}
+
+/// [`canvas_retried`] for a device on `backend` that failed with `error`, of the backends `order`
+/// (`named`: only those `WGPU_BACKEND` names), in a run that has `left` Vulkan already or not: on
+/// Vulkan, where OpenGL ES is still to try; not for a canvas larger than the GPU's textures go
+/// (OpenGL ES's go no further), nor a device lost making it (its loss is recovered from as any
+/// other's, see [`recover`]).
+fn retried(backend: wgpu::Backend, error: &GpuError, order: &[wgpu::Backends], named: bool, left: bool) -> bool {
+    backend == wgpu::Backend::Vulkan
+        && !named
+        && !left
+        && order.contains(&wgpu::Backends::GL)
+        && !matches!(error, GpuError::TooLarge(..) | GpuError::Lost)
+}
+
+/// The session's canvas couldn't be made on its Vulkan device (`error`, one [`canvas_retried`]
+/// takes): the rest of the run goes to OpenGL ES, as after a device lost as a canvas opened, and
+/// so do later starts in this build unless the GPU was only short of memory; the app's device and
+/// the session's are let go (the canvas was never made: what was opened is still there to make it
+/// from). The render thread then makes a device on OpenGL ES and the canvas on it (see
+/// `render.rs`). Whether it is to: false if OpenGL ES isn't to be tried (nothing changed then).
+pub(crate) fn canvas_failed(shared: &Shared, error: &GpuError) -> bool {
+    let Some(gpu) = shared.lock().gpu.clone() else { return false };
+    if !canvas_retried(&gpu, error) || failed_in(&LOSSES, record(), error).is_none() {
+        return false;
+    }
+    drop(gpu);
+    leave_vulkan(shared);
+    true
+}
+
+/// The session leaves its Vulkan device for good (see [`canvas_failed`]): the app's device let go
+/// too if it is Vulkan's, the kept pipelines forgotten (what its driver made of them may be what
+/// it refused), and OpenGL ES kept from now on even where some of the canvases' pipelines fail on
+/// it, as where Vulkan's driver crashed the app (it is the last there is).
+fn leave_vulkan(shared: &Shared) {
+    let gone = procraft_gpu::forget_kept_pipelines();
+    log::warn!("leaving Vulkan: the kept pipelines forgotten ({gone} files)");
+    procraft_gpu::vulkan_crashed(true);
+    {
+        let mut kept = super::kept();
+        if kept.as_ref().is_some_and(|k| k.backend() == wgpu::Backend::Vulkan) {
+            *kept = None;
+        }
+    }
+    shared.let_go_of_lost_canvas();
+}
+
+/// [`canvas_failed`] counted in `losses`, with the record in `record` (its folder and build): the
+/// run left for OpenGL ES (its index in the backends), and the record told so for later starts
+/// unless the GPU was only short of memory; none if there is no OpenGL ES, or the run left Vulkan
+/// already.
+fn failed_in(losses: &Mutex<Losses>, record: Option<(PathBuf, String)>, error: &GpuError) -> Option<usize> {
+    let opengl = backends_after(record.as_ref()).iter().position(|b| *b == wgpu::Backends::GL)?;
+    {
+        let mut losses = losses.lock().unwrap_or_else(PoisonError::into_inner);
+        if losses.left {
+            return None;
+        }
+        losses.left = true;
+    }
+    // (memory short once, as a big artwork leaves it, isn't the driver's doing: Vulkan again next
+    // start)
+    let kept = !matches!(error, GpuError::OutOfMemory(_));
+    log::warn!(
+        "Vulkan couldn't make the canvas ({error}): OpenGL ES from now on{}",
+        if kept { ", and in later starts until the app or the system is updated" } else { " in this run" }
+    );
+    if kept && let Some((dir, build)) = &record {
+        left_saying(dir, build, opengl, FAILED_SAYS);
+    }
+    Some(opengl)
+}
+
 /// The backend this run makes its devices from since its Vulkan devices were lost: OpenGL ES's
 /// index in `order`, if the run has left Vulkan.
 pub(crate) fn left_vulkan(order: &[wgpu::Backends]) -> Option<usize> {
@@ -213,9 +303,14 @@ pub(crate) fn left_vulkan(order: &[wgpu::Backends]) -> Option<usize> {
 /// Records in `dir`, for `build`, that the app left Vulkan for OpenGL ES (index `opengl`) after
 /// Vulkan lost its device: the record starts there, and [`LOST_RECORD`] says why.
 fn left_in(dir: &Path, build: &str, opengl: usize) {
+    left_saying(dir, build, opengl, "vulkan lost");
+}
+
+/// [`left_in`], [`LOST_RECORD`] saying `why` Vulkan was left.
+fn left_saying(dir: &Path, build: &str, opengl: usize, why: &str) {
     note_in(dir, build, opengl, Stage::Made);
     let _writing = writing();
-    write_record(&dir.join(LOST_RECORD), "vulkan lost", build.trim(), "");
+    write_record(&dir.join(LOST_RECORD), why, build.trim(), "");
 }
 
 /// The backend to start from, of those in `order`, in the build `build`, where the record in `dir`
@@ -236,7 +331,8 @@ pub(crate) fn start_for(dir: &Path, build: &str, order: &[wgpu::Backends], start
             return start;
         }
         if let (Some(wgpu::Backends::VULKAN), Some(opengl), false) = (on, opengl, unfinished) {
-            log::warn!("Vulkan lost the GPU device in an earlier run of this build: starting on OpenGL ES");
+            let what = if lost.starts_with(FAILED_SAYS) { "couldn't make a canvas" } else { "lost the GPU device" };
+            log::warn!("Vulkan {what} in an earlier run of this build: starting on OpenGL ES");
             procraft_gpu::vulkan_crashed(true);
             return opengl;
         }
@@ -570,6 +666,155 @@ mod tests {
             on_vulkan.as_millis(),
             on_opengl.as_millis()
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&record);
+    }
+
+    /// Which canvases that couldn't be made are made on OpenGL ES instead: Vulkan's, refused or
+    /// short of memory, while OpenGL ES is still to try. Not one too large for the GPU (OpenGL ES's
+    /// textures go no further), nor one whose device was lost (recovered from as any loss), nor on
+    /// OpenGL ES or another backend, nor where WGPU_BACKEND names the backends, there is no OpenGL
+    /// ES, or the run has left Vulkan already.
+    #[test]
+    fn a_canvas_vulkan_refuses_is_made_on_opengl_where_that_can_help() {
+        let refused = GpuError::Failed("Validation Error: texture width".to_owned());
+        let short = GpuError::OutOfMemory("no memory for the texture".to_owned());
+        let vulkan = wgpu::Backend::Vulkan;
+        assert!(retried(vulkan, &refused, &TWO, false, false));
+        assert!(retried(vulkan, &short, &TWO, false, false));
+        assert!(!retried(vulkan, &GpuError::TooLarge(20000, 20000, 16384), &TWO, false, false));
+        assert!(!retried(vulkan, &GpuError::Lost, &TWO, false, false));
+        assert!(!retried(wgpu::Backend::Gl, &refused, &TWO, false, false));
+        assert!(!retried(wgpu::Backend::Dx12, &refused, &TWO, false, false));
+        assert!(!retried(vulkan, &refused, &TWO, true, false));
+        assert!(!retried(vulkan, &refused, &[Backends::VULKAN], false, false));
+        assert!(!retried(vulkan, &refused, &TWO, false, true));
+    }
+
+    /// A canvas Vulkan refused sends the run to OpenGL ES once, and later starts in the build begin
+    /// there until the app is updated; one it was only short of memory for sends the run alone (a
+    /// big artwork once is no reason to leave Vulkan for good).
+    #[test]
+    fn a_build_whose_vulkan_refused_a_canvas_starts_on_opengl_until_updated() {
+        let order = Gpu::backends();
+        let Some(opengl) = order.iter().position(|b| *b == Backends::GL) else {
+            return eprintln!("skipped: no OpenGL here");
+        };
+        let Some(vulkan) = order.iter().position(|b| *b == Backends::VULKAN) else {
+            return eprintln!("skipped: no Vulkan here");
+        };
+        let refused_dir = folder("refused");
+        let dir = refused_dir.clone();
+        let recorded = || Some((dir.clone(), BUILD.to_owned()));
+        let refused = GpuError::Failed("Validation Error".to_owned());
+        note_in(&dir, BUILD, vulkan, Stage::Made);
+        let losses = Mutex::new(Losses::default());
+        assert_eq!(failed_in(&losses, recorded(), &refused), Some(opengl));
+        assert!(losses.lock().unwrap().left);
+        assert_eq!(failed_in(&losses, recorded(), &refused), None, "left once");
+        assert_eq!(std::fs::read_to_string(dir.join(RECORD)).unwrap(), format!("{opengl} made\n{BUILD}"));
+        assert_eq!(std::fs::read_to_string(dir.join(LOST_RECORD)).unwrap(), format!("{FAILED_SAYS}\n{BUILD}"));
+        assert_eq!(start_for(&dir, BUILD, &order, start_in(&dir, &order)), opengl);
+        assert_eq!(start_for(&dir, HOTFIX, &order, start_in(&dir, &order)), vulkan);
+
+        let dir = folder("short");
+        let recorded = || Some((dir.clone(), BUILD.to_owned()));
+        note_in(&dir, BUILD, vulkan, Stage::Made);
+        let losses = Mutex::new(Losses::default());
+        let short = GpuError::OutOfMemory("no memory".to_owned());
+        assert_eq!(failed_in(&losses, recorded(), &short), Some(opengl));
+        assert!(losses.lock().unwrap().left, "this run on OpenGL ES");
+        assert!(!dir.join(LOST_RECORD).exists());
+        assert_eq!(start_for(&dir, BUILD, &order, start_in(&dir, &order)), vulkan, "the next start on Vulkan");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&refused_dir);
+    }
+
+    /// #412 as the render thread goes through it (see `render.rs`), on this machine: an artwork
+    /// saved with a stroke is opened on a Vulkan device that refuses its canvas (an error as it is
+    /// made, as a driver that can't make it gives). The app isn't told: no error, no canvas, what
+    /// was opened kept and nothing written over the save. The run leaves for OpenGL ES, the Vulkan
+    /// device is let go, and the artwork's canvas is made on an OpenGL ES device as it was opened,
+    /// drawn on and saved, with no GPU error there.
+    #[test]
+    fn a_canvas_vulkan_refuses_is_made_on_opengl_before_the_app_is_told() {
+        let order = Gpu::backends();
+        let position = |backend| order.iter().position(|b| *b == backend);
+        let (Some(vulkan), Some(opengl)) = (position(Backends::VULKAN), position(Backends::GL)) else {
+            return eprintln!("skipped: no Vulkan and OpenGL here");
+        };
+        let Ok((on_vulkan, from)) = Gpu::for_canvases_from(vulkan, |_| {}) else {
+            return eprintln!("skipped: no GPU");
+        };
+        if from != vulkan {
+            return eprintln!("skipped: no Vulkan device");
+        }
+        let (dir, record) = (folder("refused-artwork"), folder("refused-record"));
+        let path = dir.to_string_lossy().into_owned();
+        let saved = {
+            let s = crate::CanvasSession::new(64, 64);
+            s.use_gpu(on_vulkan.clone());
+            s.show_in(64, 64);
+            stroke(&s, 16.0);
+            s.save(path.clone()).unwrap();
+            contents(&s)
+        };
+        let kept = files(&dir);
+        assert!(saved.iter().any(|px| px.iter().any(|&v| v != 0)), "painted");
+
+        // opened, its canvas refused on Vulkan
+        let s = crate::CanvasSession::open(path.clone()).unwrap();
+        s.show_in(64, 64);
+        s.shared.lock().gpu = Some(on_vulkan.clone());
+        on_vulkan.refuse_canvases(true);
+        let made = s.shared.make_canvas_untold();
+        on_vulkan.refuse_canvases(false);
+        let error = made.expect_err("the canvas refused");
+        eprintln!("refused: {error}");
+        {
+            let st = s.shared.lock();
+            assert!(st.canvas.is_none() && st.canvas_failed);
+            assert!(st.error.is_none(), "the app isn't told yet");
+            assert!(!st.pending_pixels.is_empty(), "what was opened is kept");
+        }
+        // none made again on it meanwhile (a call that wants the canvas)
+        s.shared.lock().ensure_canvas();
+        assert!(s.shared.lock().canvas.is_none());
+        assert!(retried(on_vulkan.backend(), &error, &order, false, false));
+
+        // the run leaves for OpenGL ES; the session's Vulkan device let go
+        let losses = Mutex::new(Losses::default());
+        assert_eq!(failed_in(&losses, Some((record.clone(), BUILD.to_owned())), &error), Some(opengl));
+        s.shared.let_go_of_lost_canvas();
+        assert!(s.shared.lock().gpu.is_none());
+        assert_eq!(files(&dir), kept, "nothing written over the save");
+        drop(on_vulkan);
+
+        // made on OpenGL ES as it was opened
+        let started = Instant::now();
+        let Ok((gl, from)) = Gpu::for_canvases_from(opengl, |_| {}) else {
+            return eprintln!("skipped: OpenGL makes no device here");
+        };
+        if from != opengl {
+            return eprintln!("skipped: OpenGL's pipelines failed here");
+        }
+        s.shared.reopen_after_loss(gl.clone()).unwrap();
+        eprintln!(
+            "the canvas made on OpenGL ES (its device and pipelines made) in {} ms",
+            started.elapsed().as_millis()
+        );
+        {
+            let st = s.shared.lock();
+            assert!(st.canvas.is_some(), "the canvas made on OpenGL ES");
+            assert!(st.error.is_none());
+        }
+        assert_eq!(s.reopened_after_loss(), 0, "only the device is new: nothing to read again");
+        assert_eq!(contents(&s), saved, "as it was opened");
+        stroke(&s, 40.0);
+        s.save(path.clone()).unwrap();
+        assert_ne!(contents(&s), saved, "drawn on OpenGL ES");
+        assert_eq!(gl.errors(), 0);
+        assert_eq!(start_for(&record, BUILD, &order, start_in(&record, &order)), opengl);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&record);
     }

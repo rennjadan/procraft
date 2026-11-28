@@ -197,6 +197,8 @@ def main():
     head = ['ProCraft is made with the following third-party software, under the licences given.', '',
             'The interface font, Inter, is under the SIL Open Font License 1.1 (its text above).', '',
             'The app keeps Lucide icons (lucide.dev), under the ISC License (its text above).', '',
+            "The undo and redo icons are Google's Material Symbols (fonts.google.com/icons), under the",
+            'Apache License 2.0 (its text at the end).', '',
             "The colour panel's OKLab model is Okhsl, worked out after Björn Ottosson's code",
             '(bottosson.github.io/posts/colorpicker), under the MIT License:', '',
             MIT.format(holders='2021 Björn Ottosson'), '']

@@ -506,7 +506,11 @@ private fun FontCard(vm: CanvasViewModel, info: TextInfo, modifier: Modifier) {
     val look = shownLook(vm, info)
     // Font and Style are one card split by a line: square where they meet
     Card("Font", modifier, RoundedCornerShape(topStart = CardCorner, bottomStart = CardCorner)) {
-        LazyColumn(Modifier.padding(start = 10.dp, end = 17.dp), contentPadding = PaddingValues(top = 6.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        LazyColumn(
+            Modifier.padding(start = 10.dp, end = 17.dp), contentPadding = PaddingValues(top = 6.dp), verticalArrangement = Arrangement.spacedBy(9.dp),
+            flingBehavior = rememberScrollFling(),
+            overscrollEffect = rememberScrollEdges(),
+        ) {
             items(TextRenderer.families) { f ->
                 Cell(f.name, f.family == look.font, TextRenderer.typeface(f.family, "Regular")) { vm.restyleText(TextStyleChange.Font(f.family)) }
             }
@@ -518,7 +522,11 @@ private fun FontCard(vm: CanvasViewModel, info: TextInfo, modifier: Modifier) {
 private fun StyleCard(vm: CanvasViewModel, info: TextInfo, modifier: Modifier) {
     val look = shownLook(vm, info)
     Card("Style", modifier, RoundedCornerShape(topEnd = CardCorner, bottomEnd = CardCorner)) {
-        LazyColumn(Modifier.padding(start = 10.dp, end = 17.dp), contentPadding = PaddingValues(top = 6.dp), verticalArrangement = Arrangement.spacedBy(9.dp)) {
+        LazyColumn(
+            Modifier.padding(start = 10.dp, end = 17.dp), contentPadding = PaddingValues(top = 6.dp), verticalArrangement = Arrangement.spacedBy(9.dp),
+            flingBehavior = rememberScrollFling(),
+            overscrollEffect = rememberScrollEdges(),
+        ) {
             items(TextRenderer.styles) { st ->
                 Cell(st.name, st.name == look.style, TextRenderer.typeface(look.font, st.name)) { vm.restyleText(TextStyleChange.Style(st.name)) }
             }

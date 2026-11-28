@@ -55,7 +55,7 @@ impl Curve {
         if pts.len() < 2 {
             return Curve::linear();
         }
-        let table = sampled(&pts);
+        let table = shared_table(&pts);
         Curve { points: pts, table }
     }
 
@@ -71,6 +71,28 @@ impl Curve {
         let (a, b) = (at(i), at(i + 1));
         a + (b - a) * (f - i as f32)
     }
+}
+
+/// The table of the curve through `pts` (see [`sampled`]), shared with every other curve through
+/// the same points still held: a set's brushes mostly have the same curves, and thousands of
+/// brushes brought in held a table (4 KB) of their own for each of their several curves, the
+/// straight ones too (#415).
+fn shared_table(pts: &[Vec2]) -> Arc<[f32]> {
+    type Tables = std::collections::HashMap<Vec<[u32; 2]>, std::sync::Weak<[f32]>>;
+    // (and how many there were when those no longer held were last let go)
+    static TABLES: std::sync::LazyLock<std::sync::Mutex<(Tables, usize)>> = std::sync::LazyLock::new(Default::default);
+    let key: Vec<[u32; 2]> = pts.iter().map(|p| [p.x.to_bits(), p.y.to_bits()]).collect();
+    let mut tables = TABLES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(table) = tables.0.get(&key).and_then(std::sync::Weak::upgrade) {
+        return table;
+    }
+    let table = sampled(pts);
+    tables.0.insert(key, Arc::downgrade(&table));
+    if tables.0.len() > tables.1.max(256) * 2 {
+        tables.0.retain(|_, table| table.strong_count() > 0);
+        tables.1 = tables.0.len();
+    }
+    table
 }
 
 /// The curve through `pts` (sorted, at least two) sampled at [`STEPS`] places: the points scaled
@@ -183,5 +205,23 @@ mod tests {
         assert!((c.eval(0.25) - 0.25).abs() < 1e-5);
         assert_eq!(Curve::linear().eval(f32::NAN), 0.0);
         assert_eq!(Curve::linear().eval(4.0), 1.0);
+    }
+
+    /// Curves through the same points share one table, the straight one too, the same as each
+    /// would have had of its own; one no longer held is let go.
+    #[test]
+    fn curves_through_the_same_points_share_their_table() {
+        let points = [Vec2::new(0.0, 0.0), Vec2::new(0.31, 0.62), Vec2::new(1.0, 1.0)];
+        let (a, b) = (Curve::new(&points), Curve::new(&points));
+        assert!(Arc::ptr_eq(&a.table, &b.table));
+        assert_eq!(a.table[..], sampled(&a.points)[..]);
+        let straight = Curve::new(&[Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)]);
+        assert!(Arc::ptr_eq(&straight.table, &Curve::new(&[Vec2::new(1.0, 1.0), Vec2::new(0.0, 0.0)]).table));
+        assert_eq!(straight.table[..], Curve::linear().table[..]);
+        let other = Curve::new(&[Vec2::new(0.0, 0.0), Vec2::new(0.3, 0.6), Vec2::new(1.0, 1.0)]);
+        assert!(!Arc::ptr_eq(&a.table, &other.table));
+        let weak = Arc::downgrade(&a.table);
+        drop((a, b));
+        assert!(weak.upgrade().is_none());
     }
 }

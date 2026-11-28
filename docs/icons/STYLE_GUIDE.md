@@ -1,7 +1,8 @@
 # ProCraft icon style guide
 
-The rules for ProCraft's interface icons, every one of them drawn for ProCraft: by us, or by a
-contributor. `LucideIcons` keeps the Lucide set beside them.
+The rules for ProCraft's interface icons, every one of them drawn for ProCraft, by us or by a
+contributor, but for Undo and Redo, which are Google's Material Symbols. `LucideIcons` keeps the
+Lucide set beside them.
 
 ## Where an icon comes from
 
@@ -20,6 +21,11 @@ contributor. `LucideIcons` keeps the Lucide set beside them.
   and under the same first rule. `draw_icons.py` rounds its corners to the set's smallest round and
   places it in its slot like ours; it is checked to weigh what its neighbours do where it is shown,
   and `ATTRIBUTION.md` credits who drew it.
+- **An icon from an open set** is taken only where the maintainer picked it by name: so far Undo
+  and Redo, Google's Material Symbols (Outlined, weight 400, Apache-2.0). Its file stays as given in
+  `assets/icons/<set>/`, with the set's licence and a `SOURCE.md` beside it; `draw_icons.py`
+  (`TAKEN_ICONS`) puts it on this grid and places it in its slot as drawn, keeping its own weight,
+  and `ATTRIBUTION.md`, `NOTICE` and the apps' Licences credit the set.
 
 ## Grid and shapes
 
@@ -52,7 +58,7 @@ contributor. `LucideIcons` keeps the Lucide set beside them.
 | Smudge | a hand pointing down to the left (lork's drawing) |
 | Erase | an eraser block with a band at its lower end (lork's drawing, its end drawn whole) |
 | Layers | two rounded sheets, the back one up to the right (lork's drawing, set further apart) |
-| Undo / Redo | a curved arrow turning back / forward |
+| Undo / Redo | Material Symbols' undo / redo: an arrowhead pointing back / forward, its line curving round below to end flat (taken whole) |
 
 ## The Actions panel's tabs
 

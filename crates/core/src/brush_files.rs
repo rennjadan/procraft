@@ -91,6 +91,17 @@ impl CanvasSession {
     }
 
     fn brush_pictures(&self, brush: &Brush, set: u32, index: u32) -> Made {
+        // its pictures still in their files (or still to be drawn) read on twins of their own, let
+        // go once written: a library of thousands written out held every brush's after (#415)
+        let mut apart = brush.clone();
+        crate::brushes::each_source(&mut apart, &mut |source| {
+            if !source.pixels.is_drawn()
+                && let Some(twin) = source.pixels.twin()
+            {
+                source.pixels = twin;
+            }
+        });
+        let brush = &apart;
         // the preview it came with, else one drawn
         let thumbnail = brush.thumbnail.as_deref().map(<[u8]>::to_vec).unwrap_or_else(|| {
             self.brush_preview_for_file(set, index, THUMBNAIL.0, THUMBNAIL.1)
@@ -436,6 +447,12 @@ pub struct BrushFileReading {
     /// What to say once an engine has had the file (a title, if it is to be asked to be read, and
     /// the text): what came in, or what went wrong.
     notice: std::sync::Mutex<Option<(Option<String>, String)>>,
+    /// The brushes' folder each brush read puts its pictures in as it is read, not holding them
+    /// (see `brush_pictures::spill`); none: held.
+    spill_to: std::sync::Mutex<Option<std::path::PathBuf>>,
+    /// The makers' pictures and signatures read so far, by their bytes' hash: every brush of a set
+    /// naming the same shares one (each held its own, a set's maker's picture thousands of times).
+    makers: std::sync::Mutex<std::collections::HashMap<u64, std::sync::Arc<[u8]>>>,
 }
 
 #[uniffi::export]
@@ -526,11 +543,40 @@ impl BrushFileReading {
     }
 
     /// `file` made a brush, unless the reading was stopped; counted.
+    /// `brush`'s maker's picture and signature (and its second's) shared with the brushes read
+    /// before it that have the same.
+    fn share_makers(&self, brush: &mut Brush) {
+        let mut makers = self.makers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(author) = brush.author.as_mut() {
+            for picture in [&mut author.picture, &mut author.signature].into_iter().flatten() {
+                let shared = makers.entry(crate::project::pixels_hash(picture)).or_insert_with(|| picture.clone());
+                if **shared == **picture {
+                    *picture = std::sync::Arc::clone(shared);
+                }
+            }
+        }
+        drop(makers);
+        if let Some(second) = brush.secondary.as_deref_mut() {
+            self.share_makers(second);
+        }
+    }
+
     fn made(&self, file: Option<BrushFile>) -> Option<Brush> {
         if self.cancelled() {
             return None;
         }
-        let brush = file.map(|f| brush_from(&f));
+        let mut brush = file.map(|f| brush_from(&f));
+        if let Some(brush) = brush.as_mut() {
+            self.share_makers(brush);
+        }
+        let spill_to = self.spill_to.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if let (Some(brush), Some(dir)) = (brush.as_mut(), spill_to) {
+            crate::brush_pictures::spill(
+                &dir.join(crate::brush_pictures::FOLDER),
+                &crate::grain_store::folder_in(&dir),
+                brush,
+            );
+        }
         self.done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         brush
     }
@@ -554,6 +600,9 @@ pub fn read_brushes_from(
     let (stem, ext) = name.rsplit_once('.').unwrap_or((name.as_str(), ""));
     let stem = stem.trim().to_owned();
     let other = OTHER_BRUSH_EXTENSIONS.iter().any(|o| o.eq_ignore_ascii_case(ext));
+    // each brush's pictures put in their files as it is read, so however many there are only a
+    // few are held (thousands of them closed the app on a phone, #415)
+    *reading.spill_to.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = crate::brush_pictures::spill_folder();
     if !other && let Some(zip) = procraft_engine::zip::ZipReader::open(path) {
         if ext.eq_ignore_ascii_case(brushlibrary::EXTENSION) || brushlibrary::is_library(zip.names()) {
             reading.begin(zip.names().filter(|n| n.ends_with(".brush")).count());

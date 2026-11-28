@@ -4,6 +4,7 @@
 //! click chooses one; a right click on one of the plugin's pictures offers to delete it (its file
 //! control cleared).
 
+use crate::scroll::ScrollArea;
 use std::sync::OnceLock;
 
 use egui::epaint::RectShape;
@@ -159,7 +160,7 @@ impl Textures {
         let mut add = false;
         let mut delete_at = None;
         ui.scope_builder(UiBuilder::new().max_rect(grid), |ui| {
-            egui::ScrollArea::vertical()
+            ScrollArea::vertical()
                 .id_salt("plugin textures")
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {

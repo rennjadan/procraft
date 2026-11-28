@@ -416,10 +416,12 @@ private struct Timeline: View {
     let tool: AnimationAssist
     let width: CGFloat
 
-    /// The place in the middle while a drag moves it, and where it began.
+    /// The place in the middle while dragging or coasting.
     @State private var dragged: CGFloat?
-    @State private var from: CGFloat = 0
+    @State private var dragTranslation: CGFloat = 0
+    @State private var dragging = false
     @State private var shown = 0
+    @State private var coast = FrameLoop()
 
     var body: some View {
         let slots = tool.slots
@@ -447,7 +449,14 @@ private struct Timeline: View {
                     .clipShape(card)
                     .overlay(card.strokeBorder(frameEdge, lineWidth: 1))
                     .contentShape(card)
-                    .onTapGesture { tool.tapFrame(i) }
+                    .onTapGesture {
+                        if dragged != nil {
+                            coast.stop()
+                            tool.endScrub(nil)
+                            dragged = nil
+                        }
+                        tool.tapFrame(i)
+                    }
                     .offset(x: x, y: 2)
                 }
             }
@@ -461,28 +470,54 @@ private struct Timeline: View {
             DragGesture(minimumDistance: 6)
                 .onChanged { drag in
                     guard slots.count > 1 else { return }
-                    if dragged == nil {
-                        from = CGFloat(focus)
+                    if !dragging {
+                        coast.stop()
+                        dragging = true
+                        dragTranslation = 0
+                        dragged = dragged ?? CGFloat(focus)
                         shown = focus
                         tool.beginScrub()
                     }
-                    let p = min(max(from - drag.translation.width / pitch, 0), CGFloat(last))
-                    dragged = p
-                    let i = Int(p.rounded())
-                    if i != shown {
-                        shown = i
-                        tool.scrub(i)
-                    }
+                    let delta = dragTranslation - drag.translation.width
+                    dragTranslation = drag.translation.width
+                    let p = scrollDrag(position: Float((dragged ?? CGFloat(focus)) * pitch), delta: Float(delta),
+                                       min: 0, max: Float(last) * Float(pitch), viewport: Float(width))
+                    show(CGFloat(p) / pitch, last: last)
                 }
                 .onEnded { drag in
-                    guard dragged != nil else { return }
-                    // it coasts as far as the flick would take it, and settles on a frame
-                    let target = Int(min(max(from - drag.predictedEndTranslation.width / pitch, 0), CGFloat(last)).rounded())
-                    withAnimation(Motion.frameSlide) { dragged = CGFloat(target) }
-                    tool.endScrub(target)
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { dragged = nil }
+                    guard dragging, let dragged else { return }
+                    dragging = false
+                    let from = Float(dragged * pitch)
+                    let end = Float(last) * Float(pitch)
+                    let velocity = scrollDragVelocity(position: from, velocity: -Float(drag.velocity.width),
+                                                      min: 0, max: end, viewport: Float(width))
+                    let motion = scrollMotion(from: from, velocity: velocity, min: 0, max: end, snap: Float(pitch))
+                    let started = CACurrentMediaTime()
+                    coast.start { _ in
+                        let sample = scrollMotionAt(motion: motion, seconds: Float(CACurrentMediaTime() - started))
+                        let position = CGFloat(sample.position) / pitch
+                        show(position, last: last)
+                        if sample.done {
+                            tool.endScrub(min(max(Int(position.rounded()), 0), last))
+                            self.dragged = nil
+                        }
+                        return !sample.done
+                    }
                 }
         )
+        .onDisappear {
+            coast.stop()
+            if dragged != nil { tool.endScrub(nil) }
+        }
+    }
+
+    private func show(_ position: CGFloat, last: Int) {
+        dragged = position
+        let slot = min(max(Int(position.rounded()), 0), last)
+        if slot != shown {
+            shown = slot
+            tool.scrub(slot)
+        }
     }
 }
 

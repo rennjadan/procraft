@@ -54,6 +54,69 @@ pub fn side_slider_tap(at: f32, value: f32, thumb: f32, notches: Vec<f32>, panel
     SideSliderTap::Jump { value: near.unwrap_or(at).clamp(0.0, 1.0) }
 }
 
+/// How far from the thumb's middle (points, straight across) a touch lands for the thumb to jump
+/// under it at once: a finger's, and the Pencil's, which lands where it points.
+const LAND_REACH_FINGER: f32 = 25.0;
+const LAND_REACH_PEN: f32 = 17.0;
+
+/// How far along the slider (points) a touch goes from where it landed before it moves the thumb:
+/// short of that it is a tap, and moves nothing.
+const DRAG_SLOP: f32 = 5.0;
+
+/// How long (seconds) a touch may stay down and still be a tap.
+const TAP_SECONDS: f64 = 0.15;
+
+/// A touch landing on a side slider at `at` (the value under it, the thumb's middle there),
+/// `from_thumb` points from the thumb's middle, by the Pencil or not (`pen`), the thumb reaching
+/// `thumb` (value units) either side of its middle: farther from the thumb than a finger's or the
+/// Pencil's reach, the thumb jumps under it as it lands, onto a saved notch it lands as close to
+/// (and a panel up goes), and this is the value it jumps to; closer, none: the thumb stays where it
+/// is, to be tapped or dragged from there.
+#[uniffi::export]
+pub fn side_slider_land(at: f32, from_thumb: f32, pen: bool, thumb: f32, notches: Vec<f32>) -> Option<f32> {
+    let reach = if pen { LAND_REACH_PEN } else { LAND_REACH_FINGER };
+    if !at.is_finite() || !from_thumb.is_finite() || from_thumb.abs() <= reach {
+        return None;
+    }
+    let near = notches
+        .into_iter()
+        .filter(|n| (n - at).abs() <= thumb)
+        .min_by(|a, b| (a - at).abs().total_cmp(&(b - at).abs()));
+    Some(near.unwrap_or(at).clamp(0.0, 1.0))
+}
+
+/// Whether a touch `along` points along the slider from where it landed moves the thumb: once it
+/// has gone [`DRAG_SLOP`], the whole of its way from where it landed does (none of it is lost).
+#[uniffi::export]
+pub fn side_slider_drags(along: f32) -> bool {
+    along.abs() >= DRAG_SLOP
+}
+
+/// What a touch on a side slider does as it lifts at `at` (the value under it, the thumb's middle
+/// there), the slider at `value`, its thumb reaching `thumb` either side of its middle, after
+/// `seconds` down: a tap (lifted quickly, never having dragged, nor jumped the thumb as it landed)
+/// on the thumb brings its panel up, or takes it away (`panel_up`). Anything else does nothing
+/// more as it lifts: a jump was done as it landed, a drag leaves its panel up, and a tap beside the
+/// thumb but within its reach is nothing.
+#[uniffi::export]
+pub fn side_slider_lift(
+    at: f32,
+    value: f32,
+    thumb: f32,
+    jumped: bool,
+    dragged: bool,
+    seconds: f64,
+    panel_up: bool,
+) -> Option<SideSliderTap> {
+    // (a time or place that isn't a number is no tap)
+    let quick = seconds.is_finite() && seconds < TAP_SECONDS;
+    let on_thumb = (at - value).abs() <= thumb;
+    if jumped || dragged || !quick || !on_thumb {
+        return None;
+    }
+    Some(if panel_up { SideSliderTap::ClosePanel } else { SideSliderTap::Panel })
+}
+
 /// One step of a side slider thumb's shadow: the thumb's pill grown by `grow` points (shrunk where
 /// negative, its ends as much rounder or tighter), moved `down` points, filled black at `alpha`
 /// over the steps drawn before it.
@@ -187,6 +250,52 @@ mod tests {
         assert_eq!(side_slider_tap(0.9, 0.5, 0.06, vec![0.25], false), SideSliderTap::Jump { value: 0.9 });
         // past the ends it holds to them
         assert_eq!(side_slider_tap(1.02, 0.5, 0.01, vec![], false), SideSliderTap::Jump { value: 1.0 });
+    }
+
+    /// The size slider's thumb reach in value units: the thumb's half height (9 points) over its
+    /// travel (170 - 18 - 8 points).
+    const THUMB: f32 = 9.0 / 144.0;
+
+    #[test]
+    fn a_touch_landing_well_off_the_thumb_jumps_it_there_at_once_and_a_near_one_leaves_it() {
+        // a finger 60 points below the thumb: under the finger as it lands (before any lift)
+        assert_eq!(side_slider_land(0.2, 60.0, false, THUMB, vec![]), Some(0.2));
+        // within a finger's reach of the thumb's middle (25 points), even off the thumb: it stays
+        for off in [0.0, 9.5, 20.0, 25.0, -25.0] {
+            assert_eq!(side_slider_land(0.5, off, false, THUMB, vec![]), None, "{off}");
+        }
+        // the Pencil's reach is shorter (17 points): it lands where it points
+        assert_eq!(side_slider_land(0.6, 20.0, true, THUMB, vec![]), Some(0.6));
+        assert_eq!(side_slider_land(0.6, 16.0, true, THUMB, vec![]), None);
+        // onto a saved notch it lands as close to, the nearer of two; past the ends, held to them
+        assert_eq!(side_slider_land(0.21, 40.0, false, THUMB, vec![0.25, 0.18]), Some(0.18));
+        assert_eq!(side_slider_land(1.03, 40.0, false, THUMB, vec![]), Some(1.0));
+        assert_eq!(side_slider_land(f32::NAN, 40.0, false, THUMB, vec![]), None);
+    }
+
+    #[test]
+    fn a_drag_moves_the_thumb_once_it_has_gone_five_points_and_a_tap_moves_nothing() {
+        // a finger's wobble as it taps moves nothing (it moved the thumb with every point before)
+        for along in [0.0, 0.5, 2.0, 4.9, -4.9] {
+            assert!(!side_slider_drags(along), "{along}");
+        }
+        assert!(side_slider_drags(5.0) && side_slider_drags(-12.0));
+    }
+
+    #[test]
+    fn a_quick_tap_on_the_thumb_shows_or_hides_its_panel_and_nothing_else_does_as_it_lifts() {
+        let lift = |at: f32, jumped: bool, dragged: bool, seconds: f64, up: bool| {
+            side_slider_lift(at, 0.5, THUMB, jumped, dragged, seconds, up)
+        };
+        assert_eq!(lift(0.52, false, false, 0.08, false), Some(SideSliderTap::Panel));
+        assert_eq!(lift(0.48, false, false, 0.08, true), Some(SideSliderTap::ClosePanel));
+        // too slow to be a tap (a hold shows the panel by itself), dragged, or jumped as it landed
+        assert_eq!(lift(0.5, false, false, 0.15, false), None);
+        assert_eq!(lift(0.5, false, true, 0.08, false), None);
+        assert_eq!(lift(0.5, true, false, 0.08, true), None);
+        // beside the thumb within its reach, which didn't jump it: nothing
+        assert_eq!(lift(0.5 + 2.0 * THUMB, false, false, 0.08, false), None);
+        assert_eq!(lift(0.5, false, false, f64::NAN, false), None);
     }
 
     #[test]

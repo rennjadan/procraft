@@ -4,7 +4,8 @@
 //! adjustment's own panel rising from the foot of the window. What each does is the core's
 //! (adjusting.rs); the touches swipe its amount.
 
-use egui::{Align2, Color32, Id, LayerId, Order, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
+use crate::scroll::ScrollArea;
+use egui::{Align2, Color32, Id, LayerId, Order, Pos2, Rect, Sense, Stroke, Ui, UiBuilder, pos2, vec2};
 use procraft_core::{
     AdjustShown, Adjustment, CLONE_PUCK_RADIUS, CanvasSession, PerspectiveKind, PluginAction, PluginInfo,
     adjustment_groups, adjustment_label,

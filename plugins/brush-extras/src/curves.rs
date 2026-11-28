@@ -21,6 +21,9 @@ const CLOSED: f32 = 0.18;
 /// A closed stroke's bend turns the other way from the rest when it does by more than this (the
 /// sine of the angle): less is a hand's wobble.
 const TURNS_BACK: f32 = 0.1;
+/// Bends this near where a closed stroke's ends meet (a part of its size) are the join's, and
+/// never count as turning back.
+const JOIN: f32 = 0.12;
 
 kit::quickshape_curve!(offered);
 
@@ -148,24 +151,41 @@ fn closed(pts: &[P]) -> bool {
 /// the other way from the rest, as an ellipse's never do). None with fewer than three bends.
 ///
 /// The stroke stops where it comes nearest its start again, once past halfway: what runs on
-/// beyond lies over its start. The bends are found going once round from the point farthest from
-/// the start, so the start, where the stroke closes, is no bend unless it is one; they are laid
-/// from the one nearest the start, as the stroke went, and the first again at the end closes it.
+/// beyond lies over its start. It begins again where its first stretch comes nearest that: a tick
+/// the pen landed with, or the start that the end crossed inside of, is no part of the loop. The
+/// bends are found going once round from the point farthest from the start, so the start, where
+/// the stroke closes, is no bend unless it is one; they are laid from the one nearest the start, as
+/// the stroke went, and the first again at the end closes it. Where the ends meet, a hand's join
+/// can kink against the way the loop bends: no bend there counts as one turning back.
 fn fit_closed(pts: &[P]) -> Option<(Vec<P>, bool)> {
     let start = *pts.first()?;
     // where it closes: the point nearest its start over the second half of its way
-    let half = path_length(pts) / 2.0;
+    let whole = path_length(pts);
     let mut gone = 0.0;
     let mut close_at = pts.len() - 1;
     let mut nearest = f32::MAX;
     for (i, w) in pts.windows(2).enumerate() {
         gone += length(sub(w[1], w[0]));
         let d = length(sub(w[1], start));
-        if gone >= half && d < nearest {
+        if gone >= whole / 2.0 && d < nearest {
             (close_at, nearest) = (i + 1, d);
         }
     }
-    let pts = &pts[..=close_at];
+    // where it begins again: the point of its first quarter nearest where it closes
+    let end = pts[close_at];
+    let (mut begin, mut nearest, mut gone) = (0, length(sub(start, end)), 0.0);
+    for (i, w) in pts.windows(2).enumerate().take(close_at.saturating_sub(3)) {
+        gone += length(sub(w[1], w[0]));
+        if gone > whole / 4.0 {
+            break;
+        }
+        let d = length(sub(w[1], end));
+        if d < nearest {
+            (begin, nearest) = (i + 1, d);
+        }
+    }
+    let pts = &pts[begin..=close_at];
+    let start = pts[0];
     let far = pts.iter().enumerate().fold((0, 0.0f32), |best, (i, &p)| {
         let d = length(sub(p, start));
         if d > best.1 { (i, d) } else { best }
@@ -182,8 +202,10 @@ fn fit_closed(pts: &[P]) -> Option<(Vec<P>, bool)> {
     let first = (0..n).min_by(|&a, &b| length(sub(anchors[a], start)).total_cmp(&length(sub(anchors[b], start))))?;
     anchors.rotate_left(first);
     let at = |i: usize| anchors[i % n];
-    // which way each bend turns, of those that clearly do
+    // which way each bend turns, of those that clearly do, but where the ends meet
+    let join = JOIN * size(pts);
     let turns: Vec<f32> = (0..n)
+        .filter(|&i| length(sub(at(i), start)) > join)
         .filter_map(|i| {
             let (u, v) = (sub(at(i), at(i + n - 1)), sub(at(i + 1), at(i)));
             let sine = (u.0 * v.1 - u.1 * v.0) / (length(u) * length(v)).max(1e-6);
@@ -895,6 +917,62 @@ mod tests {
         assert!(offer(&wobbly, None).is_some_and(|n| closes_smoothly(&n)));
         // and polygons stay QuickShape's
         assert_eq!(offer(&cloud(0.0), Some(kit::ShapeKind::Quadrilateral)), None);
+    }
+
+    /// A loop as a hand draws it, about (300, 300) with half-axes `rx` and `ry`: a little lumpy, the
+    /// pen landing with a tick out from it, going `turns` round, its end coming `end_in` inside as
+    /// it runs on past its start (crossing inside it), with a tremor of a third of a point.
+    fn hand_loop(rx: f32, ry: f32, turns: f32, tick: f32, end_in: f32, seed: u32) -> Vec<P> {
+        let mut seed = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+        let mut tremor = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            ((seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.7
+        };
+        let (sin, cos) = 0.35f32.sin_cos();
+        let at = |a: f32, inward: f32| {
+            let lumps = 1.0 + 0.05 * (0.6 * (2.0 * a + 1.3).sin() + 0.4 * (3.0 * a + 0.4).sin());
+            let (x, y) = ((rx * lumps - inward) * a.cos(), (ry * lumps - inward) * a.sin());
+            (300.0 + x * cos - y * sin, 300.0 + x * sin + y * cos)
+        };
+        let start = -1.9f32;
+        let first = at(start, 0.0);
+        let out = sub(first, (300.0, 300.0));
+        let out = scale(out, 1.0 / length(out));
+        let mut pts: Vec<P> = (0..6).map(|k| add(first, scale(out, tick * (1.0 - k as f32 / 6.0)))).collect();
+        let n = 150;
+        for i in 0..=n {
+            let u = i as f32 / n as f32;
+            let p = 0.25 * u + 0.75 * u * u * (3.0 - 2.0 * u);
+            pts.push(at(start - turns * std::f32::consts::TAU * p, end_in * p.powi(8)));
+        }
+        pts.iter().map(|&(x, y)| (x + tremor(), y + tremor())).collect()
+    }
+
+    /// #411: a hand's loop that runs on past its start, crossing inside it, or lands with a tick,
+    /// bends only one way but where its ends meet: it stays the ellipse it is. (The join's kink and
+    /// the tick were taken for bends turning back, and the loop became a curve with a notch.)
+    #[test]
+    fn a_hand_drawn_loop_meeting_itself_is_left_the_ellipse_it_is() {
+        let mut curves = Vec::new();
+        let mut loops = 0;
+        for (rx, ry) in [(30.0, 22.0), (48.0, 34.0), (120.0, 85.0)] {
+            for (turns, tick, end_in) in
+                [(1.04, 0.0, 6.0), (1.1, 0.0, 6.0), (1.04, 5.0, 0.0), (1.1, 5.0, 4.0), (1.0, 4.0, 0.0)]
+            {
+                for seed in 1..4 {
+                    loops += 1;
+                    if offer(&hand_loop(rx, ry, turns, tick, end_in, seed), Some(kit::ShapeKind::Ellipse)).is_some() {
+                        curves.push(format!("{rx}x{ry} {turns} round, tick {tick}, {end_in} in, seed {seed}"));
+                    }
+                }
+            }
+        }
+        println!("{} of {loops} hand-drawn loops made curves", curves.len());
+        assert!(curves.is_empty(), "{} of {loops} made curves: {curves:#?}", curves.len());
+        // a cloud drawn so still closes as a curve
+        let cloud: Vec<P> =
+            cloud(0.06).into_iter().enumerate().map(|(i, (x, y))| (x + 0.3 * (i as f32).sin(), y)).collect();
+        assert!(offer(&cloud, Some(kit::ShapeKind::Ellipse)).is_some_and(|n| closes_smoothly(&n)));
     }
 
     /// How many nodes the curve hook gives for `stroke`, QuickShape having found `found` (its

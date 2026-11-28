@@ -150,7 +150,11 @@ private fun SavedSelections(vm: CanvasViewModel) {
     // one row at a time slid open; a tap on another row, or on it, closes it. The newest is at the
     // top, each named by its place among them, oldest first
     var open by remember { mutableStateOf<Int?>(null) }
-    LazyColumn(Modifier.fillMaxWidth().height(172.dp), verticalArrangement = Arrangement.spacedBy(1.dp)) {
+    LazyColumn(
+        Modifier.fillMaxWidth().height(172.dp), verticalArrangement = Arrangement.spacedBy(1.dp),
+        flingBehavior = rememberScrollFling(),
+        overscrollEffect = rememberScrollEdges(),
+    ) {
         items(vm.savedSelections) { row ->
             val i = vm.savedSelections - 1 - row
             SavedSelectionRow(

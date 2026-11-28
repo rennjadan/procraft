@@ -872,7 +872,8 @@ final class CanvasViewController: UIViewController, UIPencilInteractionDelegate 
     override var canBecomeFirstResponder: Bool { true }
 
     /// The system's own three-finger editing gestures (undo, redo, copy, paste, the editing menu)
-    /// stay off the canvas, whose finger taps undo and redo: they would take them first.
+    /// stay off the canvas, whose finger taps undo and redo: they would take them first. (Every
+    /// responder says so, SwiftUI's own too: see `EditingGestures`.)
     override var editingInteractionConfiguration: UIEditingInteractionConfiguration { .none }
 
     override func viewDidAppear(_ animated: Bool) {

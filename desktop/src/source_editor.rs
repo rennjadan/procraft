@@ -4,6 +4,7 @@
 //! two-finger tap (or the other mouse button) turns the image negative; all but the shape can also be made to repeat without
 //! seams. Cancel leaves the brush as it was, the tick keeps the change.
 
+use crate::scroll::ScrollArea;
 use std::collections::HashSet;
 
 use egui::epaint::RectShape;
@@ -466,7 +467,7 @@ impl SourceEditor {
         let step = (grid.width() - 2.0 * CELL_GAP) / 3.0 + CELL_GAP;
         let mut picked = None;
         ui.scope_builder(UiBuilder::new().max_rect(grid), |ui| {
-            egui::ScrollArea::vertical()
+            ScrollArea::vertical()
                 .id_salt(("source library", library.grains))
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
                 .show(ui, |ui| {
