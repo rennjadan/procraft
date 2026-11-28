@@ -577,6 +577,11 @@ struct Press {
 /// the first point (not from where a drag would be told apart), and it is no tap.
 const SLIDER_SLOP: f32 = 2.5;
 
+/// A drag on a side slider follows the finger whole until it goes this far (points) out from the
+/// slider's middle, about the far side of its panel: a finger that wanders over the panel as it
+/// drags isn't slowed (the finer control is past it).
+const FINE_FROM: f32 = SLIDER_PANEL_SIDE + SLIDER_PANEL_GAP;
+
 /// A slider held still this long brings up its panel.
 const HOLD: std::time::Duration = std::time::Duration::from_millis(400);
 const NOTCH_WIDTH: f32 = 20.0;
@@ -900,7 +905,9 @@ impl SideBar {
                 press.raw = (press.raw - (now.y - from.y) / travel).clamp(0.0, 1.0);
                 set(session.slider_notch_at(size, press.raw).unwrap_or(press.raw));
             } else if press.moved && dy != 0.0 {
-                let across = now.x - rect.center().x;
+                // the finger wanders over the slider's panel as it goes: only past that (as far
+                // out as the slider's own reach beyond it) does the thumb go finer
+                let across = ((now.x - rect.center().x).abs() - FINE_FROM).max(0.0);
                 press.raw = (press.raw - dy / travel * side_slider_drag_share(across)).clamp(0.0, 1.0);
                 set(session.slider_notch_at(size, press.raw).unwrap_or(press.raw));
             }

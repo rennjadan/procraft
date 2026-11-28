@@ -5259,6 +5259,40 @@ mod tests {
         untouched(&w, "the size slider");
     }
 
+    /// The opacity slider dragged with a finger that wanders out over its panel: the thumb still
+    /// goes as far as the finger does.
+    #[test]
+    fn a_slider_drag_over_its_panel_still_follows_the_finger() {
+        use crate::look::pc;
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), false) else { return };
+        w.frame();
+        let bar = crate::panel::side_bar_shown_at(&w.ctx).expect("the side bar");
+        w.session.set_brush_opacity(0.8);
+        w.frame();
+        let before = w.session.info().opacity;
+        let travel = pc::SLIDER_HEIGHT - pc::THUMB_HEIGHT - pc::THUMB_INSET * 2.0;
+        // pressed on the opacity slider, out over the panel, then down 40 points there
+        let from = bar.min + vec2(25.0, 248.0 + 40.0);
+        w.pen(TouchPhase::Started, from);
+        w.frame();
+        let out = from + vec2(120.0, 0.0);
+        for k in 1..=10 {
+            w.pen(TouchPhase::Moved, from + (out - from) * (k as f32 / 10.0));
+            w.frame();
+        }
+        let mid = w.session.info().opacity;
+        let mut at = out;
+        for k in 1..=20 {
+            at = out + vec2(0.0, 2.0 * k as f32);
+            w.pen(TouchPhase::Moved, at);
+            w.frame();
+        }
+        w.pen(TouchPhase::Ended, at);
+        w.frame();
+        let moved = mid - w.session.info().opacity;
+        assert!((moved - 40.0 / travel).abs() < 0.02, "moved {moved} for 40 points ({before} at first)");
+    }
+
     /// A pen used once: fingers leave painting and picking colours to it, and only once.
     #[test]
     fn a_pen_used_leaves_painting_to_it_once() {
