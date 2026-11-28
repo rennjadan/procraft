@@ -24,6 +24,15 @@ use crate::look::{Look, Themed, Weight, argb, text};
 use crate::panel;
 
 pub const BACKGROUND: Themed = Themed(0xFF212121, 0xFFF0F0F0);
+/// A let-go artwork gliding to where it went.
+struct Landing {
+    artwork: GalleryArtwork,
+    from: Rect,
+    to: String,
+    into: bool,
+    since: Instant,
+}
+
 /// A thumbnail's shadow, dropped below it, and the rim round it.
 const THUMB_SHADOW: Themed = Themed(0x45000000, 0x1D000000);
 const THUMB_RIM: Themed = Themed(0xFF424242, 0xFFBEBEBE);
@@ -122,10 +131,9 @@ const SWIPE_S: f32 = 0.3;
 fn swipe_ease(t: f32) -> f32 {
     crate::look::spring(SWIPE_S, 0.75, 0.0, t)
 }
-/// Held this long, an artwork (or a stack) lifts to be dragged; while it is, its cell stays behind
-/// faint, and what it would be stacked onto is washed blue.
+/// Held this long, an artwork (or a stack) lifts to be dragged; while it is, its place stays behind
+/// empty (outlined), and what it would be stacked onto grows, lit blue.
 const HOLD_S: f64 = 0.4;
-const DRAGGED_FADE: f32 = 0.7;
 const DROP_WASH: u32 = 0x800064DC;
 const PREVIEW_ARROW: u32 = 0xFFB4B4B4;
 
@@ -323,6 +331,12 @@ pub struct Gallery {
     /// Where it would go as last shown while held (and whether on the way back out of a stack):
     /// a finger lifting has no place of its own (the pointer goes with it), so it goes there.
     last_target: Option<(Option<String>, usize)>,
+    /// Where the lifted picture is held, trailing the finger a touch (it has some weight).
+    float: Option<Pos2>,
+    /// A let-go picture on its way to where it went (a place, or into a stack), as Procreate's
+    /// glide in: what it shows, where it was let go, where it goes (by folder), whether into a
+    /// stack (shrinking as it goes), and since when.
+    landing: Option<Landing>,
     last_back: bool,
     slid: HashMap<String, Vec2>,
     /// Where each was drawn this frame, slid (by folder).
@@ -396,6 +410,14 @@ impl Lift {
 const PRESS_DELAY_S: f64 = 0.1;
 const PRESSED: (f32, f32) = (0.87, 0.15);
 const LIFTED: (f32, f32) = (1.07, 0.25);
+/// The one a lifted artwork would go onto grows a little to take it.
+const TARGETED: (f32, f32) = (1.06, 0.14);
+/// A lifted picture over one it would go onto shrinks this much, as if going in.
+const GOING_IN: f32 = 0.82;
+/// How quickly a lifted picture catches up with the finger (a second's share).
+const FLOAT_EASE: f32 = 30.0;
+/// A let-go picture's glide to its place (seconds).
+const LANDING_S: f32 = 0.24;
 const DROPPED: (f32, f32) = (1.0, 0.25);
 
 impl Gallery {
@@ -463,6 +485,8 @@ impl Gallery {
             stack_cells: HashMap::new(),
             shuffle: None,
             last_target: None,
+            float: None,
+            landing: None,
             last_back: false,
             slid: HashMap::new(),
             shown_at: HashMap::new(),
@@ -1541,8 +1565,12 @@ impl Gallery {
                     let dir = entry_dir(entry);
                     let pressed = ui.input(|inp| inp.pointer.press_start_time().map_or(0.0, |t| inp.time - t));
                     let down = response.is_pointer_button_down_on() && !response.dragged();
+                    let target =
+                        matches!(&self.last_target, Some((Some(onto), _)) if onto == dir) && self.lifted.is_some();
                     let size = if self.lifted.as_ref().is_some_and(|(d, _)| d == dir) {
                         LIFTED
+                    } else if target {
+                        TARGETED
                     } else if down && pressed >= PRESS_DELAY_S {
                         PRESSED
                     } else {
@@ -1640,6 +1668,7 @@ impl Gallery {
                 .shown(shown.state.clamped_offset().y, (shown.content_size.y - shown.inner_rect.height()).max(0.0));
         });
         self.drag(ui, &entries, &cells);
+        self.land(ui);
         self.drawn_cells = drawn;
         if into_stack {
             self.refresh();
@@ -1737,6 +1766,49 @@ impl Gallery {
     /// on the way back, out to the gallery's front. Resting a moment on a stack opens it, and on
     /// the way back opens the gallery, the drag going on: so an artwork is put in a stack, or
     /// taken out of one to wherever in the gallery it is let go.
+    /// A let-go picture gliding from where it was let go to where it went (its place's picture,
+    /// as drawn), easing in; into a stack, it shrinks and fades as it goes.
+    fn land(&mut self, ui: &Ui) {
+        let Some(l) = &self.landing else { return };
+        let t = (l.since.elapsed().as_secs_f32() / LANDING_S).min(1.0);
+        let Some(to) = self.pictures.get(&l.to).copied() else {
+            // its place not drawn yet (the gallery just changed): wait a frame, but not for ever
+            if t >= 1.0 {
+                self.landing = None;
+            }
+            ui.ctx().request_repaint();
+            return;
+        };
+        let e = 1.0 - (1.0 - t).powi(3);
+        let to = if l.into { Rect::from_center_size(to.center(), to.size() * 0.5) } else { to };
+        let lerp = |a: Pos2, b: Pos2| a + (b - a) * e;
+        let picture = Rect::from_min_max(lerp(l.from.min, to.min), lerp(l.from.max, to.max));
+        let alpha = if l.into { 1.0 - e } else { 1.0 };
+        let painter = ui.ctx().layer_painter(egui::LayerId::new(Order::Tooltip, Id::unique("landing artwork")));
+        let lift = 1.0 - e;
+        let shadow = egui::epaint::Shadow {
+            offset: [0, (4.0 * lift) as i8],
+            blur: (24.0 * lift) as u8,
+            spread: 0,
+            color: Color32::from_black_alpha((0x80 as f32 * lift * alpha) as u8),
+        };
+        painter.add(shadow.as_shape(picture, 8));
+        painter.rect_filled(picture, 8, Color32::WHITE.gamma_multiply(alpha));
+        let artwork = l.artwork.clone();
+        if let Some(texture) = self.texture(&artwork) {
+            let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+            painter.add(
+                egui::epaint::RectShape::filled(picture, 8, Color32::WHITE.gamma_multiply(alpha))
+                    .with_texture(texture, uv),
+            );
+        }
+        if t >= 1.0 {
+            self.landing = None;
+        } else {
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn drag(&mut self, ui: &Ui, entries: &[GalleryEntry], cells: &[(usize, Rect)]) {
         let Some((dir, from)) = self.lifted.clone() else { return };
         // shown here, or carried in from where it was lifted (into a stack, or out of one)
@@ -1814,19 +1886,40 @@ impl Gallery {
         }
         for &(i, cell) in cells {
             if entries.get(i).is_some_and(|e| entry_dir(e) == dir) {
-                // faint where it would go (its place, slid with the others)
+                // where it would go (its place, slid with the others): an empty place, its outline
+                // soft
                 let at = self.shown_at.get(&dir).copied().unwrap_or(cell);
-                ui.painter().rect_filled(at, 0, argb(BACKGROUND).gamma_multiply(DRAGGED_FADE));
+                ui.painter().rect_filled(at, 0, argb(BACKGROUND));
+                let frame = Self::thumb_box(at);
+                let hole = match &entry {
+                    GalleryEntry::Artwork { artwork } => Self::fitted(frame, artwork),
+                    GalleryEntry::Stack { .. } => frame,
+                };
+                ui.painter().rect_stroke(
+                    hole,
+                    8,
+                    Stroke::new(1.5, Color32::from_gray(128).gamma_multiply(0.35)),
+                    egui::StrokeKind::Inside,
+                );
             }
             if let Some((Some(onto), _)) = &target
                 && entries.get(i).is_some_and(|e| entry_dir(e) == onto)
             {
-                let frame = Self::thumb_box(cell);
-                let picture = match entries.get(i) {
-                    Some(GalleryEntry::Artwork { artwork }) => Self::fitted(frame, artwork),
-                    _ => frame,
-                };
-                ui.painter().rect_filled(picture, 8, argb(DROP_WASH));
+                // grown to take it (as drawn), lit blue with a rim
+                let at = self.pictures.get(onto).copied().unwrap_or_else(|| {
+                    let frame = Self::thumb_box(cell);
+                    match entries.get(i) {
+                        Some(GalleryEntry::Artwork { artwork }) => Self::fitted(frame, artwork),
+                        _ => frame,
+                    }
+                });
+                ui.painter().rect_filled(at, 8, argb(DROP_WASH).gamma_multiply(0.45));
+                ui.painter().rect_stroke(
+                    at.expand(2.0),
+                    10,
+                    Stroke::new(3.0, argb(crate::look::pc::ACCENT)),
+                    egui::StrokeKind::Outside,
+                );
             }
         }
         // the picture under the pointer, held where it was taken
@@ -1840,11 +1933,20 @@ impl Gallery {
         {
             self.lifted_picture = Self::fitted(Self::thumb_box(cell), a);
         }
-        if let (Some(a), Some(p)) = (shown, pointer)
+        // it trails the finger a touch
+        let dt = ui.input(|i| i.stable_dt.clamp(0.001, 0.05));
+        if let Some(p) = pointer.filter(|_| down) {
+            let at = self.float.get_or_insert(p);
+            *at += (p - *at) * (dt * FLOAT_EASE).min(1.0);
+        }
+        let going_in = matches!(&target, Some((Some(_), _)));
+        let squeeze = self.lift(ui.ctx(), "\u{0}going in", if going_in { (GOING_IN, 0.16) } else { (1.0, 0.16) });
+        let mut let_go_at = None;
+        if let (Some(a), Some(p)) = (shown, self.float.or(pointer))
             && self.lifted_picture.is_positive()
         {
-            // grown as it lifts, about where it is held
-            let k = self.lifts.get(&dir).map_or(LIFTED.0, Lift::now);
+            // grown as it lifts, about where it is held (smaller over one it would go into)
+            let k = self.lifts.get(&dir).map_or(LIFTED.0, Lift::now) * squeeze;
             let picture = self.lifted_picture.translate(p - from);
             let picture = Rect::from_min_max(p + (picture.min - p) * k, p + (picture.max - p) * k);
             let texture = self.texture(&a);
@@ -1857,6 +1959,7 @@ impl Gallery {
                 let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
                 painter.add(egui::epaint::RectShape::filled(picture, 8, Color32::WHITE).with_texture(t, uv));
             }
+            let_go_at = Some((a, picture));
         }
         if down {
             ui.ctx().request_repaint();
@@ -1865,6 +1968,17 @@ impl Gallery {
         self.lifted = None;
         self.lifted_entry = None;
         self.rest = DragRest::default();
+        self.float = None;
+        // let go: it glides to where it went (into a stack, shrinking as it goes)
+        if let Some((artwork, picture)) = let_go_at
+            && !back
+        {
+            let (to, into) = match &target {
+                Some((Some(onto), _)) => (onto.clone(), true),
+                _ => (dir.clone(), false),
+            };
+            self.landing = Some(Landing { artwork, from: picture, to, into, since: Instant::now() });
+        }
         // let go: the gallery takes its new order, each where it now is
         self.shuffle = None;
         self.last_target = None;
