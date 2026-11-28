@@ -1109,14 +1109,20 @@ pub struct Pickers {
     snap_held: bool,
 }
 
-/// A double-tap's second tap lands within this long of the first lifting, and this near it.
-const DOUBLE_TAP_S: f64 = 0.4;
+/// A double-tap's second tap lands within this long of the first lifting (Windows' own
+/// double-click time; a pen's taps, lifted clear of the glass between, came 0.4 s apart and more),
+/// and this near it.
+const DOUBLE_TAP_S: f64 = 0.5;
 const DOUBLE_TAP_REACH: f32 = 36.0;
 
 impl Pickers {
     /// Whether a press on `response` just now is the second tap of a double-tap (a snap: held
     /// until it lifts), or the press of one is still down. Taps that lift are kept for the next.
-    fn double_tap(&mut self, ui: &Ui, response: &egui::Response) -> bool {
+    ///
+    /// Returns `(snap, held)`: the press snaps now, and the pointer picks nothing this frame (a
+    /// snap's press held, or lifting: its last place would undo the snap).
+    fn double_tap(&mut self, ui: &Ui, response: &egui::Response) -> (bool, bool) {
+        let was = self.snap_held;
         let (now, pressed, origin) = ui.input(|i| (i.time, i.pointer.any_pressed(), i.pointer.press_origin()));
         if pressed
             && let Some(at) = origin
@@ -1128,7 +1134,7 @@ impl Pickers {
             self.snap_held = second;
             if second {
                 self.last_tap = None;
-                return true;
+                return (true, true);
             }
         }
         if response.clicked() {
@@ -1140,7 +1146,7 @@ impl Pickers {
             self.snap_held = false;
             self.last_tap = None;
         }
-        false
+        (false, was)
     }
 
     /// The disc picker in `rect` (364 square, or smaller and scaled alike): a hue ring (radii 124
@@ -1157,8 +1163,8 @@ impl Pickers {
         // double-tapped, as Procreate's: the ring snaps to the nearest primary or secondary hue
         // (red, yellow, green, cyan, blue, magenta), the disc to the nearest of white, black and
         // the pure hue; the second tap held there till it lifts
-        let snap = self.double_tap(ui, &response);
-        if let Some(p) = response.interact_pointer_pos().filter(|_| !self.snap_held || snap) {
+        let (snap, held) = self.double_tap(ui, &response);
+        if let Some(p) = response.interact_pointer_pos().filter(|_| !held || snap) {
             let d = p - centre;
             let ring = *self.on_ring.get_or_insert(d.length() > (disc_radius + ring_inner) / 2.0);
             if ring {
@@ -1238,8 +1244,8 @@ impl Pickers {
         let ppp = ctx.pixels_per_point();
         let before = *hsv;
         let response = ui.interact(square, ui.scope_id().with("classic square"), Sense::click_and_drag());
-        let snap = self.double_tap(ui, &response);
-        if let Some(p) = response.interact_pointer_pos().filter(|_| !self.snap_held || snap) {
+        let (snap, held) = self.double_tap(ui, &response);
+        if let Some(p) = response.interact_pointer_pos().filter(|_| !held || snap) {
             hsv[1] = ((p.x - square.left()) / square.width()).clamp(0.0, 1.0);
             hsv[2] = 1.0 - ((p.y - square.top()) / square.height()).clamp(0.0, 1.0);
             // double-tapped, the nearest corner: white, the pure hue, or black (either lower one)
@@ -2430,8 +2436,9 @@ pub fn rgb_to_hsv([r, g, b]: [f32; 3]) -> [f32; 3] {
 
 /// The points a double-tap on the disc snaps to, for hue `h`: white, black and the pure hue.
 fn snap_points(h: f32) -> Vec<[f32; 3]> {
-    // (black is every saturation at no brightness: each place it shows on the disc)
-    vec![[h, 0.0, 1.0], [h, 1.0, 1.0], [h, 0.0, 0.0], [h, 0.5, 0.0], [h, 1.0, 0.0]]
+    // white, the pure hue, black (every saturation at no brightness: each place it shows on the
+    // disc), and as Procreate's also mid-grey and half saturation
+    vec![[h, 0.0, 1.0], [h, 1.0, 1.0], [h, 0.0, 0.0], [h, 0.5, 0.0], [h, 1.0, 0.0], [h, 0.0, 0.5], [h, 0.5, 1.0]]
 }
 
 /// Where on `model`'s ring the primary or secondary hue nearest `hue` is (red, yellow, green,
@@ -2475,7 +2482,97 @@ mod tests {
         // the disc's points: white, the pure hue and black
         let points = snap_points(0.3);
         assert!(points.contains(&[0.3, 0.0, 1.0]) && points.contains(&[0.3, 1.0, 1.0]));
-        assert!(points.iter().filter(|p| p[2] == 0.0).count() >= 1 && points.len() == 5);
+        assert!(points.iter().filter(|p| p[2] == 0.0).count() >= 1 && points.len() == 7);
+    }
+
+    /// Taps on the disc picker in `rect` at `at` (points), each pressed and let go: `(seconds since
+    /// the first, where)`. The colour as it is after them.
+    fn disc_tapped(start: [f32; 3], taps: &[(f64, Pos2)], touch: bool) -> [f32; 3] {
+        let ctx = egui::Context::default();
+        let mut pickers = Pickers::default();
+        let mut hsv = start;
+        let rect = Rect::from_min_size(pos2(100.0, 100.0), vec2(PICKER, PICKER));
+        let mut frame = |time: f64, events: Vec<egui::Event>| {
+            let input = egui::RawInput {
+                time: Some(time),
+                events,
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(800.0, 800.0))),
+                ..Default::default()
+            };
+            let mut out = ctx.run_ui(input, |ui| {
+                pickers.disc(ui, &mut hsv, rect);
+            });
+            out.textures_delta.clear();
+        };
+        frame(1.0, vec![]);
+        for &(t, at) in taps {
+            let t = 2.0 + t;
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            let mut down = vec![egui::Event::PointerMoved(at), button(true)];
+            if touch {
+                down.insert(
+                    0,
+                    egui::Event::Touch {
+                        device_id: egui::TouchDeviceId(1),
+                        id: egui::TouchId(7),
+                        phase: egui::TouchPhase::Start,
+                        pos: at,
+                        force: None,
+                    },
+                );
+            }
+            frame(t, down);
+            // a pen's tap slips a point or two
+            frame(t + 0.03, vec![egui::Event::PointerMoved(at + vec2(1.5, -1.0))]);
+            let mut up = vec![button(false)];
+            if touch {
+                up.push(egui::Event::PointerGone);
+            }
+            frame(t + 0.07, up);
+            frame(t + 0.1, vec![]);
+        }
+        hsv
+    }
+
+    /// Double-tapped as Procreate's disc is: the 'perfect' colour nearest where it is tapped,
+    /// white, black, mid-grey, half saturation, the pure hue; the taps half a second apart (as
+    /// Windows' double-click), and on the disc's very edge (its border, not yet the ring) too.
+    #[test]
+    fn a_double_tap_on_the_disc_snaps_to_white_black_and_the_rest() {
+        let centre = pos2(100.0 + PICKER / 2.0, 100.0 + PICKER / 2.0);
+        let start = [0.03, 0.6, 0.4];
+        let on = |x: f32, y: f32| centre + vec2(x, y) * DISC_RADIUS;
+        let r = std::f32::consts::FRAC_1_SQRT_2;
+        let cases = [
+            ("white", on(-r * 0.85, -r * 0.85), Some(1.0), Some(0.0)),
+            ("the pure hue", on(r * 0.85, -r * 0.85), Some(1.0), Some(1.0)),
+            ("black, at the bottom", on(0.1, 0.9), Some(0.0), None),
+            // past the disc's edge, in its border before the ring
+            ("black, tapped on the border", on(0.0, 1.07), Some(0.0), None),
+            ("mid-grey", on(-0.9, 0.05), Some(0.5), Some(0.0)),
+            ("half saturation", on(0.05, -0.92), Some(1.0), Some(0.5)),
+        ];
+        for touch in [false, true] {
+            for gap in [0.25, 0.5] {
+                for (name, at, v, s) in cases {
+                    let hsv = disc_tapped(start, &[(0.0, at), (gap, at + vec2(4.0, 3.0))], touch);
+                    let ok = v.is_none_or(|v| (hsv[2] - v).abs() < 1e-4) && s.is_none_or(|s| (hsv[1] - s).abs() < 1e-4);
+                    assert!(ok, "{name} ({gap} s apart, touch {touch}): {hsv:?}");
+                }
+            }
+        }
+        // on the ring, a little off red: red itself, kept as the pen lifts
+        let ring = centre + vec2(153.0 * 0.03_f32.cos(), -153.0 * 0.2_f32.sin());
+        let hsv = disc_tapped([0.5, 0.8, 0.8], &[(0.0, ring), (0.3, ring)], true);
+        assert!(hsv[0] < 1e-3 || hsv[0] > 1.0 - 1e-3, "the ring to red: {hsv:?}");
+        // two taps too far apart in time, or place, pick as taps do
+        let far = disc_tapped(start, &[(0.0, on(0.1, 0.9)), (0.9, on(0.1, 0.9))], true);
+        assert!(far[2] > 0.0);
     }
 
     #[test]
