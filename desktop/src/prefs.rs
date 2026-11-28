@@ -70,6 +70,9 @@ pub struct Prefs {
     /// A pen has been used here once, and fingers were set to leave painting to it (done once:
     /// the settings are the user's after that).
     pub pen_set_up: bool,
+    /// A finger's touch and hold picks a colour again (an earlier setting up turned it off): done
+    /// once.
+    pub hold_pick_back: bool,
     pub cursor_shows: CursorShows,
     pub cursor_style: CursorStyle,
     /// The colour model the Colors panel's disc and Value sliders work in.
@@ -157,6 +160,7 @@ impl Default for Prefs {
             strip_colors: String::new(),
             strip_shown: true,
             pen_set_up: false,
+            hold_pick_back: false,
             cursor_shows: CursorShows::Hovering,
             cursor_style: CursorStyle::Brush,
             colour_model: procraft_core::ColourModel::Hsb,
@@ -240,6 +244,7 @@ impl Prefs {
                 "strip_colors" => p.strip_colors = value.to_owned(),
                 "strip_shown" => p.strip_shown = on,
                 "pen_set_up" => p.pen_set_up = on,
+                "hold_pick_back" => p.hold_pick_back = on,
                 "card_width_in" => p.card_width_in = number.map_or(p.card_width_in, |v| v.clamp(0.5, 20.0)),
                 "cursor_shows" => p.cursor_shows = pick(&SHOWS, value).unwrap_or(p.cursor_shows),
                 "cursor_style" => p.cursor_style = pick(&STYLES, value).unwrap_or(p.cursor_style),
@@ -328,6 +333,7 @@ impl Prefs {
             format!("strip_colors {}", self.strip_colors),
             format!("strip_shown {}", self.strip_shown),
             format!("pen_set_up {}", self.pen_set_up),
+            format!("hold_pick_back {}", self.hold_pick_back),
             format!("cursor_shows {}", place(&SHOWS, self.cursor_shows)),
             format!("cursor_style {}", place(&STYLES, self.cursor_style)),
             format!("colour_model {}", self.colour_model.key()),

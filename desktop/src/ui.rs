@@ -1822,20 +1822,28 @@ impl Interface {
     }
 
     /// The first time a pen is used here, as Procreate does once a Pencil is: fingers leave
-    /// painting to it (they move, zoom and turn the canvas, and tap), and a finger kept still no
-    /// longer picks a colour (it would, a pinch's first finger landing a moment early). Once: the
-    /// settings (Gestures) are the user's after that.
+    /// painting to it (they move, zoom and turn the canvas, tap, and kept still pick a colour, as
+    /// Procreate's do). Once: the settings (Gestures) are the user's after that. A finger's touch
+    /// and hold picking a colour, turned off by an earlier setting up, comes back once.
     fn pen_set_up(&mut self, session: &CanvasSession) {
+        if self.prefs.pen_set_up && !self.prefs.hold_pick_back {
+            self.prefs.hold_pick_back = true;
+            self.prefs.keep();
+            self.gestures.set(GesturePurpose::Eyedropper, "HOLD".into(), true);
+            session.set_touch_settings(self.prefs.touch_settings(&self.gestures));
+            crate::files::keep_gestures(&self.gestures.kept());
+            log::info!("a finger's touch and hold picks a colour again");
+        }
         if self.prefs.pen_set_up || !crate::pen::seen() {
             return;
         }
         self.prefs.pen_set_up = true;
+        self.prefs.hold_pick_back = true;
         self.prefs.keep();
         self.gestures.set(GesturePurpose::General, "FINGER_PAINT".into(), false);
-        self.gestures.set(GesturePurpose::Eyedropper, "HOLD".into(), false);
         session.set_touch_settings(self.prefs.touch_settings(&self.gestures));
         crate::files::keep_gestures(&self.gestures.kept());
-        log::info!("a pen in use: fingers leave painting and picking colours to it");
+        log::info!("a pen in use: fingers leave painting to it");
         self.overlays
             .notice("Pen in use: fingers now pinch, zoom and turn without painting (Gestures to change)", false);
     }
@@ -4392,6 +4400,7 @@ mod tests {
             let mut ui = Interface::with_prefs(prefs);
             // the pen the tests use set up already (fingers left as each test has them)
             ui.prefs.pen_set_up = true;
+            ui.prefs.hold_pick_back = true;
             ui.opened(&session, 1.0);
             let (input, touches) = (Input::default(), Default::default());
             let mut window = Window {
@@ -5376,16 +5385,35 @@ mod tests {
         w.frame();
     }
 
-    /// A pen used once: fingers leave painting and picking colours to it, and only once.
+    /// Set up for a pen by an earlier version (which turned a finger's touch and hold off): it picks
+    /// a colour again, once; turned off after that, it stays off.
+    #[test]
+    fn a_finger_s_hold_picks_a_colour_again_once() {
+        let Some(mut w) = Window::open(vec2(1180.0, 820.0), true) else { return };
+        w.ui.prefs.pen_set_up = true;
+        w.ui.prefs.hold_pick_back = false;
+        w.ui.gestures.set(GesturePurpose::Eyedropper, "HOLD".into(), false);
+        w.frame();
+        assert!(w.ui.gestures.is_on(GesturePurpose::Eyedropper, "HOLD".into()));
+        assert!(w.ui.prefs.hold_pick_back);
+        w.ui.gestures.set(GesturePurpose::Eyedropper, "HOLD".into(), false);
+        w.frame();
+        assert!(!w.ui.gestures.is_on(GesturePurpose::Eyedropper, "HOLD".into()));
+    }
+
+    /// A pen used once: fingers leave painting to it, and only once.
     #[test]
     fn a_pen_used_leaves_painting_to_it_once() {
         let Some(mut w) = Window::open(vec2(1180.0, 820.0), true) else { return };
         w.ui.prefs.pen_set_up = false;
+        w.ui.prefs.hold_pick_back = false;
         w.ui.gestures.set(GesturePurpose::General, "FINGER_PAINT".into(), true);
+        w.ui.gestures.set(GesturePurpose::Eyedropper, "HOLD".into(), true);
         crate::pen::pointer_kind(9001, true);
         w.frame();
         assert!(!w.ui.gestures.is_on(GesturePurpose::General, "FINGER_PAINT".into()));
-        assert!(!w.ui.gestures.is_on(GesturePurpose::Eyedropper, "HOLD".into()));
+        // a finger kept still still picks a colour, as Procreate's does (left as it was)
+        assert!(w.ui.gestures.is_on(GesturePurpose::Eyedropper, "HOLD".into()));
         assert!(w.ui.prefs.pen_set_up);
         // turned back on, it stays on
         w.ui.gestures.set(GesturePurpose::General, "FINGER_PAINT".into(), true);
