@@ -24,6 +24,11 @@ pub fn part(name: &'static str, since: Instant) {
     PARTS.with(|p| p.borrow_mut().push((name, took)));
 }
 
+/// The part of the window event under way that took longest, and how long.
+pub fn longest() -> Option<(&'static str, Duration)> {
+    PARTS.with(|p| p.borrow().iter().copied().max_by_key(|(_, took)| *took))
+}
+
 /// What the parts timed in the window event under way say, for the end of its line in the log
 /// (" (the canvas 120 ms, ...)"); nothing where none took long.
 pub fn said() -> String {

@@ -240,6 +240,84 @@ impl Drop for Timed {
         if took > SLOW_EVENT {
             log::warn!("{} took {} ms{}", self.0, took.as_millis(), frame_parts::said());
         }
+        if self.0 == "a frame" {
+            PACING.with(|p| p.borrow_mut().frame(took));
+        }
+    }
+}
+
+/// A frame longer than this is a hitch felt in a stroke or a pinch (two of the screen's sixtieths),
+/// though too short for [`SLOW_EVENT`]'s line: they're counted, and every [`PACING_EVERY`] a line
+/// tells how many there were, the worst, and which part held them up most.
+const HITCH: Duration = Duration::from_millis(33);
+const PACING_EVERY: Duration = Duration::from_secs(30);
+
+thread_local! {
+    static PACING: std::cell::RefCell<Pacing> = std::cell::RefCell::new(Pacing::new());
+}
+
+/// The frames since the last pacing line.
+struct Pacing {
+    since: Instant,
+    frames: u32,
+    hitches: u32,
+    over_50: u32,
+    worst: Duration,
+    worst_part: Option<(&'static str, Duration)>,
+    /// Which part was longest in each hitch, and how often.
+    held_by: Vec<(&'static str, u32)>,
+}
+
+impl Pacing {
+    fn new() -> Pacing {
+        Pacing {
+            since: Instant::now(),
+            frames: 0,
+            hitches: 0,
+            over_50: 0,
+            worst: Duration::ZERO,
+            worst_part: None,
+            held_by: Vec::new(),
+        }
+    }
+
+    fn frame(&mut self, took: Duration) {
+        self.frames += 1;
+        if took > HITCH {
+            self.hitches += 1;
+            if took > Duration::from_millis(50) {
+                self.over_50 += 1;
+            }
+            let part = frame_parts::longest();
+            if took > self.worst {
+                self.worst = took;
+                self.worst_part = part;
+            }
+            let name = part.map_or("its own work", |(name, _)| name);
+            match self.held_by.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, count)) => *count += 1,
+                None => self.held_by.push((name, 1)),
+            }
+        }
+        if self.since.elapsed() >= PACING_EVERY {
+            if self.hitches > 0 {
+                self.held_by.sort_by_key(|h| std::cmp::Reverse(h.1));
+                let held: Vec<String> = self.held_by.iter().map(|(n, c)| format!("{n} {c}")).collect();
+                let worst_part = self.worst_part.map_or(String::new(), |(n, t)| format!(" ({n} {} ms)", t.as_millis()));
+                log::info!(
+                    "frames in the last {} s: {}, {} over {} ms ({} over 50 ms); the worst {} ms{worst_part}; \
+                     held up most by: {}",
+                    self.since.elapsed().as_secs(),
+                    self.frames,
+                    self.hitches,
+                    HITCH.as_millis(),
+                    self.over_50,
+                    self.worst.as_millis(),
+                    held.join(", ")
+                );
+            }
+            *self = Pacing::new();
+        }
     }
 }
 /// The veil over the window while it does.
