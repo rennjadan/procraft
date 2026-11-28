@@ -93,6 +93,7 @@ impl InterfaceTouches {
         let mut heard = Vec::new();
         match touch.phase {
             TouchPhase::Started => {
+                crate::pen::touch_down(touch.id);
                 let on_canvas = !on_interface((touch.location.x as f32, touch.location.y as f32));
                 match self.pointer {
                     None => self.pointer = Some((touch, on_canvas)),
@@ -327,6 +328,12 @@ impl Input {
     /// Nothing is pressed on the canvas and the view isn't moving.
     pub fn idle(&self) -> bool {
         self.down.is_empty() && !self.panning && self.key_drag.is_none()
+    }
+
+    /// Only fingers are on the canvas (no pen, no mouse): the brush's outline is the pen's, and
+    /// shows for none of them.
+    pub fn fingers_only(&self) -> bool {
+        !self.down.is_empty() && self.down.iter().all(|&id| id != MOUSE && crate::pen::is_pen(id) == Some(false))
     }
 
     /// Something is pressed on the canvas (a pen, the mouse, a finger), and not to move the view.
@@ -921,6 +928,10 @@ fn pen_pressure(touch: &Touch) -> Option<f32> {
     match crate::pen::is_pen(touch.id) {
         Some(true) => Some(force.or_else(|| crate::pen::pressure(touch.id)).unwrap_or(1.0)),
         Some(false) => None,
+        // on Windows every touch comes through the system's pointer messages, which say which it
+        // is: one not said is a finger's (a touch screen's fingers have a pressure too, and one
+        // taken for the pen showed the brush's outline under it, coming and going)
+        None if cfg!(windows) => None,
         None => force,
     }
 }

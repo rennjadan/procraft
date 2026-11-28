@@ -165,6 +165,20 @@ pub fn eraser_end(id: u64) -> bool {
     flags & (FLAG_INVERTED | FLAG_ERASER) != 0
 }
 
+/// The touch that went down last (none yet: `u64::MAX`).
+static LAST_DOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Touch `id` went down (on the interface or the canvas).
+pub fn touch_down(id: u64) {
+    LAST_DOWN.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the touch that went down last is the pen's, as the system said.
+pub fn last_touch_is_pen() -> bool {
+    let id = LAST_DOWN.load(std::sync::atomic::Ordering::Relaxed);
+    id != u64::MAX && is_pen(id) == Some(true)
+}
+
 /// A pen has touched the screen in this run.
 static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

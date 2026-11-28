@@ -66,8 +66,17 @@ struct Press {
     avoid: Option<Rect>,
     /// The colour being dragged out: where it is, and whether it has come to rest.
     drag: Option<Arc<ColourDrag>>,
-    /// And as it is drawn.
+    /// And as it is drawn, a pen's dot or a finger's.
     blob: Option<Arc<ColourBlob>>,
+    pen_dot: bool,
+}
+
+impl ColourDrop {
+    /// The colour being dragged out: whether it is a pen's dot (for tests).
+    #[cfg(test)]
+    pub fn carried_pen_dot(&self) -> Option<bool> {
+        self.press.as_ref().filter(|p| p.dragging).map(|p| p.pen_dot)
+    }
 }
 
 pub struct ColourDrop {
@@ -180,8 +189,17 @@ impl ColourDrop {
             } else {
                 ColourPress::button(origin.x, origin.y, ms)
             };
-            self.press =
-                Some(Press { id, origin, last: origin, reading, dragging: false, avoid, drag: None, blob: None });
+            self.press = Some(Press {
+                id,
+                origin,
+                last: origin,
+                reading,
+                dragging: false,
+                avoid,
+                drag: None,
+                blob: None,
+                pen_dot: false,
+            });
         }
         let press = self.press.as_mut().filter(|p| p.id == id)?;
         let at = at.unwrap_or(press.origin);
@@ -249,13 +267,16 @@ impl ColourDrop {
             // a mouse or a pen: a little wobble still rests
             press.drag = Some(ColourDrag::new(at.x, at.y, ms, true, self.threshold));
             // pulled out of the colour button's centre, or from where a swatch was pressed; a pen
-            // moving the pointer drags a pen's dot
+            // drags a pen's dot (the screen's own pen comes as a touch: a finger's dot, three
+            // times as big, hid where it was going)
             let from = if swatch { press.origin } else { centre };
-            let pen = crate::pen::mouse_pen().is_some();
+            let touching = ctx.input(egui::InputState::any_touches);
+            let pen = crate::pen::mouse_pen().is_some() || (touching && crate::pen::last_touch_is_pen());
             let blob = ColourBlob::new(from.x, from.y, !swatch, pen, reduce_motion(), ms);
             let button = self.button.unwrap_or(from);
             blob.point_to(at.x, at.y, over_bar(ctx, at), button.x, button.y);
             press.blob = Some(blob);
+            press.pen_dot = pen;
             self.poured = false;
             self.refused = false;
             self.swatch = swatch.then_some(rgb);

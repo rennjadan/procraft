@@ -1595,6 +1595,12 @@ impl Interface {
             return;
         }
         if !input.idle() {
+            // fingers on the canvas (a pinch, a tap): the pen's outline goes from where it last
+            // hovered, rather than staying there to come and go as the fingers do
+            if input.fingers_only() {
+                self.overlays.hover(session, info, ctx.pixels_per_point(), None);
+                return;
+            }
             // the view moved (the middle button, Space, R, or Space and Ctrl held): the outline
             // goes, nothing being painted where it was; hovering again, it comes back where the
             // pointer is
@@ -1686,7 +1692,9 @@ impl Interface {
                 }
                 // (from afar it shows however it is set to, the hand not being on the stroke)
                 TouchCommand::Cursor { x, y }
-                    if self.prefs.cursor_shown(false) || (self.prefs.brush_cursor && input.pressing_from_afar()) =>
+                    if !input.fingers_only()
+                        && (self.prefs.cursor_shown(false)
+                            || (self.prefs.brush_cursor && input.pressing_from_afar())) =>
                 {
                     self.overlays.cursor(ctx, session, Some((x, y)));
                 }
@@ -4475,6 +4483,22 @@ mod tests {
             self.canvas_hears(&WindowEvent::Touch(touch));
         }
 
+        /// Finger `id` touching at `at`, as the system's pointer messages bring it (no pressure).
+        fn finger(&mut self, id: u64, phase: TouchPhase, at: Pos2) {
+            crate::pen::pointer_kind(id, false);
+            let location = PhysicalPosition::new(f64::from(at.x), f64::from(at.y));
+            let touch = Touch { device_id: DeviceId::dummy(), phase, location, force: None, id };
+            let canvas = self.ui.canvas_rect;
+            let ctx = &self.ctx;
+            for heard in self.touches.route(WindowEvent::Touch(touch), |p| crate::screen::on_interface(ctx, p, canvas))
+            {
+                if let WindowEvent::Touch(t) = heard {
+                    self.egui_touch(&t);
+                }
+            }
+            self.canvas_hears(&WindowEvent::Touch(touch));
+        }
+
         /// A touch as egui-winit gives it to egui: as itself, and as the pointer while it is the
         /// first one down.
         fn egui_touch(&mut self, t: &Touch) {
@@ -5291,6 +5315,65 @@ mod tests {
         w.frame();
         let moved = mid - w.session.info().opacity;
         assert!((moved - 40.0 / travel).abs() < 0.02, "moved {moved} for 40 points ({before} at first)");
+    }
+
+    /// The colour dragged out of the colour button with the pen carries a pen's small dot; with a
+    /// finger, a finger's.
+    #[test]
+    fn a_colour_dragged_with_the_pen_carries_a_pen_s_dot() {
+        let Some(mut w) = Window::open(vec2(1200.0, 800.0), false) else { return };
+        let button = w.tool_button(BarButton::Colour, 1.0);
+        let artwork = pos2(600.0, 400.0);
+        for (pen, id) in [(true, 0), (false, 5501)] {
+            if pen {
+                w.pen(TouchPhase::Started, button);
+            } else {
+                w.finger(id, TouchPhase::Started, button);
+            }
+            w.frame();
+            let mut dot = None;
+            for k in 1..=12 {
+                let at = button + (artwork - button) * (k as f32 / 12.0);
+                if pen {
+                    w.pen(TouchPhase::Moved, at);
+                } else {
+                    w.finger(id, TouchPhase::Moved, at);
+                }
+                w.frame();
+                dot = dot.or(w.ui.drop.carried_pen_dot());
+            }
+            assert_eq!(dot, Some(pen), "dragged with the pen: {pen}");
+            if pen {
+                w.pen(TouchPhase::Ended, artwork);
+            } else {
+                w.finger(id, TouchPhase::Ended, artwork);
+            }
+            w.frame();
+            w.frame();
+        }
+    }
+
+    /// The brush's outline left where the pen last hovered goes once fingers are down on the
+    /// canvas (a pinch), rather than coming and going under them.
+    #[test]
+    fn fingers_down_take_the_pen_s_outline_away() {
+        let Some(mut w) = Window::open(vec2(1200.0, 800.0), false) else { return };
+        w.ui.prefs.brush_cursor = true;
+        let at = pos2(600.0, 400.0);
+        w.hover(at);
+        w.frame();
+        assert!(w.ui.overlays.outline_shown(), "the outline hovering");
+        w.finger(6601, TouchPhase::Started, pos2(500.0, 300.0));
+        w.frame();
+        w.finger(6602, TouchPhase::Started, pos2(700.0, 500.0));
+        for k in 1..=6 {
+            w.finger(6601, TouchPhase::Moved, pos2(500.0 - k as f32 * 8.0, 300.0));
+            w.frame();
+            assert!(!w.ui.overlays.outline_shown(), "fingers down, step {k}");
+        }
+        w.finger(6601, TouchPhase::Ended, pos2(452.0, 300.0));
+        w.finger(6602, TouchPhase::Ended, pos2(700.0, 500.0));
+        w.frame();
     }
 
     /// A pen used once: fingers leave painting and picking colours to it, and only once.
