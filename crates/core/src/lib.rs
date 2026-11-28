@@ -2392,7 +2392,7 @@ fn canvas_of_opened(
             c.let_go_of_spares();
         }
         log::info!(
-            "canvas made in {} ms: {} layers, {} kept compressed, {} KB of copies of the rest",
+            "canvas made in {} ms: {w}×{h}, {} layers, {} kept compressed, {} KB of copies of the rest",
             started.elapsed().as_millis(),
             ids.len(),
             c.parked_layers(),

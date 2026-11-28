@@ -167,6 +167,18 @@ pub static AmdPowerXpressRequestHighPerformance: u32 = 1;
 const LAYERS_ON_GPU: u64 = 2 << 30;
 /// The least they may take on a GPU that shares the computer's memory.
 const LAYERS_ON_SHARED_GPU_LEAST: u64 = 512 << 20;
+/// The most they may take on a GPU that shares a roomy computer's memory (see [`ROOMY_COMPUTER`]),
+/// as Procreate's measured layer limits work out on an M1 iPad Pro of 8 GB (Procreate 5.2): 58
+/// layers of 4096², 246 of 2048², 500 of 1920×1080, each 4 bytes a pixel, 3.6 to 3.9 GiB. A Surface
+/// Pro 9 of 16 GB (Windows says 15.7 GiB) gives a quarter, 3.93 GiB: 62, 251 and 508 of those on
+/// the GPU before any is kept compressed. With the history's most (768 MiB) and the canvas's own
+/// textures (about 0.6 GiB at 4096²) that is 5.3 GiB of the 7.9 GiB Windows lets its Iris Xe take,
+/// leaving 2.6 GiB for the system and other apps.
+const LAYERS_ON_SHARED_GPU_MOST: u64 = 4 << 30;
+/// A computer with this much memory or more (16 GB, as Windows tells it, is 15.7 GiB) gives an
+/// integrated GPU's layers a quarter of it; less, an eighth (its share of what the GPU may take
+/// is too thin to give more).
+const ROOMY_COMPUTER: u64 = 12 << 30;
 
 /// What the layers' textures may take on the GPU (see [`LAYERS_ON_GPU`]), on a GPU that has its own
 /// memory (`dedicated`, bytes, where the system says) or `shares` the computer's `memory` (bytes,
@@ -174,12 +186,18 @@ const LAYERS_ON_SHARED_GPU_LEAST: u64 = 512 << 20;
 /// (see [`gpus::layers_on_card`]). An integrated GPU has at most half the computer's memory (as
 /// Windows gives it), which the system and every other app draw on too, and running out of it loses
 /// the device (wgpu loses it on a copy it can't make room for): its layers take an eighth of the
-/// computer's memory, 512 MiB to 2 GiB. A laptop of 8 GB gives them 1 GiB, which the canvas takes
+/// computer's memory, 512 MiB to 2 GiB, or a quarter of a computer of 16 GB or more, up to 4 GiB
+/// (see [`LAYERS_ON_SHARED_GPU_MOST`]). A laptop of 8 GB gives them 1 GiB, which the canvas takes
 /// for a device of little memory: its history's older steps kept compressed off the GPU, and fewer
 /// of wet paint's marks to go back to.
 fn layers_on_gpu(shares: bool, memory: Option<u64>, dedicated: Option<u64>) -> u64 {
     match (shares, memory) {
         (false, _) => gpus::layers_on_card(dedicated, LAYERS_ON_GPU),
+        // a computer of 16 GB (Windows says a little less): a quarter, as Procreate gives an M1
+        // iPad Pro (see [`LAYERS_ON_SHARED_GPU_MOST`])
+        (true, Some(memory)) if memory >= ROOMY_COMPUTER => {
+            (memory / 4).clamp(LAYERS_ON_SHARED_GPU_LEAST, LAYERS_ON_SHARED_GPU_MOST)
+        }
         (true, Some(memory)) => (memory / 8).clamp(LAYERS_ON_SHARED_GPU_LEAST, LAYERS_ON_GPU),
         (true, None) => LAYERS_ON_GPU / 2,
     }
@@ -2242,7 +2260,7 @@ mod tests {
     }
 
     #[test]
-    fn a_gpu_sharing_the_computers_memory_gives_the_layers_an_eighth_of_it() {
+    fn a_gpu_sharing_the_computers_memory_gives_the_layers_an_eighth_or_a_quarter_of_it() {
         use super::layers_on_gpu;
         const GB: u64 = 1 << 30;
         // a graphics card whose memory isn't known: 2 GiB, whatever the computer has
@@ -2256,8 +2274,18 @@ mod tests {
         assert!(layers_on_gpu(true, Some(8 * GB), None) <= 1280 << 20);
         assert_eq!(layers_on_gpu(true, Some(4 * GB), None), 512 << 20);
         assert_eq!(layers_on_gpu(true, Some(2 * GB), None), 512 << 20);
-        assert_eq!(layers_on_gpu(true, Some(16 * GB), None), 2 * GB);
-        assert_eq!(layers_on_gpu(true, Some(64 * GB), None), 2 * GB);
+        // 16 GB or more: a quarter, up to 4 GiB, as Procreate on an M1 iPad Pro
+        assert_eq!(layers_on_gpu(true, Some(16 * GB), None), 4 * GB);
+        assert_eq!(layers_on_gpu(true, Some(64 * GB), None), 4 * GB);
+        // a Surface Pro 9 of 16 GB, as Windows tells it (8104 MB the GPU may take)
+        let surface = layers_on_gpu(true, Some(16_855_000_000), None);
+        assert_eq!(surface, 16_855_000_000 / 4);
+        let layer = |w: u64, h: u64| surface / (w * h * 4);
+        assert_eq!((layer(4096, 4096), layer(2048, 2048), layer(1920, 1080)), (62, 251, 508));
+        // with the history and the canvas's own textures, well within what Windows lets it take
+        assert!(surface + (768 << 20) + (640 << 20) < 8104 * (1 << 20) * 3 / 4);
+        // under 12 GiB: an eighth, as before
+        assert_eq!(layers_on_gpu(true, Some(12 * GB - 1), None), (12 * GB - 1) / 8);
         assert_eq!(layers_on_gpu(true, None, None), GB);
     }
 

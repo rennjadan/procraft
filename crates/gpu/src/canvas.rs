@@ -3499,6 +3499,9 @@ pub struct Canvas {
     /// Buffers pixels go up to the layers through, kept mapped for the next upload once the GPU
     /// is done with them (see [`Uploads`]).
     uploads: Uploads,
+    /// Being filled as an artwork opens (from [`Canvas::unfilled`] to [`Canvas::fill_rest`]): its
+    /// layers go up a strip at a time, no more than one ahead of the GPU (see [`UPLOAD_STRIP`]).
+    opening: bool,
     sampler: wgpu::Sampler,
     grains_view: wgpu::TextureView,
     grain_sampler: wgpu::Sampler,
@@ -3904,11 +3907,14 @@ impl Canvas {
     /// instead, so that a canvas of many layers never holds a texture for every one at once.
     /// [`Canvas::fill_rest`] ends it.
     pub fn unfilled(gpu: &Gpu, doc: &Document) -> Result<Canvas, GpuError> {
-        Canvas::make(gpu, doc, None, true)
+        let mut canvas = Canvas::make(gpu, doc, None, true)?;
+        canvas.opening = true;
+        Ok(canvas)
     }
 
     /// Makes the textures of the layers that have none and aren't parked (clear).
     pub fn fill_rest(&mut self, gpu: &Gpu, doc: &Document) {
+        self.opening = false;
         self.sync_layers(gpu, doc);
     }
 
@@ -4053,6 +4059,7 @@ impl Canvas {
             spare_before: None,
             spares: Mutex::new(Vec::new()),
             uploads: Uploads::default(),
+            opening: false,
             sampler,
             grains_view,
             grain_sampler,
@@ -13416,11 +13423,33 @@ impl Canvas {
 
     /// [`Canvas::upload`] sent at once, ahead of whatever is recorded but not yet sent.
     fn upload_now(&self, gpu: &Gpu, texture: &wgpu::Texture, rect: IRect, data: &[u8], offset: usize, row: usize) {
-        let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upload") });
-        let used = self.upload(gpu, &mut encoder, texture, rect, data, offset, row);
-        gpu.queue.submit([encoder.finish()]);
-        if let Some(buffer) = used {
-            self.uploads.give_back(buffer);
+        // a strip at a time (see [`UPLOAD_STRIP`]): the GPU does one copy at once, and a frame sent
+        // meanwhile goes after it, so none waits behind the whole layer
+        let rows = i32::try_from(strip_rows(rect.width().max(1), UPLOAD_STRIP)).unwrap_or(i32::MAX);
+        let mut in_flight = None;
+        let mut y = rect.y0;
+        while y < rect.y1 {
+            let end = rect.y1.min(y.saturating_add(rows));
+            let strip = IRect::new(rect.x0, y, rect.x1, end);
+            let from = offset + (y - rect.y0) as usize * row;
+            let mut encoder =
+                gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("upload") });
+            let used = self.upload(gpu, &mut encoder, texture, strip, data, from, row);
+            let index = gpu.queue.submit([encoder.finish()]);
+            if let Some(buffer) = used {
+                self.uploads.give_back(buffer);
+            }
+            y = end;
+            // opening (off the interface's thread): the strip before this one waited for while
+            // the GPU copies this, so a frame shown meanwhile queues behind two strips at most
+            if self.opening
+                && let Some(before) = in_flight.replace(index)
+            {
+                let wait = wgpu::PollType::Wait { submission_index: Some(before), timeout: Some(PACED_WAIT_MOST) };
+                if let Err(e) = crate::poll(&gpu.device, wait) {
+                    log::warn!("waiting for a layer's strip to go up: {e}");
+                }
+            }
         }
     }
 
@@ -15435,6 +15464,13 @@ const UPLOAD_FAILED: u8 = 2;
 /// The most bytes of upload buffers kept between uploads: two layers the size of a large tablet
 /// canvas; bigger ones are made for each upload.
 const UPLOADS_KEPT: u64 = 96 << 20;
+
+/// A layer goes up to the GPU at most this much at once, bytes: about 1.6 ms of copying at the
+/// 10 GB/s an integrated GPU's shared memory moves texels (an Iris Xe's LPDDR5 at 83 GB/s, a
+/// copy reading and writing each byte, in tiles), a fifth of a 120 Hz frame's 8.3 ms. A whole
+/// 4096² layer (64 MiB) took 6.5 ms, and an artwork's layers one after another held the frames
+/// shown meanwhile back 400 to 600 ms as it opened.
+const UPLOAD_STRIP: u64 = 16 << 20;
 
 impl Uploads {
     /// A mapped buffer of `size` bytes or more: one kept and back from the GPU, or one waited
@@ -18115,5 +18151,44 @@ mod tests {
         assert!(preview.windows(2).all(|w| w[0] != w[1]));
         // the next frame's input, the next pass
         assert_ne!(wet_pass(15.0, false), wet_pass(18.0, false));
+    }
+}
+
+#[cfg(test)]
+mod opening_in_strips {
+    use super::*;
+
+    /// An artwork's layer taller than a strip goes up a strip at a time as it opens, each strip
+    /// where it belongs: read back, it is the layer as it was, and so is a part of one.
+    #[test]
+    fn a_layer_goes_up_in_strips_whole() {
+        use procraft_engine::document::Document;
+        let Ok(gpu) = Gpu::headless() else { return };
+        // 1500 across: a row of 6144 bytes, so a strip of 16 MiB is 2730 rows; 6000 rows is three
+        let (w, h) = (1500u32, 6000u32);
+        assert!(i64::from(h) > i64::from(strip_rows(w, UPLOAD_STRIP)) * 2);
+        let mut doc = Document::new(w, h);
+        doc.add_layer();
+        let ids: Vec<_> = doc.layers().iter().map(|l| l.id).collect();
+        let px: Vec<u8> = (0..w * h * 4).map(|i| (i % 251) as u8).collect();
+        let mut canvas = Canvas::unfilled(&gpu, &doc).unwrap();
+        let (Some(&whole), Some(&part)) = (ids.first(), ids.get(1)) else { panic!("two layers") };
+        canvas.upload_layer_painted(&gpu, whole, &px, Some(IRect::new(0, 0, w as i32, h as i32))).unwrap();
+        // only a box painted, from row 100 down past two strips
+        let painted = IRect::new(300, 100, 900, 5900);
+        canvas.upload_layer_painted(&gpu, part, &px, Some(painted)).unwrap();
+        canvas.fill_rest(&gpu, &doc);
+        assert_eq!(canvas.read_layer(&gpu, whole).unwrap(), px);
+        let read = canvas.read_layer(&gpu, part).unwrap();
+        for y in [0u32, 99, 100, 2829, 2830, 2831, 5899, 5900, 5999] {
+            for x in [0u32, 299, 300, 899, 900, 1499] {
+                let at = ((y * w + x) * 4) as usize;
+                let (x0, y0) = (x as i32, y as i32);
+                let inside = x0 >= painted.x0 && x0 < painted.x1 && y0 >= painted.y0 && y0 < painted.y1;
+                let want = if inside { px.get(at..at + 4) } else { Some(&[0u8; 4][..]) };
+                assert_eq!(read.get(at..at + 4), want, "({x}, {y})");
+            }
+        }
+        assert_eq!(gpu.errors(), 0);
     }
 }
